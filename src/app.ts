@@ -232,7 +232,7 @@ app.get('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserControll
 app.post('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.create);
 app.get('/api/franchise/:id/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.getByFranchise);
 app.patch('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.update);
-app.patch('/api/users/:id/reset-password', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.resetPassword);
+app.patch('/api/users/:id/reset-password', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), UserController.resetPassword);
 app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.delete);
 
 // Governance & Settings
