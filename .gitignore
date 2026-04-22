@@ -1,0 +1,44 @@
+# Dependency directories
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Prisma
+/prisma/migrations/
+/prisma/*.db
+/prisma/*.db-journal
+
+# Temporary/Scratch files
+test.txt
+login.json
+test_login.js
+verify_movements.js
+verify_operations.ts
+verify_pos.js
+verify_pos.ts
+verify_users.js

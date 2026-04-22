@@ -1,0 +1,24 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: food_erp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: food_admin
+      POSTGRES_PASSWORD: food_password
+      POSTGRES_DB: food_erp_db
+    ports:
+      - '5432:5432'
+    volumes:
+      - food_erp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U food_admin -d food_erp_db']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  food_erp_pgdata:
+    driver: local
