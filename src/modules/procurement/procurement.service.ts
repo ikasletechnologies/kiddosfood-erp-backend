@@ -179,15 +179,25 @@ export class ProcurementService {
     notes?: string;
     items: Array<{ inventoryItemId: string; quantity: number; price: number }>;
   }) {
+    // 1. Calculate total
     const totalAmount = data.items.reduce((acc, item) => acc + item.quantity * item.price, 0);
 
-    // Fetch current balance BEFORE this transaction (auto-advance calculation)
+    // 2. Fetch current balance (CREDIT - DEBIT)
     const currentBalance = await this.getVendorBalance(data.vendorId);
-    const newAdvancePayment = data.advancePaid && data.advancePaid > 0 ? data.advancePaid : 0;
-    // Available advance = existing balance + any new advance being paid now
-    const availableForThisPO = currentBalance + newAdvancePayment;
-    // Auto-applied advance shown on PO (display only — actual balance comes from ledger)
-    const autoAppliedAdvance = Math.max(0, Math.min(availableForThisPO, totalAmount));
+    const existingCredit = Math.max(0, currentBalance); // Only positive balance counts as advance
+    
+    // 3. Determine how much advance to mark on this PO
+    // We auto-apply whatever they have, but if they sent a higher amount, we treat the rest as new payment.
+    const autoApplied = Math.min(totalAmount, existingCredit);
+    const providedAmount = data.advancePaid || 0;
+    
+    // Final amount shown on PO as "Paid"
+    const finalAdvancePaid = Math.max(autoApplied, providedAmount);
+    
+    // How much NEW money are they actually paying?
+    // If they have ₹15,000 and the PO is ₹5,000, and they sent advancePaid: 5000, newMoney is 0.
+    // If they have ₹1,000 and they sent advancePaid: 5000, newMoney is ₹4,000.
+    const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Create the PO
@@ -195,7 +205,7 @@ export class ProcurementService {
         data: {
           vendorId: data.vendorId,
           totalAmount,
-          advancePaid: autoAppliedAdvance,
+          advancePaid: finalAdvancePaid,
           expectedDeliveryDate: data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null,
           notes: data.notes,
           status: 'PENDING',
@@ -210,7 +220,7 @@ export class ProcurementService {
         include: { poItems: { include: { inventoryItem: true } }, vendor: true }
       });
 
-      // 2. Create Ledger DEBIT for PO amount (goods ordered = liability)
+      // 2. Create Ledger DEBIT for PO amount (Always reduces balance / increase liability)
       await tx.vendorLedger.create({
         data: {
           vendorId: data.vendorId,
@@ -222,16 +232,16 @@ export class ProcurementService {
         }
       });
 
-      // 3. If user is paying new advance NOW (along with PO creation), record CREDIT
-      if (newAdvancePayment > 0) {
+      // 3. Only record a NEW CREDIT if user is actually paying new money now
+      if (newMoneyPayment > 0) {
         await tx.vendorLedger.create({
           data: {
             vendorId: data.vendorId,
             type: 'CREDIT',
-            amount: newAdvancePayment,
+            amount: newMoneyPayment,
             referenceType: 'ADVANCE',
             referenceId: po.id,
-            note: `Advance Payment with PO #${po.id.substring(0, 8)}`
+            note: `New Advance Payment with PO #${po.id.substring(0, 8)}`
           }
         });
       }
@@ -474,7 +484,17 @@ export class ProcurementService {
     const vendors = await this.getVendors();
     const totalVendors = vendors.length;
     
-    const totalOwed    = vendors.filter(v => v.balance < 0).reduce((s, v) => s + Math.abs(v.balance), 0);
+    // Fetch all non-cancelled POs to calculate total outstanding liability
+    const orders = await prisma.procurementOrder.findMany({
+      where: { NOT: { status: 'CANCELLED' } },
+      select: { totalAmount: true, advancePaid: true }
+    });
+
+    // Total Owed = Sum of (Total - Paid) across all orders
+    // This matches the "Balance Due" shown on the Purchase Orders page
+    const totalOwed = orders.reduce((s, o) => s + Math.max(0, o.totalAmount - o.advancePaid), 0);
+    
+    // Total Advance = Net positive balance (Advance - Liability) for all vendors who are in surplus
     const totalAdvance = vendors.filter(v => v.balance > 0).reduce((s, v) => s + v.balance, 0);
     const totalMaterials = await prisma.vendorMaterial.count();
 
