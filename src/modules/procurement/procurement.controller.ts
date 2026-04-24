@@ -91,6 +91,15 @@ export class ProcurementController {
     }
   }
 
+  static async approvePO(req: Request, res: Response) {
+    try {
+      const po = await ProcurementService.approvePO(req.params.id);
+      res.json(po);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async cancelPO(req: Request, res: Response) {
     try {
       const po = await ProcurementService.cancelPO(req.params.id);
@@ -131,6 +140,60 @@ export class ProcurementController {
       const { vendorId, materialId, price } = req.body;
       const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price);
       res.json(link);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getVendorSummary(_req: Request, res: Response) {
+    try {
+      const summary = await ProcurementService.getVendorsSummary();
+      res.json(summary);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async filterVendors(req: Request, res: Response) {
+    try {
+      const { materialId, balanceType, minPrice, maxPrice } = req.query;
+      const data = await ProcurementService.filterVendors({
+        materialId,
+        balanceType,
+        minPrice,
+        maxPrice
+      });
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  // --- Ledger Management ---
+  static async getVendorLedger(req: Request, res: Response) {
+    try {
+      const data = await ProcurementService.getVendorLedger(req.params.id, req.query);
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async recordPayment(req: Request, res: Response) {
+    try {
+      const { amount, note } = req.body;
+      const data = await ProcurementService.recordPayment(req.params.id, amount, note);
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async recordAdjustment(req: Request, res: Response) {
+    try {
+      const { amount, type, note } = req.body;
+      const data = await ProcurementService.recordAdjustment(req.params.id, amount, type, note);
+      res.json(data);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

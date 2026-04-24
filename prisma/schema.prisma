@@ -116,6 +116,7 @@ model InventoryItem {
   requestItems    StockRequestItem[]
   transferItems   StockTransferItem[]
   poItems         ProcurementOrderItem[]
+  grnItems        GoodsReceiptItem[]
   vendors         VendorMaterial[]
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
@@ -159,13 +160,44 @@ model Vendor {
   name            String
   contact         String
   email           String?
-  rating          Float?             @default(5.0)
+  address            String?
+  remark             String?
+  manualPurchaseAdj  Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
+  manualAdvanceAdj   Float              @default(0) // @deprecated: Use VendorLedger for all advances
+  rating             Float?             @default(5.0)
   items           InventoryItem[]
   orders          ProcurementOrder[]
   rfqs            PurchaseRFQ[]
   purchaseReturns PurchaseReturn[]
   suppliedMaterials VendorMaterial[]
+  ledgerEntries   VendorLedger[]
+  invoices        VendorInvoice[]
   createdAt       DateTime           @default(now())
+}
+
+model VendorLedger {
+  id              String             @id @default(uuid())
+  vendorId        String
+  vendor          Vendor             @relation(fields: [vendorId], references: [id])
+  type            VendorLedgerType
+  amount          Float
+  referenceType   VendorLedgerReferenceType
+  referenceId     String?            // ID of PO, Payment, etc.
+  note            String?
+  createdAt       DateTime           @default(now())
+}
+
+enum VendorLedgerType {
+  CREDIT
+  DEBIT
+}
+
+enum VendorLedgerReferenceType {
+  PO
+  PAYMENT
+  ADVANCE
+  ADJUSTMENT
+  OPENING_BALANCE
 }
 
 model VendorMaterial {
@@ -192,6 +224,7 @@ model ProcurementOrder {
   items           Json? // Legacy compatibility
   poItems         ProcurementOrderItem[]
   goodsReceipts   GoodsReceipt[]
+  invoices        VendorInvoice[]
   received        Boolean                @default(false)
   purchaseReturns PurchaseReturn[]
   expenses        Expense[]
@@ -212,7 +245,51 @@ model GoodsReceipt {
   id               String           @id @default(uuid())
   poId             String
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
+  receivedBy       String?
   receivedAt       DateTime         @default(now())
+  status           GRNStatus        @default(PENDING)
+  items            GoodsReceiptItem[]
+  invoices         VendorInvoice[]
+  createdAt        DateTime         @default(now())
+}
+
+model GoodsReceiptItem {
+  id               String       @id @default(uuid())
+  grnId            String
+  grn              GoodsReceipt @relation(fields: [grnId], references: [id])
+  materialId       String
+  inventoryItem    InventoryItem @relation(fields: [materialId], references: [id])
+  quantity         Float        // Ordered Qty
+  receivedQty      Float        // Received Qty
+  acceptedQty      Float
+  rejectedQty      Float
+  price            Float        // Price at time of PO
+}
+
+model VendorInvoice {
+  id               String           @id @default(uuid())
+  vendorId         String
+  vendor           Vendor           @relation(fields: [vendorId], references: [id])
+  poId             String
+  procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
+  grnId            String?
+  grn              GoodsReceipt?    @relation(fields: [grnId], references: [id])
+  invoiceNumber    String           @unique
+  amount           Float
+  status           InvoiceStatus    @default(PENDING)
+  createdAt        DateTime         @default(now())
+}
+
+enum GRNStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  PENDING
+  MATCHED
+  MISMATCH
 }
 
 enum POStatus {

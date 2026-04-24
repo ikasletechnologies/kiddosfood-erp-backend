@@ -36,6 +36,8 @@ import { SalesController } from './modules/sales/sales.controller';
 import { PurchaseController } from './modules/purchase/purchase.controller';
 import { RawMaterialsController } from './modules/inventory/raw-materials.controller';
 import { UserController } from './modules/users/user.controller';
+import { GRNController } from './modules/grn/grn.controller';
+import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoices.controller';
 
 const app: Express = express();
 
@@ -189,10 +191,15 @@ app.get('/api/analytics/daily-sales', authenticate, authorizeRole(['ADMIN', 'MAN
 // Procurement & Vendors
 app.get('/api/vendors', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getAllVendors);
 app.post('/api/vendors', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.createVendor);
+app.get('/api/vendors/summary', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getVendorSummary);
+app.get('/api/vendors/filter', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.filterVendors);
 app.get('/api/vendors/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getVendorById);
 app.patch('/api/vendors/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.updateVendor);
 app.delete('/api/vendors/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.deleteVendor);
 app.post('/api/vendors/link-material', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.linkMaterial);
+app.get('/api/vendors/:id/ledger', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getVendorLedger);
+app.post('/api/vendors/:id/payment', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.recordPayment);
+app.post('/api/vendors/:id/adjustment', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.recordAdjustment);
 app.get('/api/suppliers', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getAllVendors); // Alias
 app.post('/api/suppliers', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.createVendor); // Alias
 
@@ -200,14 +207,29 @@ app.get('/api/procurement/orders', authenticate, authorizeRole(['ADMIN', 'MANAGE
 app.get('/api/procurement/orders/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getOne);
 app.post('/api/procurement/po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.createPO);
 
-// Purchase Orders (Phase 4 requested endpoints)
+// Purchase Orders
 app.get('/api/purchase-orders', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getPOs);
 app.post('/api/purchase-orders', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.createPO);
 app.get('/api/purchase-orders/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.getOne);
-app.post('/api/purchase-orders/:id/receive', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.receiveGoods);
+app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.approvePO);
 app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.recordAdvance);
 app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.cancelPO);
 app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.deletePO);
+// Legacy receive endpoint (kept for backward compat; prefer GRN flow)
+app.post('/api/purchase-orders/:id/receive', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.receiveGoods);
+
+// GRN (Goods Receipt Notes)
+app.get('/api/grn', authenticate, authorizeRole(['ADMIN', 'MANAGER']), GRNController.getAll);
+app.get('/api/grn/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), GRNController.getById);
+app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['ADMIN', 'MANAGER']), GRNController.createFromPO);
+app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['ADMIN', 'MANAGER']), GRNController.approve);
+app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['ADMIN', 'MANAGER']), GRNController.cancel);
+
+// Vendor Invoices (3-way matching)
+app.get('/api/vendor-invoices', authenticate, authorizeRole(['ADMIN', 'MANAGER']), VendorInvoiceController.getAll);
+app.post('/api/vendor-invoices', authenticate, authorizeRole(['ADMIN', 'MANAGER']), VendorInvoiceController.create);
+app.post('/api/vendor-invoices/:id/match', authenticate, authorizeRole(['ADMIN', 'MANAGER']), VendorInvoiceController.match);
+app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER']), VendorInvoiceController.updateStatus);
 
 // Franchise Management & Logistics
 app.get('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), FranchiseController.getAll);
