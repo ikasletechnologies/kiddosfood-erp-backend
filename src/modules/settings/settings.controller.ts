@@ -20,4 +20,22 @@ export class SettingsController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getCompanyProfile(req: Request, res: Response) {
+    try {
+      const profile = await SettingsService.getCompanyProfile();
+      res.json(profile);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async updateCompanyProfile(req: Request, res: Response) {
+    try {
+      const profile = await SettingsService.updateCompanyProfile(req.body);
+      res.json(profile);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

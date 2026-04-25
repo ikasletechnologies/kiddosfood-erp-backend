@@ -1,23 +1,36 @@
 import prisma from '../../lib/prisma';
-import { StockMovementType } from '@prisma/client';
-import { AuditService } from '../audit/audit.service';
+import { ItemCategory, StockMovementType } from '@prisma/client';
 
 export class InventoryService {
   /**
-   * Fetch inventory items for a specific franchise/branch
+   * Get all inventory items for a franchise
    */
   static async getInventory(franchiseId: string) {
     return prisma.inventoryItem.findMany({
       where: { franchiseId },
-      include: { vendor: true, movements: { take: 5, orderBy: { createdAt: 'desc' } } },
-      orderBy: { name: 'asc' }
+      include: {
+        movements: {
+          orderBy: { createdAt: 'desc' },
+          take: 10
+        }
+      },
+      orderBy: { updatedAt: 'desc' }
     });
   }
 
+  /**
+   * Get a single item by ID with full movement history
+   */
   static async getItemById(id: string) {
     return prisma.inventoryItem.findUnique({
       where: { id },
-      include: { vendor: true, movements: { take: 20, orderBy: { createdAt: 'desc' } } }
+      include: {
+        movements: {
+          orderBy: { createdAt: 'desc' },
+          take: 50
+        },
+        vendor: true
+      }
     });
   }
 
@@ -25,81 +38,121 @@ export class InventoryService {
    * Create a new inventory item
    */
   static async createItem(data: any) {
-    let franchiseId = data.franchiseId;
-
-    // Defensive check: ensure franchiseId is valid
-    if (!franchiseId || franchiseId === 'root-franchise' || franchiseId === 'undefined') {
-      const first = await prisma.franchise.findFirst();
-      if (first) {
-        franchiseId = first.id;
-      } else {
-        // Absolute fallback: Create the HQ franchise if it's missing
-        const hq = await prisma.franchise.create({
-          data: {
-            id: 'hq-001',
-            name: 'Kiddos Food HQ',
-            location: 'Corporate',
-            ownerName: 'Admin',
-            contactNum: '0000000000'
-          }
-        });
-        franchiseId = hq.id;
-      }
-    }
-
     return prisma.inventoryItem.create({
       data: {
         name: data.name,
         sku: data.sku,
-        category: data.category,
+        category: data.category || ItemCategory.RAW_MATERIAL,
         currentStock: data.currentStock || 0,
-        unit: data.unit,
+        unit: data.unit || 'kg',
         minimumStock: data.minimumStock || 10,
-        batchNo: data.batchNo,
-        expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
-        franchiseId: franchiseId,
+        hsnCode: data.hsnCode,
+        gstRate: data.gstRate || 5,
+        franchiseId: data.franchiseId,
         vendorId: data.vendorId
       }
     });
   }
 
   /**
-   * Unified Method to Record Stock Movements
+   * Update item details
    */
-  static async recordMovement(tx: any, data: {
-    itemId: string,
-    type: StockMovementType,
-    quantity: number,
-    referenceType?: string,
-    referenceId?: string,
-    note?: string,
-    userId?: string
+  static async updateItem(id: string, data: any) {
+    return prisma.inventoryItem.update({
+      where: { id },
+      data
+    });
+  }
+
+  /**
+   * Delete an item (be careful with referential integrity)
+   */
+  static async deleteItem(id: string) {
+    return prisma.inventoryItem.delete({
+      where: { id }
+    });
+  }
+
+  /**
+   * Manual Stock In (e.g. from procurement or surplus)
+   */
+  static async stockIn(data: { itemId: string; quantity: number; type?: StockMovementType; note?: string; userId?: string }) {
+    return prisma.$transaction(async (tx) => {
+      return this.recordMovement(tx, {
+        itemId: data.itemId,
+        type: data.type || StockMovementType.PURCHASE_IN,
+        quantity: data.quantity,
+        note: data.note,
+        userId: data.userId
+      });
+    });
+  }
+
+  /**
+   * Manual Stock Out (e.g. wastage or external sales)
+   */
+  static async stockOut(data: { itemId: string; quantity: number; type?: StockMovementType; note?: string; userId?: string }) {
+    return prisma.$transaction(async (tx) => {
+      return this.recordMovement(tx, {
+        itemId: data.itemId,
+        type: data.type || StockMovementType.PRODUCTION_OUT,
+        quantity: -data.quantity,
+        note: data.note,
+        userId: data.userId
+      });
+    });
+  }
+
+  /**
+   * Physical inventory adjustment (sets absolute stock)
+   */
+  static async adjustStock(data: { itemId: string; newQuantity: number; note?: string; userId?: string }) {
+    return prisma.$transaction(async (tx) => {
+      const currentItem = await tx.inventoryItem.findUnique({ where: { id: data.itemId } });
+      if (!currentItem) throw new Error('Inventory item not found');
+
+      const difference = data.newQuantity - currentItem.currentStock;
+
+      return this.recordMovement(tx, {
+        itemId: data.itemId,
+        type: StockMovementType.ADJUSTMENT,
+        quantity: difference,
+        note: data.note || 'Manual physical adjustment',
+        userId: data.userId
+      });
+    });
+  }
+
+  /**
+   * Core engine: Records movement AND updates currentStock
+   * Used internally and by other services (POS, Production, Logistics)
+   */
+  static async recordMovement(tx: any, data: { 
+    itemId: string; 
+    type: string; 
+    quantity: number; 
+    referenceType?: string; 
+    referenceId?: string; 
+    note?: string; 
+    userId?: string 
   }) {
-    // 1. Update the current stock level
-    // quantity > 0 for additions (PURCHASE_IN), < 0 for deductions (SALES_OUT)
-    const result = await tx.inventoryItem.update({
+    // 1. Update the actual stock level
+    const updatedItem = await tx.inventoryItem.update({
       where: { id: data.itemId },
       data: {
-        currentStock: { increment: data.quantity }
+        currentStock: {
+          increment: data.quantity
+        }
       }
     });
 
-    if (data.userId) {
-      await AuditService.log({
-        userId: data.userId,
-        action: data.quantity > 0 ? 'STOCK_IN' : 'STOCK_OUT',
-        entityType: 'INVENTORY',
-        entityId: data.itemId,
-        targetFranchiseId: result.franchiseId,
-        details: { quantity: data.quantity, type: data.type, note: data.note }
-      });
-    }
-
-    // 2. Create the movement record
+    // 2. Log the movement
+    // Note: We store the absolute quantity and rely on movementType for direction insight,
+    // OR we store signed quantity. Based on logic, we use signed quantity (data.quantity).
     await tx.stockMovement.create({
       data: {
         itemId: data.itemId,
-        movementType: data.type,
+        movementType: data.type as any,
         quantity: data.quantity,
         referenceType: data.referenceType,
         referenceId: data.referenceId,
@@ -108,112 +161,30 @@ export class InventoryService {
       }
     });
 
-    return result;
+    return updatedItem;
   }
 
   /**
-   * Stock In (Purchase/Transfer/Adjustment)
+   * Get movement history with filters
    */
-  static async stockIn(data: { itemId: string, quantity: number, type: StockMovementType, note?: string, userId?: string }, txClient?: any) {
-    if (txClient) {
-      return this.recordMovement(txClient, {
-        itemId: data.itemId,
-        type: data.type,
-        quantity: data.quantity,
-        note: data.note,
-        userId: data.userId
-      });
-    }
-    return prisma.$transaction(async (tx) => {
-      return this.recordMovement(tx, {
-        itemId: data.itemId,
-        type: data.type,
-        quantity: data.quantity,
-        note: data.note,
-        userId: data.userId
-      });
-    });
-  }
-
-  /**
-   * Stock Out (Waste/Adjustment/Sales)
-   */
-  static async stockOut(data: { itemId: string, quantity: number, type: StockMovementType, note?: string, userId?: string }, txClient?: any) {
-    if (txClient) {
-      return this.recordMovement(txClient, {
-        itemId: data.itemId,
-        type: data.type,
-        quantity: -data.quantity,
-        note: data.note,
-        userId: data.userId
-      });
-    }
-    return prisma.$transaction(async (tx) => {
-      return this.recordMovement(tx, {
-        itemId: data.itemId,
-        type: data.type,
-        quantity: -data.quantity, // Negative for deduction
-        note: data.note,
-        userId: data.userId
-      });
-    });
-  }
-
-  /**
-   * Stock Adjustment (Physical Count Correction)
-   */
-  static async adjustStock(data: { itemId: string, newQuantity: number, note?: string, userId?: string }) {
-    return prisma.$transaction(async (tx) => {
-      const current = await tx.inventoryItem.findUnique({ where: { id: data.itemId } });
-      if (!current) throw new Error('Item not found');
-
-      const difference = data.newQuantity - current.currentStock;
-      
-      return this.recordMovement(tx, {
-        itemId: data.itemId,
-        type: 'ADJUSTMENT',
-        quantity: difference,
-        note: data.note || 'Manual physical adjustment',
-        userId: data.userId
-      });
-    });
-  }
-
-  static async updateItem(id: string, data: { name?: string; sku?: string; category?: any; unit?: string; minimumStock?: number }) {
-    return prisma.inventoryItem.update({ where: { id }, data });
-  }
-
-  static async deleteItem(id: string) {
-    return prisma.inventoryItem.delete({ where: { id } });
-  }
-
   static async getMovements(filters: any) {
     return prisma.stockMovement.findMany({
       where: filters,
-      include: { item: true },
+      include: {
+        item: true
+      },
       orderBy: { createdAt: 'desc' }
     });
   }
 
-  static async getAlerts(franchiseId?: string) {
+  /**
+   * Identify items below threshold
+   */
+  static async getAlerts(franchiseId: string) {
     const items = await prisma.inventoryItem.findMany({
-      where: {
-        ...(franchiseId ? { franchiseId } : {}),
-      }
+      where: { franchiseId }
     });
 
-    return items
-      .filter((item) => item.currentStock <= item.minimumStock)
-      .map((item) => ({
-        id: item.id,
-        name: item.name,
-        sku: item.sku,
-        currentStock: item.currentStock,
-        minimumStock: item.minimumStock,
-        unit: item.unit,
-        franchiseId: item.franchiseId,
-        severity: item.currentStock === 0 ? 'CRITICAL' : 'LOW',
-        expiryDate: item.expiryDate
-      }));
+    return items.filter(item => item.currentStock <= item.minimumStock);
   }
 }

@@ -103,6 +103,8 @@ model InventoryItem {
   currentStock    Float
   unit            String // kg, pc, ltr
   minimumStock    Float                  @default(10)
+  hsnCode         String?                // GST Compliance
+  gstRate         Float                  @default(5) // Default 5%
   batchNo         String?
   expiryDate      DateTime?
   franchiseId     String
@@ -196,6 +198,7 @@ enum VendorLedgerReferenceType {
   PO
   PAYMENT
   ADVANCE
+  RETURN
   ADJUSTMENT
   OPENING_BALANCE
 }
@@ -216,8 +219,14 @@ model ProcurementOrder {
   vendorId        String
   vendor          Vendor                 @relation(fields: [vendorId], references: [id])
   status          POStatus               @default(PENDING)
+  subtotal        Float                  @default(0)
+  cgst            Float                  @default(0)
+  sgst            Float                  @default(0)
+  igst            Float                  @default(0)
   totalAmount     Float
-  advancePaid     Float                  @default(0)
+  advancePaid     Float                  @default(0) // @deprecated: use paid field
+  paid            Float                  @default(0)
+  balance         Float                  @default(0)
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   notes               String?
@@ -237,8 +246,16 @@ model ProcurementOrderItem {
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
   inventoryItemId  String
   inventoryItem    InventoryItem    @relation(fields: [inventoryItemId], references: [id])
+  itemName         String?          // Flattened for audit
+  hsnCode          String?          // Flattened for audit
+  gstRate          Float            @default(5)
   quantity         Float
   price            Float
+  subtotal         Float            @default(0)
+  cgst             Float            @default(0)
+  sgst             Float            @default(0)
+  igst             Float            @default(0)
+  total            Float            @default(0)
 }
 
 model GoodsReceipt {
@@ -296,6 +313,7 @@ enum POStatus {
   PENDING
   APPROVED
   RECEIVED
+  CLOSED
   CANCELLED
 }
 

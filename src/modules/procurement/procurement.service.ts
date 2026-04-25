@@ -45,35 +45,48 @@ export class ProcurementService {
       include: { 
         _count: { select: { orders: true } },
         suppliedMaterials: { include: { material: true } },
-        ledgerEntries: { select: { type: true, amount: true } },
+        ledgerEntries: { select: { type: true, amount: true, referenceType: true } },
         orders: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 }
       },
       orderBy: { name: 'asc' }
     });
 
     return vendors.map(v => {
-      // Calculate balance from ledger: Credit - Debit
-      const balance = v.ledgerEntries.reduce((acc, entry) => {
-        return acc + (entry.type === 'CREDIT' ? entry.amount : -entry.amount);
-      }, 0);
+      // MASTER ACCOUNTING FORMULA (Optimized for correctness)
+      // 1. Total Paid (Actual money out - actual money back)
+      const totalPayments = v.ledgerEntries
+        .filter(e => e.type === 'CREDIT' && e.referenceType === 'PAYMENT')
+        .reduce((s, e) => s + e.amount, 0);
 
-      // Keep legacy fields for UI compatibility but calculate from ledger
-      const totalOrder = v.ledgerEntries
-        .filter(e => e.type === 'DEBIT')
+      const totalReturns = v.ledgerEntries
+        .filter(e => e.type === 'DEBIT' && e.referenceType === 'RETURN')
+        .reduce((s, e) => s + e.amount, 0);
+
+      // 2. Total Purchases (PO Obligations)
+      const totalPurchased = v.ledgerEntries
+        .filter(e => e.type === 'DEBIT' && e.referenceType === 'PO')
         .reduce((s, e) => s + e.amount, 0);
       
-      const totalAdvance = v.ledgerEntries
-        .filter(e => e.type === 'CREDIT')
+      // 3. Adjustments / Advances (Manual adjustments)
+      const manualCredits = v.ledgerEntries
+        .filter(e => e.type === 'CREDIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE'))
+        .reduce((s, e) => s + e.amount, 0);
+      
+      const manualDebits = v.ledgerEntries
+        .filter(e => e.type === 'DEBIT' && e.referenceType === 'ADJUSTMENT')
         .reduce((s, e) => s + e.amount, 0);
 
-      const lastOrderDate = v.orders[0]?.createdAt || null;
+      const netPaid = (totalPayments + manualCredits) - (totalReturns + manualDebits);
+      const balance = netPaid - totalPurchased;
 
       return {
         ...v,
-        totalOrder,
-        totalAdvance,
-        balance,
-        lastOrderDate
+        totalPurchased,
+        totalPaid: netPaid, 
+        balance: balance,
+        advance: balance > 0 ? balance : 0,
+        due: balance < 0 ? Math.abs(balance) : 0,
+        lastOrderDate: v.orders[0]?.createdAt || null
       };
     });
   }
@@ -179,48 +192,84 @@ export class ProcurementService {
     notes?: string;
     items: Array<{ inventoryItemId: string; quantity: number; price: number }>;
   }) {
-    // 1. Calculate total
-    const totalAmount = data.items.reduce((acc, item) => acc + item.quantity * item.price, 0);
+    // 1. Fetch item details for GST calculation
+    const poItemsData = await Promise.all(data.items.map(async (item) => {
+      const inventoryItem = await prisma.inventoryItem.findUnique({
+        where: { id: item.inventoryItemId }
+      });
+      const gstRate = inventoryItem?.gstRate || 5;
+      const subtotal = item.quantity * item.price;
+      const gstAmount = (subtotal * gstRate) / 100;
+      
+      // Simple logic: If inside the same state (mocked as CGST/SGST), else IGST
+      // For now, split 50/50 for CGST/SGST as default
+      const cgst = gstAmount / 2;
+      const sgst = gstAmount / 2;
+      
+      return {
+        ...item,
+        gstRate,
+        subtotal,
+        cgst,
+        sgst,
+        igst: 0,
+        total: subtotal + gstAmount
+      };
+    }));
 
-    // 2. Fetch current balance (CREDIT - DEBIT)
-    const currentBalance = await this.getVendorBalance(data.vendorId);
-    const existingCredit = Math.max(0, currentBalance); // Only positive balance counts as advance
+    const totalSubtotal = poItemsData.reduce((acc, item) => acc + item.subtotal, 0);
+    const totalCGST = poItemsData.reduce((acc, item) => acc + item.cgst, 0);
+    const totalSGST = poItemsData.reduce((acc, item) => acc + item.sgst, 0);
+    const totalIGST = poItemsData.reduce((acc, item) => acc + item.igst, 0);
+    const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
+
+    // 2. Fetch current balance (Purchased - Paid)
+    // Here we use the Ledger balance to see if they have existing credits
+    const ledgerBalance = await this.getVendorBalance(data.vendorId);
+    // Negative balance in old logic meant "We Owe", but here we want to know if they have ADVANCE
+    // Let's stick to getVendorBalance meaning (Paid - Purchased) for internal check
+    const existingCredit = Math.max(0, ledgerBalance); 
     
     // 3. Determine how much advance to mark on this PO
-    // We auto-apply whatever they have, but if they sent a higher amount, we treat the rest as new payment.
     const autoApplied = Math.min(totalAmount, existingCredit);
     const providedAmount = data.advancePaid || 0;
-    
-    // Final amount shown on PO as "Paid"
-    const finalAdvancePaid = Math.max(autoApplied, providedAmount);
-    
-    // How much NEW money are they actually paying?
-    // If they have ₹15,000 and the PO is ₹5,000, and they sent advancePaid: 5000, newMoney is 0.
-    // If they have ₹1,000 and they sent advancePaid: 5000, newMoney is ₹4,000.
+    const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create the PO
+      // 1. Create the PO with GST fields
       const po = await tx.procurementOrder.create({
         data: {
           vendorId: data.vendorId,
+          subtotal: totalSubtotal,
+          cgst: totalCGST,
+          sgst: totalSGST,
+          igst: totalIGST,
           totalAmount,
-          advancePaid: finalAdvancePaid,
+          advancePaid: finalPaidOnPO,
+          paid: finalPaidOnPO,
+          balance: totalAmount - finalPaidOnPO,
           expectedDeliveryDate: data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null,
           notes: data.notes,
           status: 'PENDING',
           poItems: {
-            create: data.items.map((item) => ({
+            create: poItemsData.map((item) => ({
               inventoryItemId: item.inventoryItemId,
+              gstRate: item.gstRate,
               quantity: item.quantity,
-              price: item.price
+              price: item.price,
+              subtotal: item.subtotal,
+              cgst: item.cgst,
+              sgst: item.sgst,
+              igst: item.igst,
+              total: item.total
             }))
           }
         },
         include: { poItems: { include: { inventoryItem: true } }, vendor: true }
       });
 
-      // 2. Create Ledger DEBIT for PO amount (Always reduces balance / increase liability)
+      // 2. Create Ledger DEBIT for total PO amount
       await tx.vendorLedger.create({
         data: {
           vendorId: data.vendorId,
@@ -228,11 +277,11 @@ export class ProcurementService {
           amount: totalAmount,
           referenceType: 'PO',
           referenceId: po.id,
-          note: `Purchase Order #${po.id.substring(0, 8)} — ₹${totalAmount.toLocaleString('en-IN')}`
+          note: `Purchase Order #${po.id.substring(0, 8)} — Total: ₹${totalAmount.toLocaleString('en-IN')}`
         }
       });
 
-      // 3. Only record a NEW CREDIT if user is actually paying new money now
+      // 3. Record NEW CREDIT if money provided
       if (newMoneyPayment > 0) {
         await tx.vendorLedger.create({
           data: {
@@ -241,7 +290,7 @@ export class ProcurementService {
             amount: newMoneyPayment,
             referenceType: 'ADVANCE',
             referenceId: po.id,
-            note: `New Advance Payment with PO #${po.id.substring(0, 8)}`
+            note: `Advance Payment with PO #${po.id.substring(0, 8)}`
           }
         });
       }
@@ -334,10 +383,16 @@ export class ProcurementService {
       }
 
       const amountToApply = Math.min(remainingDue, balance);
+      const newPaid = po.paid + amountToApply;
 
       return tx.procurementOrder.update({
         where: { id: poId },
-        data: { advancePaid: po.advancePaid + amountToApply },
+        data: { 
+          paid: newPaid,
+          balance: po.totalAmount - newPaid,
+          // If fully paid and received, mark as CLOSED
+          status: (po.totalAmount - newPaid <= 0 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+        },
         include: { vendor: true, poItems: { include: { inventoryItem: true } } }
       });
     });
@@ -348,11 +403,29 @@ export class ProcurementService {
       include: { vendor: true, poItems: { include: { inventoryItem: true } }, goodsReceipts: true },
       orderBy: { createdAt: 'desc' }
     });
-    // Attach live balanceDue for each PO
-    return orders.map((po) => ({
-      ...po,
-      balanceDue: Math.max(0, po.totalAmount - po.advancePaid)
-    }));
+
+    // 1. Get ALL ledger entries for these vendors to calculate LIVE paid amounts
+    const vendorIds = Array.from(new Set(orders.map(o => o.vendorId)));
+    const allLedger = await prisma.vendorLedger.findMany({
+      where: { vendorId: { in: vendorIds } }
+    });
+
+    return orders.map((po) => {
+      // 2. Calculate Paid amount: (Explicitly linked) + (Share of auto-settled balance from 'po.paid' field)
+      // Note: 'po.paid' is maintained by our auto-settlement engine in recordPayment() and settleVendorOrders()
+      const linkedPayments = allLedger
+        .filter(l => l.referenceId === po.id && l.type === 'CREDIT')
+        .reduce((sum, l) => sum + l.amount, 0);
+
+      // 3. Fallback to 'po.paid' which captures auto-distributed advance credits
+      const livePaid = Math.max(po.paid || 0, linkedPayments);
+
+      return {
+        ...po,
+        paid: livePaid,
+        balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2)))
+      };
+    });
   }
 
   static async getPurchaseOrderById(id: string) {
@@ -514,23 +587,24 @@ export class ProcurementService {
 
   static async getVendorsSummary() {
     const vendors = await this.getVendors();
+    
+    // totalAdvance = sum(all vendor advances)
+    // totalDue = sum(all vendor dues)
+    // totalPurchased = sum(all vendor purchases)
+    const totalAdvance = vendors.reduce((s, v) => s + (v.advance || 0), 0);
+    const totalDue = vendors.reduce((s, v) => s + (v.due || 0), 0);
+    const totalPurchased = vendors.reduce((s, v) => s + (v.totalPurchased || 0), 0);
+    
     const totalVendors = vendors.length;
-    
-    // Fetch all non-cancelled POs to calculate total outstanding liability
-    const orders = await prisma.procurementOrder.findMany({
-      where: { NOT: { status: 'CANCELLED' } },
-      select: { totalAmount: true, advancePaid: true }
-    });
-
-    // Total Owed = Sum of (Total - Paid) across all orders
-    // This matches the "Balance Due" shown on the Purchase Orders page
-    const totalOwed = orders.reduce((s, o) => s + Math.max(0, o.totalAmount - o.advancePaid), 0);
-    
-    // Total Advance = Net positive balance (Advance - Liability) for all vendors who are in surplus
-    const totalAdvance = vendors.filter(v => v.balance > 0).reduce((s, v) => s + v.balance, 0);
     const totalMaterials = await prisma.vendorMaterial.count();
 
-    return { totalVendors, totalOwed, totalAdvance, totalMaterials };
+    return { 
+      totalVendors, 
+      totalOwed: totalDue, 
+      totalAdvance, 
+      totalMaterials,
+      totalPurchased
+    };
   }
 
   /**
@@ -552,25 +626,97 @@ export class ProcurementService {
     }).reverse(); // Latest first for UI
   }
 
-  static async recordPayment(vendorId: string, amount: number, note: string) {
-    return prisma.vendorLedger.create({
+  static async recordPayment(vendorId: string, amount: number, note: string, referenceId?: string) {
+    const payment = await prisma.vendorLedger.create({
       data: {
         vendorId,
         type: 'CREDIT',
         amount,
         referenceType: 'PAYMENT',
-        note: note || 'Direct Payment'
+        referenceId,
+        note: note || (referenceId ? `Payment for PO #${referenceId.substring(0, 8)}` : 'Direct Payment')
+      }
+    });
+
+    // Auto-settlement logic: If it's a direct payment, apply to oldest ones.
+    // If it's linked to a PO, update that PO specifically.
+    if (referenceId) {
+      const po = await prisma.procurementOrder.findUnique({ where: { id: referenceId } });
+      if (po) {
+        const remainingToPay = po.totalAmount - (po.paid || 0);
+        const allocation = Math.min(amount, remainingToPay);
+        const newPaid = (po.paid || 0) + allocation;
+        
+        await prisma.procurementOrder.update({
+          where: { id: referenceId },
+          data: {
+            paid: newPaid,
+            balance: Math.max(0, Number((po.totalAmount - newPaid).toFixed(2))),
+            status: (po.totalAmount - newPaid <= 0.01 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+          }
+        });
+      }
+    } else {
+      await this.settleVendorOrders(vendorId);
+    }
+
+    return payment;
+  }
+
+  /**
+   * Internal helper to automatically apply unallocated credits to outstanding POs (Oldest first)
+   */
+  static async settleVendorOrders(vendorId: string) {
+    return prisma.$transaction(async (tx) => {
+      // 1. Get vendor's available unallocated advance
+      const vendors = await this.getVendors();
+      const vendor = vendors.find(v => v.id === vendorId);
+      if (!vendor || (vendor.balance || 0) <= 0) return; // No advance to apply
+
+      let availableAdvance = vendor.balance;
+
+      // 2. Get all non-closed orders that owe money (Oldest first)
+      const outstandingOrders = await tx.procurementOrder.findMany({
+        where: {
+          vendorId,
+          status: { in: ['APPROVED', 'RECEIVED'] },
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      for (const po of outstandingOrders) {
+        if (availableAdvance <= 0) break;
+
+        const currentPaid = po.paid || po.advancePaid || 0;
+        const totalDue = po.totalAmount;
+        const remainingDue = Math.max(0, totalDue - currentPaid);
+
+        if (remainingDue > 0) {
+          const amountToApply = Math.min(remainingDue, availableAdvance);
+          const newPaid = currentPaid + amountToApply;
+
+          await tx.procurementOrder.update({
+            where: { id: po.id },
+            data: {
+              paid: newPaid,
+              balance: totalDue - newPaid,
+              status: (totalDue - newPaid <= 0 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+            }
+          });
+
+          availableAdvance -= amountToApply;
+        }
       }
     });
   }
 
-  static async recordAdjustment(vendorId: string, amount: number, type: 'CREDIT' | 'DEBIT', note: string) {
+  static async recordAdjustment(vendorId: string, amount: number, type: 'CREDIT' | 'DEBIT', note: string, referenceType: any = 'ADJUSTMENT') {
     return prisma.vendorLedger.create({
       data: {
         vendorId,
         type,
         amount,
-        referenceType: 'ADJUSTMENT',
+        referenceType,
         note: note || 'Manual Ledger Adjustment'
       }
     });

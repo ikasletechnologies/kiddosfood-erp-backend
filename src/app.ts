@@ -262,6 +262,8 @@ app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserC
 // Governance & Settings
 app.get('/api/settings', authenticate, authorizeRole(['SUPER_ADMIN']), SettingsController.getAll);
 app.post('/api/settings', authenticate, authorizeRole(['SUPER_ADMIN']), SettingsController.setSetting);
+app.get('/api/settings/company', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), SettingsController.getCompanyProfile);
+app.patch('/api/settings/company', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), SettingsController.updateCompanyProfile);
 app.get('/api/audit/logs', authenticate, authorizeRole(['SUPER_ADMIN']), AuditController.getLogs);
 
 // POS (frontend-facing aliases with recipeId→productId resolution + auto loyalty)

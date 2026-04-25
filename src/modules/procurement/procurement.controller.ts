@@ -194,8 +194,8 @@ export class ProcurementController {
 
   static async recordPayment(req: Request, res: Response) {
     try {
-      const { amount, note } = req.body;
-      const data = await ProcurementService.recordPayment(req.params.id, amount, note);
+      const { amount, note, referenceId } = req.body;
+      const data = await ProcurementService.recordPayment(req.params.id, amount, note, referenceId);
       res.json(data);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -204,8 +204,8 @@ export class ProcurementController {
 
   static async recordAdjustment(req: Request, res: Response) {
     try {
-      const { amount, type, note } = req.body;
-      const data = await ProcurementService.recordAdjustment(req.params.id, amount, type, note);
+      const { amount, type, note, referenceType } = req.body;
+      const data = await ProcurementService.recordAdjustment(req.params.id, amount, type, note, referenceType);
       res.json(data);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

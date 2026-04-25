@@ -36,4 +36,24 @@ export class SettingsService {
     });
     return setting ? setting.value : defaultValue;
   }
+
+  /**
+   * Get core company profile
+   */
+  static async getCompanyProfile() {
+    const raw = await this.getSettingValue('COMPANY_PROFILE', '{}');
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Update core company profile
+   */
+  static async updateCompanyProfile(data: any) {
+    const value = JSON.stringify(data);
+    return this.setSetting('COMPANY_PROFILE', value, 'GENERAL', 'Enterprise Company Identity Data');
+  }
 }
