@@ -311,6 +311,38 @@ export class ProcurementService {
     });
   }
 
+  /**
+   * Apply available vendor credit balance to an existing PO.
+   * This is useful for clearing "Balance Due" using funds already in the ledger.
+   */
+  static async applyAdvanceToPO(poId: string) {
+    return prisma.$transaction(async (tx) => {
+      const po = await tx.procurementOrder.findUnique({
+        where: { id: poId },
+        include: { vendor: true }
+      });
+      if (!po) throw new Error('Purchase Order not found');
+
+      const balance = await this.getVendorBalance(po.vendorId);
+      if (balance <= 0) {
+        throw new Error(`Vendor ${po.vendor.name} has no available advance balance (Current: ₹${balance})`);
+      }
+
+      const remainingDue = po.totalAmount - po.advancePaid;
+      if (remainingDue <= 0) {
+        throw new Error('This Purchase Order is already fully paid.');
+      }
+
+      const amountToApply = Math.min(remainingDue, balance);
+
+      return tx.procurementOrder.update({
+        where: { id: poId },
+        data: { advancePaid: po.advancePaid + amountToApply },
+        include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+      });
+    });
+  }
+
   static async getPurchaseOrders() {
     const orders = await prisma.procurementOrder.findMany({
       include: { vendor: true, poItems: { include: { inventoryItem: true } }, goodsReceipts: true },

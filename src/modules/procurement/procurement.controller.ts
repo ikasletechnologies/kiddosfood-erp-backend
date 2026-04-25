@@ -135,6 +135,19 @@ export class ProcurementController {
     }
   }
 
+  /**
+   * Apply available vendor credit balance to an existing PO (mark as paid from ledger)
+   * POST /api/purchase-orders/:id/apply-advance
+   */
+  static async applyAdvance(req: Request, res: Response) {
+    try {
+      const po = await ProcurementService.applyAdvanceToPO(req.params.id);
+      res.json(po);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async linkMaterial(req: Request, res: Response) {
     try {
       const { vendorId, materialId, price } = req.body;

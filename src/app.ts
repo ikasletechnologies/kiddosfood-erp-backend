@@ -215,6 +215,8 @@ app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['ADMI
 app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.recordAdvance);
 app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.cancelPO);
 app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.deletePO);
+// Manual reconciliation: Pay this PO using existing vendor advance balance
+app.post('/api/purchase-orders/:id/apply-advance', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.applyAdvance);
 // Legacy receive endpoint (kept for backward compat; prefer GRN flow)
 app.post('/api/purchase-orders/:id/receive', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProcurementController.receiveGoods);
 
