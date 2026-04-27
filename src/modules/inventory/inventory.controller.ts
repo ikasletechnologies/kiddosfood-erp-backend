@@ -7,10 +7,14 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
 
-      if (!franchiseId) return res.status(400).json({ error: 'Franchise ID is required' });
-      
+      // SUPER_ADMIN without franchiseId filter returns HQ inventory by default
+      if (!franchiseId) {
+        const items = await InventoryService.getInventory('hq-001');
+        return res.json(items);
+      }
+
       const items = await InventoryService.getInventory(franchiseId);
       res.json(items);
     } catch (error: any) {

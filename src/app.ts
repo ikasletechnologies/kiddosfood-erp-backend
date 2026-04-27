@@ -38,6 +38,8 @@ import { RawMaterialsController } from './modules/inventory/raw-materials.contro
 import { UserController } from './modules/users/user.controller';
 import { GRNController } from './modules/grn/grn.controller';
 import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoices.controller';
+import { FranchiseOrderController } from './modules/franchise/franchise-order.controller';
+import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
 
 const app: Express = express();
 
@@ -89,7 +91,7 @@ app.get('/api/me', authenticate, UserController.getMe);
 app.get('/api/me/navigation', authenticate, NavController.getNavigation);
 
 // Dashboard Metrics
-app.get('/api/dashboard/summary', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), DashboardController.getSummary);
+app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), DashboardController.getSummary);
 
 // API Routes (Protected)
 // Admin Only: User & Role Management
@@ -107,13 +109,13 @@ app.delete('/api/roles/:id', authenticate, authorizeRole(['ADMIN']), RoleControl
 
 // Other Business Modules
 // Inventory & Stock Management
-app.get('/api/inventory', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), InventoryController.getInventory);
-app.get('/api/inventory/items/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), InventoryController.getItem);
-app.post('/api/inventory/items', authenticate, authorizeRole(['ADMIN', 'MANAGER']), InventoryController.createItem);
-app.post('/api/inventory/stock-in', authenticate, authorizeRole(['ADMIN', 'MANAGER']), InventoryController.stockIn);
-app.post('/api/inventory/stock-out', authenticate, authorizeRole(['ADMIN', 'MANAGER']), InventoryController.stockOut);
-app.post('/api/inventory/adjustment', authenticate, authorizeRole(['ADMIN', 'MANAGER']), InventoryController.adjustment);
-app.get('/api/inventory/movements', authenticate, authorizeRole(['ADMIN', 'MANAGER']), InventoryController.getMovements);
+app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'STAFF']), InventoryController.getInventory);
+app.get('/api/inventory/items/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'STAFF']), InventoryController.getItem);
+app.post('/api/inventory/items', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.createItem);
+app.post('/api/inventory/stock-in', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.stockIn);
+app.post('/api/inventory/stock-out', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.stockOut);
+app.post('/api/inventory/adjustment', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.adjustment); // SUPER_ADMIN only — no manual stock edits
+app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.getMovements);
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), RawMaterialsController.getAll);
@@ -134,9 +136,9 @@ app.get('/api/orders/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STA
 app.get('/api/invoices/:orderId', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), OrderController.getInvoice);
 
 // Products & Recipes
-app.get('/api/products', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), ProductController.getAll);
+app.get('/api/products', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), ProductController.getAll);
 app.post('/api/products', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProductController.create);
-app.get('/api/products/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), ProductController.getOne);
+app.get('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), ProductController.getOne);
 app.patch('/api/products/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProductController.update);
 app.delete('/api/products/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ProductController.delete);
 app.get('/api/recipes', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), RecipeController.getAll);
@@ -147,10 +149,17 @@ app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['ADMIN',
 app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['ADMIN', 'MANAGER']), RecipeController.calculateCost);
 
 // Production Workflow
-app.get('/api/production/history', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.getHistory);
-app.post('/api/production/batch', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.startBatch);
-app.get('/api/production/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.getOne);
-app.patch('/api/production/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.updateStatus);
+app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.getHistory);
+app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.startBatch);
+app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), async (req, res) => {
+  try {
+    const { ProductionService } = await import('./modules/production/production.service');
+    const batches = await ProductionService.getProductBatches(req.query.productId as string | undefined);
+    res.json(batches);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.getOne);
+app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.updateStatus);
 
 // Logistics (Stock Requests & Transfers)
 app.get('/api/logistics/requests', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), LogisticsController.getRequests);
@@ -412,6 +421,30 @@ app.post('/api/purchase/returns', authenticate, authorizeRole(['ADMIN', 'MANAGER
 app.patch('/api/purchase/returns/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.updatePurchaseReturn);
 
 app.post('/api/purchase/requisitions', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseController.createRequisition);
+
+// ─── Franchise Orders (Phase 7) ───────────────────────────────────────────────
+app.get('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), FranchiseOrderController.getAll);
+app.post('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), FranchiseOrderController.create);
+app.get('/api/franchise-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), FranchiseOrderController.getById);
+app.patch('/api/franchise-orders/:id/status', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), FranchiseOrderController.updateStatus);
+app.post('/api/franchise-orders/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), FranchiseOrderController.recordPayment);
+
+// ─── GST Invoice (Phase 10) ────────────────────────────────────────────────────
+app.get('/api/franchise-orders/:id/invoice', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), async (req, res) => {
+  try {
+    const isInterState = req.query.interState === 'true';
+    const invoice = await GSTInvoiceService.generateFranchiseInvoice(req.params.id, isInterState);
+    res.json(invoice);
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+
+// ─── Vendor Ledger Balance ─────────────────────────────────────────────────────
+app.get('/api/vendors/:id/balance', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), async (req, res) => {
+  try {
+    const balance = await GSTInvoiceService.getVendorBalance(req.params.id);
+    res.json(balance);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 
 // Centralized Error Handling
 app.use(errorHandler);
