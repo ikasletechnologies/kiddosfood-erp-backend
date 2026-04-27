@@ -87,6 +87,7 @@ model Franchise {
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
   productions       Production[]
+  franchiseOrders   FranchiseOrder[]
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
   activityLogs      ActivityLog[]
@@ -320,22 +321,31 @@ enum POStatus {
 
 // --- Recipe & Production ---
 
+enum ProductType {
+  FINISHED_GOOD   // ready stock — block order if stock = 0
+  MADE_TO_ORDER   // produced after order — no stock restriction
+}
+
 model Product {
-  id           String      @id @default(uuid())
-  name         String
-  sku          String?     @unique
-  description  String?
-  basePrice    Float
-  category     String?
-  taxPercent   Float       @default(5)
-  isActive     Boolean     @default(true)
-  emoji        String?
-  isVeg        Boolean     @default(true)
-  is_menu_item Boolean     @default(true)
-  recipe       Recipe?
-  orderItems   OrderItem[]
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+  id              String             @id @default(uuid())
+  name            String
+  sku             String?            @unique
+  description     String?
+  basePrice       Float
+  category        String?
+  taxPercent      Float              @default(5)
+  hsnCode         String?
+  isActive        Boolean            @default(true)
+  emoji           String?
+  isVeg           Boolean            @default(true)
+  is_menu_item    Boolean            @default(true)
+  productType     ProductType        @default(FINISHED_GOOD)
+  recipe          Recipe?
+  orderItems      OrderItem[]
+  batches         ProductBatch[]
+  franchiseOrders FranchiseOrderItem[]
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
 }
 
 model Recipe {
@@ -373,6 +383,66 @@ model Production {
   producedBy     String?
   producedAt     DateTime         @default(now())
   items          ProductionItem[]
+  batches        ProductBatch[]
+}
+
+// Every production creates a batch — stock = sum of batch quantities
+model ProductBatch {
+  id           String     @id @default(uuid())
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id])
+  productionId String?
+  production   Production? @relation(fields: [productionId], references: [id])
+  quantity     Float       // remaining quantity in this batch
+  expiryDate   DateTime?
+  batchCode    String?
+  createdAt    DateTime   @default(now())
+}
+
+// --- Franchise Order System ---
+
+enum FranchiseOrderStatus {
+  PENDING
+  APPROVED
+  IN_PRODUCTION
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentType {
+  COD
+  ONLINE
+}
+
+model FranchiseOrder {
+  id                   String               @id @default(uuid())
+  orderNumber          String               @unique
+  franchiseId          String
+  franchise            Franchise            @relation(fields: [franchiseId], references: [id])
+  status               FranchiseOrderStatus @default(PENDING)
+  totalAmount          Float
+  paymentType          PaymentType          @default(COD)
+  paymentStatus        String               @default("UNPAID") // UNPAID, PARTIAL, PAID
+  notes                String?
+  expectedDispatchDate DateTime?
+  actualDispatchDate   DateTime?
+  delayStatus          String?              // ON_TIME, DELAYED
+  items                FranchiseOrderItem[]
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+}
+
+model FranchiseOrderItem {
+  id               String         @id @default(uuid())
+  orderId          String
+  order            FranchiseOrder @relation(fields: [orderId], references: [id])
+  productId        String
+  product          Product        @relation(fields: [productId], references: [id])
+  quantity         Float
+  unitPrice        Float
+  totalAmount      Float
+  productType      ProductType    @default(FINISHED_GOOD)
 }
 
 enum ProductionStatus {
