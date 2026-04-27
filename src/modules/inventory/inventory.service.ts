@@ -38,6 +38,18 @@ export class InventoryService {
    * Create a new inventory item
    */
   static async createItem(data: any) {
+    if (data.name && data.franchiseId) {
+      const existing = await prisma.inventoryItem.findFirst({
+        where: {
+          franchiseId: data.franchiseId,
+          name: { equals: data.name, mode: 'insensitive' }
+        }
+      });
+      if (existing) {
+        throw new Error(`A material with the name "${data.name}" already exists in your inventory. Please use the existing material instead of creating a duplicate.`);
+      }
+    }
+
     return prisma.inventoryItem.create({
       data: {
         name: data.name,
