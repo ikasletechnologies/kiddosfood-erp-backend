@@ -533,9 +533,22 @@ export class ProcurementService {
         });
       }
 
-      // 3. Create Goods Receipt record
+      // 3. Create Goods Receipt record with items for audit
       await tx.goodsReceipt.create({
-        data: { poId: po.id }
+        data: {
+          poId: po.id,
+          status: 'COMPLETED',
+          items: {
+            create: po.poItems.map((item) => ({
+              materialId: item.inventoryItemId,
+              quantity: item.quantity,
+              receivedQty: item.quantity,
+              acceptedQty: item.quantity,
+              rejectedQty: 0,
+              price: item.price
+            }))
+          }
+        }
       });
 
       // 4. Update PO Status

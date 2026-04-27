@@ -42,7 +42,8 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => m.quantity > 0).reduce((s, m) => s + m.quantity, 0);
       const outbound = Math.abs(todayMoves.filter(m => m.quantity < 0).reduce((s, m) => s + m.quantity, 0));
 
-      return { ...item, currentStock: computedStock, inbound, outbound };
+      const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
+      return { ...item, currentStock: computedStock, inbound, outbound, status };
     });
   }
 

@@ -58,14 +58,22 @@ export class GRNService {
         receivedBy: data.receivedBy,
         status: 'PENDING',
         items: {
-          create: data.items.map((item) => ({
-            materialId: item.materialId,
-            quantity: item.orderedQty,
-            receivedQty: item.receivedQty,
-            acceptedQty: item.acceptedQty,
-            rejectedQty: item.rejectedQty,
-            price: item.price
-          }))
+          create: data.items.map((item) => {
+            const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
+            const qty = Number(item.orderedQty ?? item.quantity ?? poItem?.quantity ?? 0);
+            const price = Number(item.price ?? poItem?.price ?? 0);
+            
+            console.log(`[GRN Debug] Mapping item ${item.materialId}: qty=${qty}, price=${price}`);
+            
+            return {
+              materialId: item.materialId,
+              quantity: qty,
+              receivedQty: Number(item.receivedQty ?? 0),
+              acceptedQty: Number(item.acceptedQty ?? 0),
+              rejectedQty: Number(item.rejectedQty ?? 0),
+              price: price
+            };
+          })
         }
       },
       include: {
