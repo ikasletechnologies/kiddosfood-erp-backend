@@ -216,6 +216,7 @@ model VendorMaterial {
 
 model ProcurementOrder {
   id              String                 @id @default(uuid())
+  poNumber        String?                @unique
   vendorId        String
   vendor          Vendor                 @relation(fields: [vendorId], references: [id])
   status          POStatus               @default(PENDING)

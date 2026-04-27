@@ -237,9 +237,15 @@ export class ProcurementService {
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
+      // Generate PO Number
+      const year = new Date().getFullYear();
+      const count = await tx.procurementOrder.count();
+      const poNumber = `PO-${year}-${(count + 1).toString().padStart(4, '0')}`;
+
       // 1. Create the PO with GST fields
       const po = await tx.procurementOrder.create({
         data: {
+          poNumber,
           vendorId: data.vendorId,
           subtotal: totalSubtotal,
           cgst: totalCGST,
@@ -277,7 +283,7 @@ export class ProcurementService {
           amount: totalAmount,
           referenceType: 'PO',
           referenceId: po.id,
-          note: `Purchase Order #${po.id.substring(0, 8)} — Total: ₹${totalAmount.toLocaleString('en-IN')}`
+          note: `Purchase Order #${po.poNumber} — Total: ₹${totalAmount.toLocaleString('en-IN')}`
         }
       });
 
@@ -290,7 +296,7 @@ export class ProcurementService {
             amount: newMoneyPayment,
             referenceType: 'ADVANCE',
             referenceId: po.id,
-            note: `Advance Payment with PO #${po.id.substring(0, 8)}`
+            note: `Advance Payment with PO #${po.poNumber}`
           }
         });
       }
@@ -332,7 +338,7 @@ export class ProcurementService {
           amount: advancePaid,
           referenceType: 'ADVANCE',
           referenceId: po.id,
-          note: `Advance Payment for PO #${po.id.substring(0, 8)}`
+          note: `Advance Payment for PO #${po.poNumber || po.id.substring(0, 8)}`
         }
       });
 
@@ -627,6 +633,12 @@ export class ProcurementService {
   }
 
   static async recordPayment(vendorId: string, amount: number, note: string, referenceId?: string) {
+    let resolvedNote = note;
+    if (!resolvedNote && referenceId) {
+      const po = await prisma.procurementOrder.findUnique({ where: { id: referenceId } });
+      resolvedNote = po?.poNumber ? `Payment for PO #${po.poNumber}` : `Payment for PO #${referenceId.substring(0, 8)}`;
+    }
+
     const payment = await prisma.vendorLedger.create({
       data: {
         vendorId,
@@ -634,7 +646,7 @@ export class ProcurementService {
         amount,
         referenceType: 'PAYMENT',
         referenceId,
-        note: note || (referenceId ? `Payment for PO #${referenceId.substring(0, 8)}` : 'Direct Payment')
+        note: resolvedNote || 'Direct Payment'
       }
     });
 
