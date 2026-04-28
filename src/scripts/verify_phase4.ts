@@ -47,7 +47,7 @@ async function verify() {
     console.log('⏳ Receiving Goods (Triggering GRN Logic)...');
     const updatedPO = await ProcurementService.receiveGoods(po.id);
     
-    let updatedMaterial = await prisma.inventoryItem.findUnique({ where: { id: material.id } });
+    const updatedMaterial = await prisma.inventoryItem.findUnique({ where: { id: material.id } });
     console.log(`📊 Stock after Receiving: ${updatedMaterial?.currentStock}g (Expected: 600g)`);
 
     if (updatedMaterial?.currentStock !== 600) {
@@ -63,8 +63,8 @@ async function verify() {
     try {
       await ProcurementService.receiveGoods(po.id);
       throw new Error('Double receive should have failed!');
-    } catch (err: any) {
-      console.log(`✅ Double Receive correctly blocked: ${err.message}`);
+    } catch (err) {
+      console.log(`✅ Double Receive correctly blocked: ${(err as Error).message}`);
     }
 
     console.log('🌟 PHASE 4 VERIFIED SUCCESSFULLY! 🌟');

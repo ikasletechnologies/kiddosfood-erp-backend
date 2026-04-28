@@ -56,7 +56,7 @@ async function main() {
   );
 
   // 3. Create Roles Hierarchy
-  const superAdminRole = await prisma.role.upsert({
+  await prisma.role.upsert({
     where: { name: 'SUPER_ADMIN' },
     update: {},
     create: {
@@ -106,7 +106,7 @@ async function main() {
     },
   });
 
-  const staffRole = await prisma.role.upsert({
+  await prisma.role.upsert({
     where: { name: 'STAFF' },
     update: {},
     create: {
@@ -156,11 +156,11 @@ async function main() {
   }
 
   // 5. Create Sample Vendors
-  const vendor1 = await prisma.vendor.create({
+  await prisma.vendor.create({
     data: { name: 'Fresh Farm Supplies', contact: '9988776655', email: 'supply@freshfarm.com' }
   });
 
-  const vendor2 = await prisma.vendor.create({
+  await prisma.vendor.create({
     data: { name: 'Global Packaging Ltd', contact: '8877665544', email: 'info@globalpack.com' }
   });
 

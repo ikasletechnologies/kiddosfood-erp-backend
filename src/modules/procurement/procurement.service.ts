@@ -635,7 +635,7 @@ export class ProcurementService {
   /**
    * Ledger Operations
    */
-  static async getVendorLedger(vendorId: string, filters: any = {}) {
+  static async getVendorLedger(vendorId: string, _filters: any = {}) {
     const ledger = await prisma.vendorLedger.findMany({
       where: { vendorId },
       orderBy: { createdAt: 'asc' } // Sorted for running balance

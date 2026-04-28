@@ -12,8 +12,8 @@ export class SalesController {
         search: req.query.search as string
       });
       res.json(quotations);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -22,8 +22,8 @@ export class SalesController {
       const quotation = await SalesService.getQuotationById(req.params.id);
       if (!quotation) return res.status(404).json({ error: 'Quotation not found' });
       res.json(quotation);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -32,8 +32,8 @@ export class SalesController {
       const createdBy = (req as any).user?.id;
       const quotation = await SalesService.createQuotation({ ...req.body, createdBy });
       res.status(201).json(quotation);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -41,8 +41,8 @@ export class SalesController {
     try {
       const quotation = await SalesService.updateQuotation(req.params.id, req.body);
       res.json(quotation);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -51,8 +51,8 @@ export class SalesController {
       const createdBy = (req as any).user?.id;
       const salesOrder = await SalesService.convertQuotationToOrder(req.params.id, createdBy);
       res.status(201).json(salesOrder);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -66,8 +66,8 @@ export class SalesController {
         search: req.query.search as string
       });
       res.json(orders);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -76,8 +76,8 @@ export class SalesController {
       const order = await SalesService.getSalesOrderById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Sales order not found' });
       res.json(order);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -86,8 +86,8 @@ export class SalesController {
       const createdBy = (req as any).user?.id;
       const order = await SalesService.createSalesOrder({ ...req.body, createdBy });
       res.status(201).json(order);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -95,8 +95,8 @@ export class SalesController {
     try {
       const order = await SalesService.updateSalesOrder(req.params.id, req.body);
       res.json(order);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -110,8 +110,8 @@ export class SalesController {
         search: req.query.search as string
       });
       res.json(returns);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -119,8 +119,8 @@ export class SalesController {
     try {
       const returnOrder = await SalesService.createReturnOrder(req.body);
       res.status(201).json(returnOrder);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -129,8 +129,8 @@ export class SalesController {
       const approverId = (req as any).user?.id;
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 

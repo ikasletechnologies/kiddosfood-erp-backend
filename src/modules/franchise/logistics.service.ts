@@ -1,6 +1,5 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
-import { AuditService } from '../audit/audit.service';
 import { StockTransferStatus, StockMovementType } from '@prisma/client';
 
 export class LogisticsService {

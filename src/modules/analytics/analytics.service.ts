@@ -1,5 +1,4 @@
 import prisma from '../../lib/prisma';
-import { PaymentMode } from '@prisma/client';
 
 export class AnalyticsService {
   /**

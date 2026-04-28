@@ -12,8 +12,8 @@ export class PurchaseController {
         search: req.query.search as string
       });
       res.json(rfqs);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -22,8 +22,8 @@ export class PurchaseController {
       const rfq = await PurchaseService.getRFQById(req.params.id);
       if (!rfq) return res.status(404).json({ error: 'RFQ not found' });
       res.json(rfq);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -32,8 +32,8 @@ export class PurchaseController {
       const createdBy = (req as any).user?.id;
       const rfq = await PurchaseService.createRFQ({ ...req.body, createdBy });
       res.status(201).json(rfq);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -41,8 +41,8 @@ export class PurchaseController {
     try {
       const rfq = await PurchaseService.updateRFQ(req.params.id, req.body);
       res.json(rfq);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -50,8 +50,8 @@ export class PurchaseController {
     try {
       const po = await PurchaseService.convertRFQtoPO(req.params.id);
       res.status(201).json(po);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -65,8 +65,8 @@ export class PurchaseController {
         search: req.query.search as string
       });
       res.json(returns);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -74,8 +74,8 @@ export class PurchaseController {
     try {
       const ret = await PurchaseService.createPurchaseReturn(req.body);
       res.status(201).json(ret);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -83,8 +83,8 @@ export class PurchaseController {
     try {
       const ret = await PurchaseService.updatePurchaseReturn(req.params.id, req.body);
       res.json(ret);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 

@@ -1,12 +1,20 @@
 import { Request, Response } from 'express';
+import { AuthenticatedRequest } from '../../types/request';
+
+interface MenuItem {
+  title: string;
+  icon?: string;
+  path?: string;
+  children?: MenuItem[];
+}
 
 export class NavController {
   static async getNavigation(req: Request, res: Response) {
     try {
-      const user = (req as any).user;
-      const role = user.role;
+      const user = (req as AuthenticatedRequest).user;
+      const role = user?.role;
 
-      const menu: any[] = [
+      const menu: MenuItem[] = [
         { title: 'Dashboard', icon: 'LayoutDashboard', path: '/dashboard' }
       ];
 
@@ -101,8 +109,8 @@ export class NavController {
       });
 
       res.json(menu);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 }

@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import prisma from '../../lib/prisma';
 
 export class InventoryController {
   static async getInventory(req: Request, res: Response) {
@@ -11,7 +12,7 @@ export class InventoryController {
 
       // For SUPER_ADMIN without franchiseId, fetch the first available franchise to avoid empty screen
       if (!franchiseId) {
-        const franchises = await require('../../lib/prisma').default.franchise.findMany({ take: 1 });
+        const franchises = await prisma.franchise.findMany({ take: 1 });
         const defaultId = franchises[0]?.id || 'hq-001';
         const items = await InventoryService.getInventory(defaultId);
         return res.json(items);

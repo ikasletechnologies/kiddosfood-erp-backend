@@ -11,11 +11,11 @@ export class ProductionController {
         franchiseId,
         targetInventoryItemId,
         productionType,
-        userId: (req as any).user?.id
+        userId: (req as unknown as { user: { id: string } }).user?.id
       });
       res.status(201).json(result);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -24,8 +24,8 @@ export class ProductionController {
       const franchiseId = req.query.franchiseId as string;
       const history = await ProductionService.getProductionHistory(franchiseId);
       res.json(history);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -34,8 +34,8 @@ export class ProductionController {
       const batch = await ProductionService.getBatchById(req.params.id);
       if (!batch) return res.status(404).json({ error: 'Production batch not found' });
       res.json(batch);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 

@@ -6,8 +6,8 @@ export class RecipeController {
     try {
       const recipe = await RecipeService.upsertRecipe(req.body);
       res.status(201).json(recipe);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -15,8 +15,8 @@ export class RecipeController {
     try {
       const recipes = await RecipeService.getRecipes();
       res.json(recipes);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -25,8 +25,8 @@ export class RecipeController {
       const recipe = await RecipeService.getRecipeById(req.params.id);
       if (!recipe) return res.status(404).json({ error: 'Recipe not found' });
       res.json(recipe);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -35,8 +35,8 @@ export class RecipeController {
       const recipe = await RecipeService.getRecipeByProduct(req.params.productId);
       if (!recipe) return res.status(404).json({ error: 'Recipe not found for this product' });
       res.json(recipe);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -44,8 +44,8 @@ export class RecipeController {
     try {
       const cost = await RecipeService.calculateCost(req.params.id);
       res.json(cost);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 

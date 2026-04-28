@@ -1,6 +1,5 @@
 import prisma from '../lib/prisma';
 import { IsolationUtil } from '../utils/isolation.util';
-import { AuthService } from '../modules/auth/auth.service';
 import { NavController } from '../modules/users/nav.controller';
 
 /**
@@ -49,10 +48,8 @@ async function verify() {
     } as any);
 
     // Test NavController logic manually for logic check
-    const NavControllerLocal = require('../modules/users/nav.controller').NavController;
-    
-    await NavControllerLocal.getNavigation({ user: { role: 'STAFF' } } as any, mockRes((d: any) => staffNav = d));
-    await NavControllerLocal.getNavigation({ user: { role: 'SUPER_ADMIN' } } as any, mockRes((d: any) => saNav = d));
+    await NavController.getNavigation({ user: { role: 'STAFF' } } as any, mockRes((d: any) => staffNav = d));
+    await NavController.getNavigation({ user: { role: 'SUPER_ADMIN' } } as any, mockRes((d: any) => saNav = d));
 
     const staffHasBranchMgmt = staffNav.some(m => m.title === 'Branch Management');
     const saHasBranchMgmt = saNav.some(m => m.title === 'Branch Management');

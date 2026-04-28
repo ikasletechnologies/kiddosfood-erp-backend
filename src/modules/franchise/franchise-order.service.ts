@@ -169,7 +169,7 @@ export class FranchiseOrderService {
   }
 
   // ─── Payment ───────────────────────────────────────────────────────────────
-  static async recordPayment(id: string, amount: number) {
+  static async recordPayment(id: string, _amount: number) {
     return prisma.franchiseOrder.update({
       where: { id },
       data: { paymentStatus: 'PAID' },

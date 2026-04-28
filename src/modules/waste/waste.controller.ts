@@ -9,8 +9,8 @@ export class WasteController {
         req.query.dateTo as string
       );
       res.json(entries);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -19,8 +19,8 @@ export class WasteController {
       const entry = await WasteService.getById(req.params.id);
       if (!entry) return res.status(404).json({ error: 'Waste entry not found' });
       res.json(entry);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -28,8 +28,8 @@ export class WasteController {
     try {
       const entry = await WasteService.create(req.body);
       res.status(201).json(entry);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -37,8 +37,8 @@ export class WasteController {
     try {
       const summary = await WasteService.getSummary();
       res.json(summary);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 }

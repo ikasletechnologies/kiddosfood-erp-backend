@@ -4,10 +4,10 @@ import { VendorInvoiceService } from './vendor-invoices.service';
 export class VendorInvoiceController {
   static async getAll(req: Request, res: Response) {
     try {
-      const data = await VendorInvoiceService.getAll(req.query as any);
+      const data = await VendorInvoiceService.getAll(req.query as unknown as { vendorId?: string; status?: string });
       res.json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -15,8 +15,8 @@ export class VendorInvoiceController {
     try {
       const invoice = await VendorInvoiceService.create(req.body);
       res.status(201).json(invoice);
-    } catch (error: any) {
-      res.status(400).json({ error: error.message });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
@@ -24,8 +24,8 @@ export class VendorInvoiceController {
     try {
       const invoice = await VendorInvoiceService.match(req.params.id);
       res.json(invoice);
-    } catch (error: any) {
-      res.status(400).json({ error: error.message });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
@@ -34,8 +34,8 @@ export class VendorInvoiceController {
       const { status } = req.body;
       const invoice = await VendorInvoiceService.updateStatus(req.params.id, status);
       res.json(invoice);
-    } catch (error: any) {
-      res.status(400).json({ error: error.message });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 }

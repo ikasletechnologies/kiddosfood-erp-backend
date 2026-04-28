@@ -1,7 +1,7 @@
+import { Prisma, TicketStatus, TicketType } from '@prisma/client';
 import prisma from '../../lib/prisma';
 
 let ticketCounter = 1000;
-let rfqCounter = 100;
 
 function generateTicketNumber() {
   return `TKT-${Date.now()}-${++ticketCounter}`;
@@ -17,9 +17,9 @@ export class ServiceCRMService {
     assigneeId?: string;
     search?: string;
   }) {
-    const where: any = {};
-    if (filters.status) where.status = filters.status;
-    if (filters.type) where.type = filters.type;
+    const where: Prisma.ServiceTicketWhereInput = {};
+    if (filters.status) where.status = filters.status as TicketStatus;
+    if (filters.type) where.type = filters.type as TicketType;
     if (filters.priority) where.priority = filters.priority;
     if (filters.assigneeId) where.assigneeId = filters.assigneeId;
     if (filters.search) {
@@ -65,7 +65,7 @@ export class ServiceCRMService {
         customerEmail: data.customerEmail,
         title: data.title,
         description: data.description,
-        type: (data.type as any) || 'COMPLAINT',
+        type: (data.type as TicketType) || 'COMPLAINT',
         priority: data.priority || 'MEDIUM',
         slaDeadline: data.slaDeadline ? new Date(data.slaDeadline) : undefined,
         assigneeId: data.assigneeId,
@@ -90,7 +90,7 @@ export class ServiceCRMService {
       where: { id },
       data: {
         ...data,
-        status: data.status as any,
+        status: data.status as TicketStatus,
         slaDeadline: data.slaDeadline ? new Date(data.slaDeadline) : undefined,
         resolvedAt: data.resolvedAt ? new Date(data.resolvedAt) : undefined
       },
@@ -105,7 +105,7 @@ export class ServiceCRMService {
   // ─── Field Visits ────────────────────────────────────────────────────────────
 
   static async getFieldVisits(filters: { ticketId?: string; agentId?: string; status?: string }) {
-    const where: any = {};
+    const where: Prisma.FieldVisitWhereInput = {};
     if (filters.ticketId) where.ticketId = filters.ticketId;
     if (filters.agentId) where.agentId = filters.agentId;
     if (filters.status) where.status = filters.status;

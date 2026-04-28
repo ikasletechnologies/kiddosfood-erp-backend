@@ -6,8 +6,8 @@ export class RoleController {
     try {
       const roles = await RoleService.getRoles();
       res.json(roles);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -16,8 +16,8 @@ export class RoleController {
       const role = await RoleService.getRoleById(req.params.id);
       if (!role) return res.status(404).json({ error: 'Role not found' });
       res.json(role);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -25,8 +25,8 @@ export class RoleController {
     try {
       const role = await RoleService.createRole(req.body);
       res.status(201).json(role);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -34,8 +34,8 @@ export class RoleController {
     try {
       const role = await RoleService.updateRole(req.params.id, req.body);
       res.json(role);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
