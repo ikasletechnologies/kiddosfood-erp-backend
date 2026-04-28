@@ -1,12 +1,16 @@
+import { IsolationUtil as DataIsolator } from '../../utils/isolation.util';
 import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import prisma from '../../lib/prisma';
+
 
 /**
  * Raw Materials Controller
  * Maps to InventoryItem model in Prisma
  */
+
 export class RawMaterialsController {
+
   
   static async getActiveFranchiseId(requestedId?: string): Promise<string> {
     // 1. Check if the specific requested ID exists
@@ -45,19 +49,38 @@ export class RawMaterialsController {
    */
   static async getAll(req: Request, res: Response) {
     try {
-      const franchiseId = await RawMaterialsController.getActiveFranchiseId(req.query.franchiseId as string);
+      const user = (req as any).user;
+      const franchiseFilter = DataIsolator.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
+
+      if (!franchiseId) {
+        // Fallback for SUPER_ADMIN if no franchiseId provided in query
+        const defaultId = await this.getActiveFranchiseId();
+        const items = await InventoryService.getInventory(defaultId);
+        return res.json(items);
+      }
+
       const items = await InventoryService.getInventory(franchiseId);
       res.json(items);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      console.error('[RawMaterialsController.getAll] Error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined 
+      });
     }
   }
 
   static async create(req: Request, res: Response) {
     try {
-      console.log('[Procurement] Creating material:', req.body);
-      const franchiseId = await RawMaterialsController.getActiveFranchiseId(req.body.franchiseId);
-      console.log('[Procurement] Resolved Franchise ID:', franchiseId);
+      const user = (req as any).user;
+      const franchiseId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
+      
+      if (!franchiseId) {
+        return res.status(400).json({ error: "Franchise identification is required to create a material." });
+      }
+
+      console.log(`[RawMaterials] Creating material for franchise: ${franchiseId}`);
 
       let sku = req.body.sku || ('RM-' + Math.random().toString(36).substring(7).toUpperCase());
       
@@ -102,6 +125,22 @@ export class RawMaterialsController {
       res.json({ message: 'Raw material deleted' });
     } catch (error: any) {
       res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async getById(req: Request, res: Response) {
+    console.log(`🔍 [RawMaterials] Fetching material by ID: ${req.params.id}`);
+    try {
+      const item = await InventoryService.getItemById(req.params.id);
+      if (!item) {
+        console.warn(`⚠️ [RawMaterials] Material not found: ${req.params.id}`);
+        return res.status(404).json({ error: 'Material not found' });
+      }
+      console.log(`✅ [RawMaterials] Found material: ${item.name}`);
+      res.json(item);
+    } catch (error: any) {
+      console.error(`❌ [RawMaterials] Error fetching material ${req.params.id}:`, error);
+      res.status(500).json({ error: error.message });
     }
   }
 }

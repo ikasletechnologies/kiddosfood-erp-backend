@@ -1,10 +1,13 @@
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+
 
 const ACCESS_SECRET = process.env.ACCESS_TOKEN_SECRET || 'kiddos_access_secret_8822';
 const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || 'kiddos_refresh_secret_9933';
 
 export interface TokenPayload {
   userId: string;
+  email?: string;
   role: string;
   franchiseId?: string | null;
   branchId?: string | null;
@@ -13,11 +16,17 @@ export interface TokenPayload {
 
 export class JwtUtil {
   static generateAccessToken(payload: TokenPayload): string {
-    return jwt.sign(payload, ACCESS_SECRET, { expiresIn: '15m' });
+    return jwt.sign(payload, ACCESS_SECRET, { 
+      expiresIn: '15m',
+      jwtid: crypto.randomUUID()
+    });
   }
 
   static generateRefreshToken(payload: TokenPayload): string {
-    return jwt.sign(payload, REFRESH_SECRET, { expiresIn: '7d' });
+    return jwt.sign(payload, REFRESH_SECRET, { 
+      expiresIn: '7d',
+      jwtid: crypto.randomUUID()
+    });
   }
 
   static verifyAccessToken(token: string): TokenPayload | null {

@@ -11,9 +11,10 @@ async function main() {
     create: {
       id: 'hq-001',
       name: 'Kiddos Food Headquarters',
-      location: 'Corporate Office',
+      location: 'Corporate Office, Mumbai',
       ownerName: 'Super Admin',
       contactNum: '9999999999',
+      status: 'ACTIVE',
     },
   });
 
@@ -27,6 +28,7 @@ async function main() {
       location: 'Jaipur, Rajasthan',
       ownerName: 'Branch Manager',
       contactNum: '8888888888',
+      status: 'ACTIVE',
     },
   });
 
@@ -153,13 +155,56 @@ async function main() {
     });
   }
 
-  console.log('✅ Kiddos Food ERP hierarchy seeded successfully.');
+  // 5. Create Sample Vendors
+  const vendor1 = await prisma.vendor.create({
+    data: { name: 'Fresh Farm Supplies', contact: '9988776655', email: 'supply@freshfarm.com' }
+  });
+
+  const vendor2 = await prisma.vendor.create({
+    data: { name: 'Global Packaging Ltd', contact: '8877665544', email: 'info@globalpack.com' }
+  });
+
+  // 6. Create Sample Inventory Items
+  const items = [
+    { name: 'Organic Wheat Flour', sku: 'RM-WHT-001', category: 'RAW_MATERIAL' as const, unit: 'kg', franchiseId: rootFranchise.id, minimumStock: 20, currentStock: 0 },
+    { name: 'Refined Sugar', sku: 'RM-SGR-001', category: 'RAW_MATERIAL' as const, unit: 'kg', franchiseId: rootFranchise.id, minimumStock: 15, currentStock: 0 },
+    { name: 'Eco-Friendly Box', sku: 'PK-BOX-001', category: 'PACKAGING' as const, unit: 'pc', franchiseId: rootFranchise.id, minimumStock: 100, currentStock: 0 },
+  ];
+
+  const createdItems = [];
+  for (const item of items) {
+    const invItem = await prisma.inventoryItem.create({ data: item });
+    createdItems.push(invItem);
+  }
+
+  // 7. Create Sample Stock Movements (Today) to populate Inbound/Outbound
+  // We add these to the admin user
+  const admin = await prisma.user.findFirst({ where: { email: 'admin@kiddosfood.com' } });
+
+  const movements = [
+    // Inbound Movements (Purchases)
+    { itemId: createdItems[0].id, quantity: 150, movementType: 'PURCHASE_IN' as const, note: 'Morning delivery', createdBy: admin?.id },
+    { itemId: createdItems[1].id, quantity: 80, movementType: 'PURCHASE_IN' as const, note: 'Restock', createdBy: admin?.id },
+    
+    // Outbound Movements (Production/Sales)
+    { itemId: createdItems[0].id, quantity: -45, movementType: 'PRODUCTION_OUT' as const, note: 'Batch #101 consumption', createdBy: admin?.id },
+    { itemId: createdItems[2].id, quantity: -120, movementType: 'SALES_OUT' as const, note: 'Bulk order dispatch', createdBy: admin?.id },
+  ];
+
+  for (const move of movements) {
+    await prisma.stockMovement.create({ data: move });
+    // Update currentStock cache on the item
+    await prisma.inventoryItem.update({
+      where: { id: move.itemId },
+      data: { currentStock: { increment: move.quantity } }
+    });
+  }
+
+  console.log('✅ Kiddos Food ERP hierarchy and movement data seeded successfully.');
   console.log('   Admin: admin@kiddosfood.com / admin123');
   console.log('   Manager: manager@kiddosfood.com / admin123');
 }
 
 main()
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
+  .catch(e => { console.error(e); process.exit(1); })
+  .finally(() => prisma.$disconnect());

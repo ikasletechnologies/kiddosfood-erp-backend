@@ -7,10 +7,16 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
 
-      if (!franchiseId) return res.status(400).json({ error: 'Franchise ID is required' });
-      
+      // For SUPER_ADMIN without franchiseId, fetch the first available franchise to avoid empty screen
+      if (!franchiseId) {
+        const franchises = await require('../../lib/prisma').default.franchise.findMany({ take: 1 });
+        const defaultId = franchises[0]?.id || 'hq-001';
+        const items = await InventoryService.getInventory(defaultId);
+        return res.json(items);
+      }
+
       const items = await InventoryService.getInventory(franchiseId);
       res.json(items);
     } catch (error: any) {

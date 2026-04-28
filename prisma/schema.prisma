@@ -87,6 +87,7 @@ model Franchise {
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
   productions       Production[]
+  franchiseOrders   FranchiseOrder[]
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
   activityLogs      ActivityLog[]
@@ -103,6 +104,8 @@ model InventoryItem {
   currentStock    Float
   unit            String // kg, pc, ltr
   minimumStock    Float                  @default(10)
+  hsnCode         String?                // GST Compliance
+  gstRate         Float                  @default(5) // Default 5%
   batchNo         String?
   expiryDate      DateTime?
   franchiseId     String
@@ -116,6 +119,7 @@ model InventoryItem {
   requestItems    StockRequestItem[]
   transferItems   StockTransferItem[]
   poItems         ProcurementOrderItem[]
+  grnItems        GoodsReceiptItem[]
   vendors         VendorMaterial[]
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
@@ -159,13 +163,45 @@ model Vendor {
   name            String
   contact         String
   email           String?
-  rating          Float?             @default(5.0)
+  address            String?
+  remark             String?
+  manualPurchaseAdj  Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
+  manualAdvanceAdj   Float              @default(0) // @deprecated: Use VendorLedger for all advances
+  rating             Float?             @default(5.0)
   items           InventoryItem[]
   orders          ProcurementOrder[]
   rfqs            PurchaseRFQ[]
   purchaseReturns PurchaseReturn[]
   suppliedMaterials VendorMaterial[]
+  ledgerEntries   VendorLedger[]
+  invoices        VendorInvoice[]
   createdAt       DateTime           @default(now())
+}
+
+model VendorLedger {
+  id              String             @id @default(uuid())
+  vendorId        String
+  vendor          Vendor             @relation(fields: [vendorId], references: [id])
+  type            VendorLedgerType
+  amount          Float
+  referenceType   VendorLedgerReferenceType
+  referenceId     String?            // ID of PO, Payment, etc.
+  note            String?
+  createdAt       DateTime           @default(now())
+}
+
+enum VendorLedgerType {
+  CREDIT
+  DEBIT
+}
+
+enum VendorLedgerReferenceType {
+  PO
+  PAYMENT
+  ADVANCE
+  RETURN
+  ADJUSTMENT
+  OPENING_BALANCE
 }
 
 model VendorMaterial {
@@ -181,17 +217,25 @@ model VendorMaterial {
 
 model ProcurementOrder {
   id              String                 @id @default(uuid())
+  poNumber        String?                @unique
   vendorId        String
   vendor          Vendor                 @relation(fields: [vendorId], references: [id])
   status          POStatus               @default(PENDING)
+  subtotal        Float                  @default(0)
+  cgst            Float                  @default(0)
+  sgst            Float                  @default(0)
+  igst            Float                  @default(0)
   totalAmount     Float
-  advancePaid     Float                  @default(0)
+  advancePaid     Float                  @default(0) // @deprecated: use paid field
+  paid            Float                  @default(0)
+  balance         Float                  @default(0)
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   notes               String?
   items           Json? // Legacy compatibility
   poItems         ProcurementOrderItem[]
   goodsReceipts   GoodsReceipt[]
+  invoices        VendorInvoice[]
   received        Boolean                @default(false)
   purchaseReturns PurchaseReturn[]
   expenses        Expense[]
@@ -204,42 +248,104 @@ model ProcurementOrderItem {
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
   inventoryItemId  String
   inventoryItem    InventoryItem    @relation(fields: [inventoryItemId], references: [id])
+  itemName         String?          // Flattened for audit
+  hsnCode          String?          // Flattened for audit
+  gstRate          Float            @default(5)
   quantity         Float
   price            Float
+  subtotal         Float            @default(0)
+  cgst             Float            @default(0)
+  sgst             Float            @default(0)
+  igst             Float            @default(0)
+  total            Float            @default(0)
 }
 
 model GoodsReceipt {
   id               String           @id @default(uuid())
   poId             String
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
+  receivedBy       String?
   receivedAt       DateTime         @default(now())
+  status           GRNStatus        @default(PENDING)
+  items            GoodsReceiptItem[]
+  invoices         VendorInvoice[]
+  createdAt        DateTime         @default(now())
+}
+
+model GoodsReceiptItem {
+  id               String       @id @default(uuid())
+  grnId            String
+  grn              GoodsReceipt @relation(fields: [grnId], references: [id])
+  materialId       String
+  inventoryItem    InventoryItem @relation(fields: [materialId], references: [id])
+  quantity         Float        // Ordered Qty
+  receivedQty      Float        // Received Qty
+  acceptedQty      Float
+  rejectedQty      Float
+  price            Float        // Price at time of PO
+}
+
+model VendorInvoice {
+  id               String           @id @default(uuid())
+  vendorId         String
+  vendor           Vendor           @relation(fields: [vendorId], references: [id])
+  poId             String
+  procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
+  grnId            String?
+  grn              GoodsReceipt?    @relation(fields: [grnId], references: [id])
+  invoiceNumber    String           @unique
+  amount           Float
+  status           InvoiceStatus    @default(PENDING)
+  createdAt        DateTime         @default(now())
+}
+
+enum GRNStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  PENDING
+  MATCHED
+  MISMATCH
 }
 
 enum POStatus {
   PENDING
   APPROVED
   RECEIVED
+  CLOSED
   CANCELLED
 }
 
 // --- Recipe & Production ---
 
+enum ProductType {
+  FINISHED_GOOD   // ready stock — block order if stock = 0
+  MADE_TO_ORDER   // produced after order — no stock restriction
+}
+
 model Product {
-  id           String      @id @default(uuid())
-  name         String
-  sku          String?     @unique
-  description  String?
-  basePrice    Float
-  category     String?
-  taxPercent   Float       @default(5)
-  isActive     Boolean     @default(true)
-  emoji        String?
-  isVeg        Boolean     @default(true)
-  is_menu_item Boolean     @default(true)
-  recipe       Recipe?
-  orderItems   OrderItem[]
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+  id              String             @id @default(uuid())
+  name            String
+  sku             String?            @unique
+  description     String?
+  basePrice       Float
+  category        String?
+  taxPercent      Float              @default(5)
+  hsnCode         String?
+  isActive        Boolean            @default(true)
+  emoji           String?
+  isVeg           Boolean            @default(true)
+  is_menu_item    Boolean            @default(true)
+  productType     ProductType        @default(FINISHED_GOOD)
+  recipe          Recipe?
+  orderItems      OrderItem[]
+  batches         ProductBatch[]
+  franchiseOrders FranchiseOrderItem[]
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
 }
 
 model Recipe {
@@ -277,6 +383,66 @@ model Production {
   producedBy     String?
   producedAt     DateTime         @default(now())
   items          ProductionItem[]
+  batches        ProductBatch[]
+}
+
+// Every production creates a batch — stock = sum of batch quantities
+model ProductBatch {
+  id           String     @id @default(uuid())
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id])
+  productionId String?
+  production   Production? @relation(fields: [productionId], references: [id])
+  quantity     Float       // remaining quantity in this batch
+  expiryDate   DateTime?
+  batchCode    String?
+  createdAt    DateTime   @default(now())
+}
+
+// --- Franchise Order System ---
+
+enum FranchiseOrderStatus {
+  PENDING
+  APPROVED
+  IN_PRODUCTION
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentType {
+  COD
+  ONLINE
+}
+
+model FranchiseOrder {
+  id                   String               @id @default(uuid())
+  orderNumber          String               @unique
+  franchiseId          String
+  franchise            Franchise            @relation(fields: [franchiseId], references: [id])
+  status               FranchiseOrderStatus @default(PENDING)
+  totalAmount          Float
+  paymentType          PaymentType          @default(COD)
+  paymentStatus        String               @default("UNPAID") // UNPAID, PARTIAL, PAID
+  notes                String?
+  expectedDispatchDate DateTime?
+  actualDispatchDate   DateTime?
+  delayStatus          String?              // ON_TIME, DELAYED
+  items                FranchiseOrderItem[]
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+}
+
+model FranchiseOrderItem {
+  id               String         @id @default(uuid())
+  orderId          String
+  order            FranchiseOrder @relation(fields: [orderId], references: [id])
+  productId        String
+  product          Product        @relation(fields: [productId], references: [id])
+  quantity         Float
+  unitPrice        Float
+  totalAmount      Float
+  productType      ProductType    @default(FINISHED_GOOD)
 }
 
 enum ProductionStatus {
