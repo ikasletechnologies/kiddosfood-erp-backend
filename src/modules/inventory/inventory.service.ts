@@ -155,7 +155,7 @@ export class InventoryService {
 
   // Only update metadata — never update currentStock directly
   static async updateItem(id: string, data: any) {
-    const { currentStock, ...safeData } = data; // strip any stock field
+    const { currentStock: _currentStock, ...safeData } = data; // strip any stock field
     return prisma.inventoryItem.update({ where: { id }, data: safeData });
   }
 

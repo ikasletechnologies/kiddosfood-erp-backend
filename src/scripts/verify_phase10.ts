@@ -1,6 +1,6 @@
 import prisma from '../lib/prisma';
 import { LogisticsService } from '../modules/franchise/logistics.service';
-import { StockMovementType } from '@prisma/client';
+// import { StockMovementType } from '@prisma/client';
 
 /**
  * Verification Script for Phase 10: Inter-Branch Logistics

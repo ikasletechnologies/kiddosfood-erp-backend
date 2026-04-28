@@ -7,8 +7,8 @@ export class ProductController {
       const category = req.query.category as string;
       const products = await ProductService.getAll(category ? { category } : {});
       res.json(products);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -16,8 +16,8 @@ export class ProductController {
     try {
       const product = await ProductService.create(req.body);
       res.status(201).json(product);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -26,8 +26,8 @@ export class ProductController {
       const product = await ProductService.getById(req.params.id);
       if (!product) return res.status(404).json({ error: 'Product not found' });
       res.json(product);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -35,8 +35,8 @@ export class ProductController {
     try {
       const product = await ProductService.update(req.params.id, req.body);
       res.json(product);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { ServiceCRMService } from './service-crm.service';
+import { AuthenticatedRequest } from '../../types/request';
 
 export class ServiceCRMController {
   // ─── Tickets ────────────────────────────────────────────────────────────────
@@ -14,8 +15,8 @@ export class ServiceCRMController {
         search: req.query.search as string
       });
       res.json(tickets);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -24,18 +25,18 @@ export class ServiceCRMController {
       const ticket = await ServiceCRMService.getTicketById(req.params.id);
       if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
       res.json(ticket);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
   static async createTicket(req: Request, res: Response) {
     try {
-      const creatorId = (req as any).user?.id;
+      const creatorId = (req as AuthenticatedRequest).user?.id;
       const ticket = await ServiceCRMService.createTicket({ ...req.body, creatorId });
       res.status(201).json(ticket);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -43,8 +44,8 @@ export class ServiceCRMController {
     try {
       const ticket = await ServiceCRMService.updateTicket(req.params.id, req.body);
       res.json(ticket);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -52,8 +53,8 @@ export class ServiceCRMController {
     try {
       await ServiceCRMService.deleteTicket(req.params.id);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -61,8 +62,8 @@ export class ServiceCRMController {
     try {
       const stats = await ServiceCRMService.getTicketStats();
       res.json(stats);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -76,8 +77,8 @@ export class ServiceCRMController {
         status: req.query.status as string
       });
       res.json(visits);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -85,8 +86,8 @@ export class ServiceCRMController {
     try {
       const visit = await ServiceCRMService.createFieldVisit(req.body);
       res.status(201).json(visit);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -94,8 +95,8 @@ export class ServiceCRMController {
     try {
       const visit = await ServiceCRMService.checkInVisit(req.params.id, req.body);
       res.json(visit);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -103,8 +104,8 @@ export class ServiceCRMController {
     try {
       const visit = await ServiceCRMService.checkOutVisit(req.params.id, req.body);
       res.json(visit);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -112,8 +113,8 @@ export class ServiceCRMController {
     try {
       const log = await ServiceCRMService.logLocation(req.params.id, req.body);
       res.status(201).json(log);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 
@@ -121,8 +122,8 @@ export class ServiceCRMController {
     try {
       const visit = await ServiceCRMService.updateVisitStatus(req.params.id, req.body);
       res.json(visit);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 }

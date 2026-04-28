@@ -62,11 +62,11 @@ export class RawMaterialsController {
 
       const items = await InventoryService.getInventory(franchiseId);
       res.json(items);
-    } catch (error: any) {
+    } catch (error) {
       console.error('[RawMaterialsController.getAll] Error:', error);
       res.status(500).json({ 
-        error: error.message,
-        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined 
+        error: (error as Error).message,
+        stack: process.env.NODE_ENV === 'development' ? (error as Error).stack : undefined 
       });
     }
   }
@@ -114,8 +114,8 @@ export class RawMaterialsController {
     try {
       const item = await InventoryService.updateItem(req.params.id, req.body);
       res.json(item);
-    } catch (error: any) {
-      res.status(400).json({ error: error.message });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
@@ -138,9 +138,8 @@ export class RawMaterialsController {
       }
       console.log(`✅ [RawMaterials] Found material: ${item.name}`);
       res.json(item);
-    } catch (error: any) {
-      console.error(`❌ [RawMaterials] Error fetching material ${req.params.id}:`, error);
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
     }
   }
 }

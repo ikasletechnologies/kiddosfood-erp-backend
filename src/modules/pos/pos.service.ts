@@ -179,7 +179,7 @@ export class POSService {
       const order = await tx.order.findUnique({ where: { id: orderId } });
       if (!order) throw new Error('Order not found');
 
-      const payment = await tx.payment.create({
+      await tx.payment.create({
         data: {
           orderId,
           paymentMode: method,
