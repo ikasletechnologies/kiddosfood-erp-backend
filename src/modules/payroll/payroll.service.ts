@@ -91,7 +91,7 @@ export class PayrollService {
       }
     });
 
-    const payslips = [];
+    const payslips: object[] = [];
 
     for (const emp of employees) {
       if (!emp.salaryStructure) continue;

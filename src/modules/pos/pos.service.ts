@@ -38,8 +38,8 @@ export class POSService {
              price = prod.basePrice;
            }
 
-           const tax = Number((price * 0.05).toFixed(2));
-           const total = Number((price * it.quantity).toFixed(2));
+           const tax = Number((price! * 0.05).toFixed(2));
+           const total = Number((price! * it.quantity).toFixed(2));
 
            await tx.orderItem.create({
               data: {
