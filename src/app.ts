@@ -119,6 +119,7 @@ app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), RawMaterialsController.getAll);
+app.get('/api/raw-materials/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), RawMaterialsController.getById);
 app.post('/api/raw-materials', authenticate, authorizeRole(['ADMIN', 'MANAGER']), RawMaterialsController.create);
 app.patch('/api/raw-materials/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), RawMaterialsController.update);
 app.delete('/api/raw-materials/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), RawMaterialsController.delete);

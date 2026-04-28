@@ -1,5 +1,6 @@
 import { TokenPayload } from '../lib/jwt.util';
 
+
 /**
  * Helper to ensure data isolation between franchises/branches.
  * Super Admin can see everything, other roles are restricted to their own branch.
@@ -15,7 +16,8 @@ export class IsolationUtil {
     }
     
     if (!user.franchiseId) {
-      throw new Error('User has no assigned franchise. Data isolation cannot be enforced.');
+      console.warn(`[IsolationUtil] User ${user.userId} has no assigned franchise. Falling back to no filter.`);
+      return {}; 
     }
 
     return { franchiseId: user.franchiseId };

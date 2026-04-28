@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { InventoryService } from '../inventory/inventory.service';
 
 export class GRNService {
   static async getAll(params: { poId?: string; status?: string } = {}) {
@@ -60,7 +61,7 @@ export class GRNService {
         items: {
           create: data.items.map((item) => {
             const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
-            const qty = Number(item.orderedQty ?? item.quantity ?? poItem?.quantity ?? 0);
+            const qty = Number(item.orderedQty ?? poItem?.quantity ?? 0);
             const price = Number(item.price ?? poItem?.price ?? 0);
             
             console.log(`[GRN Debug] Mapping item ${item.materialId}: qty=${qty}, price=${price}`);
@@ -101,24 +102,29 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
-        await tx.stockMovement.create({
-          data: {
-            itemId: item.materialId,
-            movementType: 'PURCHASE_IN',
-            quantity: item.acceptedQty,
-            referenceType: 'GRN',
-            referenceId: grnId,
-            note: `GRN approved — accepted ${item.acceptedQty} units`
-          }
+        await InventoryService.recordMovement(tx, {
+          itemId: item.materialId,
+          type: 'PURCHASE_IN',
+          quantity: item.acceptedQty,
+          referenceType: 'GRN',
+          referenceId: grnId,
+          note: `GRN approved for PO-${grn.procurementOrder.poNumber || grn.procurementOrder.id.substring(0, 8)} — accepted ${item.acceptedQty} units`
         });
 
+        // Link material to vendor permanently
         await tx.inventoryItem.update({
           where: { id: item.materialId },
-          data: { currentStock: { increment: item.acceptedQty } }
+          data: { vendorId: grn.procurementOrder.vendorId }
         });
       }
 
-      // Mark GRN as completed
+      // 1. Mark PO as RECEIVED FIRST
+      await tx.procurementOrder.update({
+        where: { id: grn.poId },
+        data: { status: 'RECEIVED', received: true }
+      });
+
+      // 2. Mark GRN as completed SECOND
       const updatedGRN = await tx.goodsReceipt.update({
         where: { id: grnId },
         data: { status: 'COMPLETED' },
@@ -126,12 +132,6 @@ export class GRNService {
           procurementOrder: { include: { vendor: true } },
           items: { include: { inventoryItem: true } }
         }
-      });
-
-      // Mark PO as RECEIVED
-      await tx.procurementOrder.update({
-        where: { id: grn.poId },
-        data: { status: 'RECEIVED', received: true }
       });
 
       return updatedGRN;

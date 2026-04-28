@@ -9,9 +9,11 @@ export class InventoryController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
 
-      // SUPER_ADMIN without franchiseId filter returns HQ inventory by default
+      // For SUPER_ADMIN without franchiseId, fetch the first available franchise to avoid empty screen
       if (!franchiseId) {
-        const items = await InventoryService.getInventory('hq-001');
+        const franchises = await require('../../lib/prisma').default.franchise.findMany({ take: 1 });
+        const defaultId = franchises[0]?.id || 'hq-001';
+        const items = await InventoryService.getInventory(defaultId);
         return res.json(items);
       }
 

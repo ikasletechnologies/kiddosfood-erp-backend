@@ -304,19 +304,26 @@ export class ProcurementService {
       return po;
     });
 
-    // Link materials to vendor (non-critical, outside transaction)
+    // Link materials to vendor (ensure consistency)
     for (const item of data.items) {
-      this.linkMaterialToVendor(data.vendorId, item.inventoryItemId, item.price).catch(console.error);
+      await this.linkMaterialToVendor(data.vendorId, item.inventoryItemId, item.price);
     }
 
     return result;
   }
 
   static async linkMaterialToVendor(vendorId: string, materialId: string, price?: number) {
-    return prisma.vendorMaterial.upsert({
+    // 1. Update the cross-reference join table
+    await prisma.vendorMaterial.upsert({
       where: { vendorId_materialId: { vendorId, materialId } },
       update: { price, lastUpdated: new Date() },
       create: { vendorId, materialId, price }
+    });
+
+    // 2. Set the primary vendorId on the material if not already set or updated
+    return prisma.inventoryItem.update({
+      where: { id: materialId },
+      data: { vendorId }
     });
   }
 
@@ -516,20 +523,19 @@ export class ProcurementService {
 
       // 2. Increase Stock for each item
       for (const item of po.poItems) {
-        await tx.stockMovement.create({
-          data: {
-            itemId: item.inventoryItemId,
-            movementType: 'PURCHASE_IN',
-            quantity: item.quantity,
-            referenceType: 'PROCUREMENT_ORDER',
-            referenceId: po.id,
-            note: `GRN for PO ${po.id}`
-          }
+        await InventoryService.recordMovement(tx, {
+          itemId: item.inventoryItemId,
+          type: 'PURCHASE_IN',
+          quantity: item.quantity,
+          referenceType: 'PROCUREMENT_ORDER',
+          referenceId: po.id,
+          note: `GRN for PO ${po.poNumber || po.id.substring(0, 8)}`
         });
 
+        // Link material to vendor
         await tx.inventoryItem.update({
           where: { id: item.inventoryItemId },
-          data: { currentStock: { increment: item.quantity } }
+          data: { vendorId: po.vendorId }
         });
       }
 

@@ -17,6 +17,7 @@ export class InventoryService {
       where: { franchiseId },
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
+        vendor: true,
       },
       orderBy: { name: 'asc' },
     });
@@ -36,14 +37,57 @@ export class InventoryService {
     });
     const stockMap = new Map(allMovements.map(m => [m.itemId, m._sum.quantity ?? 0]));
 
+    // Identify which items have EVER been purchased (from movements or linked vendor)
+    const itemsWithPurchaseMovements = await prisma.stockMovement.findMany({
+      where: { 
+        item: { franchiseId },
+        movementType: StockMovementType.PURCHASE_IN
+      },
+      select: { itemId: true },
+      distinct: ['itemId']
+    });
+    const purchasedItemIds = new Set(itemsWithPurchaseMovements.map(m => m.itemId));
+
+    // Calculate "Incoming" stock from Pending/Approved but not yet Received POs
+    const pendingOrders = await prisma.procurementOrderItem.findMany({
+      where: {
+        procurementOrder: { status: { in: ['PENDING', 'APPROVED'] } },
+        inventoryItem: { franchiseId }
+      },
+      select: { inventoryItemId: true, quantity: true }
+    });
+    const pendingMap = new Map();
+    pendingOrders.forEach(po => {
+      pendingMap.set(po.inventoryItemId, (pendingMap.get(po.inventoryItemId) || 0) + po.quantity);
+    });
+
     return items.map(item => {
-      const computedStock = stockMap.get(item.id) ?? item.currentStock;
+      // Use recomputed stock from ledger (movements) as source of truth
+      // Fallback to item.currentStock ONLY if no movements exist for this item
+      const hasMovements = stockMap.has(item.id);
+      const computedStock = hasMovements ? (stockMap.get(item.id) ?? 0) : item.currentStock;
+      
       const todayMoves = movementsToday.filter(m => m.itemId === item.id);
       const inbound = todayMoves.filter(m => m.quantity > 0).reduce((s, m) => s + m.quantity, 0);
       const outbound = Math.abs(todayMoves.filter(m => m.quantity < 0).reduce((s, m) => s + m.quantity, 0));
 
       const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
-      return { ...item, currentStock: computedStock, inbound, outbound, status };
+      
+      const incomingStock = pendingMap.get(item.id) || 0;
+
+      // An item is considered "Purchased" if it has a linked vendor OR has been purchased in the past OR has a pending order
+      const hasPurchaseMovement = item.movements?.some(m => m.movementType === 'PURCHASE_IN');
+      const isPurchased = !!item.vendorId || purchasedItemIds.has(item.id) || hasPurchaseMovement || incomingStock > 0;
+
+      return { 
+        ...item, 
+        currentStock: computedStock, 
+        inbound, 
+        outbound, 
+        status,
+        isPurchased,
+        incomingStock
+      };
     });
   }
 
