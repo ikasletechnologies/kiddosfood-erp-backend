@@ -110,11 +110,13 @@ export class InventoryService {
       const existing = await prisma.inventoryItem.findFirst({
         where: {
           franchiseId: data.franchiseId,
-          name: { equals: data.name, mode: 'insensitive' }
+          name: { equals: data.name, mode: 'insensitive' },
+          vendorId: data.vendorId // Only block if the same name AND same vendor (or both manual)
         }
       });
       if (existing) {
-        throw new Error(`A material with the name "${data.name}" already exists in your inventory. Please use the existing material instead of creating a duplicate.`);
+        const sourceLabel = data.vendorId ? "the same vendor" : "manual entry";
+        throw new Error(`A material with the name "${data.name}" already exists for ${sourceLabel}. Please update the existing record or use a distinct name.`);
       }
     }
 
@@ -160,6 +162,42 @@ export class InventoryService {
   }
 
   static async deleteItem(id: string) {
+    // Check for critical dependencies to provide helpful error messages
+    const [
+      recipeLinks, 
+      productionLinks, 
+      poLinks, 
+      movementLinks,
+      requestLinks,
+      transferLinks,
+      wastageLinks
+    ] = await Promise.all([
+      prisma.recipeItem.count({ where: { inventoryItemId: id } }),
+      prisma.productionItem.count({ where: { inventoryItemId: id } }),
+      prisma.procurementOrderItem.count({ where: { inventoryItemId: id } }),
+      prisma.stockMovement.count({ where: { itemId: id } }),
+      prisma.stockRequestItem.count({ where: { inventoryItemId: id } }),
+      prisma.stockTransferItem.count({ where: { inventoryItemId: id } }),
+      prisma.wastage.count({ where: { inventoryItemId: id } }),
+    ]);
+
+    if (recipeLinks > 0) {
+      throw new Error(`Deletion Blocked: This material is part of ${recipeLinks} recipe(s). Please remove it from your recipes first.`);
+    }
+
+    if (productionLinks > 0 || movementLinks > 0) {
+      const totalHistory = productionLinks + movementLinks + wastageLinks;
+      throw new Error(`Deletion Blocked: This item has ${totalHistory} recorded history entries (Production/Stock Movements). Deleting it would break audit logs. Please mark it as 'Inactive' instead.`);
+    }
+
+    if (poLinks > 0) {
+      throw new Error(`Deletion Blocked: This material is referenced in ${poLinks} purchase order(s) or GRNs.`);
+    }
+
+    if (requestLinks > 0 || transferLinks > 0) {
+      throw new Error(`Deletion Blocked: This material is linked to pending branch requests or transfers.`);
+    }
+
     return prisma.inventoryItem.delete({ where: { id } });
   }
 

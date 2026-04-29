@@ -95,7 +95,12 @@ export class RawMaterialsController {
         sku: sku,
         unit: req.body.unit || 'kg',
         category: req.body.category || 'RAW_MATERIAL',
-        franchiseId: franchiseId
+        franchiseId: franchiseId,
+        minimumStock: req.body.minimumStock,
+        initialStock: req.body.initialStock,
+        hsnCode: req.body.hsnCode,
+        gstRate: req.body.gstRate,
+        userId: user.id
       };
       
       const item = await InventoryService.createItem(data);

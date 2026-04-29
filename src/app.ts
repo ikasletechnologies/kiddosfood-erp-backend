@@ -9,7 +9,6 @@ import { validate } from './middleware/validate.middleware';
 import { loginSchema, registerSchema } from './modules/auth/auth.validation';
 import { errorHandler } from './middleware/error.middleware';
 import { DeliveryController } from './modules/delivery/delivery.controller';
-import { HRController } from './modules/hr/hr.controller';
 import { FinanceController } from './modules/finance/finance.controller';
 import { AnalyticsController } from './modules/analytics/analytics.controller';
 import { ProductionController } from './modules/production/production.controller';
@@ -114,7 +113,7 @@ app.get('/api/inventory/items/:id', authenticate, authorizeRole(['SUPER_ADMIN', 
 app.post('/api/inventory/items', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.createItem);
 app.post('/api/inventory/stock-in', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.stockIn);
 app.post('/api/inventory/stock-out', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.stockOut);
-app.post('/api/inventory/adjustment', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.adjustment); // SUPER_ADMIN only — no manual stock edits
+app.post('/api/inventory/adjustment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.adjustment);
 app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), InventoryController.getMovements);
 
 // Raw Materials (Phase 3 requested endpoints)
@@ -152,6 +151,8 @@ app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['ADMIN', 'MANAGER
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.getHistory);
 app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.startBatch);
+app.post('/api/production/:id/stop', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER', 'KITCHEN']), ProductionController.stopBatch);
+app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProductionController.approveBatch);
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), async (req, res) => {
   try {
     const { ProductionService } = await import('./modules/production/production.service');
@@ -176,10 +177,7 @@ app.get('/api/delivery/active', authenticate, authorizeRole(['ADMIN', 'MANAGER',
 app.post('/api/delivery/update', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'DELIVERY']), DeliveryController.update);
 app.post('/api/delivery/verify', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'DELIVERY']), DeliveryController.verify);
 
-// HR & Attendance
-app.get('/api/hr/attendance', authenticate, authorizeRole(['ADMIN', 'MANAGER']), HRController.getAttendance);
-app.post('/api/hr/check-in', authenticate, HRController.checkIn);
-app.post('/api/hr/check-out/:id', authenticate, HRController.checkOut);
+
 
 // Financials & Reports
 app.get('/api/finance/pl', authenticate, authorizeRole(['ADMIN', 'FRANCHISEE']), FinanceController.getPL);
