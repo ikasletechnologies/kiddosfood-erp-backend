@@ -25,7 +25,7 @@ export const authorizeRole = (allowedRoles: string[]) => {
     const user = (req as any).user;
     
     // Diagnostic Log
-    console.log(`[RBAC] User: ${user?.email} | Role: ${user?.role} | Required: [${allowedRoles.join(', ')}]`);
+    console.log(`[RBAC] UserID: ${user?.userId} | Role: ${user?.role} | Required: [${allowedRoles.join(', ')}]`);
 
     // Super Admin bypass (God-Mode)
     if (user && user.role === 'SUPER_ADMIN') {
