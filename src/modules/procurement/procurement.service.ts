@@ -173,6 +173,7 @@ export class ProcurementService {
     expectedDeliveryDate?: string;
     notes?: string;
     items: Array<{ inventoryItemId: string; quantity: number; price: number }>;
+    manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     const poItemsData = await Promise.all(data.items.map(async (item) => {
       const inventoryItem = await prisma.inventoryItem.findUnique({
@@ -196,9 +197,9 @@ export class ProcurementService {
     }));
 
     const totalSubtotal = poItemsData.reduce((acc, item) => acc + item.subtotal, 0);
-    const totalCGST = poItemsData.reduce((acc, item) => acc + item.cgst, 0);
-    const totalSGST = poItemsData.reduce((acc, item) => acc + item.sgst, 0);
-    const totalIGST = poItemsData.reduce((acc, item) => acc + item.igst, 0);
+    const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
+    const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
+    const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
     const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
 
     const ledgerBalance = await this.getVendorBalance(data.vendorId);
@@ -279,11 +280,11 @@ export class ProcurementService {
     return result;
   }
 
-  static async linkMaterialToVendor(vendorId: string, materialId: string, price?: number) {
+  static async linkMaterialToVendor(vendorId: string, materialId: string, price?: number, quantity?: number) {
     await prisma.vendorMaterial.upsert({
       where: { vendorId_materialId: { vendorId, materialId } },
-      update: { price, lastUpdated: new Date() },
-      create: { vendorId, materialId, price }
+      update: { price, quantity, lastUpdated: new Date() },
+      create: { vendorId, materialId, price, quantity }
     });
     return prisma.inventoryItem.update({
       where: { id: materialId },

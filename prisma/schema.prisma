@@ -124,6 +124,7 @@ model InventoryItem {
   vendors         VendorMaterial[]
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
+  isActive        Boolean                @default(true)
 
   @@unique([sku, franchiseId])
 }
@@ -212,6 +213,7 @@ model VendorMaterial {
   vendor      Vendor        @relation(fields: [vendorId], references: [id])
   material    InventoryItem @relation(fields: [materialId], references: [id], onDelete: Cascade)
   price       Float?        // Last supplied price
+  quantity    Float?        // Standard/last supplied quantity
   lastUpdated DateTime      @default(now())
 
   @@id([vendorId, materialId])

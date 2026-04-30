@@ -12,9 +12,12 @@ export class InventoryService {
     return result._sum.quantity ?? 0;
   }
 
-  static async getInventory(franchiseId: string) {
+  static async getInventory(franchiseId: string, includeInactive = false) {
     const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId },
+      where: { 
+        franchiseId,
+        ...(includeInactive ? {} : { isActive: true })
+      },
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
         vendor: true,
@@ -199,6 +202,20 @@ export class InventoryService {
     }
 
     return prisma.inventoryItem.delete({ where: { id } });
+  }
+
+  static async deactivateItem(id: string) {
+    return (prisma.inventoryItem as any).update({
+      where: { id },
+      data: { isActive: false },
+    });
+  }
+
+  static async activateItem(id: string) {
+    return (prisma.inventoryItem as any).update({
+      where: { id },
+      data: { isActive: true },
+    });
   }
 
   // Internal: stock-in via GRN / procurement — not exposed as free-form UI edit

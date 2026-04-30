@@ -151,8 +151,8 @@ export class ProcurementController {
 
   static async linkMaterial(req: Request, res: Response) {
     try {
-      const { vendorId, materialId, price } = req.body;
-      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price);
+      const { vendorId, materialId, price, quantity } = req.body;
+      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price, quantity);
       res.json(link);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
