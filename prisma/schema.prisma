@@ -810,6 +810,7 @@ model Employee {
   panNumber         String?
   pfNumber          String?
   esiNumber         String?
+  salary            Decimal?
   salaryStructureId String?
   salaryStructure   SalaryStructure? @relation(fields: [salaryStructureId], references: [id])
   leaves            Leave[]
@@ -1160,4 +1161,22 @@ model FranchiseRequest {
   managedById   String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+}
+
+// --- Accounting & Payments ---
+
+model FinancialPayment {
+  id             String      @id @default(uuid())
+  date           DateTime    @default(now())
+  entity         String      // e.g. "Ravi" or Vendor Name
+  entityType     String      // EMPLOYEE, VENDOR, CUSTOMER, OTHER
+  flowType       String      // INFLOW, OUTFLOW
+  amount         Float
+  method         String      // CASH, UPI, BANK_TRANSFER, etc.
+  status         String      @default("PAID") // PAID, PENDING, FAILED
+  reference      String?     // e.g. Payslip ID, PO ID
+  description    String?
+  type           String?     // e.g. PAYROLL, PURCHASE, SALE
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 }

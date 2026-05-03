@@ -185,6 +185,10 @@ app.post('/api/delivery/verify', authenticate, authorizeRole(['ADMIN', 'MANAGER'
 app.get('/api/finance/pl', authenticate, authorizeRole(['ADMIN', 'FRANCHISEE']), FinanceController.getPL);
 app.post('/api/finance/expense', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.addExpense);
 app.get('/api/finance/invoices', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getInvoices);
+app.get('/api/finance/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getAllPayments);
+app.get('/api/finance/payments/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getPaymentById);
+app.post('/api/finance/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.recordPayment);
+app.get('/api/finance/payments/stats', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getPaymentStats);
 
 // Phase 5 & 7 Reports (Consolidated)
 app.get('/api/reports/sales', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getSalesReport);

@@ -162,7 +162,7 @@ export class CRMService {
     return prisma.cRMForm.findMany({
       where: {
         ...(filters.pipelineId ? { pipelineId: filters.pipelineId } : {}),
-        ...(filters.status && filters.status !== 'All'
+        ...(filters.status && typeof filters.status === 'string' && filters.status !== 'All'
           ? { status: filters.status.toUpperCase() }
           : {})
       },

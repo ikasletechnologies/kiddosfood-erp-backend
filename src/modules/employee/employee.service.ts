@@ -1,8 +1,21 @@
 import prisma from '../../lib/prisma';
+import { AppError } from '../../middleware/error.middleware';
 
-let empCounter = 1000;
-function generateEmployeeCode() {
-  return `EMP-${String(++empCounter).padStart(4, '0')}`;
+async function generateEmployeeCode() {
+  const lastEmp = await prisma.employee.findFirst({
+    orderBy: { employeeCode: 'desc' },
+    select: { employeeCode: true }
+  });
+  
+  let nextNum = 1001;
+  if (lastEmp?.employeeCode) {
+    const lastNum = parseInt(lastEmp.employeeCode.split('-')[1]);
+    if (!isNaN(lastNum)) {
+      nextNum = lastNum + 1;
+    }
+  }
+  
+  return `EMP-${String(nextNum).padStart(4, '0')}`;
 }
 
 export class EmployeeService {
@@ -52,12 +65,26 @@ export class EmployeeService {
     panNumber?: string;
     pfNumber?: string;
     esiNumber?: string;
+    salary?: number;
     salaryStructureId?: string;
   }) {
+    // 1. Check if user already has an employee record
+    const existing = await prisma.employee.findUnique({
+      where: { userId: data.userId }
+    });
+
+    if (existing) {
+      throw new AppError('User already has an employee profile', 400);
+    }
+
+    // 2. Generate Unique Employee Code
+    const employeeCode = await generateEmployeeCode();
+
+    // 3. Create Record
     return prisma.employee.create({
       data: {
         userId: data.userId,
-        employeeCode: generateEmployeeCode(),
+        employeeCode,
         department: data.department,
         designation: data.designation,
         dateOfJoining: new Date(data.dateOfJoining),
@@ -70,6 +97,7 @@ export class EmployeeService {
         panNumber: data.panNumber,
         pfNumber: data.pfNumber,
         esiNumber: data.esiNumber,
+        salary: data.salary,
         salaryStructureId: data.salaryStructureId
       },
       include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }
@@ -86,6 +114,7 @@ export class EmployeeService {
     panNumber: string;
     pfNumber: string;
     esiNumber: string;
+    salary: number;
     salaryStructureId: string;
   }>) {
     return prisma.employee.update({

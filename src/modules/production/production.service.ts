@@ -113,7 +113,7 @@ export class ProductionService {
         targetItem = await tx.inventoryItem.create({
           data: {
             name: recipe.product.name,
-            sku: recipe.product.sku || `PRD-${recipe.product.id.substring(0, 5).toUpperCase()}`,
+            sku: recipe.product?.sku || `PRD-${(recipe.product?.id || Math.random().toString()).substring(0, 5).toUpperCase()}`,
             category: 'FINISHED_GOOD', // Explicitly mark as finished good for inventory visibility
             currentStock: 0,
             unit: recipe.recipeItems[0]?.unit || 'unit', // Fallback to first ingredient unit or 'unit'

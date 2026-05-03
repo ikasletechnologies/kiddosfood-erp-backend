@@ -123,7 +123,7 @@ export class InventoryService {
       }
     }
 
-    const sku = data.sku
+    const sku = (data.sku && typeof data.sku === 'string')
       ? data.sku.toUpperCase()
       : `RM-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
