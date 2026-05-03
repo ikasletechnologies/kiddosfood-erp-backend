@@ -52,15 +52,14 @@ export class RawMaterialsController {
       const user = (req as any).user;
       const franchiseFilter = DataIsolator.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
-
-      if (!franchiseId) {
-        // Fallback for SUPER_ADMIN if no franchiseId provided in query
-        const defaultId = await this.getActiveFranchiseId();
-        const items = await InventoryService.getInventory(defaultId);
-        return res.json(items);
-      }
-
-      const items = await InventoryService.getInventory(franchiseId);
+      const includeInactive = req.query.includeInactive === 'true';
+      const items = await prisma.inventoryItem.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          ...(includeInactive ? {} : { isActive: true })
+        },
+        orderBy: { name: 'asc' }
+      });
       res.json(items);
     } catch (error) {
       console.error('[RawMaterialsController.getAll] Error:', error);
@@ -95,7 +94,12 @@ export class RawMaterialsController {
         sku: sku,
         unit: req.body.unit || 'kg',
         category: req.body.category || 'RAW_MATERIAL',
-        franchiseId: franchiseId
+        franchiseId: franchiseId,
+        minimumStock: req.body.minimumStock,
+        initialStock: req.body.initialStock,
+        hsnCode: req.body.hsnCode,
+        gstRate: req.body.gstRate,
+        userId: user.id
       };
       
       const item = await InventoryService.createItem(data);
@@ -123,6 +127,24 @@ export class RawMaterialsController {
     try {
       await InventoryService.deleteItem(req.params.id);
       res.json({ message: 'Raw material deleted' });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async deactivate(req: Request, res: Response) {
+    try {
+      await InventoryService.deactivateItem(req.params.id);
+      res.json({ message: 'Material marked as inactive' });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async activate(req: Request, res: Response) {
+    try {
+      await InventoryService.activateItem(req.params.id);
+      res.json({ message: 'Material reactivated' });
     } catch (error: any) {
       res.status(400).json({ error: error.message });
     }

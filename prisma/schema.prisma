@@ -20,7 +20,7 @@ model User {
   franchise     Franchise?     @relation(fields: [franchiseId], references: [id])
   branchId      String?
   is_active     Boolean        @default(true)
-  attendance    Attendance[]
+
   refreshTokens RefreshToken[]
   employee      Employee?
   createdAt     DateTime       @default(now())
@@ -66,6 +66,7 @@ model Customer {
   salesOrders    SalesOrder[]
   returnOrders   ReturnOrder[]
   serviceTickets ServiceTicket[]
+  productions    Production[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 }
@@ -123,6 +124,7 @@ model InventoryItem {
   vendors         VendorMaterial[]
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
+  isActive        Boolean                @default(true)
 
   @@unique([sku, franchiseId])
 }
@@ -148,7 +150,7 @@ enum StockMovementType {
 model StockMovement {
   id            String            @id @default(uuid())
   itemId        String
-  item          InventoryItem     @relation(fields: [itemId], references: [id])
+  item          InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
   movementType  StockMovementType
   quantity      Float
   referenceType String? // PURCHASE, PRODUCTION, ORDER, WASTE, TRANSFER, ADJUSTMENT
@@ -184,6 +186,7 @@ model VendorLedger {
   vendor          Vendor             @relation(fields: [vendorId], references: [id])
   type            VendorLedgerType
   amount          Float
+  paymentMode     PaymentMode
   referenceType   VendorLedgerReferenceType
   referenceId     String?            // ID of PO, Payment, etc.
   note            String?
@@ -208,8 +211,9 @@ model VendorMaterial {
   vendorId    String
   materialId  String
   vendor      Vendor        @relation(fields: [vendorId], references: [id])
-  material    InventoryItem @relation(fields: [materialId], references: [id])
+  material    InventoryItem @relation(fields: [materialId], references: [id], onDelete: Cascade)
   price       Float?        // Last supplied price
+  quantity    Float?        // Standard/last supplied quantity
   lastUpdated DateTime      @default(now())
 
   @@id([vendorId, materialId])
@@ -247,7 +251,7 @@ model ProcurementOrderItem {
   poId             String
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
   inventoryItemId  String
-  inventoryItem    InventoryItem    @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem    InventoryItem    @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   itemName         String?          // Flattened for audit
   hsnCode          String?          // Flattened for audit
   gstRate          Float            @default(5)
@@ -277,7 +281,7 @@ model GoodsReceiptItem {
   grnId            String
   grn              GoodsReceipt @relation(fields: [grnId], references: [id])
   materialId       String
-  inventoryItem    InventoryItem @relation(fields: [materialId], references: [id])
+  inventoryItem    InventoryItem @relation(fields: [materialId], references: [id], onDelete: Cascade)
   quantity         Float        // Ordered Qty
   receivedQty      Float        // Received Qty
   acceptedQty      Float
@@ -366,7 +370,7 @@ model RecipeItem {
   recipeId         String
   recipe           Recipe        @relation(fields: [recipeId], references: [id])
   inventoryItemId  String
-  inventoryItem    InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem    InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   quantityRequired Float
   unit             String        @default("g")
 }
@@ -379,9 +383,14 @@ model Production {
   quantity       Float // Quantity produced
   franchiseId    String
   franchise      Franchise        @relation(fields: [franchiseId], references: [id])
-  status         ProductionStatus @default(COMPLETED)
+  customerId     String?
+  customer       Customer?        @relation(fields: [customerId], references: [id])
+  status         ProductionStatus @default(PENDING)
+  startTime      DateTime?
+  endTime        DateTime?
   producedBy     String?
   producedAt     DateTime         @default(now())
+  expiryDate     DateTime?
   items          ProductionItem[]
   batches        ProductBatch[]
 }
@@ -448,6 +457,7 @@ model FranchiseOrderItem {
 enum ProductionStatus {
   PENDING
   IN_PROGRESS
+  STOPPED
   COMPLETED
   CANCELLED
 }
@@ -457,7 +467,7 @@ model ProductionItem {
   productionId    String
   production      Production    @relation(fields: [productionId], references: [id])
   inventoryItemId String
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   usedQuantity    Float
 }
 
@@ -487,7 +497,7 @@ model StockRequestItem {
   stockRequestId  String
   stockRequest    StockRequest  @relation(fields: [stockRequestId], references: [id])
   inventoryItemId String
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   requestedQty    Float
   approvedQty     Float?
 }
@@ -519,7 +529,7 @@ model StockTransferItem {
   transferId      String
   transfer        StockTransfer @relation(fields: [transferId], references: [id])
   inventoryItemId String
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   quantity        Float
 }
 
@@ -602,14 +612,7 @@ enum PaymentMode {
 
 // --- HR & Operations ---
 
-model Attendance {
-  id       String    @id @default(uuid())
-  userId   String
-  user     User      @relation(fields: [userId], references: [id])
-  checkIn  DateTime
-  checkOut DateTime?
-  status   String    @default("PRESENT")
-}
+
 
 model Expense {
   id              String            @id @default(uuid())
@@ -626,7 +629,7 @@ model Expense {
 model Wastage {
   id              String        @id @default(uuid())
   inventoryItemId String
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   quantity        Float
   reason          String
   cost            Float

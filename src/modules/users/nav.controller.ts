@@ -84,7 +84,7 @@ export class NavController {
           icon: 'UserCog',
           children: [
             { title: 'Employees', path: '/hr/employees' },
-            { title: 'Attendance', path: '/hr/attendance' }
+
           ]
         });
       }

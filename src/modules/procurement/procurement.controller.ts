@@ -55,6 +55,7 @@ export class ProcurementController {
       const po = await ProcurementService.createPurchaseOrder(req.body);
       res.status(201).json(po);
     } catch (error: any) {
+      console.error(`[ProcurementController] createPO Error:`, error);
       res.status(500).json({ error: error.message });
     }
   }
@@ -150,8 +151,8 @@ export class ProcurementController {
 
   static async linkMaterial(req: Request, res: Response) {
     try {
-      const { vendorId, materialId, price } = req.body;
-      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price);
+      const { vendorId, materialId, price, quantity } = req.body;
+      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price, quantity);
       res.json(link);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -194,8 +195,7 @@ export class ProcurementController {
 
   static async recordPayment(req: Request, res: Response) {
     try {
-      const { amount, note, referenceId } = req.body;
-      const data = await ProcurementService.recordPayment(req.params.id, amount, note, referenceId);
+      const data = await ProcurementService.recordPayment(req.params.id, req.body);
       res.json(data);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

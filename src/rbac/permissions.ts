@@ -32,7 +32,7 @@ export const Permissions = {
   RECIPES_MANAGE: 'recipes:manage',
 
   // HR
-  ATTENDANCE_VIEW: 'attendance:view',
+
   PAYROLL_MANAGE: 'payroll:manage',
 };
 
