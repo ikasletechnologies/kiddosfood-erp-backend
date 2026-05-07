@@ -3,6 +3,7 @@ import { InventoryService } from '../inventory/inventory.service';
 import SocketService from '../../lib/socket';
 import { FinanceService } from '../finance/finance.service';
 import { AuditService } from '../audit/audit.service';
+import { AccountService } from '../finance/account.service';
 
 export class POSService {
 
@@ -108,9 +109,20 @@ export class POSService {
     // Phase 5: Trigger Accounting (Invoice & Payment) after update succeeds
     if (status === 'COMPLETED') {
         try {
+            await prisma.customerLedger.create({
+              data: {
+                customerId: order.customerId!,
+                type: 'DEBIT',
+                amount: order.totalAmount,
+                paymentMode: 'CASH', // Placeholder until payment
+                referenceType: 'SALE',
+                referenceId: order.id,
+                note: `POS Sale — Invoice #${order.invoiceNum}`
+              }
+            });
             await FinanceService.createInvoiceFromOrder(orderId);
         } catch (accErr) {
-            console.error('[Accounting] Failed to create invoice', accErr);
+            console.error('[Accounting] Failed to create invoice/ledger', accErr);
         }
     }
 
@@ -174,19 +186,45 @@ export class POSService {
   }
 
   // Step 5: Finalize Payment
-  static async payOrder(orderId: string, method: 'CASH'|'UPI'|'CARD') {
+  static async payOrder(orderId: string, method: 'CASH'|'UPI'|'CARD', accountId: string) {
+    if (!accountId) throw new Error('Source Account ID is required for POS payments.');
+
     return prisma.$transaction(async (tx) => {
       const order = await tx.order.findUnique({ where: { id: orderId } });
       if (!order) throw new Error('Order not found');
 
+      // 1. Create Payment Entity
       await tx.payment.create({
         data: {
           orderId,
+          type: 'INVOICE_LINKED',
           paymentMode: method,
           paidAmount: order.totalAmount,
+          accountId,
+          entityType: 'CUSTOMER',
+          entityId: order.customerId,
           status: 'SUCCESS'
         }
       });
+
+      // 2. Adjust Balance (Money IN)
+      await AccountService.adjustBalance(tx, accountId, order.totalAmount, 'INFLOW');
+
+      // 3. Customer Ledger CREDIT (They paid us)
+      if (order.customerId) {
+        await tx.customerLedger.create({
+          data: {
+            customerId: order.customerId,
+            type: 'CREDIT',
+            amount: order.totalAmount,
+            paymentMode: method,
+            referenceType: 'PAYMENT',
+            referenceId: order.id,
+            accountId,
+            note: `Payment for Order #${order.invoiceNum}`
+          }
+        });
+      }
 
       const updated = await tx.order.update({
         where: { id: orderId },
@@ -316,6 +354,6 @@ export class POSService {
   }
 
   static async addPayment(orderId: string, data: any) {
-    return this.payOrder(orderId, data.paymentMode);
+    return this.payOrder(orderId, data.paymentMode, data.accountId);
   }
 }

@@ -67,8 +67,37 @@ model Customer {
   returnOrders   ReturnOrder[]
   serviceTickets ServiceTicket[]
   productions    Production[]
+  ledgerEntries  CustomerLedger[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
+}
+
+model CustomerLedger {
+  id              String             @id @default(uuid())
+  customerId      String
+  customer        Customer           @relation(fields: [customerId], references: [id])
+  type            LedgerType
+  amount          Float
+  paymentMode     PaymentMode
+  referenceType   CustomerLedgerRefType
+  referenceId     String?            // ID of Order, Payment, etc.
+  accountId       String?
+  account         Account?           @relation(fields: [accountId], references: [id])
+  note            String?
+  createdAt       DateTime           @default(now())
+}
+
+enum LedgerType {
+  CREDIT
+  DEBIT
+}
+
+enum CustomerLedgerRefType {
+  SALE
+  PAYMENT
+  RETURN
+  ADJUSTMENT
+  OPENING_BALANCE
 }
 
 // --- Franchise Management ---
@@ -184,19 +213,18 @@ model VendorLedger {
   id              String             @id @default(uuid())
   vendorId        String
   vendor          Vendor             @relation(fields: [vendorId], references: [id])
-  type            VendorLedgerType
+  type            LedgerType
   amount          Float
   paymentMode     PaymentMode
   referenceType   VendorLedgerReferenceType
   referenceId     String?            // ID of PO, Payment, etc.
+  accountId       String?
+  account         Account?           @relation(fields: [accountId], references: [id])
   note            String?
   createdAt       DateTime           @default(now())
 }
 
-enum VendorLedgerType {
-  CREDIT
-  DEBIT
-}
+// Replaced by LedgerType
 
 enum VendorLedgerReferenceType {
   PO
@@ -581,15 +609,27 @@ model OrderItem {
 
 model Payment {
   id             String      @id @default(uuid())
-  orderId        String
-  order          Order       @relation(fields: [orderId], references: [id])
+  type           AccountingPaymentType @default(INVOICE_LINKED)
+  orderId        String?
+  order          Order?      @relation(fields: [orderId], references: [id])
   paymentMode    PaymentMode @default(CASH)
   paidAmount     Float
   transactionRef String?
   status         String      @default("SUCCESS")
   invoiceId      String?
   invoice        Invoice?    @relation(fields: [invoiceId], references: [id])
+  accountId      String?
+  account        Account?    @relation(fields: [accountId], references: [id])
+  entityType     String?     // VENDOR or CUSTOMER
+  entityId       String?     // ID of Vendor or Customer
   createdAt      DateTime    @default(now())
+}
+
+enum AccountingPaymentType {
+  INVOICE_LINKED
+  ADVANCE
+  EXPENSE
+  DIRECT
 }
 
 model Invoice {
@@ -608,6 +648,28 @@ enum PaymentMode {
   CASH
   UPI
   CARD
+  BANK_TRANSFER
+  CHEQUE
+  NEFT
+}
+
+model Account {
+  id              String           @id @default(uuid())
+  name            String
+  type            AccountType
+  balance         Float            @default(0)
+  payments        Payment[]
+  vendorLedgers   VendorLedger[]
+  customerLedgers CustomerLedger[]
+  expenses        Expense[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+enum AccountType {
+  CASH
+  BANK
+  UPI
 }
 
 // --- HR & Operations ---
@@ -624,6 +686,8 @@ model Expense {
   description     String?
   purchaseOrderId String?
   purchaseOrder   ProcurementOrder? @relation(fields: [purchaseOrderId], references: [id])
+  accountId       String?
+  account         Account?          @relation(fields: [accountId], references: [id])
 }
 
 model Wastage {

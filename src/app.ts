@@ -39,6 +39,7 @@ import { GRNController } from './modules/grn/grn.controller';
 import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoices.controller';
 import { FranchiseOrderController } from './modules/franchise/franchise-order.controller';
 import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
+import { AccountController } from './modules/finance/account.controller';
 
 const app: Express = express();
 
@@ -185,10 +186,17 @@ app.post('/api/delivery/verify', authenticate, authorizeRole(['ADMIN', 'MANAGER'
 app.get('/api/finance/pl', authenticate, authorizeRole(['ADMIN', 'FRANCHISEE']), FinanceController.getPL);
 app.post('/api/finance/expense', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.addExpense);
 app.get('/api/finance/invoices', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getInvoices);
-app.get('/api/finance/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getAllPayments);
-app.get('/api/finance/payments/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getPaymentById);
-app.post('/api/finance/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.recordPayment);
-app.get('/api/finance/payments/stats', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getPaymentStats);
+app.get('/api/finance/cash-flow', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getCashFlow);
+
+// Accounting (New Frontend mapping)
+app.get('/api/accounting/expenses', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF']), FinanceController.getExpenses);
+app.post('/api/accounting/expenses', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.addExpense);
+app.get('/api/accounting/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF']), FinanceController.getPayments);
+app.post('/api/accounting/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.recordPayment);
+
+// Accounts management
+app.get('/api/accounts', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), AccountController.getAll);
+app.get('/api/accounts/:id', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), AccountController.getById);
 
 // Phase 5 & 7 Reports (Consolidated)
 app.get('/api/reports/sales', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getSalesReport);
