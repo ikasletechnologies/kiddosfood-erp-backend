@@ -51,23 +51,7 @@ export class EmployeeService {
     });
   }
 
-  static async create(data: {
-    userId: string;
-    department?: string;
-    designation?: string;
-    dateOfJoining: string;
-    dateOfBirth?: string;
-    gender?: string;
-    address?: string;
-    emergencyContact?: string;
-    bankAccount?: string;
-    ifscCode?: string;
-    panNumber?: string;
-    pfNumber?: string;
-    esiNumber?: string;
-    salary?: number;
-    salaryStructureId?: string;
-  }) {
+  static async create(data: any) {
     // 1. Check if user already has an employee record
     const existing = await prisma.employee.findUnique({
       where: { userId: data.userId }
@@ -78,7 +62,7 @@ export class EmployeeService {
     }
 
     // 2. Generate Unique Employee Code
-    const employeeCode = await generateEmployeeCode();
+    const employeeCode = data.employeeCode || await generateEmployeeCode();
 
     // 3. Create Record
     return prisma.employee.create({
@@ -87,39 +71,95 @@ export class EmployeeService {
         employeeCode,
         department: data.department,
         designation: data.designation,
-        dateOfJoining: new Date(data.dateOfJoining),
-        dateOfBirth: data.dateOfBirth ? new Date(data.dateOfBirth) : undefined,
+        dateOfJoining: data.dateOfJoining ? new Date(data.dateOfJoining) : new Date(),
+        dateOfBirth: data.dob ? new Date(data.dob) : (data.dateOfBirth ? new Date(data.dateOfBirth) : null),
         gender: data.gender,
         address: data.address,
-        emergencyContact: data.emergencyContact,
+        
+        // Detailed Profile Info
+        personalEmail: data.personalEmail,
+        mobile: data.mobile,
+        altMobile: data.altMobile,
+        emergencyContactName: data.emergencyContactName,
+        emergencyContactPhone: data.emergencyContactPhone,
+        bloodGroup: data.bloodGroup,
+        maritalStatus: data.maritalStatus,
+        aadhaarNumber: data.aadhaarNumber,
+        
+        // Address Details
+        permDoorNo: data.permDoorNo,
+        permStreet: data.permStreet,
+        permArea: data.permArea,
+        permCity: data.permCity,
+        permDistrict: data.permDistrict,
+        permState: data.permState,
+        permPincode: data.permPincode,
+        currentCity: data.currentCity,
+        currentState: data.currentState,
+        currentPincode: data.currentPincode,
+        
+        // Bank Details
+        bankAccountHolder: data.bankAccountHolder,
+        bankName: data.bankName,
+        bankBranch: data.bankBranch,
         bankAccount: data.bankAccount,
         ifscCode: data.ifscCode,
+        upiId: data.upiId,
+        
+        // Identity & Verification
         panNumber: data.panNumber,
+        verificationStatus: data.verificationStatus,
+        
+        // Salary & Payroll Details
+        salary: data.salary,
+        salaryType: data.salaryType,
+        allowances: data.allowances ? Number(data.allowances) : 0,
+        incentives: data.incentives ? Number(data.incentives) : 0,
+        isOvertimeEligible: data.isOvertimeEligible === true || data.isOvertimeEligible === 'true',
+        paymentMethod: data.paymentMethod,
+        salaryCreditDate: data.salaryCreditDate,
         pfNumber: data.pfNumber,
         esiNumber: data.esiNumber,
-        salary: data.salary,
+        
+        // Work Information
+        reportingManager: data.reportingManager,
+        shiftTiming: data.shiftTiming,
+        workLocation: data.workLocation,
+        employeeType: data.employeeType,
+        
+        // Access Permissions
+        hasErpAccess: data.hasErpAccess === true || data.hasErpAccess === 'true',
+        hasAttendanceAccess: data.hasAttendanceAccess === true || data.hasAttendanceAccess === 'true',
+        hasPayrollAccess: data.hasPayrollAccess === true || data.hasPayrollAccess === 'true',
+        hasLeaveAccess: data.hasLeaveAccess === true || data.hasLeaveAccess === 'true',
+        
         salaryStructureId: data.salaryStructureId
       },
       include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }
     });
   }
 
-  static async update(id: string, data: Partial<{
-    department: string;
-    designation: string;
-    address: string;
-    emergencyContact: string;
-    bankAccount: string;
-    ifscCode: string;
-    panNumber: string;
-    pfNumber: string;
-    esiNumber: string;
-    salary: number;
-    salaryStructureId: string;
-  }>) {
+  static async update(id: string, data: any) {
+    // Handle date fields if they exist
+    const updateData: any = { ...data };
+    if (data.dateOfJoining) updateData.dateOfJoining = new Date(data.dateOfJoining);
+    if (data.dob) updateData.dateOfBirth = new Date(data.dob);
+    if (data.dateOfBirth) updateData.dateOfBirth = new Date(data.dateOfBirth);
+    
+    // Ensure numbers are handled correctly
+    if (data.salary) updateData.salary = Number(data.salary);
+    if (data.allowances) updateData.allowances = Number(data.allowances);
+    if (data.incentives) updateData.incentives = Number(data.incentives);
+    
+    // Clean up internal fields that shouldn't be in the direct update if they came from a spread
+    delete updateData.id;
+    delete updateData.userId;
+    delete updateData.user;
+    delete updateData.dob; // replaced by dateOfBirth
+
     return prisma.employee.update({
       where: { id },
-      data,
+      data: updateData,
       include: { user: { select: { id: true, fullName: true, email: true } } }
     });
   }

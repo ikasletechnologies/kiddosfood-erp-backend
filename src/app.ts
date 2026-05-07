@@ -94,9 +94,9 @@ app.get('/api/me/navigation', authenticate, NavController.getNavigation);
 app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), DashboardController.getSummary);
 
 // API Routes (Protected)
-// Admin Only: User & Role Management
-app.get('/api/users', authenticate, authorizeRole(['ADMIN']), UserController.getAll);
-app.get('/api/users/:id', authenticate, authorizeRole(['ADMIN']), UserController.getOne);
+// Admin & Manager: User Management
+app.get('/api/users', authenticate, authorizeRole(['ADMIN', 'MANAGER']), UserController.getAll);
+app.get('/api/users/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), UserController.getOne);
 app.post('/api/users', authenticate, authorizeRole(['ADMIN']), UserController.create);
 app.patch('/api/users/:id', authenticate, authorizeRole(['ADMIN']), UserController.update);
 app.delete('/api/users/:id', authenticate, authorizeRole(['ADMIN']), UserController.delete);
@@ -273,13 +273,9 @@ app.post('/api/franchise/product-requests', authenticate, authorizeRole(['FRANCH
 app.patch('/api/franchise/product-requests/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), FranchiseController.updateProductRequest);
 app.delete('/api/franchise/product-requests/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'FRANCHISEE']), FranchiseController.deleteProductRequest);
 
-// User Governance (SUPER_ADMIN only)
-app.get('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.getAll);
-app.post('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.create);
-app.get('/api/franchise/:id/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.getByFranchise);
-app.patch('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.update);
+// User Governance Extensions
+app.get('/api/franchise/:id/users', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), UserController.getByFranchise);
 app.patch('/api/users/:id/reset-password', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), UserController.resetPassword);
-app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.delete);
 
 // Governance & Settings
 app.get('/api/settings', authenticate, authorizeRole(['SUPER_ADMIN']), SettingsController.getAll);

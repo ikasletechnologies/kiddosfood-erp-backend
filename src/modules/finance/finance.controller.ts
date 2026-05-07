@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { FinanceService } from './finance.service';
 import { PaymentService } from './payment.service';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class FinanceController {
   static async getPL(req: Request, res: Response) {
@@ -93,6 +94,18 @@ export class FinanceController {
     }
   }
 
+  static async addExpense(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      
+      const expense = await FinanceService.addExpense({ ...req.body, franchiseId });
+      res.status(201).json(expense);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getPayments(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -125,4 +138,5 @@ export class FinanceController {
       res.status(isBusinessError ? 400 : 500).json({ error: error.message });
     }
   }
+
 }
