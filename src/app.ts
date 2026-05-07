@@ -89,6 +89,9 @@ app.post('/api/auth/refresh', AuthController.refresh);
 app.post('/api/auth/logout', AuthController.logout);
 app.get('/api/me', authenticate, UserController.getMe);
 app.get('/api/me/navigation', authenticate, NavController.getNavigation);
+app.patch('/api/me/password', authenticate, UserController.changeOwnPassword);
+app.patch('/api/me/update', authenticate, UserController.updateMe);
+// Profile update route registered correctly.
 
 // Dashboard Metrics
 app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN', 'MANAGER']), DashboardController.getSummary);

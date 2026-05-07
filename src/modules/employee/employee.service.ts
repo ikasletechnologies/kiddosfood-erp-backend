@@ -52,90 +52,119 @@ export class EmployeeService {
   }
 
   static async create(data: any) {
-    // 1. Check if user already has an employee record
-    const existing = await prisma.employee.findUnique({
-      where: { userId: data.userId }
-    });
+    return await prisma.$transaction(async (tx) => {
+      let userId = data.userId;
 
-    if (existing) {
-      throw new AppError('User already has an employee profile', 400);
-    }
+      // 1. If no userId provided, create a new User account for the employee
+      if (!userId || userId.trim() === '' || userId === 'null' || userId === 'undefined') {
+        // Find default STAFF role
+        const staffRole = await tx.role.findFirst({ 
+          where: { name: { in: ['STAFF', 'EMPLOYEE'], mode: 'insensitive' } } 
+        });
 
-    // 2. Generate Unique Employee Code
-    const employeeCode = data.employeeCode || await generateEmployeeCode();
+        if (!staffRole) throw new AppError('Default Employee role not found', 500);
 
-    // 3. Create Record
-    return prisma.employee.create({
-      data: {
-        userId: data.userId,
-        employeeCode,
-        department: data.department,
-        designation: data.designation,
-        dateOfJoining: data.dateOfJoining ? new Date(data.dateOfJoining) : new Date(),
-        dateOfBirth: data.dob ? new Date(data.dob) : (data.dateOfBirth ? new Date(data.dateOfBirth) : null),
-        gender: data.gender,
-        address: data.address,
-        
-        // Detailed Profile Info
-        personalEmail: data.personalEmail,
-        mobile: data.mobile,
-        altMobile: data.altMobile,
-        emergencyContactName: data.emergencyContactName,
-        emergencyContactPhone: data.emergencyContactPhone,
-        bloodGroup: data.bloodGroup,
-        maritalStatus: data.maritalStatus,
-        aadhaarNumber: data.aadhaarNumber,
-        
-        // Address Details
-        permDoorNo: data.permDoorNo,
-        permStreet: data.permStreet,
-        permArea: data.permArea,
-        permCity: data.permCity,
-        permDistrict: data.permDistrict,
-        permState: data.permState,
-        permPincode: data.permPincode,
-        currentCity: data.currentCity,
-        currentState: data.currentState,
-        currentPincode: data.currentPincode,
-        
-        // Bank Details
-        bankAccountHolder: data.bankAccountHolder,
-        bankName: data.bankName,
-        bankBranch: data.bankBranch,
-        bankAccount: data.bankAccount,
-        ifscCode: data.ifscCode,
-        upiId: data.upiId,
-        
-        // Identity & Verification
-        panNumber: data.panNumber,
-        verificationStatus: data.verificationStatus,
-        
-        // Salary & Payroll Details
-        salary: data.salary,
-        salaryType: data.salaryType,
-        allowances: data.allowances ? Number(data.allowances) : 0,
-        incentives: data.incentives ? Number(data.incentives) : 0,
-        isOvertimeEligible: data.isOvertimeEligible === true || data.isOvertimeEligible === 'true',
-        paymentMethod: data.paymentMethod,
-        salaryCreditDate: data.salaryCreditDate,
-        pfNumber: data.pfNumber,
-        esiNumber: data.esiNumber,
-        
-        // Work Information
-        reportingManager: data.reportingManager,
-        shiftTiming: data.shiftTiming,
-        workLocation: data.workLocation,
-        employeeType: data.employeeType,
-        
-        // Access Permissions
-        hasErpAccess: data.hasErpAccess === true || data.hasErpAccess === 'true',
-        hasAttendanceAccess: data.hasAttendanceAccess === true || data.hasAttendanceAccess === 'true',
-        hasPayrollAccess: data.hasPayrollAccess === true || data.hasPayrollAccess === 'true',
-        hasLeaveAccess: data.hasLeaveAccess === true || data.hasLeaveAccess === 'true',
-        
-        salaryStructureId: data.salaryStructureId
-      },
-      include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }
+        const { AuthService } = require('../auth/auth.service');
+        const passwordHash = await AuthService.hashPassword('emp123');
+
+        const newUser = await tx.user.create({
+          data: {
+            fullName: data.fullName,
+            email: data.personalEmail || `${data.employeeCode.toLowerCase()}@kiddosfood.com`,
+            phone: data.mobile,
+            passwordHash,
+            roleId: staffRole.id,
+            is_active: true
+          }
+        });
+        userId = newUser.id;
+      }
+
+      // 2. Check if user already has an employee record
+      const existing = await tx.employee.findUnique({
+        where: { userId }
+      });
+
+      if (existing) {
+        throw new AppError('User already has an employee profile', 400);
+      }
+
+      // 3. Generate Unique Employee Code
+      const employeeCode = data.employeeCode || await generateEmployeeCode();
+
+      // 4. Create Record
+      return tx.employee.create({
+        data: {
+          userId,
+          employeeCode,
+          department: data.department,
+          designation: data.designation,
+          dateOfJoining: data.dateOfJoining ? new Date(data.dateOfJoining) : new Date(),
+          dateOfBirth: data.dob ? new Date(data.dob) : (data.dateOfBirth ? new Date(data.dateOfBirth) : null),
+          gender: data.gender,
+          address: data.address,
+          
+          // Detailed Profile Info
+          personalEmail: data.personalEmail,
+          mobile: data.mobile,
+          altMobile: data.altMobile,
+          emergencyContactName: data.emergencyContactName,
+          emergencyContactPhone: data.emergencyContactPhone,
+          bloodGroup: data.bloodGroup,
+          maritalStatus: data.maritalStatus,
+          aadhaarNumber: data.aadhaarNumber,
+          
+          // Address Details
+          permDoorNo: data.permDoorNo,
+          permStreet: data.permStreet,
+          permArea: data.permArea,
+          permCity: data.permCity,
+          permDistrict: data.permDistrict,
+          permState: data.permState,
+          permPincode: data.permPincode,
+          currentCity: data.currentCity,
+          currentState: data.currentState,
+          currentPincode: data.currentPincode,
+          
+          // Bank Details
+          bankAccountHolder: data.bankAccountHolder,
+          bankName: data.bankName,
+          bankBranch: data.bankBranch,
+          bankAccount: data.bankAccount,
+          ifscCode: data.ifscCode,
+          upiId: data.upiId,
+          
+          // Identity & Verification
+          panNumber: data.panNumber,
+          verificationStatus: data.verificationStatus,
+          
+          // Salary & Payroll Details
+          salary: data.salary,
+          salaryType: data.salaryType,
+          allowances: data.allowances ? Number(data.allowances) : 0,
+          incentives: data.incentives ? Number(data.incentives) : 0,
+          isOvertimeEligible: data.isOvertimeEligible === true || data.isOvertimeEligible === 'true',
+          paymentMethod: data.paymentMethod,
+          salaryCreditDate: data.salaryCreditDate,
+          pfNumber: data.pfNumber,
+          esiNumber: data.esiNumber,
+          
+          // Work Information
+          reportingManager: data.reportingManager,
+          shiftTiming: data.shiftTiming,
+          workLocation: data.workLocation,
+          employeeType: data.employeeType,
+          
+          // Access Permissions
+          hasErpAccess: data.hasErpAccess === true || data.hasErpAccess === 'true',
+          hasAttendanceAccess: data.hasAttendanceAccess === true || data.hasAttendanceAccess === 'true',
+          hasPayrollAccess: data.hasPayrollAccess === true || data.hasPayrollAccess === 'true',
+          hasLeaveAccess: data.hasLeaveAccess === true || data.hasLeaveAccess === 'true',
+          
+          salaryStructureId: data.salaryStructureId
+        },
+        include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }
+      });
     });
   }
 

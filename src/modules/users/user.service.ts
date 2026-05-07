@@ -109,6 +109,12 @@ export class UserService {
           if (existing) throw new AppError('Email already in use', 400);
       }
 
+      // Handle password update if provided
+      if (updateData.password && updateData.password.trim() !== '') {
+        updateData.passwordHash = await AuthService.hashPassword(updateData.password);
+      }
+      delete updateData.password;
+
       return await prisma.user.update({
         where: { id },
         data: updateData,
