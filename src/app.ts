@@ -190,13 +190,20 @@ app.get('/api/finance/cash-flow', authenticate, authorizeRole(['ADMIN', 'FRANCHI
 
 // Accounting (New Frontend mapping)
 app.get('/api/accounting/expenses', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF']), FinanceController.getExpenses);
+app.get('/api/accounting/expenses/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF']), FinanceController.getExpenseDetails);
 app.post('/api/accounting/expenses', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.addExpense);
+app.post('/api/accounting/expenses/:id/payment', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.recordExpensePayment);
+app.delete('/api/accounting/expenses/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.cancelExpense);
 app.get('/api/accounting/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF']), FinanceController.getPayments);
 app.post('/api/accounting/payments', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.recordPayment);
+app.post('/api/accounting/payments/:id/cancel', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.cancelPayment);
+app.post('/api/accounting/transfers', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), FinanceController.transferFunds);
+app.get('/api/accounting/ledger-summary', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'FRANCHISEE']), FinanceController.getLedgerSummary);
 
 // Accounts management
-app.get('/api/accounts', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), AccountController.getAll);
-app.get('/api/accounts/:id', authenticate, authorizeRole(['ADMIN', 'FRANCHISE_ADMIN']), AccountController.getById);
+app.get('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'FRANCHISE_ADMIN']), AccountController.getAll);
+app.post('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), AccountController.create);
+app.delete('/api/accounts/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN']), AccountController.delete);
 
 // Phase 5 & 7 Reports (Consolidated)
 app.get('/api/reports/sales', authenticate, authorizeRole(['ADMIN', 'MANAGER']), FinanceController.getSalesReport);
@@ -220,6 +227,7 @@ app.patch('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN
 app.delete('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.deleteVendor);
 app.post('/api/vendors/link-material', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.linkMaterial);
 app.get('/api/vendors/:id/ledger', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getVendorLedger);
+app.get('/api/vendors/:id/aging', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getVendorAging);
 app.post('/api/vendors/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.recordPayment);
 app.post('/api/vendors/:id/adjustment', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.recordAdjustment);
 app.get('/api/suppliers', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getAllVendors); // Alias

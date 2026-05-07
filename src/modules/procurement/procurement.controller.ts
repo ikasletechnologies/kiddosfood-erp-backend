@@ -211,4 +211,13 @@ export class ProcurementController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getVendorAging(req: Request, res: Response) {
+    try {
+      const aging = await ProcurementService.getVendorAging(req.params.id);
+      res.json(aging);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

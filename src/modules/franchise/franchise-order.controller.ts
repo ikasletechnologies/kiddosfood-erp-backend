@@ -58,8 +58,14 @@ export class FranchiseOrderController {
 
   static async recordPayment(req: Request, res: Response) {
     try {
-      const { amount } = req.body;
-      const updated = await FranchiseOrderService.recordPayment(req.params.id, amount);
+      const user = (req as any).user;
+      const { amount, accountId } = req.body;
+      const updated = await FranchiseOrderService.recordPayment(
+        req.params.id, 
+        amount, 
+        accountId,
+        user?.fullName || user?.email || 'System'
+      );
       res.json(updated);
     } catch (e: any) {
       res.status(400).json({ error: e.message });

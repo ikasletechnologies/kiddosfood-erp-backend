@@ -227,12 +227,7 @@ export class SalesService {
     });
   }
 
-  static async updateSalesOrder(id: string, data: {
-    status?: string;
-    deliveryDate?: string;
-    deliveryAddress?: string;
-    notes?: string;
-  }) {
+  static async updateSalesOrder(id: string, data: any) {
     return prisma.salesOrder.update({
       where: { id },
       data: {
@@ -241,6 +236,36 @@ export class SalesService {
         deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined
       },
       include: { items: true }
+    });
+  }
+
+  static async recordPayment(orderId: string, data: { accountId: string; method: string; amount: number; createdBy?: string }) {
+    const { FinanceService } = require('../finance/finance.service');
+    
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.salesOrder.findUnique({ where: { id: orderId } });
+      if (!order) throw new Error('Sales Order not found');
+
+      const payment = await FinanceService.createPayment({
+        tx,
+        amount: data.amount,
+        flow: 'IN',
+        status: 'PAID',
+        sourceAccount: data.accountId,
+        method: data.method,
+        sourceModule: 'POS', // Use POS for all sales-related inflows for now
+        linkedDocType: 'INVOICE',
+        linkedDocId: order.id,
+        entity: order.customerName || 'Customer',
+        createdBy: data.createdBy
+      });
+
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: { paymentStatus: 'PAID' }
+      });
+
+      return payment;
     });
   }
 
@@ -303,6 +328,37 @@ export class SalesService {
         approvedBy: data.approvedBy,
         approvedAt: data.status === 'APPROVED' ? new Date() : undefined
       }
+    });
+  }
+
+  static async recordRefund(returnId: string, data: { accountId: string; method: string; createdBy?: string }) {
+    const { FinanceService } = require('../finance/finance.service');
+
+    return prisma.$transaction(async (tx) => {
+      const ret = await tx.returnOrder.findUnique({ where: { id: returnId } });
+      if (!ret) throw new Error('Return Order not found');
+      if (ret.status !== 'APPROVED') throw new Error('Only approved returns can be refunded');
+
+      const payment = await FinanceService.createPayment({
+        tx,
+        amount: ret.refundAmount,
+        flow: 'OUT',
+        status: 'PAID',
+        sourceAccount: data.accountId,
+        method: data.method,
+        sourceModule: 'POS',
+        linkedDocType: 'DIRECT',
+        linkedDocId: ret.id,
+        entity: 'Customer Refund',
+        createdBy: data.createdBy
+      });
+
+      await tx.returnOrder.update({
+        where: { id: returnId },
+        data: { status: 'COMPLETED' }
+      });
+
+      return payment;
     });
   }
 

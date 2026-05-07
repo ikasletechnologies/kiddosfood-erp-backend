@@ -127,10 +127,16 @@ export class PayrollController {
 
   static async markPaid(req: Request, res: Response) {
     try {
-      const payslip = await PayrollService.markPayslipPaid(req.params.id);
+      const user = (req as any).user;
+      const { accountId } = req.body;
+      const payslip = await PayrollService.markPayslipPaid(
+        req.params.id, 
+        accountId,
+        user?.fullName || user?.email || 'System'
+      );
       res.json(payslip);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 

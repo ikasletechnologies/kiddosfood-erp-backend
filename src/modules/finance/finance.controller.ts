@@ -51,6 +51,20 @@ export class FinanceController {
     }
   }
 
+  static async getLedgerSummary(req: Request, res: Response) {
+    try {
+      const { startDate, endDate, franchiseId } = req.query;
+      const summary = await FinanceService.getLedgerSummary({
+        franchiseId: franchiseId as string,
+        startDate: startDate ? new Date(startDate as string) : undefined,
+        endDate: endDate ? new Date(endDate as string) : undefined
+      });
+      res.json(summary);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getSalesReport(req: Request, res: Response) {
     try {
       const { startDate, endDate } = req.query;
@@ -103,6 +117,41 @@ export class FinanceController {
     }
   }
 
+  static async getExpenseDetails(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const expense = await FinanceService.getExpenseDetails(id);
+      res.json(expense);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async recordExpensePayment(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const user = (req as any).user;
+      const result = await FinanceService.recordExpensePayment(id, {
+        ...req.body,
+        createdBy: user?.fullName || user?.email || 'System'
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async cancelExpense(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const user = (req as any).user;
+      const result = await FinanceService.cancelExpense(id, user?.fullName || user?.email || 'System');
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async getPayments(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -121,11 +170,13 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       
-      const payment = await FinanceService.createPayment({ ...req.body, franchiseId });
+      const payment = await FinanceService.createPayment({ 
+        ...req.body, 
+        franchiseId,
+        createdBy: user?.fullName || user?.email || 'System'
+      });
       res.status(201).json(payment);
     } catch (error: any) {
-      // Business-rule violations (insufficient balance, bad direction, missing account)
-      // are expected errors — return 400 with the message so the UI can display it.
       const isBusinessError = error.message && (
         error.message.startsWith('Insufficient') ||
         error.message.startsWith('Invalid payment') ||
@@ -133,6 +184,30 @@ export class FinanceController {
         error.message.includes('account found')
       );
       res.status(isBusinessError ? 400 : 500).json({ error: error.message });
+    }
+  }
+
+  static async transferFunds(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const result = await FinanceService.transferFunds({
+        ...req.body,
+        createdBy: user?.fullName || user?.email || 'System'
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async cancelPayment(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { id } = req.params;
+      const result = await FinanceService.cancelPayment(id, user?.fullName || user?.email || 'System');
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
     }
   }
 }

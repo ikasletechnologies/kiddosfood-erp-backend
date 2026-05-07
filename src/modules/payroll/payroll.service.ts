@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { FinanceService } from '../finance/finance.service';
 
 export class PayrollService {
   // ─── Salary Components ───────────────────────────────────────────────────────
@@ -181,10 +182,38 @@ export class PayrollService {
     });
   }
 
-  static async markPayslipPaid(id: string) {
-    return prisma.payslip.update({
-      where: { id },
-      data: { status: 'PAID', paidAt: new Date() }
+  static async markPayslipPaid(id: string, accountId: string, paidBy?: string) {
+    if (!accountId) throw new Error('Source Account ID is required for payroll payments.');
+
+    return prisma.$transaction(async (tx) => {
+      const payslip = await tx.payslip.findUnique({ 
+        where: { id },
+        include: { employee: { include: { user: true } } }
+      });
+      if (!payslip) throw new Error('Payslip not found');
+      if (payslip.status === 'PAID') throw new Error('Payslip is already paid');
+
+      // 1. Central Payment & Account Adjustment
+      await FinanceService.createPayment({
+        tx,
+        amount: payslip.netSalary,
+        flow: 'OUT',
+        status: 'PAID',
+        sourceAccount: accountId,
+        method: 'BANK_TRANSFER', // Default for salary
+        sourceModule: 'PAYROLL',
+        linkedDocType: 'PAYSLIP',
+        linkedDocId: payslip.id,
+        entityType: 'EMPLOYEE',
+        entityId: payslip.employeeId,
+        createdBy: paidBy || 'PAYROLL_SYSTEM'
+      });
+
+      // 2. Update Payslip status
+      return tx.payslip.update({
+        where: { id },
+        data: { status: 'PAID', paidAt: new Date() }
+      });
     });
   }
 
