@@ -75,8 +75,11 @@ export class POSController {
 
   static async getOrders(req: Request, res: Response) {
     try {
-      const filters: any = {};
-      if (req.query.franchiseId) filters.franchiseId = req.query.franchiseId as string;
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      
+      const filters: any = { ...franchiseFilter };
+      if (req.query.franchiseId && user.role === 'SUPER_ADMIN') filters.franchiseId = req.query.franchiseId as string;
       if (req.query.status) filters.status = req.query.status as string;
 
       const orders = await POSService.getAllOrders(filters);

@@ -1,18 +1,22 @@
 import { Request, Response } from 'express';
 import { ProductionService } from './production.service';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class ProductionController {
   static async startBatch(req: Request, res: Response) {
     try {
       const { recipeId, quantity, franchiseId, customerId, productionType, expiryDate } = req.body;
+      const user = (req as any).user;
+      const enforcedFranchiseId = IsolationUtil.enforceFranchiseMatch(user, franchiseId);
+
       const result = await ProductionService.startProduction({
         recipeId,
         quantity: Number(quantity),
-        franchiseId,
+        franchiseId: enforcedFranchiseId as string,
         customerId,
         productionType,
         expiryDate,
-        userId: (req as unknown as { user: { id: string } }).user?.id
+        userId: user?.id
       });
       res.status(201).json(result);
     } catch (error) {
@@ -22,7 +26,10 @@ export class ProductionController {
 
   static async getHistory(req: Request, res: Response) {
     try {
-      const franchiseId = req.query.franchiseId as string;
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = (user.role === 'SUPER_ADMIN' ? req.query.franchiseId : franchiseFilter.franchiseId) as string;
+      
       const history = await ProductionService.getProductionHistory(franchiseId);
       res.json(history);
     } catch (error) {
