@@ -605,10 +605,6 @@ model Account {
   expenses        Expense[]
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
-  customerLedgers CustomerLedger[]
-  expenses        Expense[]
-  payments        Payment[]
-  vendorLedgers   VendorLedger[]
 }
 
 model Expense {
@@ -627,9 +623,13 @@ model Expense {
   purchaseOrderId String?
   accountId       String?
   account         Account?          @relation(fields: [accountId], references: [id])
+  franchise       Franchise?        @relation(fields: [franchiseId], references: [id])
+  purchaseOrder   ProcurementOrder? @relation(fields: [purchaseOrderId], references: [id])
   isCancelled     Boolean           @default(false)
   cancelledAt     DateTime?
   attachmentUrl   String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 }
 
 model Wastage {
@@ -932,7 +932,6 @@ model SalesOrder {
   updatedAt       DateTime         @updatedAt
   returns         ReturnOrder[]
   customer        Customer?        @relation(fields: [customerId], references: [id])
-  items           SalesOrderItem[]
 }
 
 model SalesOrderItem {
@@ -1113,14 +1112,6 @@ enum StockMovementType {
   ADJUSTMENT
 }
 
-enum VendorLedgerReferenceType {
-  PO
-  PAYMENT
-  ADVANCE
-  RETURN
-  ADJUSTMENT
-  OPENING_BALANCE
-}
 
 enum GRNStatus {
   PENDING
@@ -1193,12 +1184,6 @@ enum OrderStatus {
   REFUNDED
 }
 
-enum AccountingPaymentType {
-  INVOICE_LINKED
-  ADVANCE
-  EXPENSE
-  DIRECT
-}
 
 enum PaymentMode {
   CASH
