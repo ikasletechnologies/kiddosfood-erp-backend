@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
 import { FinanceService } from './finance.service';
-import { PaymentService } from './payment.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 
 export class FinanceController {

@@ -206,9 +206,8 @@ export class ProcurementService {
 
     const ledgerBalance = await this.getVendorBalance(data.vendorId);
     const existingCredit = Math.max(0, ledgerBalance); 
-    const autoApplied = Math.min(totalAmount, existingCredit);
     const providedAmount = data.advancePaid || 0;
-    const finalPaidOnPO = Math.max(autoApplied, providedAmount);
+    // const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
@@ -277,7 +276,7 @@ export class ProcurementService {
             entityId: data.vendorId,
             paidAmount: newMoneyPayment,
             accountId: data.accountId,
-            referenceId: po.id,
+            transactionRef: po.id,
             status: 'SUCCESS'
           }
         });
@@ -624,7 +623,7 @@ export class ProcurementService {
           entityId: vendorId,
           paidAmount: amount,
           accountId: accountId,
-          referenceId: referenceId,
+          transactionRef: referenceId,
           status: 'SUCCESS'
         }
       });

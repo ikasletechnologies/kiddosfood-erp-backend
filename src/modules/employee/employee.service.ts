@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { AppError } from '../../middleware/error.middleware';
+import { AuthService } from '../auth/auth.service';
 
 async function generateEmployeeCode() {
   const lastEmp = await prisma.employee.findFirst({
@@ -64,7 +65,7 @@ export class EmployeeService {
 
         if (!staffRole) throw new AppError('Default Employee role not found', 500);
 
-        const { AuthService } = require('../auth/auth.service');
+
         const passwordHash = await AuthService.hashPassword('emp123');
 
         const newUser = await tx.user.create({

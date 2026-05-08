@@ -64,7 +64,6 @@ model Customer {
   quotations     Quotation[]
   returnOrders   ReturnOrder[]
   salesOrders    SalesOrder[]
-  serviceTickets ServiceTicket[]
 }
 
 model CustomerLedger {
@@ -612,62 +611,7 @@ model CRMForm {
   pipeline      Pipeline @relation(fields: [pipelineId], references: [id])
 }
 
-model ServiceTicket {
-  id               String       @id @default(uuid())
-  ticketNumber     String       @unique
-  customerId       String?
-  customerName     String?
-  customerPhone    String?
-  customerEmail    String?
-  title            String
-  description      String
-  type             TicketType   @default(COMPLAINT)
-  status           TicketStatus @default(OPEN)
-  priority         String       @default("MEDIUM")
-  slaDeadline      DateTime?
-  assigneeId       String?
-  creatorId        String?
-  resolvedAt       DateTime?
-  customerFeedback String?
-  feedbackRating   Int?
-  createdAt        DateTime     @default(now())
-  updatedAt        DateTime     @updatedAt
-  fieldVisits      FieldVisit[]
-  customer         Customer?    @relation(fields: [customerId], references: [id])
-}
-
-model FieldVisit {
-  id           String        @id @default(uuid())
-  ticketId     String
-  agentId      String
-  scheduledAt  DateTime
-  visitedAt    DateTime?
-  status       String        @default("SCHEDULED")
-  remarks      String?
-  checkInLat   Float?
-  checkInLng   Float?
-  checkOutLat  Float?
-  checkOutLng  Float?
-  checkInTime  DateTime?
-  checkOutTime DateTime?
-  distanceKm   Float?
-  taAmount     Float?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  ticket       ServiceTicket @relation(fields: [ticketId], references: [id])
-  locationLogs LocationLog[]
-}
-
-model LocationLog {
-  id        String     @id @default(uuid())
-  visitId   String
-  latitude  Float
-  longitude Float
-  timestamp DateTime   @default(now())
-  visit     FieldVisit @relation(fields: [visitId], references: [id])
-}
-
-model Employee {
+ model Employee {
   id                    String           @id @default(uuid())
   userId                String           @unique
   employeeCode          String           @unique
@@ -1181,22 +1125,7 @@ enum LeadStatus {
   DELETED
 }
 
-enum TicketType {
-  COMPLAINT
-  MAINTENANCE
-  WARRANTY
-  INQUIRY
-}
-
-enum TicketStatus {
-  OPEN
-  IN_PROGRESS
-  RESOLVED
-  CLOSED
-  WAITING_FEEDBACK
-}
-
-enum LeaveStatus {
+ enum LeaveStatus {
   PENDING
   APPROVED
   REJECTED

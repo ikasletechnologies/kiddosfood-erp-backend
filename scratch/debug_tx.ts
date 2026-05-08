@@ -4,7 +4,7 @@ async function testTransaction() {
   try {
     await prisma.$transaction(async (tx) => {
       console.log('Keys on tx:', Object.keys(tx).filter(k => !k.startsWith('_')));
-      // @ts-ignore
+      // @ts-expect-error Internal tx property check
       console.log('financialPayment on tx:', !!tx.financialPayment);
     });
   } catch (err) {

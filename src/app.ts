@@ -25,10 +25,8 @@ import { LogisticsController } from './modules/logistics/logistics.controller';
 import { KDSController } from './modules/kds/kds.controller';
 import { CustomerController } from './modules/customers/customer.controller';
 import { LoyaltyController } from './modules/loyalty/loyalty.controller';
-import { MenuController } from './modules/menu/menu.controller';
 import { WasteController } from './modules/waste/waste.controller';
 import { CRMController } from './modules/crm/crm.controller';
-import { ServiceCRMController } from './modules/service-crm/service-crm.controller';
 import { EmployeeController } from './modules/employee/employee.controller';
 import { PayrollController } from './modules/payroll/payroll.controller';
 import { SalesController } from './modules/sales/sales.controller';
@@ -295,13 +293,6 @@ app.get('/api/pos/orders', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STA
 app.get('/api/kds/orders', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN', 'STAFF']), KDSController.getOrders);
 app.patch('/api/kds/orders/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'KITCHEN']), KDSController.updateStatus);
 
-// Menu Management (wraps Products with category + toggle support)
-app.get('/api/menu/categories', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), MenuController.getCategories);
-app.post('/api/menu/categories', authenticate, authorizeRole(['ADMIN', 'MANAGER']), MenuController.createCategory);
-app.get('/api/menu/items', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF', 'KITCHEN']), MenuController.getItems);
-app.post('/api/menu/items', authenticate, authorizeRole(['ADMIN', 'MANAGER']), MenuController.createItem);
-app.patch('/api/menu/items/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), MenuController.updateItem);
-app.delete('/api/menu/items/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), MenuController.deleteItem);
 
 // Customers
 app.get('/api/customers', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), CustomerController.getAll);
@@ -349,20 +340,6 @@ app.get('/api/crm/reports/lead-source', authenticate, authorizeRole(['ADMIN', 'M
 app.get('/api/crm/reports/team-sales', authenticate, authorizeRole(['ADMIN', 'MANAGER']), CRMController.getTeamSalesReport);
 app.get('/api/crm/reports/client-performance', authenticate, authorizeRole(['ADMIN', 'MANAGER']), CRMController.getClientPerformanceReport);
 
-// ─── Service CRM ─────────────────────────────────────────────────────────────
-app.get('/api/service/tickets', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), ServiceCRMController.getTickets);
-app.post('/api/service/tickets', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), ServiceCRMController.createTicket);
-app.get('/api/service/tickets/stats', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ServiceCRMController.getStats);
-app.get('/api/service/tickets/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), ServiceCRMController.getTicket);
-app.patch('/api/service/tickets/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), ServiceCRMController.updateTicket);
-app.delete('/api/service/tickets/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ServiceCRMController.deleteTicket);
-
-app.get('/api/service/field-visits', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), ServiceCRMController.getFieldVisits);
-app.post('/api/service/field-visits', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ServiceCRMController.createFieldVisit);
-app.post('/api/service/field-visits/:id/check-in', authenticate, ServiceCRMController.checkIn);
-app.post('/api/service/field-visits/:id/check-out', authenticate, ServiceCRMController.checkOut);
-app.post('/api/service/field-visits/:id/location', authenticate, ServiceCRMController.logLocation);
-app.patch('/api/service/field-visits/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER']), ServiceCRMController.updateVisitStatus);
 
 // ─── Employee Management ──────────────────────────────────────────────────────
 app.get('/api/employees', authenticate, authorizeRole(['ADMIN', 'MANAGER']), EmployeeController.getAll);

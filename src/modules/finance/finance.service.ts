@@ -174,7 +174,7 @@ export class FinanceService {
    * Cash Flow Status
    */
   static async getCashFlow() {
-    // @ts-ignore
+
     const accounts = await prisma.account.findMany();
 
     const totalCash = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);
@@ -218,7 +218,7 @@ export class FinanceService {
   static async getPayments(franchiseId?: string) {
     const payments = await prisma.payment.findMany({
       where: franchiseId ? { order: { franchiseId } } : undefined,
-      // @ts-ignore
+
       include: { order: true, invoice: true, account: true },
       orderBy: { createdAt: 'desc' }
     });
@@ -226,16 +226,16 @@ export class FinanceService {
     return payments.map(p => ({
       id: p.id,
       date: p.createdAt.toISOString(),
-      // @ts-ignore
+
       entity: p.entityId || p.transactionRef || "Manual Entry",
-      // @ts-ignore
+
       flow: p.entityType === 'VENDOR' ? 'OUT' : 'IN',
       method: p.paymentMode,
       amount: p.paidAmount,
       status: p.status,
-      // @ts-ignore
+
       reference: p.transactionRef || "",
-      // @ts-ignore
+
       type: p.type || "DIRECT"
     }));
   }
@@ -262,7 +262,7 @@ export class FinanceService {
 
     return prisma.$transaction(async (tx) => {
       // ── 3. Resolve account (first matching type) ──────────────────────────
-      // @ts-ignore
+      // @ts-expect-error Prisma model types mismatch
       const account = await tx.account.findFirst({ where: { type: accountType } });
 
       // ── 4. Balance check — only for OUTFLOW + PAID ────────────────────────
@@ -282,7 +282,7 @@ export class FinanceService {
       }
 
       // ── 5. Create the payment record ──────────────────────────────────────
-      // @ts-ignore
+
       const payment = await tx.payment.create({
         data: {
           paidAmount:     amount,
@@ -301,7 +301,7 @@ export class FinanceService {
       // FAILED  → no money moves (transaction did not succeed)
       // PAID    → money actually moved, adjust the real balance
       if (account && status === 'PAID') {
-        // @ts-ignore
+
         await tx.account.update({
           where: { id: account.id },
           data: {

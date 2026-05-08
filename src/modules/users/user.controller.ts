@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
 import { UserService } from './user.service';
-import { AuthenticatedRequest } from '../../types/request';
 
 export class UserController {
   static async getAll(req: Request, res: Response) {
