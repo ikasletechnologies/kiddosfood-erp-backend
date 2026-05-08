@@ -171,8 +171,70 @@ export class FinanceService {
   }
 
   /**
-   * Cash Flow Status
+   * Comprehensive Ledger Summary for Reports
    */
+  static async getLedgerSummary(filters: { franchiseId?: string; startDate?: Date; endDate?: Date }) {
+    const dateQuery = {
+      ...(filters.startDate || filters.endDate ? { gte: filters.startDate, lte: filters.endDate } : {})
+    };
+
+    const [invoiced, collected, expenseBilled, expensePaid] = await Promise.all([
+      // 1. Total Invoiced (Accrual)
+      prisma.invoice.aggregate({
+        where: { ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined },
+        _sum: { finalAmount: true },
+        _count: { id: true }
+      }),
+      // 2. Total Collected (Cash)
+      prisma.payment.aggregate({
+        where: { 
+          entityType: 'CUSTOMER', 
+          status: 'PAID', 
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
+          order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined 
+        },
+        _sum: { paidAmount: true }
+      }),
+      // 3. Total Expense Billed (Accrual)
+      prisma.expense.aggregate({
+        where: { ...(filters.startDate || filters.endDate ? { date: dateQuery } : {}), franchiseId: filters.franchiseId },
+        _sum: { amount: true },
+        _count: { id: true }
+      }),
+      // 4. Total Expense Paid (Cash)
+      prisma.payment.aggregate({
+        where: { 
+          sourceModule: 'EXPENSE', 
+          status: 'PAID', 
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
+          // Linkage check (optional if sourceModule is enough)
+        },
+        _sum: { paidAmount: true }
+      })
+    ]);
+
+    const totalInvoiced = invoiced._sum?.finalAmount || 0;
+    const totalCollected = collected._sum?.paidAmount || 0;
+    const totalExpBilled = expenseBilled._sum?.amount || 0;
+    const totalExpPaid = expensePaid._sum?.paidAmount || 0;
+
+    return {
+      invoices: {
+        count: invoiced._count.id,
+        total: totalInvoiced,
+        received: totalCollected,
+        due: Math.max(0, totalInvoiced - totalCollected)
+      },
+      expenses: {
+        count: expenseBilled._count.id,
+        total: totalExpBilled,
+        paid: totalExpPaid,
+        due: Math.max(0, totalExpBilled - totalExpPaid)
+      },
+      generatedAt: new Date()
+    };
+  }
+
   static async getCashFlow() {
 
     const accounts = await prisma.account.findMany();
@@ -197,117 +259,254 @@ export class FinanceService {
   }
 
   static async addExpense(data: any) {
-    return prisma.expense.create({ 
-      data: {
-        franchiseId: data.franchiseId,
-        category: data.category,
-        amount: data.amount,
-        description: data.note || data.description,
-        date: data.date ? new Date(data.date) : new Date(),
-      } 
+    return prisma.$transaction(async (tx) => {
+      // 1. Generate Expense Number
+      const year = new Date().getFullYear();
+      const count = await tx.expense.count({
+        where: { date: { gte: new Date(year, 0, 1) } }
+      });
+      const expenseNumber = `EXP-${year}-${(count + 1).toString().padStart(4, "0")}`;
+
+      const amount = data.amount;
+      const initialPaidAmount = data.isPaidImmediately ? amount : 0;
+      const status = data.isPaidImmediately ? "PAID" : "UNPAID";
+
+      // 2. Create Expense
+      const expense = await tx.expense.create({ 
+        data: {
+          expenseNumber,
+          franchiseId: data.franchiseId,
+          category: data.category,
+          payee: data.payee,
+          amount: amount,
+          paidAmount: initialPaidAmount,
+          description: data.note || data.description,
+          date: data.date ? new Date(data.date) : new Date(),
+          dueDate: data.dueDate ? new Date(data.dueDate) : null,
+          status: status,
+          accountId: data.accountId,
+          paymentMode: data.paymentMode || 'CASH'
+        } 
+      });
+
+      // 3. If PAID immediately and account provided, hit the ledger
+      if (initialPaidAmount > 0 && data.accountId) {
+        await this.createPayment({
+          tx,
+          amount: initialPaidAmount,
+          flow: 'OUT',
+          status: 'PAID',
+          sourceAccount: data.accountId,
+          method: expense.paymentMode || 'CASH',
+          sourceModule: 'EXPENSE',
+          linkedDocType: 'EXPENSE_BILL',
+          linkedDocId: expense.id,
+          entity: expense.payee || expense.category,
+          createdBy: data.createdBy || 'SYSTEM'
+        });
+      }
+
+      return expense;
     });
+  }
+
+  static async recordExpensePayment(expenseId: string, data: { amount: number, accountId: string, paymentMode: any, note?: string, createdBy?: string }) {
+    return prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({ where: { id: expenseId } });
+      if (!expense) throw new Error("Expense not found");
+      if (expense.isCancelled) throw new Error("Cannot pay a cancelled expense");
+
+      const remaining = expense.amount - expense.paidAmount;
+      if (data.amount > remaining + 0.01) { // small buffer for float
+        throw new Error(`Payment amount ₹${data.amount} exceeds remaining balance ₹${remaining}`);
+      }
+
+      const newPaidAmount = expense.paidAmount + data.amount;
+      const newStatus = newPaidAmount >= expense.amount - 0.01 ? "PAID" : "PARTIAL";
+
+      // 1. Update Expense
+      await tx.expense.update({
+        where: { id: expenseId },
+        data: {
+          paidAmount: newPaidAmount,
+          status: newStatus,
+          accountId: data.accountId, // Store last used account
+          paymentMode: data.paymentMode
+        }
+      });
+
+      // 2. Create Payment Record
+      await this.createPayment({
+        tx,
+        amount: data.amount,
+        flow: 'OUT',
+        status: 'PAID',
+        sourceAccount: data.accountId,
+        method: data.paymentMode,
+        sourceModule: 'EXPENSE',
+        linkedDocType: 'EXPENSE_BILL',
+        linkedDocId: expense.id,
+        entity: expense.payee || expense.category,
+        transactionRef: data.note,
+        createdBy: data.createdBy || 'SYSTEM'
+      });
+
+      return { success: true };
+    });
+  }
+
+  static async cancelExpense(expenseId: string, cancelledBy?: string) {
+    return prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({ where: { id: expenseId } });
+      if (!expense) throw new Error("Expense not found");
+      if (expense.status === "PAID") throw new Error("Cannot cancel a fully paid expense. Please cancel the payments first.");
+
+      // 1. Mark as cancelled
+      await tx.expense.update({
+        where: { id: expenseId },
+        data: {
+          isCancelled: true,
+          cancelledAt: new Date(),
+          status: "CANCELLED"
+        }
+      });
+
+      // 2. If there were partial payments, they should probably be reversed?
+      // For now, enterprise logic usually requires manual reversal of payments to maintain audit trail.
+      // But we can check if there are any payments linked and warn.
+
+      return { success: true };
+    });
+  }
+
+  static async getExpenseDetails(expenseId: string) {
+    const expense = await prisma.expense.findUnique({
+      where: { id: expenseId },
+      include: { account: true }
+    });
+
+    if (!expense) throw new Error("Expense not found");
+
+    const payments = await prisma.payment.findMany({
+      where: {
+        linkedDocId: expenseId,
+        linkedDocType: 'EXPENSE_BILL',
+        isCancelled: false
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    return {
+      ...expense,
+      payments
+    };
   }
 
   static async getExpenses(franchiseId?: string) {
     return prisma.expense.findMany({
-      where: franchiseId ? { franchiseId } : undefined,
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        isCancelled: false
+      },
+      include: { account: true },
       orderBy: { date: 'desc' }
     });
   }
 
   static async getPayments(franchiseId?: string) {
     const payments = await prisma.payment.findMany({
-      where: franchiseId ? { order: { franchiseId } } : undefined,
-
+      where: {
+        ...(franchiseId ? { order: { franchiseId } } : {}),
+      },
       include: { order: true, invoice: true, account: true },
       orderBy: { createdAt: 'desc' }
     });
 
     return payments.map(p => ({
       id: p.id,
+      paymentNumber: p.paymentNumber,
       date: p.createdAt.toISOString(),
-
       entity: p.entityId || p.transactionRef || "Manual Entry",
-
       flow: p.entityType === 'VENDOR' ? 'OUT' : 'IN',
       method: p.paymentMode,
       amount: p.paidAmount,
       status: p.status,
-
       reference: p.transactionRef || "",
-
-      type: p.type || "DIRECT"
+      type: p.type,
+      sourceModule: p.sourceModule,
+      linkedDocType: p.linkedDocType,
+      linkedDocId: p.linkedDocId,
+      isCancelled: p.isCancelled,
+      accountName: p.account?.name || "Unknown",
     }));
   }
 
+  /**
+   * Central Ledger Entry Creation
+   */
   static async createPayment(data: any) {
     const amount    = parseFloat(data.amount);
-    const flow      = data.flow as 'IN' | 'OUT';       // 'IN' = customer receipt, 'OUT' = vendor/expense
+    const flow      = data.flow as 'IN' | 'OUT';       
     const status    = (data.status || 'PAID') as string;
-    const sourceKey = data.sourceAccount as string;    // 'CASH_ACCOUNT' | 'BANK_ACCOUNT' | 'UPI_WALLET'
+    const sourceKey = data.sourceAccount as string;    
+    const sourceModule = (data.sourceModule || 'MANUAL');
+    const linkedDocType = data.linkedDocType || 'DIRECT';
+    const linkedDocId = data.linkedDocId;
 
-    // ── 1. Backend entity-direction guard ──────────────────────────────────────
-    // Never trust the frontend alone — enforce at DB layer too.
     if (flow !== 'IN' && flow !== 'OUT') {
       throw new Error('Invalid payment direction. Must be IN or OUT.');
     }
 
-    // ── 2. Map sourceAccount UI key → AccountType enum ───────────────────────
     const accountTypeMap: Record<string, string> = {
       CASH_ACCOUNT: 'CASH',
       BANK_ACCOUNT: 'BANK',
       UPI_WALLET:   'UPI',
+      CASH: 'CASH',
+      BANK: 'BANK',
+      UPI: 'UPI'
     };
     const accountType = accountTypeMap[sourceKey] ?? 'CASH';
 
-    return prisma.$transaction(async (tx) => {
-      // ── 3. Resolve account (first matching type) ──────────────────────────
-      // @ts-expect-error Prisma model types mismatch
-      const account = await tx.account.findFirst({ where: { type: accountType } });
+    const operation = async (tx: any) => {
+      // 1. Resolve account
+      const account = await tx.account.findFirst({ where: { type: accountType as any } });
 
-      // ── 4. Balance check — only for OUTFLOW + PAID ────────────────────────
-      // Pending/Failed payments don't move money → no check needed.
+      // 2. Balance check for OUTFLOW + PAID
       if (flow === 'OUT' && status === 'PAID') {
-        if (!account) {
-          throw new Error(
-            `No ${accountType} account found. Please ensure accounts are configured.`
-          );
-        }
+        if (!account) throw new Error(`No ${accountType} account found.`);
         if (account.balance < amount) {
-          throw new Error(
-            `Insufficient ${accountType} balance. ` +
-            `Available: ₹${account.balance.toFixed(2)}, Required: ₹${amount.toFixed(2)}.`
-          );
+          throw new Error(`Insufficient balance in ${account.name}. Available: ₹${account.balance}`);
         }
       }
 
-      // ── 5. Create the payment record ──────────────────────────────────────
+      // 3. Generate Payment Number
+      const paymentNumber = await this.generatePaymentNumber(tx);
 
+      // 4. Create the payment record
       const payment = await tx.payment.create({
         data: {
+          paymentNumber,
           paidAmount:     amount,
-          type:           'DIRECT' as any,
-          entityType:     flow === 'OUT' ? 'VENDOR' : 'CUSTOMER',
+          type:           data.type || 'DIRECT',
+          sourceModule:   sourceModule as any,
+          linkedDocType:  linkedDocType as any,
+          linkedDocId:    linkedDocId,
+          entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       data.entity,
           paymentMode:    data.method as any,
           transactionRef: data.reference || data.note || undefined,
           status,
           accountId:      account?.id ?? undefined,
+          createdBy:      data.createdBy,
         },
       });
 
-      // ── 6. Update account balance — ONLY if status is PAID ────────────────
-      // PENDING → no money moves (liability recorded, not settled)
-      // FAILED  → no money moves (transaction did not succeed)
-      // PAID    → money actually moved, adjust the real balance
+      // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
-
         await tx.account.update({
           where: { id: account.id },
           data: {
             balance: {
-              // IN  (customer pays us) → balance increases
-              // OUT (we pay someone)   → balance decreases
               increment: flow === 'IN' ? amount : -amount,
             },
           },
@@ -315,6 +514,141 @@ export class FinanceService {
       }
 
       return payment;
+    };
+
+    if (data.tx) {
+      return operation(data.tx);
+    } else {
+      return prisma.$transaction(async (tx) => operation(tx));
+    }
+  }
+
+  /**
+   * Internal Fund Transfer (Cash to Bank, etc)
+   */
+  static async transferFunds(data: { fromAccountId: string, toAccountId: string, amount: number, note?: string, createdBy?: string }) {
+    return prisma.$transaction(async (tx) => {
+      const fromAcc = await tx.account.findUnique({ where: { id: data.fromAccountId } });
+      const toAcc = await tx.account.findUnique({ where: { id: data.toAccountId } });
+
+      if (!fromAcc || !toAcc) throw new Error("Source or Destination account not found");
+      if (fromAcc.balance < data.amount) throw new Error(`Insufficient balance in ${fromAcc.name}`);
+
+      const pNum = await this.generatePaymentNumber(tx);
+
+      // 1. Outflow from source
+      await tx.payment.create({
+        data: {
+          paymentNumber: pNum,
+          paidAmount: data.amount,
+          type: 'INTERNAL_TRANSFER' as any,
+          sourceModule: 'TRANSFER' as any,
+          linkedDocType: 'TRANSFER' as any,
+          paymentMode: fromAcc.type as any,
+          status: 'PAID',
+          accountId: fromAcc.id,
+          transactionRef: `Transfer to ${toAcc.name}. ${data.note || ''}`,
+          entityType: 'ACCOUNT',
+          entityId: toAcc.id,
+          createdBy: data.createdBy
+        }
+      });
+
+      // 2. Inflow to destination
+      await tx.payment.create({
+        data: {
+          paymentNumber: pNum + "-IN", // Sub-ref
+          paidAmount: data.amount,
+          type: 'INTERNAL_TRANSFER' as any,
+          sourceModule: 'TRANSFER' as any,
+          linkedDocType: 'TRANSFER' as any,
+          paymentMode: toAcc.type as any,
+          status: 'PAID',
+          accountId: toAcc.id,
+          transactionRef: `Transfer from ${fromAcc.name}. ${data.note || ''}`,
+          entityType: 'ACCOUNT',
+          entityId: fromAcc.id,
+          createdBy: data.createdBy
+        }
+      });
+
+      // 3. Update balances
+      await tx.account.update({ where: { id: fromAcc.id }, data: { balance: { decrement: data.amount } } });
+      await tx.account.update({ where: { id: toAcc.id }, data: { balance: { increment: data.amount } } });
+
+      return { success: true };
     });
+  }
+
+  /**
+   * Payment Cancellation (Soft Delete + Reversal Entry)
+   */
+  static async cancelPayment(paymentId: string, cancelledBy?: string) {
+    return prisma.$transaction(async (tx) => {
+      const original = await tx.payment.findUnique({ 
+        where: { id: paymentId },
+        include: { account: true }
+      });
+
+      if (!original) throw new Error("Payment not found");
+      if (original.isCancelled) throw new Error("Payment already cancelled");
+
+      // 1. Mark original as cancelled
+      await tx.payment.update({
+        where: { id: paymentId },
+        data: { isCancelled: true, cancelledAt: new Date() }
+      });
+
+      // 2. If it was PAID, create reversal entry and restore balance
+      if (original.status === 'PAID' && original.accountId) {
+        const flow = original.entityType === 'VENDOR' ? 'OUT' : 'IN'; // Simplification
+        const reversalAmount = original.paidAmount;
+
+        const pNum = await this.generatePaymentNumber(tx);
+        
+        await tx.payment.create({
+          data: {
+            paymentNumber: pNum,
+            type: 'REVERSAL' as any,
+            sourceModule: original.sourceModule,
+            linkedDocType: original.linkedDocType,
+            linkedDocId: original.linkedDocId,
+            paidAmount: reversalAmount,
+            paymentMode: original.paymentMode,
+            status: 'PAID',
+            accountId: original.accountId,
+            transactionRef: `REVERSAL of ${original.paymentNumber || original.id}`,
+            reversalOfPaymentId: original.id,
+            entityType: original.entityType,
+            entityId: original.entityId,
+            createdBy: cancelledBy
+          }
+        });
+
+        // Restore balance: 
+        // If original was OUT (decreased balance) -> Inflow (increase balance)
+        // If original was IN (increased balance) -> Outflow (decrease balance)
+        const isOriginalOutflow = (original.entityType === 'VENDOR' || original.type === 'EXPENSE');
+        
+        await tx.account.update({
+          where: { id: original.accountId },
+          data: {
+            balance: {
+              increment: isOriginalOutflow ? reversalAmount : -reversalAmount
+            }
+          }
+        });
+      }
+
+      return { success: true };
+    });
+  }
+
+  private static async generatePaymentNumber(tx: any): Promise<string> {
+    const year = new Date().getFullYear();
+    const count = await tx.payment.count({
+      where: { createdAt: { gte: new Date(year, 0, 1) } }
+    });
+    return `PAY-${year}-${(count + 1).toString().padStart(4, '0')}`;
   }
 }

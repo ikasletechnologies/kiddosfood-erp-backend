@@ -149,38 +149,77 @@ model StockMovement {
 }
 
 model Vendor {
-  id                String             @id @default(uuid())
-  name              String
-  contact           String
-  email             String?
-  rating            Float?             @default(5.0)
-  createdAt         DateTime           @default(now())
-  address           String?
-  manualAdvanceAdj  Float              @default(0)
-  manualPurchaseAdj Float              @default(0)
-  remark            String?
-  items             InventoryItem[]
-  orders            ProcurementOrder[]
-  rfqs              PurchaseRFQ[]
-  purchaseReturns   PurchaseReturn[]
-  invoices          VendorInvoice[]
-  ledgerEntries     VendorLedger[]
+  id              String             @id @default(uuid())
+  vendorCode      String?            @unique
+  name            String
+  contact         String
+  email           String?
+  address            String?
+  remark             String?
+  manualPurchaseAdj  Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
+  manualAdvanceAdj   Float              @default(0) // @deprecated: Use VendorLedger for all advances
+  status             VendorStatus       @default(ACTIVE)
+  paymentTerms       PaymentTerms       @default(IMMEDIATE)
+  gstNumber          String?
+  category           String?
+  rating             Float?             @default(5.0)
+  items           InventoryItem[]
+  orders          ProcurementOrder[]
+  rfqs            PurchaseRFQ[]
+  purchaseReturns PurchaseReturn[]
   suppliedMaterials VendorMaterial[]
+  ledgerEntries   VendorLedger[]
+  invoices        VendorInvoice[]
+  createdAt       DateTime           @default(now())
+}
+
+enum VendorStatus {
+  ACTIVE
+  BLOCKED
+  BLACKLISTED
+}
+
+enum PaymentTerms {
+  NET_7
+  NET_30
+  ADVANCE
+  IMMEDIATE
 }
 
 model VendorLedger {
-  id            String                    @id @default(uuid())
-  vendorId      String
-  amount        Float
-  paymentMode   PaymentMode
-  referenceType VendorLedgerReferenceType
-  referenceId   String?
-  note          String?
-  createdAt     DateTime                  @default(now())
-  accountId     String?
-  type          LedgerType
-  account       Account?                  @relation(fields: [accountId], references: [id])
-  vendor        Vendor                    @relation(fields: [vendorId], references: [id])
+  id              String             @id @default(uuid())
+  vendorId        String
+  vendor          Vendor             @relation(fields: [vendorId], references: [id])
+  type            LedgerType
+  amount          Float
+  balanceAfterTransaction Float      @default(0)
+  paymentMode     PaymentMode
+  sourceModule    VendorLedgerSource @default(MANUAL)
+  referenceType   VendorLedgerReferenceType
+  referenceId     String?            // ID of PO, Payment, etc.
+  accountId       String?
+  account         Account?           @relation(fields: [accountId], references: [id])
+  note            String?
+  createdAt       DateTime           @default(now())
+}
+
+enum VendorLedgerSource {
+  PROCUREMENT
+  INVENTORY
+  FINANCE
+  MANUAL
+}
+
+// Replaced by LedgerType
+
+enum VendorLedgerReferenceType {
+  PURCHASE
+  PAYMENT
+  ADVANCE
+  RETURN
+  ADJUSTMENT
+  OPENING_BALANCE
+  PO
 }
 
 model VendorMaterial {
@@ -476,21 +515,69 @@ model OrderItem {
 }
 
 model Payment {
-  id             String                @id @default(uuid())
+  id             String      @id @default(uuid())
+  paymentNumber  String?     @unique // e.g., PAY-2026-0001
+  type           AccountingPaymentType @default(INVOICE_LINKED)
+  sourceModule   PaymentSourceModule   @default(MANUAL)
+  
+  // Linkages
+  linkedDocType  LinkedDocType?
+  linkedDocId    String?
+  
   orderId        String?
-  paymentMode    PaymentMode           @default(CASH)
+  order          Order?      @relation(fields: [orderId], references: [id])
+  invoiceId      String?
+  invoice        Invoice?    @relation(fields: [invoiceId], references: [id])
+  
+  paymentMode    PaymentMode @default(CASH)
   paidAmount     Float
   transactionRef String?
-  status         String                @default("SUCCESS")
-  invoiceId      String?
-  createdAt      DateTime              @default(now())
+  status         String      @default("SUCCESS")
+  
   accountId      String?
-  entityId       String?
-  entityType     String?
-  type           AccountingPaymentType @default(INVOICE_LINKED)
-  account        Account?              @relation(fields: [accountId], references: [id])
-  invoice        Invoice?              @relation(fields: [invoiceId], references: [id])
-  order          Order?                @relation(fields: [orderId], references: [id])
+  account        Account?    @relation(fields: [accountId], references: [id])
+  
+  entityType     String?     // VENDOR, CUSTOMER, EMPLOYEE
+  entityId       String?     // ID of Vendor, Customer, or Employee
+  
+  // Reversal / Cancellation
+  isCancelled        Boolean   @default(false)
+  cancelledAt        DateTime?
+  reversalOfPaymentId String?   // Points to original ID if this is a reversal transaction
+
+  // Audit
+  createdBy      String?
+  approvedBy     String?
+  
+  createdAt      DateTime    @default(now())
+}
+
+enum PaymentSourceModule {
+  POS
+  PROCUREMENT
+  PAYROLL
+  FRANCHISE
+  EXPENSE
+  MANUAL
+  TRANSFER
+}
+
+enum LinkedDocType {
+  INVOICE
+  PO
+  PAYSLIP
+  EXPENSE_BILL
+  DIRECT
+  TRANSFER
+}
+
+enum AccountingPaymentType {
+  INVOICE_LINKED
+  ADVANCE
+  EXPENSE
+  DIRECT
+  REVERSAL
+  INTERNAL_TRANSFER
 }
 
 model Invoice {
@@ -507,9 +594,15 @@ model Invoice {
 
 model Account {
   id              String           @id @default(uuid())
+  accountCode     String?          @unique // e.g., ACC-001
   name            String
   type            AccountType
   balance         Float            @default(0)
+  status          String           @default("ACTIVE")
+  payments        Payment[]
+  vendorLedgers   VendorLedger[]
+  customerLedgers CustomerLedger[]
+  expenses        Expense[]
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
   customerLedgers CustomerLedger[]
@@ -520,16 +613,23 @@ model Account {
 
 model Expense {
   id              String            @id @default(uuid())
+  expenseNumber   String?           @unique // e.g., EXP-2026-001
   franchiseId     String?
   category        String
+  payee           String?           // e.g., EB Office, Airtel, etc.
   amount          Float
+  paidAmount      Float             @default(0)
   date            DateTime          @default(now())
+  dueDate         DateTime?         // when payment is expected
   description     String?
+  status          String            @default("UNPAID") // UNPAID, PARTIAL, PAID
+  paymentMode     PaymentMode?      @default(CASH)
   purchaseOrderId String?
   accountId       String?
   account         Account?          @relation(fields: [accountId], references: [id])
-  franchise       Franchise?        @relation(fields: [franchiseId], references: [id])
-  purchaseOrder   ProcurementOrder? @relation(fields: [purchaseOrderId], references: [id])
+  isCancelled     Boolean           @default(false)
+  cancelledAt     DateTime?
+  attachmentUrl   String?
 }
 
 model Wastage {
@@ -818,6 +918,8 @@ model SalesOrder {
   customerId      String?
   customerName    String?
   status          SalesOrderStatus @default(PENDING)
+  paymentStatus   String           @default("UNPAID") // PAID, UNPAID, PARTIAL
+  items           SalesOrderItem[]
   subTotal        Float
   taxAmount       Float
   discountAmount  Float            @default(0)

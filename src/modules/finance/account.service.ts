@@ -38,9 +38,58 @@ export class AccountService {
   }
 
   static async getAccounts() {
-    return prisma.account.findMany({
-      orderBy: { name: 'asc' }
+    const accounts = await prisma.account.findMany({
+      orderBy: { name: 'asc' },
+      include: {
+        payments: { orderBy: { createdAt: 'desc' }, take: 1 },
+        expenses: { orderBy: { createdAt: 'desc' }, take: 1 }
+      }
     });
+
+    // Add a virtual 'lastTransaction' property for the UI
+    return accounts.map(acc => {
+      const lastPayment = acc.payments[0];
+      const lastExpense = acc.expenses[0];
+      
+      let lastTransaction = null;
+      if (lastPayment && (!lastExpense || lastPayment.createdAt > lastExpense.createdAt)) {
+        lastTransaction = { type: 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: 'Payment Received' };
+      } else if (lastExpense) {
+        lastTransaction = { type: 'OUTFLOW', amount: lastExpense.amount, date: lastExpense.createdAt, note: lastExpense.description || 'Business Expense' };
+      }
+
+      return { ...acc, lastTransaction };
+    });
+  }
+
+  static async createAccount(data: { name: string, type: 'CASH' | 'BANK' | 'UPI', balance?: number }) {
+    // Generate a simple account code
+    const count = await prisma.account.count();
+    const accountCode = `ACC-${(count + 1).toString().padStart(3, '0')}`;
+
+    return prisma.account.create({
+      data: {
+        name: data.name,
+        type: data.type as any,
+        balance: data.balance || 0,
+        accountCode,
+        status: 'ACTIVE'
+      }
+    });
+  }
+
+  static async deleteAccount(id: string) {
+    // Check if account has transactions before deleting
+    const account = await prisma.account.findUnique({
+      where: { id },
+      include: { _count: { select: { payments: true, vendorLedgers: true } } }
+    });
+
+    if (account && (account._count.payments > 0 || account._count.vendorLedgers > 0)) {
+      throw new Error("Cannot delete account with existing transaction history.");
+    }
+
+    return prisma.account.delete({ where: { id } });
   }
 
   static async getAccountById(id: string) {

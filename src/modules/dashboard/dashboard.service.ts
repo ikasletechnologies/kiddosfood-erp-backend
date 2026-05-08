@@ -69,12 +69,33 @@ export class DashboardService {
         by: ['paymentMode'],
         where: {
           createdAt: { gte: today, lte: periodEnd },
-          status: 'SUCCESS',
+          status: 'PAID',
           ...(franchiseId ? { order: { franchiseId } } : {})
         },
         _sum: { paidAmount: true }
+      }),
+      // 9: Real Accounts & Liquidity
+      prisma.account.findMany(),
+      // 10: Cash Flow Today (PAID only)
+      prisma.payment.aggregate({
+        where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID' },
+        _sum: { paidAmount: true }
       })
     ]);
+
+    const accounts = await prisma.account.findMany();
+    const cashBal = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);
+    const bankBal = accounts.filter(a => a.type === 'BANK').reduce((s, a) => s + a.balance, 0);
+    const upiBal = accounts.filter(a => a.type === 'UPI').reduce((s, a) => s + a.balance, 0);
+
+    const inflowsToday = await prisma.payment.aggregate({
+      where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID', entityType: { not: 'VENDOR' } }, // Simplified inflow
+      _sum: { paidAmount: true }
+    });
+    const outflowsToday = await prisma.payment.aggregate({
+      where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID', entityType: 'VENDOR' }, // Simplified outflow
+      _sum: { paidAmount: true }
+    });
     
     // Process order status counts
     let kitchenQueue = 0;
@@ -184,7 +205,13 @@ export class DashboardService {
         revenueYesterday: yestRevenue,
         revenueChangePct,
         expensesToday: expenses,
-        profitToday: profitToday,
+        profitToday: (inflowsToday._sum.paidAmount || 0) - (outflowsToday._sum.paidAmount || 0),
+        treasury: {
+          cash: cashBal,
+          bank: bankBal,
+          upi: upiBal,
+          total: cashBal + bankBal + upiBal
+        },
         paymentBreakdown: paymentData.map(p => ({
           mode: p.paymentMode,
           amount: p._sum.paidAmount || 0
