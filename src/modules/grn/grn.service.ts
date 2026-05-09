@@ -102,7 +102,7 @@ export class GRNService {
 
       // Update stock for each accepted item
       for (const item of grn.items) {
-        if (item.acceptedQty <= 0) continue;
+        if (!item.materialId || item.acceptedQty <= 0) continue;
 
         await InventoryService.recordMovement(tx, {
           itemId: item.materialId,

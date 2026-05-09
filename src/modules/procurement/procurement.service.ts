@@ -527,6 +527,7 @@ export class ProcurementService {
       if (po.received) throw new Error('Goods already received for this PO');
 
       for (const item of po.poItems) {
+        if (!item.inventoryItemId) continue;
         await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PURCHASE_IN',

@@ -172,16 +172,14 @@ export class InventoryService {
       poLinks, 
       movementLinks,
       requestLinks,
-      transferLinks,
-      wastageLinks
+      transferLinks
     ] = await Promise.all([
       prisma.recipeItem.count({ where: { inventoryItemId: id } }),
       prisma.productionItem.count({ where: { inventoryItemId: id } }),
       prisma.procurementOrderItem.count({ where: { inventoryItemId: id } }),
       prisma.stockMovement.count({ where: { itemId: id } }),
       prisma.stockRequestItem.count({ where: { inventoryItemId: id } }),
-      prisma.stockTransferItem.count({ where: { inventoryItemId: id } }),
-      prisma.wastage.count({ where: { inventoryItemId: id } }),
+      prisma.stockTransferItem.count({ where: { inventoryItemId: id } })
     ]);
 
     if (recipeLinks > 0) {
@@ -189,7 +187,7 @@ export class InventoryService {
     }
 
     if (productionLinks > 0 || movementLinks > 0) {
-      const totalHistory = productionLinks + movementLinks + wastageLinks;
+      const totalHistory = productionLinks + movementLinks;
       throw new Error(`Deletion Blocked: This item has ${totalHistory} recorded history entries (Production/Stock Movements). Deleting it would break audit logs. Please mark it as 'Inactive' instead.`);
     }
 

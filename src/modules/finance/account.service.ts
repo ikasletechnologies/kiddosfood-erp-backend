@@ -51,7 +51,7 @@ export class AccountService {
       const lastPayment = acc.payments[0];
       const lastExpense = acc.expenses[0];
       
-      let lastTransaction = null;
+      let lastTransaction: any = null;
       if (lastPayment && (!lastExpense || lastPayment.createdAt > lastExpense.createdAt)) {
         lastTransaction = { type: 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: 'Payment Received' };
       } else if (lastExpense) {

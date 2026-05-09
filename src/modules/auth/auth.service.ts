@@ -44,7 +44,7 @@ export class AuthService {
     const permissions = user.role.permissions.map(rp => rp.permission.key);
     const payload: TokenPayload = {
       userId: user.id,
-      email: user.email,
+      email: user.email || undefined,
       role: user.role.name,
       franchiseId: user.franchiseId,
       branchId: user.branchId,
@@ -100,7 +100,7 @@ export class AuthService {
     const permissions = user.role.permissions.map(rp => rp.permission.key);
     const newPayload: TokenPayload = {
       userId: user.id,
-      email: user.email,
+      email: user.email || undefined,
       role: user.role.name,
       franchiseId: user.franchiseId,
       branchId: user.branchId,

@@ -59,6 +59,20 @@ async function main() {
     update: {},
     create: {
       name: 'ADMIN',
+      description: 'System admin — manages global configurations.',
+      permissions: {
+        create: [
+          { permission: { connect: { key: '*' } } },
+        ],
+      },
+    },
+  });
+
+  await prisma.role.upsert({
+    where: { name: 'FRANCHISE_ADMIN' },
+    update: {},
+    create: {
+      name: 'FRANCHISE_ADMIN',
       description: 'Franchise admin — manages one franchise.',
       permissions: {
         create: [

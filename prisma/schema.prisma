@@ -9,7 +9,7 @@ datasource db {
 model User {
   id            String         @id @default(uuid())
   fullName      String
-  email         String         @unique
+  email         String?        @unique
   phone         String?        @unique
   passwordHash  String
   roleId        String
@@ -88,6 +88,8 @@ model Franchise {
   ownerName         String
   contactNum        String
   status            String             @default("ACTIVE")
+  dashboardPassword String?
+
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
   activityLogs      ActivityLog[]
@@ -130,8 +132,6 @@ model InventoryItem {
   requestItems    StockRequestItem[]
   transferItems   StockTransferItem[]
   vendors         VendorMaterial[]
-  wastage         Wastage[]
-
   @@unique([sku, franchiseId])
 }
 
@@ -259,7 +259,7 @@ model ProcurementOrder {
 model ProcurementOrderItem {
   id               String           @id @default(uuid())
   poId             String
-  inventoryItemId  String
+  inventoryItemId  String?
   quantity         Float
   price            Float
   cgst             Float            @default(0)
@@ -270,7 +270,7 @@ model ProcurementOrderItem {
   sgst             Float            @default(0)
   subtotal         Float            @default(0)
   total            Float            @default(0)
-  inventoryItem    InventoryItem    @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+  inventoryItem    InventoryItem?   @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
 }
 
@@ -289,14 +289,14 @@ model GoodsReceipt {
 model GoodsReceiptItem {
   id            String        @id @default(uuid())
   grnId         String
-  materialId    String
+  materialId    String?
   quantity      Float
   receivedQty   Float
   acceptedQty   Float
   rejectedQty   Float
   price         Float
   grn           GoodsReceipt  @relation(fields: [grnId], references: [id])
-  inventoryItem InventoryItem @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  inventoryItem InventoryItem? @relation(fields: [materialId], references: [id], onDelete: Cascade)
 }
 
 model VendorInvoice {
@@ -625,16 +625,6 @@ model Expense {
   attachmentUrl   String?
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
-}
-
-model Wastage {
-  id              String        @id @default(uuid())
-  inventoryItemId String
-  quantity        Float
-  reason          String
-  cost            Float
-  date            DateTime      @default(now())
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
 }
 
 model Delivery {

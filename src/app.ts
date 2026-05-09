@@ -273,6 +273,7 @@ app.post('/api/franchise/fulfill', authenticate, authorizeRole(['SUPER_ADMIN']),
 app.get('/api/franchise/transfers', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getAllTransfers);
 app.patch('/api/franchise/transfers/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.updateTransferStatus);
 app.get('/api/franchise/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getOne);
+app.post('/api/franchise/:id/verify-password', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseController.verifyDashboardPassword);
 app.patch('/api/franchise/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.update);
 app.delete('/api/franchise/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.deleteFranchise);
 

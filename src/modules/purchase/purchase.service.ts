@@ -118,7 +118,14 @@ export class PurchaseService {
       data: {
         vendorId: rfq.vendorId,
         totalAmount,
-        items: poItems
+        poItems: {
+          create: poItems.map(item => ({
+            itemName: item.itemName,
+            quantity: item.quantity,
+            price: item.rate,
+            total: item.totalAmount
+          }))
+        }
       }
     });
 
@@ -193,7 +200,14 @@ export class PurchaseService {
       data: {
         vendorId: data.vendorId,
         totalAmount,
-        items: data.items,
+        poItems: {
+          create: data.items.map(item => ({
+            itemName: item.itemName,
+            quantity: item.quantity,
+            price: item.estimatedRate || 0,
+            total: item.quantity * (item.estimatedRate || 0)
+          }))
+        },
         status: 'PENDING'
       },
       include: { vendor: true }
