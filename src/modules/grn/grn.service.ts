@@ -10,7 +10,7 @@ export class GRNService {
       },
       include: {
         procurementOrder: { include: { vendor: true } },
-        items: { include: { inventoryItem: true, warehouse: true, bin: true } }
+        items: { include: { inventoryItem: true, warehouse: true, warehouseBin: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -21,7 +21,7 @@ export class GRNService {
       where: { id },
       include: {
         procurementOrder: { include: { vendor: true, poItems: { include: { inventoryItem: true } } } },
-        items: { include: { inventoryItem: true, warehouse: true, bin: true } }
+        items: { include: { inventoryItem: true, warehouse: true, warehouseBin: true } }
       }
     });
   }
@@ -111,48 +111,37 @@ export class GRNService {
       let someReceived = false;
 
       for (const item of grn.items) {
-        if (item.acceptedQty <= 0) continue;
+        if (item.receivedQty <= 0) continue;
 
-        // Record stock movement with location info
-        await InventoryService.recordMovement(tx, {
-          itemId: item.materialId,
-          type: 'PURCHASE_IN',
-          quantity: item.acceptedQty,
-          referenceType: 'GRN',
-          referenceId: grnId,
-          note: `GRN approved for PO-${grn.procurementOrder.poNumber || grn.procurementOrder.id.substring(0, 8)}`,
+        // Add InventoryBatch in QC_HOLD state for traceability
+        // Usable stock is NOT increased yet.
+        await tx.inventoryBatch.create({
+          data: {
+            inventoryItemId: item.materialId!,
+            batchNumber: item.vendorBatchNo || `B-${Date.now()}`,
+            lotNumber: item.lotNumber,
+            mfgDate: item.mfgDate,
+            expDate: item.expDate,
+            initialQty: item.receivedQty,
+            currentQty: 0, // Not usable yet
+            status: 'QC_HOLD'
+          }
         });
 
-        // Add InventoryBatch for traceability
-        if (item.vendorBatchNo || item.lotNumber || item.expDate) {
-           await tx.inventoryBatch.create({
-              data: {
-                 inventoryItemId: item.materialId,
-                 batchNumber: item.vendorBatchNo || `B-${Date.now()}`,
-                 lotNumber: item.lotNumber,
-                 mfgDate: item.mfgDate,
-                 expDate: item.expDate,
-                 initialQty: item.acceptedQty,
-                 currentQty: item.acceptedQty
-              }
-           });
-        }
-
         await tx.inventoryItem.update({
-          where: { id: item.materialId },
+          where: { id: item.materialId! },
           data: { vendorId: grn.procurementOrder.vendorId }
         });
       }
 
       // Check PO fulfillment status
-      // We should sum up all GRNs for this PO to know true fulfillment
       const allGRNsForPO = await tx.goodsReceiptItem.findMany({
          where: { grn: { poId: grn.poId, status: 'COMPLETED' } }
       });
       
       const receivedMap = new Map();
-      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty));
-      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty)); // include current GRN
+      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
+      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
 
       for (const poItem of grn.procurementOrder.poItems) {
          const totalRcvd = receivedMap.get(poItem.inventoryItemId) || 0;
@@ -176,39 +165,13 @@ export class GRNService {
         }
       });
 
-      // FINANCIAL TRIGGER: GRN Approval -> Vendor Ledger PURCHASE (DEBIT)
-      // Calculate total value of accepted items in this GRN
-      const acceptedValue = grn.items.reduce((sum, item) => sum + (item.acceptedQty * item.price), 0);
-      
-      if (acceptedValue > 0) {
-        const lastEntry = await tx.vendorLedger.findFirst({
-          where: { vendorId: grn.procurementOrder.vendorId },
-          orderBy: { createdAt: 'desc' }
-        });
-        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-        const nextBalance = currentBalance - acceptedValue;
-
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: grn.procurementOrder.vendorId,
-            type: 'DEBIT',
-            amount: acceptedValue,
-            balanceAfterTransaction: nextBalance,
-            sourceModule: 'INVENTORY',
-            referenceType: 'PURCHASE',
-            referenceId: grn.poId,
-            note: `Goods Received Note (GRN) for PO #${grn.procurementOrder.poNumber || grn.poId.substring(0,8)} — Recognized Liability`
-          }
-        });
-      }
-
       // Add Audit log
       await tx.auditLog.create({
          data: {
             module: 'GRN',
             action: 'APPROVE',
             recordId: grnId,
-            newValue: { status: 'COMPLETED', liabilityRecognized: acceptedValue },
+            newValue: { status: 'COMPLETED', inventoryState: 'QC_HOLD' },
             performedBy: 'SYSTEM'
          }
       });

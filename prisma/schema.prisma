@@ -209,6 +209,8 @@ model VendorLedger {
   accountId               String?
   account                 Account?                  @relation(fields: [accountId], references: [id])
   note                    String?
+  invoiceId               String?
+  invoice                 VendorInvoice?            @relation(fields: [invoiceId], references: [id])
   createdAt               DateTime                  @default(now())
 }
 
@@ -252,6 +254,9 @@ model ProcurementOrder {
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   notes                String?
+  internalNotes        String?
+  vendorNotes          String?
+  deliveryInstructions String?
   items                Json?
   received             Boolean                @default(false)
   createdAt            DateTime               @default(now())
@@ -266,6 +271,8 @@ model ProcurementOrder {
   transportCost        Float                  @default(0)
   unloadingCost        Float                  @default(0)
   brokerageCost        Float                  @default(0)
+  approvedAt           DateTime?
+  approvedBy           String?
   expenses             Expense[]
   goodsReceipts        GoodsReceipt[]
   vendor               Vendor                 @relation(fields: [vendorId], references: [id])
@@ -327,6 +334,7 @@ model GoodsReceiptItem {
   warehouse      Warehouse?     @relation(fields: [warehouseId], references: [id])
   warehouseBin   WarehouseBin?  @relation(fields: [warehouseBinId], references: [id])
   warehouseBinId String?
+  inspection      InspectionRecord?
 }
 
 model VendorInvoice {
@@ -341,6 +349,8 @@ model VendorInvoice {
   grn              GoodsReceipt?    @relation(fields: [grnId], references: [id])
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
   vendor           Vendor           @relation(fields: [vendorId], references: [id])
+  ledgerEntries    VendorLedger[]
+  payments         Payment[]
 }
 
 model Product {
@@ -553,6 +563,8 @@ model Payment {
   order     Order?   @relation(fields: [orderId], references: [id])
   invoiceId String?
   invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+  vendorInvoiceId String?
+  vendorInvoice   VendorInvoice? @relation(fields: [vendorInvoiceId], references: [id])
 
   paymentMode    PaymentMode @default(CASH)
   paidAmount     Float
@@ -1376,10 +1388,10 @@ model InventoryBatch {
   expDate         DateTime?
   initialQty      Float
   currentQty      Float
-  status          String        @default("ACTIVE")
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  status          InventoryStockState @default(QC_HOLD)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  inventoryItem   InventoryItem       @relation(fields: [inventoryItemId], references: [id])
 }
 
 model AuditLog {
@@ -1414,4 +1426,44 @@ enum QuotationReviewStatus {
   REVIEWING
   ACCEPTED
   REJECTED
+}
+
+model InspectionRecord {
+  id              String           @id @default(uuid())
+  grnItemId       String           @unique
+  inspectorId     String?
+  inspectedAt     DateTime         @default(now())
+  
+  // Physical parameters
+  temperature     Float?
+  moistureContent Float?
+  packagingOk     Boolean          @default(true)
+  
+  // QC Results
+  totalQty        Float
+  approvedQty     Float
+  rejectedQty     Float
+  scrapQty        Float            @default(0)
+  actionTaken     QCAction         @default(HOLD)
+  remarks         String?
+  
+  grnItem         GoodsReceiptItem @relation(fields: [grnItemId], references: [id])
+}
+
+enum QCAction {
+  APPROVE
+  REJECT_RETURN
+  REJECT_SCRAP
+  REWORK
+  HOLD
+}
+
+enum InventoryStockState {
+  RECEIVED
+  QC_HOLD
+  APPROVED
+  REJECTED
+  BLOCKED
+  EXPIRED
+  RETURNED
 }

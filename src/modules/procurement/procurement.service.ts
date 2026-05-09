@@ -420,8 +420,6 @@ export class ProcurementService {
     const updateData: any = { status };
     if (status === 'APPROVED') {
       updateData.approvedAt = new Date();
-      // In a real system, we'd get the user from the request context. 
-      // For now, we'll mark as APPROVED_BY_SYSTEM or similar if not provided.
       updateData.approvedBy = 'SUPER_ADMIN'; 
     }
 
@@ -585,21 +583,7 @@ export class ProcurementService {
         }
       });
 
-      // FINANCIAL TRIGGER: GRN Approval -> Vendor Ledger PURCHASE (DEBIT)
-      const nextBalance = await this.getNextBalance(tx, po.vendorId, po.totalAmount, 'DEBIT');
-      await tx.vendorLedger.create({
-        data: {
-          vendorId: po.vendorId,
-          type: 'DEBIT',
-          amount: po.totalAmount,
-          balanceAfterTransaction: nextBalance,
-          paymentMode: 'CASH',
-          sourceModule: 'INVENTORY',
-          referenceType: 'PURCHASE',
-          referenceId: po.id,
-          note: `Goods Received Note (GRN) for PO #${po.poNumber} — Recognized Liability`
-        }
-      });
+      // FINANCIAL TRIGGER REMOVED: In enterprise flow, liability is recognized on INVOICE APPROVAL.
 
       return tx.procurementOrder.update({
         where: { id: poId },
@@ -608,11 +592,6 @@ export class ProcurementService {
       });
     });
 
-    try {
-        await FinanceService.recordExpenseFromPurchase(poId);
-    } catch (err) {
-        console.error('[Accounting] Failed to record purchase expense', err);
-    }
     return result;
   }
 
@@ -683,23 +662,13 @@ export class ProcurementService {
     return type === 'CREDIT' ? currentBalance + amount : currentBalance - amount;
   }
 
-  static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string }) {
-    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId } = data;
+  static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string; vendorInvoiceId?: string }) {
+    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId } = data;
     if (!accountId) throw new Error('Source Account (Cash/Bank) is mandatory for payments.');
 
     return prisma.$transaction(async (tx) => {
-      let resolvedNote = note;
-      if (!resolvedNote && referenceId) {
-        const po = await tx.procurementOrder.findUnique({ where: { id: referenceId } });
-        resolvedNote = po?.poNumber ? `Payment for PO #${po.poNumber}` : `Payment for PO #${referenceId.substring(0, 8)}`;
-      }
-      
-      if (!resolvedNote && type === 'ADVANCE') {
-        resolvedNote = 'Opening Advance Payment';
-      }
-
-      // 1. Centralized Payment & Account Adjustment
-      await FinanceService.createPayment({
+      // Centralized Payment & Account Adjustment (FinanceService will handle Ledger)
+      const payment = await FinanceService.createPayment({
         tx,
         amount,
         flow: 'OUT',
@@ -707,31 +676,16 @@ export class ProcurementService {
         sourceAccount: accountId,
         method: paymentMode || 'CASH',
         sourceModule: 'PROCUREMENT',
-        linkedDocType: referenceId ? 'PO' : (type === 'ADVANCE' ? 'ADVANCE' : 'DIRECT'),
-        linkedDocId: referenceId,
+        linkedDocType: vendorInvoiceId ? 'VENDOR_INVOICE' : (referenceId ? 'PO' : (type === 'ADVANCE' ? 'ADVANCE' : 'DIRECT')),
+        linkedDocId: vendorInvoiceId || referenceId,
+        vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',
         entityId: vendorId,
-        createdBy: 'PROCUREMENT_MODULE'
+        createdBy: 'PROCUREMENT_MODULE',
+        note: note
       });
 
-      // 2. Vendor Ledger Entry
-      const nextBalance = await this.getNextBalance(tx, vendorId, amount, 'CREDIT');
-      const ledgerEntry = await tx.vendorLedger.create({
-        data: {
-          vendorId,
-          type: 'CREDIT',
-          amount,
-          balanceAfterTransaction: nextBalance,
-          paymentMode: paymentMode || 'CASH',
-          sourceModule: 'FINANCE',
-          referenceType: type as any,
-          referenceId,
-          accountId,
-          note: resolvedNote || 'Direct Payment'
-        }
-      });
-
-      // 3. Update PO Payment status if linked
+      // Update PO Payment status if linked
       if (referenceId) {
         const po = await tx.procurementOrder.findUnique({ where: { id: referenceId } });
         if (po) {
@@ -745,26 +699,9 @@ export class ProcurementService {
             }
           });
         }
-      } else {
-        // Settle multiple orders if direct payment
-        // (This needs to be updated to use tx client)
-        // For now, let's keep it simple or implement recursive tx settlement
       }
 
-      // 4. Create Audit Payment Entity
-      await tx.payment.create({
-        data: {
-          type: referenceId ? 'INVOICE_LINKED' : 'DIRECT',
-          entityType: 'VENDOR',
-          entityId: vendorId,
-          paidAmount: amount,
-          accountId: accountId,
-          transactionRef: referenceId,
-          status: 'SUCCESS'
-        }
-      });
-
-      return ledgerEntry;
+      return payment;
     });
   }
 

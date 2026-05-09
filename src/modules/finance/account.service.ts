@@ -63,7 +63,16 @@ export class AccountService {
   }
 
   static async createAccount(data: { name: string, type: 'CASH' | 'BANK' | 'UPI', balance?: number }) {
-    // Generate a simple account code
+    // 1. Prevent duplicate accounts
+    const existing = await prisma.account.findFirst({
+      where: { name: { equals: data.name, mode: 'insensitive' } }
+    });
+
+    if (existing) {
+      throw new Error(`An account named "${data.name}" already exists.`);
+    }
+
+    // 2. Generate ERP account code
     const count = await prisma.account.count();
     const accountCode = `ACC-${(count + 1).toString().padStart(3, '0')}`;
 

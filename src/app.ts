@@ -259,10 +259,15 @@ app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['FRANCHISE_ADMIN
 app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.approve);
 app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.cancel);
 
+// QC Inspection (Enterprise Workflow)
+app.get('/api/qc/pending', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'MANAGER']), GRNController.getPendingInspections);
+app.post('/api/qc/inspect', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'MANAGER']), GRNController.recordInspection);
+
 // Vendor Invoices (3-way matching)
 app.get('/api/vendor-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.getAll);
 app.post('/api/vendor-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.create);
 app.post('/api/vendor-invoices/:id/match', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.match);
+app.post('/api/vendor-invoices/:id/approve', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'SUPER_ADMIN']), VendorInvoiceController.approve);
 app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.updateStatus);
 
 // Franchise Management & Logistics

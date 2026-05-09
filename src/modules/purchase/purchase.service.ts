@@ -238,9 +238,10 @@ export class PurchaseService {
             type: 'CREDIT',
             amount: existing.refundAmount || 0,
             balanceAfterTransaction: nextBalance,
-            sourceModule: 'PURCHASE',
+            sourceModule: 'PROCUREMENT',
             referenceType: 'RETURN',
             referenceId: id,
+            paymentMode: 'CASH',
             note: `Purchase Return ${existing.returnNumber} — Liability Reduction`
           }
         });
@@ -265,7 +266,7 @@ export class PurchaseService {
         vendorId: data.vendorId,
         totalAmount,
         items: data.items,
-        status: 'PENDING'
+        status: 'PENDING_APPROVAL'
       },
       include: { vendor: true }
     });

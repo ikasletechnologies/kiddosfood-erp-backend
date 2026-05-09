@@ -468,12 +468,17 @@ export class FinanceService {
     const accountType = accountTypeMap[sourceKey] ?? 'CASH';
 
     const operation = async (tx: any) => {
-      // 1. Resolve account
-      const account = await tx.account.findFirst({ where: { type: accountType as any } });
+      // 1. Resolve account (Prefer ID, fallback to Type mapping)
+      let account;
+      if (sourceKey && sourceKey.length > 20) { // Likely a GUID
+         account = await tx.account.findUnique({ where: { id: sourceKey } });
+      } else {
+         account = await tx.account.findFirst({ where: { type: accountType as any } });
+      }
 
       // 2. Balance check for OUTFLOW + PAID
       if (flow === 'OUT' && status === 'PAID') {
-        if (!account) throw new Error(`No ${accountType} account found.`);
+        if (!account) throw new Error(`Source account not found. Please create a ${accountType} account first.`);
         if (account.balance < amount) {
           throw new Error(`Insufficient balance in ${account.name}. Available: ₹${account.balance}`);
         }
@@ -491,6 +496,7 @@ export class FinanceService {
           sourceModule:   sourceModule as any,
           linkedDocType:  linkedDocType as any,
           linkedDocId:    linkedDocId,
+          vendorInvoiceId: data.vendorInvoiceId,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       data.entity,
           paymentMode:    data.method as any,
@@ -500,6 +506,52 @@ export class FinanceService {
           createdBy:      data.createdBy,
         },
       });
+
+      // 5. If this is a Vendor Payment, record in VendorLedger (CREDIT)
+      if (data.entityType === 'VENDOR' || flow === 'OUT') {
+        const vendorId = data.entity;
+        if (vendorId) {
+          const lastEntry = await tx.vendorLedger.findFirst({
+            where: { vendorId },
+            orderBy: { createdAt: 'desc' }
+          });
+          const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+          
+          await tx.vendorLedger.create({
+            data: {
+              vendorId,
+              type: 'CREDIT',
+              amount: amount,
+              balanceAfterTransaction: currentBalance + amount,
+              sourceModule: sourceModule as any,
+              referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
+              referenceId: payment.id,
+              invoiceId: data.vendorInvoiceId,
+              paymentMode: data.method as any,
+              note: data.note || `Payment #${paymentNumber} recorded`
+            }
+          });
+
+          // Update Invoice Status if linked
+          if (data.vendorInvoiceId) {
+             const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
+             if (inv) {
+                // Check if fully paid (this is a simple check, better to sum all payments)
+                const totalPaid = await tx.payment.aggregate({
+                   where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
+                   _sum: { paidAmount: true }
+                });
+                const total = totalPaid._sum.paidAmount || 0;
+                if (total >= inv.amount - 0.01) {
+                   await tx.vendorInvoice.update({
+                      where: { id: data.vendorInvoiceId },
+                      data: { status: 'PAID' }
+                   });
+                }
+             }
+          }
+        }
+      }
 
       // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
