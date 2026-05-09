@@ -7,7 +7,6 @@ export class PurchaseController {
   static async getRFQs(req: Request, res: Response) {
     try {
       const rfqs = await PurchaseService.getRFQs({
-        vendorId: req.query.vendorId as string,
         status: req.query.status as string,
         search: req.query.search as string
       });
@@ -37,6 +36,15 @@ export class PurchaseController {
     }
   }
 
+  static async addVendorQuotation(req: Request, res: Response) {
+    try {
+      const quote = await PurchaseService.addVendorQuotation(req.params.id, req.body);
+      res.status(201).json(quote);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
   static async updateRFQ(req: Request, res: Response) {
     try {
       const rfq = await PurchaseService.updateRFQ(req.params.id, req.body);
@@ -46,9 +54,9 @@ export class PurchaseController {
     }
   }
 
-  static async convertRFQtoPO(req: Request, res: Response) {
+  static async convertQuotationToPO(req: Request, res: Response) {
     try {
-      const po = await PurchaseService.convertRFQtoPO(req.params.id);
+      const po = await PurchaseService.convertQuotationToPO(req.params.id);
       res.status(201).json(po);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

@@ -72,30 +72,12 @@ export class AnalyticsService {
   }
 
   /**
-   * Wastage Summary: Total loss due to wastage
+   * Wastage Summary: Total loss due to wastage (REMOVED)
    */
-  static async getWastageSummary(filters: { startDate?: Date; endDate?: Date; franchiseId?: string }) {
-    const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
-    };
-
-    const wastage = await prisma.wastage.aggregate({
-      where: {
-        date: dateQuery,
-        inventoryItem: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined
-      },
-      _sum: {
-        cost: true,
-        quantity: true
-      }
-    });
-
+  static async getWastageSummary(_filters: any = {}) {
     return {
-      totalCost: wastage._sum.cost || 0,
-      totalQuantity: wastage._sum.quantity || 0
+      totalCost: 0,
+      totalQuantity: 0
     };
   }
 

@@ -93,22 +93,8 @@ export class RecipeService {
 
     if (!recipe) throw new Error('Recipe not found');
 
-    // Derive unit cost per ingredient from most recent PURCHASE_IN wastage cost records
-    const ingredientIds = recipe.recipeItems.map(i => i.inventoryItemId);
-
-    // Use wastage cost as a proxy for unit cost (cost / quantity = unit cost)
-    const wastageCosts = await prisma.wastage.findMany({
-      where: { inventoryItemId: { in: ingredientIds } },
-      orderBy: { date: 'desc' }
-    });
-
-    // Build a map: inventoryItemId -> latest unit cost from wastage records
+    // Derive unit cost per ingredient (Wastage logic removed as Wastage model was deleted)
     const unitCostMap: Record<string, number> = {};
-    for (const w of wastageCosts) {
-      if (!unitCostMap[w.inventoryItemId] && w.quantity > 0) {
-        unitCostMap[w.inventoryItemId] = w.cost / w.quantity;
-      }
-    }
 
     const breakdown: { name: string; qty: number; unit: string; unitCost: number; lineCost: number }[] = [];
     let totalCost = 0;

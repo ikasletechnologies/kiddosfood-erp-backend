@@ -55,6 +55,7 @@ export class ProcurementController {
       const po = await ProcurementService.createPurchaseOrder(req.body);
       res.status(201).json(po);
     } catch (error: any) {
+      console.error(`[ProcurementController] createPO Error:`, error);
       res.status(500).json({ error: error.message });
     }
   }
@@ -94,6 +95,16 @@ export class ProcurementController {
   static async approvePO(req: Request, res: Response) {
     try {
       const po = await ProcurementService.approvePO(req.params.id);
+      res.json(po);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async updatePOStatus(req: Request, res: Response) {
+    try {
+      const { status } = req.body;
+      const po = await ProcurementService.updatePOStatus(req.params.id, status);
       res.json(po);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
@@ -150,8 +161,8 @@ export class ProcurementController {
 
   static async linkMaterial(req: Request, res: Response) {
     try {
-      const { vendorId, materialId, price } = req.body;
-      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price);
+      const { vendorId, materialId, price, quantity } = req.body;
+      const link = await ProcurementService.linkMaterialToVendor(vendorId, materialId, price, quantity);
       res.json(link);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -194,8 +205,7 @@ export class ProcurementController {
 
   static async recordPayment(req: Request, res: Response) {
     try {
-      const { amount, note, referenceId } = req.body;
-      const data = await ProcurementService.recordPayment(req.params.id, amount, note, referenceId);
+      const data = await ProcurementService.recordPayment(req.params.id, req.body);
       res.json(data);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -207,6 +217,15 @@ export class ProcurementController {
       const { amount, type, note, referenceType } = req.body;
       const data = await ProcurementService.recordAdjustment(req.params.id, amount, type, note, referenceType);
       res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getVendorAging(req: Request, res: Response) {
+    try {
+      const aging = await ProcurementService.getVendorAging(req.params.id);
+      res.json(aging);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

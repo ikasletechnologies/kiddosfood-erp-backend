@@ -7,93 +7,59 @@ export class ProductionService {
     recipeId: string;
     quantity: number;
     franchiseId: string;
-    targetInventoryItemId?: string;
+    customerId?: string;
     productionType: string;
-    expiryDate?: string; // ISO date string for batch expiry
+    expiryDate?: string;
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
-      // 1. Fetch recipe with ingredients
+      // 1. Fetch recipe
       const recipe = await tx.recipe.findUnique({
         where: { id: data.recipeId },
-        include: {
-          recipeItems: { include: { inventoryItem: true } },
-          product: true,
-        },
+        include: { recipeItems: { include: { inventoryItem: true } }, product: true },
       });
       if (!recipe) throw new Error('Recipe not found');
 
-      const scalar = data.quantity / recipe.yieldQty;
+      // Calculate scalar based on batches (frontend sends number of batches/runs)
+      // If recipe yield is 5 and we run it 2 times, scalar is 2.
+      const scalar = data.quantity;
 
-      // 2. Check all ingredients BEFORE deducting
+      // 2. Check ingredients
       for (const item of recipe.recipeItems) {
         const amountNeeded = item.quantityRequired * scalar;
         const inv = await tx.inventoryItem.findFirst({
           where: { id: item.inventoryItemId, franchiseId: data.franchiseId },
         });
         if (!inv || inv.currentStock < amountNeeded) {
-          throw new Error(
-            `Insufficient stock for "${inv?.name ?? 'ingredient'}". ` +
-            `Required: ${amountNeeded.toFixed(2)} ${inv?.unit ?? ''}, ` +
-            `Available: ${inv?.currentStock ?? 0}`
-          );
+          throw new Error(`Insufficient stock for "${inv?.name ?? 'ingredient'}"`);
         }
       }
 
-      // 3. Resolve target inventory item (auto-create if not linked)
-      let targetId = data.targetInventoryItemId;
-      if (!targetId) {
-        const matchingItem = await tx.inventoryItem.findFirst({
-          where: {
-            franchiseId: data.franchiseId,
-            OR: [
-              { sku: recipe.product.sku ?? undefined },
-              { name: recipe.product.name },
-            ],
-          },
-        });
-
-        if (matchingItem) {
-          targetId = matchingItem.id;
-        } else {
-          const newItem = await tx.inventoryItem.create({
-            data: {
-              name: recipe.product.name,
-              sku: recipe.product.sku || `PRD-${recipe.product.id.substring(0, 5)}`,
-              category: data.productionType as any,
-              currentStock: 0,
-              unit: 'unit',
-              minimumStock: 5,
-              franchiseId: data.franchiseId,
-            },
-          });
-          targetId = newItem.id;
-        }
-      }
-
-      // 4. Create production record
+      // 3. Create production record (IN_PROGRESS)
       const production = await tx.production.create({
         data: {
           recipeId: data.recipeId,
           quantity: data.quantity,
           franchiseId: data.franchiseId,
+          customerId: data.customerId,
           productionType: data.productionType,
-          status: 'COMPLETED',
+          status: 'IN_PROGRESS',
+          startTime: new Date(),
           producedBy: data.userId,
+          expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
         },
       });
 
-      // 5. Deduct raw materials (StockMovement OUT)
+      // 4. Deduct raw materials
       for (const item of recipe.recipeItems) {
         const amountNeeded = item.quantityRequired * scalar;
-
         await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PRODUCTION_OUT',
           quantity: -amountNeeded,
           referenceType: 'PRODUCTION',
           referenceId: production.id,
-          note: `Consumed in production: ${data.quantity} × ${recipe.name}`,
+          note: `Production started: ${recipe.name}`,
           userId: data.userId,
         });
 
@@ -106,47 +72,96 @@ export class ProductionService {
         });
       }
 
-      // 6. Add finished goods (StockMovement IN)
-      await InventoryService.recordMovement(tx, {
-        itemId: targetId!,
-        type: 'PRODUCTION_IN',
-        quantity: data.quantity,
-        referenceType: 'PRODUCTION',
-        referenceId: production.id,
-        note: `Produced via recipe: ${recipe.name}`,
-        userId: data.userId,
+      return production;
+    });
+  }
+
+  static async stopProduction(id: string) {
+    return prisma.production.update({
+      where: { id },
+      data: {
+        status: 'STOPPED',
+        endTime: new Date(),
+      },
+    });
+  }
+
+  static async approveProduction(id: string, userId?: string) {
+    return prisma.$transaction(async tx => {
+      const production = await tx.production.findUnique({
+        where: { id },
+        include: { recipe: { include: { product: true, recipeItems: true } } },
       });
 
-      // 7. Create ProductBatch — every production creates a trackable batch
-      const expiryDate = data.expiryDate ? new Date(data.expiryDate) : null;
+      if (!production || production.status !== 'STOPPED') {
+        throw new Error('Production must be stopped before approval');
+      }
+
+      // 1. Resolve target inventory item
+      const recipe = production.recipe;
+      let targetItem = await tx.inventoryItem.findFirst({
+        where: {
+          franchiseId: production.franchiseId,
+          OR: [
+            { sku: recipe.product.sku ?? undefined },
+            { name: recipe.product.name },
+          ],
+        },
+      });
+
+      if (!targetItem) {
+        targetItem = await tx.inventoryItem.create({
+          data: {
+            name: recipe.product.name,
+            sku: recipe.product?.sku || `PRD-${(recipe.product?.id || Math.random().toString()).substring(0, 5).toUpperCase()}`,
+            category: 'FINISHED_GOOD', // Explicitly mark as finished good for inventory visibility
+            currentStock: 0,
+            unit: recipe.recipeItems[0]?.unit || 'unit', // Fallback to first ingredient unit or 'unit'
+            minimumStock: 5,
+            franchiseId: production.franchiseId,
+          },
+        });
+      }
+
+      // 2. Add finished goods (Total Yield = Runs * Yield per run)
+      const totalYield = production.quantity * recipe.yieldQty;
+      await InventoryService.recordMovement(tx, {
+        itemId: targetItem.id,
+        type: 'PRODUCTION_IN',
+        quantity: totalYield,
+        referenceType: 'PRODUCTION',
+        referenceId: production.id,
+        note: `Approved production: ${recipe.name} (${production.quantity} batches x ${recipe.yieldQty} yield)`,
+        userId,
+      });
+
+      // 3. Create ProductBatch
       await tx.productBatch.create({
         data: {
           productId: recipe.productId,
           productionId: production.id,
-          quantity: data.quantity,
-          expiryDate,
+          quantity: production.quantity,
+          expiryDate: production.expiryDate,
           batchCode: `BATCH-${production.id.substring(0, 8).toUpperCase()}`,
         },
       });
 
-      return tx.production.findUnique({
-        where: { id: production.id },
-        include: {
-          recipe: { include: { product: true } },
-          items: { include: { inventoryItem: true } },
-          batches: true,
-        },
+      // 4. Finalize status
+      return tx.production.update({
+        where: { id },
+        data: { status: 'COMPLETED' },
       });
     });
   }
 
-  static async getProductionHistory(franchiseId: string) {
+  static async getProductionHistory(franchiseId?: string) {
     return prisma.production.findMany({
-      where: { franchiseId },
+      where: franchiseId ? { franchiseId } : {},
       include: {
         recipe: { include: { product: true } },
         items: { include: { inventoryItem: true } },
         batches: true,
+        customer: true,
       },
       orderBy: { producedAt: 'desc' },
     });
@@ -159,6 +174,7 @@ export class ProductionService {
         recipe: { include: { product: true } },
         items: { include: { inventoryItem: true } },
         batches: true,
+        customer: true,
       },
     });
   }
@@ -178,15 +194,18 @@ export class ProductionService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return batches.map(b => ({
-      ...b,
-      expiryStatus: !b.expiryDate
-        ? 'NO_EXPIRY'
-        : b.expiryDate < now
-        ? 'EXPIRED'
-        : b.expiryDate < soonThreshold
-        ? 'EXPIRING_SOON'
-        : 'VALID',
-    }));
+    return batches.map(b => {
+      const effectiveExpiry = b.expiryDate || b.production?.expiryDate;
+      return {
+        ...b,
+        expiryStatus: !effectiveExpiry
+          ? 'NO_EXPIRY'
+          : effectiveExpiry < now
+          ? 'EXPIRED'
+          : effectiveExpiry < soonThreshold
+          ? 'EXPIRING_SOON'
+          : 'VALID',
+      };
+    });
   }
 }

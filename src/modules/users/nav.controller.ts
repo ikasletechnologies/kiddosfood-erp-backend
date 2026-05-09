@@ -78,13 +78,13 @@ export class NavController {
       });
 
       // 7. Staff (HR)
-      if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
+      if (role === 'SUPER_ADMIN' || role === 'FRANCHISE_ADMIN') {
         menu.push({
           title: 'Staff',
           icon: 'UserCog',
           children: [
             { title: 'Employees', path: '/hr/employees' },
-            { title: 'Attendance', path: '/hr/attendance' }
+
           ]
         });
       }
@@ -99,14 +99,19 @@ export class NavController {
       }
 
       // 9. Settings
-      menu.push({
+      const settings: MenuItem = {
         title: 'Settings',
         icon: 'Settings',
         children: [
-          { title: 'Users & Roles', path: '/settings/users' },
           { title: 'Company Settings', path: '/settings/company' }
         ]
-      });
+      };
+
+      if (role === 'SUPER_ADMIN') {
+        settings.children?.unshift({ title: 'Users & Roles', path: '/settings/users' });
+      }
+
+      menu.push(settings);
 
       res.json(menu);
     } catch (error) {

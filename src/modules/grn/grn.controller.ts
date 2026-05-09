@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { GRNService } from './grn.service';
+import { InspectionService } from './inspection.service';
 
 export class GRNController {
   static async getAll(req: Request, res: Response) {
@@ -43,6 +44,24 @@ export class GRNController {
     try {
       const grn = await GRNService.cancel(req.params.id);
       res.json(grn);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async getPendingInspections(req: Request, res: Response) {
+    try {
+      const data = await InspectionService.getPendingInspections();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async recordInspection(req: Request, res: Response) {
+    try {
+      const data = await InspectionService.recordInspection(req.body);
+      res.json(data);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
     }

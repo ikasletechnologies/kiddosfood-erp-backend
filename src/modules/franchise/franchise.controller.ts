@@ -195,4 +195,15 @@ export class FranchiseController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async verifyDashboardPassword(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const { password } = req.body;
+      const isValid = await FranchiseService.verifyDashboardPassword(id, password);
+      res.json({ isValid });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

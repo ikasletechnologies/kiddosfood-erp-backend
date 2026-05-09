@@ -12,7 +12,8 @@ export class EmployeeController {
       });
       res.json(employees);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -22,7 +23,8 @@ export class EmployeeController {
       if (!employee) return res.status(404).json({ error: 'Employee not found' });
       res.json(employee);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -31,7 +33,8 @@ export class EmployeeController {
       const employee = await EmployeeService.create(req.body);
       res.status(201).json(employee);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -40,7 +43,8 @@ export class EmployeeController {
       const employee = await EmployeeService.update(req.params.id, req.body);
       res.json(employee);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -51,7 +55,8 @@ export class EmployeeController {
       const types = await EmployeeService.getLeaveTypes();
       res.json(types);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -60,7 +65,8 @@ export class EmployeeController {
       const type = await EmployeeService.createLeaveType(req.body);
       res.status(201).json(type);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -69,7 +75,8 @@ export class EmployeeController {
       const type = await EmployeeService.updateLeaveType(req.params.id, req.body);
       res.json(type);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -84,7 +91,8 @@ export class EmployeeController {
       });
       res.json(leaves);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -93,7 +101,8 @@ export class EmployeeController {
       const leave = await EmployeeService.applyLeave(req.body);
       res.status(201).json(leave);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -104,7 +113,8 @@ export class EmployeeController {
       const leave = await EmployeeService.approveLeave(req.params.id, status, approverId);
       res.json(leave);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -115,7 +125,8 @@ export class EmployeeController {
       const shifts = await EmployeeService.getShifts();
       res.json(shifts);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -124,7 +135,8 @@ export class EmployeeController {
       const shift = await EmployeeService.createShift(req.body);
       res.status(201).json(shift);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -133,7 +145,8 @@ export class EmployeeController {
       const assignment = await EmployeeService.assignShift(req.body);
       res.status(201).json(assignment);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
@@ -142,7 +155,8 @@ export class EmployeeController {
       const shifts = await EmployeeService.getEmployeeShifts(req.params.id);
       res.json(shifts);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message });
     }
   }
 }

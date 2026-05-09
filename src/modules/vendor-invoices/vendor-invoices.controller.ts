@@ -38,4 +38,13 @@ export class VendorInvoiceController {
       res.status(400).json({ error: (error as Error).message });
     }
   }
+
+  static async approve(req: Request, res: Response) {
+    try {
+      const invoice = await VendorInvoiceService.approve(req.params.id, req.body.approvedBy);
+      res.json(invoice);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
 }

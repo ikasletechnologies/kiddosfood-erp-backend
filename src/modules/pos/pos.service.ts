@@ -3,6 +3,7 @@ import { InventoryService } from '../inventory/inventory.service';
 import SocketService from '../../lib/socket';
 import { FinanceService } from '../finance/finance.service';
 import { AuditService } from '../audit/audit.service';
+import { AccountService } from '../finance/account.service';
 
 export class POSService {
 
@@ -108,9 +109,20 @@ export class POSService {
     // Phase 5: Trigger Accounting (Invoice & Payment) after update succeeds
     if (status === 'COMPLETED') {
         try {
+            await prisma.customerLedger.create({
+              data: {
+                customerId: order.customerId!,
+                type: 'DEBIT',
+                amount: order.totalAmount,
+                paymentMode: 'CASH', // Placeholder until payment
+                referenceType: 'SALE',
+                referenceId: order.id,
+                note: `POS Sale — Invoice #${order.invoiceNum}`
+              }
+            });
             await FinanceService.createInvoiceFromOrder(orderId);
         } catch (accErr) {
-            console.error('[Accounting] Failed to create invoice', accErr);
+            console.error('[Accounting] Failed to create invoice/ledger', accErr);
         }
     }
 
@@ -174,27 +186,53 @@ export class POSService {
   }
 
   // Step 5: Finalize Payment
-  static async payOrder(orderId: string, method: 'CASH'|'UPI'|'CARD') {
-    return prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({ where: { id: orderId } });
-      if (!order) throw new Error('Order not found');
+  static async payOrder(orderId: string, method: 'CASH'|'UPI'|'CARD', accountId: string, createdBy?: string) {
+    if (!accountId) throw new Error('Source Account ID is required for POS payments.');
 
-      await tx.payment.create({
+    const order = await prisma.order.findUnique({ 
+      where: { id: orderId },
+      include: { invoice: true }
+    });
+    if (!order) throw new Error('Order not found');
+
+    // 1. Create Centralized Payment via FinanceService
+    await FinanceService.createPayment({
+      amount: order.totalAmount,
+      flow: 'IN',
+      status: 'PAID',
+      sourceAccount: accountId, // This might need mapping if accountId is a UUID
+      method: method,
+      sourceModule: 'POS',
+      linkedDocType: 'INVOICE',
+      linkedDocId: order.invoice?.id || order.invoiceNum,
+      entityType: 'CUSTOMER',
+      entityId: order.customerId || 'WALK_IN',
+      orderId: order.id,
+      createdBy: createdBy || 'POS_SYSTEM'
+    });
+
+    // 2. Customer Ledger CREDIT (They paid us)
+    if (order.customerId) {
+      await prisma.customerLedger.create({
         data: {
-          orderId,
+          customerId: order.customerId,
+          type: 'CREDIT',
+          amount: order.totalAmount,
           paymentMode: method,
-          paidAmount: order.totalAmount,
-          status: 'SUCCESS'
+          referenceType: 'PAYMENT',
+          referenceId: order.id,
+          accountId,
+          note: `Payment for Order #${order.invoiceNum}`
         }
       });
+    }
 
-      const updated = await tx.order.update({
-        where: { id: orderId },
-        data: { paymentStatus: 'PAID' },
-        include: { payments: true }
-      });
-      return updated;
+    const updated = await prisma.order.update({
+      where: { id: orderId },
+      data: { paymentStatus: 'PAID' },
+      include: { payments: true }
     });
+    return updated;
   }
 
 
@@ -233,16 +271,30 @@ export class POSService {
               totalAmount: Number((item.price * item.quantity).toFixed(2))
             }))
           },
-          payments: {
-            create: {
-              paymentMode: data.paymentMode,
-              paidAmount: data.totalAmount,
-              status: 'SUCCESS'
-            }
-          }
         },
-        include: { orderItems: true, payments: true, customer: true }
+        include: { orderItems: true, customer: true }
       });
+      // --- Moved post-creation logic into the transaction block ---
+
+    // Handle Payment through central logic
+    // Resolve a default account for legacy checkout (e.g. first CASH account)
+    const defaultAccount = await tx.account.findFirst({ where: { type: 'CASH' } });
+    
+    await FinanceService.createPayment({
+      tx,
+      amount: data.totalAmount,
+      flow: 'IN',
+      status: 'PAID',
+      sourceAccount: defaultAccount?.id || 'CASH', // Fallback to key
+      method: data.paymentMode,
+      sourceModule: 'POS',
+      linkedDocType: 'INVOICE',
+      linkedDocId: order.invoiceNum,
+      entityType: 'CUSTOMER',
+      entityId: data.customerId || 'WALK_IN',
+      orderId: order.id,
+      createdBy: 'LEGACY_CHECKOUT'
+    });
 
       for (const orderItem of data.items) {
         const product = await tx.product.findUnique({
@@ -316,6 +368,6 @@ export class POSService {
   }
 
   static async addPayment(orderId: string, data: any) {
-    return this.payOrder(orderId, data.paymentMode);
+    return this.payOrder(orderId, data.paymentMode, data.accountId);
   }
 }

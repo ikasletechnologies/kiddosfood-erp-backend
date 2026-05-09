@@ -5,7 +5,7 @@ export class VendorInvoiceService {
     return prisma.vendorInvoice.findMany({
       where: {
         ...(params.vendorId ? { vendorId: params.vendorId } : {}),
-        ...(params.status ? { status: params.status as "PENDING" | "MATCHED" | "MISMATCH" } : {})
+        ...(params.status ? { status: params.status as any } : {})
       },
       include: {
         vendor: true,
@@ -44,29 +44,31 @@ export class VendorInvoiceService {
   }
 
   /**
-   * Run 3-way matching: PO value vs GRN total vs Invoice amount.
-   * Marks as MATCHED if all three align within a 1% tolerance; otherwise MISMATCH.
+   * Run strict 3-way matching: 
+   * 1. PO Price vs Invoice Price
+   * 2. GRN Accepted Qty vs Invoice Billed Qty
    */
   static async match(invoiceId: string) {
     const invoice = await prisma.vendorInvoice.findUnique({
       where: { id: invoiceId },
       include: {
         procurementOrder: { include: { poItems: true } },
-        grn: { include: { items: true } }
+        grn: { include: { items: { include: { inspection: true } } } }
       }
     });
     if (!invoice) throw new Error('Invoice not found');
 
     const poValue = invoice.procurementOrder?.totalAmount ?? 0;
-    // const grnValue = invoice.grn
-    //   ? invoice.grn.items.reduce((s, i) => s + i.acceptedQty * i.price, 0)
-    //   : null;
+    
+    // Sum up the value of goods that actually passed QC
+    const acceptedGrnValue = invoice.grn?.items.reduce((s, i) => s + (i.acceptedQty * i.price), 0) ?? 0;
     const invoiceAmount = invoice.amount;
 
-    // Match logic: invoice must be within 1% of PO value
-    const tolerance = poValue * 0.01;
-    const isMatched = Math.abs(invoiceAmount - poValue) <= tolerance;
-    // const variance = invoiceAmount - poValue;
+    // Strict Match Rules
+    const priceMismatch = Math.abs(invoiceAmount - poValue) > (poValue * 0.01);
+    const qtyMismatch = Math.abs(invoiceAmount - acceptedGrnValue) > (acceptedGrnValue * 0.01);
+
+    const isMatched = !priceMismatch && !qtyMismatch;
 
     return prisma.vendorInvoice.update({
       where: { id: invoiceId },
@@ -75,7 +77,95 @@ export class VendorInvoiceService {
     });
   }
 
-  static async updateStatus(invoiceId: string, status: 'PENDING' | 'MATCHED' | 'MISMATCH') {
+  /**
+   * Approve Invoice: The point where Liability is officially recognized in the Ledger.
+   */
+  static async approve(invoiceId: string, approvedBy?: string) {
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.vendorInvoice.findUnique({
+        where: { id: invoiceId },
+        include: { vendor: true, procurementOrder: true }
+      });
+
+      if (!invoice) throw new Error('Invoice not found');
+      if (invoice.status === 'APPROVED' || invoice.status === 'PAID') throw new Error('Invoice already approved');
+
+      // 1. Recognize Liability (DEBIT in Vendor Ledger)
+      const lastEntry = await tx.vendorLedger.findFirst({
+        where: { vendorId: invoice.vendorId },
+        orderBy: { createdAt: 'desc' }
+      });
+      const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+      const nextBalance = currentBalance - invoice.amount;
+
+      const ledgerEntry = await tx.vendorLedger.create({
+        data: {
+          vendorId: invoice.vendorId,
+          type: 'DEBIT',
+          amount: invoice.amount,
+          balanceAfterTransaction: nextBalance,
+          sourceModule: 'FINANCE',
+          referenceType: 'PURCHASE',
+          referenceId: invoice.id,
+          invoiceId: invoice.id,
+          paymentMode: 'CASH',
+          note: `Approved Invoice #${invoice.invoiceNumber} — Liability Recognized`
+        }
+      });
+
+      // 2. Advance Utilization Logic
+      // Check if vendor has unutilized advances (CREDIT entries with referenceType ADVANCE)
+      const unutilizedAdvances = await tx.vendorLedger.findMany({
+        where: {
+          vendorId: invoice.vendorId,
+          referenceType: 'ADVANCE',
+          type: 'CREDIT',
+          amount: { gt: 0 }
+          // In a real system, we'd track "remainingAmount" on each ledger entry or use an Allocation model.
+          // For now, we'll check the vendor's overall positive balance.
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      // Simplified Advance Utilization: If balance is positive, we can auto-apply
+      if (currentBalance > 0) {
+        const availableAdvance = Math.min(currentBalance, invoice.amount);
+        if (availableAdvance > 0) {
+          await tx.vendorLedger.create({
+            data: {
+              vendorId: invoice.vendorId,
+              type: 'CREDIT', // Applying advance reduces liability
+              amount: availableAdvance,
+              balanceAfterTransaction: nextBalance + availableAdvance,
+              sourceModule: 'FINANCE',
+              referenceType: 'ADJUSTMENT',
+              referenceId: invoice.id,
+              invoiceId: invoice.id,
+              paymentMode: 'CASH',
+              note: `Auto-applied Advance against Invoice #${invoice.invoiceNumber}`
+            }
+          });
+          
+          // If fully paid by advance
+          if (availableAdvance >= invoice.amount) {
+            await tx.vendorInvoice.update({
+              where: { id: invoiceId },
+              data: { status: 'PAID' }
+            });
+          }
+        }
+      }
+
+      // 3. Finalize Invoice Status
+      return tx.vendorInvoice.update({
+        where: { id: invoiceId },
+        data: { status: (invoice.status as string) === 'PAID' ? 'PAID' : 'APPROVED' },
+        include: { vendor: true, procurementOrder: true }
+      });
+    });
+  }
+
+  static async updateStatus(invoiceId: string, status: 'PENDING' | 'MATCHED' | 'MISMATCH' | 'APPROVED' | 'PAID') {
     return prisma.vendorInvoice.update({
       where: { id: invoiceId },
       data: { status },

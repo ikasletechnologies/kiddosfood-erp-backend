@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, PaymentType, ProductType } from '@prisma/client';
+import { FinanceService } from '../finance/finance.service';
 
 function generateOrderNumber(): string {
   const ts = Date.now().toString(36).toUpperCase();
@@ -169,10 +170,33 @@ export class FranchiseOrderService {
   }
 
   // ─── Payment ───────────────────────────────────────────────────────────────
-  static async recordPayment(id: string, _amount: number) {
-    return prisma.franchiseOrder.update({
-      where: { id },
-      data: { paymentStatus: 'PAID' },
+  static async recordPayment(id: string, amount: number, accountId: string, paidBy?: string) {
+    if (!accountId) throw new Error('Source Account ID is required for franchise payments.');
+
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.franchiseOrder.findUnique({ where: { id } });
+      if (!order) throw new Error('Order not found');
+
+      // 1. Central Payment & Account Adjustment (Money IN from Franchise)
+      await FinanceService.createPayment({
+        tx,
+        amount: amount || order.totalAmount,
+        flow: 'IN',
+        status: 'PAID',
+        sourceAccount: accountId,
+        method: order.paymentType as any,
+        sourceModule: 'FRANCHISE',
+        linkedDocType: 'INVOICE',
+        linkedDocId: order.orderNumber,
+        entityType: 'FRANCHISE',
+        entityId: order.franchiseId,
+        createdBy: paidBy || 'FRANCHISE_SYSTEM'
+      });
+
+      return tx.franchiseOrder.update({
+        where: { id },
+        data: { paymentStatus: 'PAID' },
+      });
     });
   }
 }

@@ -46,17 +46,8 @@ async function verify() {
     await POSService.addPayment(order2.id, { paymentMode: 'UPI', paidAmount: 210 });
     await POSService.updateOrderStatus(order2.id, 'COMPLETED');
 
-    // 3. CREATE WASTAGE
-    console.log('🗑️ Creating Wastage...');
-    await prisma.wastage.create({
-        data: {
-            inventoryItemId: invItem.id,
-            quantity: 5,
-            reason: 'SPOILAGE',
-            cost: 250,
-            date: new Date()
-        }
-    });
+    // 3. CREATE WASTAGE (REMOVED)
+    console.log('🗑️ Skipping Wastage (Model deleted)...');
 
     // 4. FETCH ANALYTICS
     console.log('📊 Fetching Analytics...');
@@ -79,7 +70,6 @@ async function verify() {
 
     if (!burgerStat || burgerStat.quantity < 2) throw new Error('Burger quantity mismatch');
     if (!cashStat || cashStat.total < 210) throw new Error('Cash total mismatch');
-    if (wastage.totalCost < 250) throw new Error('Wastage cost mismatch');
 
     console.log('🌟 PHASE 7 VERIFIED SUCCESSFULLY! 🌟');
 

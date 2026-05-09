@@ -10,7 +10,7 @@ export class GRNService {
       },
       include: {
         procurementOrder: { include: { vendor: true } },
-        items: { include: { inventoryItem: true } }
+        items: { include: { inventoryItem: true, warehouse: true, warehouseBin: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -21,20 +21,17 @@ export class GRNService {
       where: { id },
       include: {
         procurementOrder: { include: { vendor: true, poItems: { include: { inventoryItem: true } } } },
-        items: { include: { inventoryItem: true } }
+        items: { include: { inventoryItem: true, warehouse: true, warehouseBin: true } }
       }
     });
   }
 
-  /**
-   * Create a GRN from an existing PO.
-   * Items contain accepted/rejected quantities per PO line item.
-   * Stock is NOT updated here — only on approve.
-   */
   static async createFromPO(
     poId: string,
     data: {
       receivedBy?: string;
+      freightCost?: number;
+      unloadingCost?: number;
       items: Array<{
         materialId: string;
         orderedQty: number;
@@ -42,6 +39,13 @@ export class GRNService {
         acceptedQty: number;
         rejectedQty: number;
         price: number;
+        qcStatus?: string;
+        vendorBatchNo?: string;
+        mfgDate?: string;
+        expDate?: string;
+        lotNumber?: string;
+        warehouseId?: string;
+        binId?: string;
       }>;
     }
   ) {
@@ -51,28 +55,37 @@ export class GRNService {
     });
     if (!po) throw new Error('Purchase Order not found');
     if (po.status === 'CANCELLED') throw new Error('Cannot create GRN for a cancelled PO');
-    if (po.status === 'RECEIVED') throw new Error('Goods already received for this PO');
+    if (po.status === 'CLOSED') throw new Error('PO is already closed');
 
     return prisma.goodsReceipt.create({
       data: {
         poId,
         receivedBy: data.receivedBy,
+        freightCost: data.freightCost || 0,
+        unloadingCost: data.unloadingCost || 0,
         status: 'PENDING',
         items: {
           create: data.items.map((item) => {
             const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
             const qty = Number(item.orderedQty ?? poItem?.quantity ?? 0);
             const price = Number(item.price ?? poItem?.price ?? 0);
-            
-            console.log(`[GRN Debug] Mapping item ${item.materialId}: qty=${qty}, price=${price}`);
+            const received = Number(item.receivedQty ?? 0);
+            const accepted = Number(item.acceptedQty ?? received); 
             
             return {
               materialId: item.materialId,
               quantity: qty,
-              receivedQty: Number(item.receivedQty ?? 0),
-              acceptedQty: Number(item.acceptedQty ?? 0),
+              receivedQty: received,
+              acceptedQty: accepted,
               rejectedQty: Number(item.rejectedQty ?? 0),
-              price: price
+              price: price,
+              qcStatus: (item.qcStatus as any) || 'PENDING',
+              vendorBatchNo: item.vendorBatchNo,
+              mfgDate: item.mfgDate ? new Date(item.mfgDate) : null,
+              expDate: item.expDate ? new Date(item.expDate) : null,
+              lotNumber: item.lotNumber,
+              warehouseId: item.warehouseId,
+              binId: item.binId
             };
           })
         }
@@ -84,47 +97,65 @@ export class GRNService {
     });
   }
 
-  /**
-   * Approve GRN: updates inventory stock by acceptedQty and marks PO as RECEIVED.
-   * This is the ONLY place where stock is updated from procurement.
-   */
   static async approve(grnId: string) {
     return prisma.$transaction(async (tx) => {
       const grn = await tx.goodsReceipt.findUnique({
         where: { id: grnId },
-        include: { items: true, procurementOrder: true }
+        include: { items: true, procurementOrder: { include: { poItems: true } } }
       });
       if (!grn) throw new Error('GRN not found');
       if (grn.status === 'COMPLETED') throw new Error('GRN already approved');
       if (grn.status === 'CANCELLED') throw new Error('Cannot approve a cancelled GRN');
 
-      // Update stock for each accepted item
-      for (const item of grn.items) {
-        if (item.acceptedQty <= 0) continue;
+      let allReceived = true;
+      let someReceived = false;
 
-        await InventoryService.recordMovement(tx, {
-          itemId: item.materialId,
-          type: 'PURCHASE_IN',
-          quantity: item.acceptedQty,
-          referenceType: 'GRN',
-          referenceId: grnId,
-          note: `GRN approved for PO-${grn.procurementOrder.poNumber || grn.procurementOrder.id.substring(0, 8)} — accepted ${item.acceptedQty} units`
+      for (const item of grn.items) {
+        if (item.receivedQty <= 0) continue;
+
+        // Add InventoryBatch in QC_HOLD state for traceability
+        // Usable stock is NOT increased yet.
+        await tx.inventoryBatch.create({
+          data: {
+            inventoryItemId: item.materialId!,
+            batchNumber: item.vendorBatchNo || `B-${Date.now()}`,
+            lotNumber: item.lotNumber,
+            mfgDate: item.mfgDate,
+            expDate: item.expDate,
+            initialQty: item.receivedQty,
+            currentQty: 0, // Not usable yet
+            status: 'QC_HOLD'
+          }
         });
 
-        // Link material to vendor permanently
         await tx.inventoryItem.update({
-          where: { id: item.materialId },
+          where: { id: item.materialId! },
           data: { vendorId: grn.procurementOrder.vendorId }
         });
       }
 
-      // 1. Mark PO as RECEIVED FIRST
+      // Check PO fulfillment status
+      const allGRNsForPO = await tx.goodsReceiptItem.findMany({
+         where: { grn: { poId: grn.poId, status: 'COMPLETED' } }
+      });
+      
+      const receivedMap = new Map();
+      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
+      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
+
+      for (const poItem of grn.procurementOrder.poItems) {
+         const totalRcvd = receivedMap.get(poItem.inventoryItemId) || 0;
+         if (totalRcvd > 0) someReceived = true;
+         if (totalRcvd < poItem.quantity) allReceived = false;
+      }
+
+      const newPOStatus = allReceived ? 'RECEIVED' : (someReceived ? 'PARTIALLY_RECEIVED' : grn.procurementOrder.status);
+
       await tx.procurementOrder.update({
         where: { id: grn.poId },
-        data: { status: 'RECEIVED', received: true }
+        data: { status: newPOStatus, received: allReceived }
       });
 
-      // 2. Mark GRN as completed SECOND
       const updatedGRN = await tx.goodsReceipt.update({
         where: { id: grnId },
         data: { status: 'COMPLETED' },
@@ -134,6 +165,17 @@ export class GRNService {
         }
       });
 
+      // Add Audit log
+      await tx.auditLog.create({
+         data: {
+            module: 'GRN',
+            action: 'APPROVE',
+            recordId: grnId,
+            newValue: { status: 'COMPLETED', inventoryState: 'QC_HOLD' },
+            performedBy: 'SYSTEM'
+         }
+      });
+
       return updatedGRN;
     });
   }
@@ -141,7 +183,7 @@ export class GRNService {
   static async cancel(grnId: string) {
     const grn = await prisma.goodsReceipt.findUnique({ where: { id: grnId } });
     if (!grn) throw new Error('GRN not found');
-    if (grn.status === 'COMPLETED') throw new Error('Cannot cancel an approved GRN — stock has already been updated');
+    if (grn.status === 'COMPLETED') throw new Error('Cannot cancel an approved GRN');
 
     return prisma.goodsReceipt.update({
       where: { id: grnId },
@@ -151,5 +193,12 @@ export class GRNService {
         items: { include: { inventoryItem: true } }
       }
     });
+  }
+
+  static async updateQCStatus(grnItemId: string, qcStatus: 'PENDING' | 'APPROVED' | 'HOLD' | 'REJECTED') {
+     return prisma.goodsReceiptItem.update({
+        where: { id: grnItemId },
+        data: { qcStatus }
+     });
   }
 }

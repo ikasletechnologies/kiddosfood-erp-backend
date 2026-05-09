@@ -17,6 +17,6 @@ export const registerSchema = z.object({
     email: z.string().email(),
     phone: z.string().optional(),
     password: z.string().min(8),
-    roleName: z.enum(['admin', 'manager', 'franchisee', 'staff', 'delivery']).default('staff'),
+    roleName: z.enum(['SUPER_ADMIN', 'FRANCHISE_ADMIN']).default('FRANCHISE_ADMIN'),
   }),
 });
