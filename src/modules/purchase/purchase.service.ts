@@ -118,8 +118,8 @@ export class PurchaseService {
 
     const po = await prisma.procurementOrder.create({
       data: {
-        vendorId: rfq.vendorId,
-        totalAmount,
+        vendorId: quote.vendorId,
+        totalAmount: quote.totalAmount,
         items: poItems
       }
     });

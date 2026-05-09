@@ -82,12 +82,12 @@ model CustomerLedger {
 }
 
 model Franchise {
-  id                String             @id @default(uuid())
+  id                String  @id @default(uuid())
   name              String
   location          String
   ownerName         String
   contactNum        String
-  status            String             @default("ACTIVE")
+  status            String  @default("ACTIVE")
   dashboardPassword String?
 
   createdAt         DateTime           @default(now())
@@ -106,33 +106,34 @@ model Franchise {
 }
 
 model InventoryItem {
-  id              String                 @id @default(uuid())
-  name            String
-  sku             String
-  category        ItemCategory
-  currentStock    Float
-  unit            String
-  minimumStock    Float                  @default(10)
-  batchNo         String?
-  expiryDate      DateTime?
-  franchiseId     String
-  vendorId        String?
-  createdAt       DateTime               @default(now())
-  updatedAt       DateTime               @updatedAt
-  gstRate         Float                  @default(5)
-  hsnCode         String?
-  isActive        Boolean                @default(true)
-  grnItems        GoodsReceiptItem[]
-  franchise       Franchise              @relation(fields: [franchiseId], references: [id])
-  vendor          Vendor?                @relation(fields: [vendorId], references: [id])
-  poItems         ProcurementOrderItem[]
-  productionItems ProductionItem[]
-  recipeItems     RecipeItem[]
-  movements       StockMovement[]
-  requestItems    StockRequestItem[]
-  transferItems   StockTransferItem[]
-  vendors         VendorMaterial[]
-  wastage         Wastage[]
+  id                   String                 @id @default(uuid())
+  name                 String
+  sku                  String
+  category             ItemCategory
+  currentStock         Float
+  unit                 String
+  minimumStock         Float                  @default(10)
+  batchNo              String?
+  expiryDate           DateTime?
+  franchiseId          String
+  vendorId             String?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  gstRate              Float                  @default(5)
+  hsnCode              String?
+  isActive             Boolean                @default(true)
+  grnItems             GoodsReceiptItem[]
+  franchise            Franchise              @relation(fields: [franchiseId], references: [id])
+  vendor               Vendor?                @relation(fields: [vendorId], references: [id])
+  poItems              ProcurementOrderItem[]
+  productionItems      ProductionItem[]
+  recipeItems          RecipeItem[]
+  movements            StockMovement[]
+  requestItems         StockRequestItem[]
+  transferItems        StockTransferItem[]
+  vendors              VendorMaterial[]
+  purchaseRequestItems PurchaseRequestItem[]
+  inventoryBatches     InventoryBatch[]
 
   @@unique([sku, franchiseId])
 }
@@ -155,28 +156,29 @@ model StockMovement {
 }
 
 model Vendor {
-  id              String             @id @default(uuid())
-  vendorCode      String?            @unique
-  name            String
-  contact         String
-  email           String?
-  address            String?
-  remark             String?
-  manualPurchaseAdj  Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
-  manualAdvanceAdj   Float              @default(0) // @deprecated: Use VendorLedger for all advances
-  status             VendorStatus       @default(ACTIVE)
-  paymentTerms       PaymentTerms       @default(IMMEDIATE)
-  gstNumber          String?
-  category           String?
-  rating             Float?             @default(5.0)
-  items           InventoryItem[]
-  orders          ProcurementOrder[]
-  rfqs            PurchaseRFQ[]
-  purchaseReturns PurchaseReturn[]
+  id                String             @id @default(uuid())
+  vendorCode        String?            @unique
+  name              String
+  contact           String
+  email             String?
+  address           String?
+  remark            String?
+  manualPurchaseAdj Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
+  manualAdvanceAdj  Float              @default(0) // @deprecated: Use VendorLedger for all advances
+  status            VendorStatus       @default(ACTIVE)
+  paymentTerms      PaymentTerms       @default(IMMEDIATE)
+  gstNumber         String?
+  category          String?
+  rating            Float?             @default(5.0)
+  items             InventoryItem[]
+  orders            ProcurementOrder[]
+  rfqs              PurchaseRFQ[]
+  purchaseReturns   PurchaseReturn[]
   suppliedMaterials VendorMaterial[]
-  ledgerEntries   VendorLedger[]
-  invoices        VendorInvoice[]
-  createdAt       DateTime           @default(now())
+  ledgerEntries     VendorLedger[]
+  invoices          VendorInvoice[]
+  createdAt         DateTime           @default(now())
+  vendorQuotations  VendorQuotation[]
 }
 
 enum VendorStatus {
@@ -305,23 +307,26 @@ model GoodsReceipt {
 }
 
 model GoodsReceiptItem {
-  id            String        @id @default(uuid())
-  grnId         String
-  materialId    String?
-  quantity      Float
-  receivedQty   Float
-  acceptedQty   Float
-  rejectedQty   Float
-  price         Float
-  qcStatus      QCStatus      @default(PENDING)
-  vendorBatchNo String?
-  mfgDate       DateTime?
-  expDate       DateTime?
-  lotNumber     String?
-  warehouseId   String?
-  binId         String?
-  grn           GoodsReceipt  @relation(fields: [grnId], references: [id])
-  inventoryItem InventoryItem @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  id             String         @id @default(uuid())
+  grnId          String
+  materialId     String?
+  quantity       Float
+  receivedQty    Float
+  acceptedQty    Float
+  rejectedQty    Float
+  price          Float
+  qcStatus       QCStatus       @default(PENDING)
+  vendorBatchNo  String?
+  mfgDate        DateTime?
+  expDate        DateTime?
+  lotNumber      String?
+  warehouseId    String?
+  binId          String?
+  grn            GoodsReceipt   @relation(fields: [grnId], references: [id])
+  inventoryItem  InventoryItem? @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  warehouse      Warehouse?     @relation(fields: [warehouseId], references: [id])
+  warehouseBin   WarehouseBin?  @relation(fields: [warehouseBinId], references: [id])
+  warehouseBinId String?
 }
 
 model VendorInvoice {

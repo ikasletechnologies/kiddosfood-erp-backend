@@ -413,7 +413,7 @@ app.get('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']),
 app.post('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.createRFQ);
 app.get('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.getRFQ);
 app.patch('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.updateRFQ);
-app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.convertRFQtoPO);
+app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.convertQuotationToPO);
 
 app.get('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.getPurchaseReturns);
 app.post('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.createPurchaseReturn);
