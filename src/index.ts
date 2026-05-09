@@ -13,7 +13,7 @@ SocketService.init(httpServer);
 
 // Restarting server to pick up controller changes
 httpServer.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
+  console.log(`🚀 Server is running on port ${PORT}`);//
   console.log(`🔌 WebSocket server active`);
 });
 
