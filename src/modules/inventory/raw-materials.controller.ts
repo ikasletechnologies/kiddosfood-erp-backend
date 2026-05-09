@@ -37,7 +37,7 @@ export class RawMaterialsController {
         id: 'hq-001',
         name: 'Main Headquarters',
         location: 'Default Location',
-        ownerName: 'Admin',
+        ownerName: 'Super Admin',
         contactNum: '0000000000'
       }
     });

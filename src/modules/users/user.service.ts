@@ -43,14 +43,21 @@ export class UserService {
 
       // 2. Find Role
       let roleId = data.roleId;
-      if (!roleId && data.roleName && typeof data.roleName === 'string') {
+      
+      // If roleId is actually a role name (like "FRANCHISE_ADMIN"), resolve it
+      if (roleId && (roleId === 'FRANCHISE_ADMIN' || roleId === 'SUPER_ADMIN' || roleId === 'ADMIN')) {
+        const role = await prisma.role.findUnique({ where: { name: roleId } });
+        if (role) roleId = role.id;
+      }
+
+      if (!roleId && data.roleName) {
         const role = await prisma.role.findUnique({ where: { name: data.roleName.toUpperCase() } });
         if (!role) throw new AppError(`Role [${data.roleName}] not found`, 404);
         roleId = role.id;
       }
 
       if (!roleId) {
-        throw new AppError('Role is required (either roleId or roleName)', 400);
+        throw new AppError('Role is required (either a valid UUID roleId or a recognized role name)', 400);
       }
 
       // 3. Hash Password (default to admin123 if not provided)

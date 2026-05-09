@@ -17,8 +17,6 @@ export class ProcurementService {
     category?: string;
     paymentTerms?: any;
     status?: any;
-    manualPurchaseAdj?: number; 
-    manualAdvanceAdj?: number 
   }) {
     // 1. Name Validation (Relaxed)
     if (!data.name || !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
@@ -66,9 +64,7 @@ export class ProcurementService {
           gstNumber: data.gstNumber,
           category: data.category,
           paymentTerms: data.paymentTerms || 'IMMEDIATE',
-          status: data.status || 'ACTIVE',
-          manualPurchaseAdj: data.manualPurchaseAdj || 0,
-          manualAdvanceAdj: data.manualAdvanceAdj || 0
+          status: data.status || 'ACTIVE'
         }
       });
     } catch (err: any) {
@@ -171,8 +167,6 @@ export class ProcurementService {
     category?: string;
     paymentTerms?: any;
     status?: any;
-    manualPurchaseAdj?: number; 
-    manualAdvanceAdj?: number 
   }) {
     if (data.name !== undefined && !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
       throw new Error("Vendor Name must be alphanumeric (symbols like & . , - () are allowed).");
@@ -559,6 +553,7 @@ export class ProcurementService {
       if (po.received) throw new Error('Goods already received for this PO');
 
       for (const item of po.poItems) {
+        if (!item.inventoryItemId) continue;
         await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PURCHASE_IN',

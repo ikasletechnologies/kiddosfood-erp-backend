@@ -118,10 +118,9 @@ export class PurchaseService {
 
     const po = await prisma.procurementOrder.create({
       data: {
-        vendorId: quote.vendorId,
-        totalAmount: quote.totalAmount,
-        status: 'PENDING_APPROVAL',
-        items: poItems // Note: items is a JSON field in PO schema for ad-hoc items
+        vendorId: rfq.vendorId,
+        totalAmount,
+        items: poItems
       }
     });
 
@@ -266,7 +265,7 @@ export class PurchaseService {
         vendorId: data.vendorId,
         totalAmount,
         items: data.items,
-        status: 'PENDING_APPROVAL'
+        status: 'PENDING'
       },
       include: { vendor: true }
     });

@@ -58,12 +58,12 @@ export class EmployeeService {
 
       // 1. If no userId provided, create a new User account for the employee
       if (!userId || userId.trim() === '' || userId === 'null' || userId === 'undefined') {
-        // Find default STAFF role
+        // Find default FRANCHISE_ADMIN role
         const staffRole = await tx.role.findFirst({ 
-          where: { name: { in: ['STAFF', 'EMPLOYEE'], mode: 'insensitive' } } 
+          where: { name: { equals: 'FRANCHISE_ADMIN', mode: 'insensitive' } } 
         });
 
-        if (!staffRole) throw new AppError('Default Employee role not found', 500);
+        if (!staffRole) throw new AppError('Default Franchise Admin role not found', 500);
 
 
         const passwordHash = await AuthService.hashPassword('emp123');

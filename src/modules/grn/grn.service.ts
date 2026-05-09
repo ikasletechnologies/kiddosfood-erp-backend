@@ -111,11 +111,6 @@ export class GRNService {
       let someReceived = false;
 
       for (const item of grn.items) {
-        if (item.qcStatus === 'HOLD' || item.qcStatus === 'REJECTED') {
-           // Do not add stock for hold/rejected items yet
-           continue;
-        }
-
         if (item.acceptedQty <= 0) continue;
 
         // Record stock movement with location info
