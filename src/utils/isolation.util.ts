@@ -31,7 +31,7 @@ export class IsolationUtil {
   static enforceFranchiseMatch(user: TokenPayload, targetFranchiseId?: string) {
     if (user.role === 'SUPER_ADMIN') return targetFranchiseId; // HQ can assign to any branch
     
-    // For ADMIN and STAFF, use their own franchise ID exclusively
+    // For FRANCHISE_ADMIN, use their own franchise ID exclusively
     return user.franchiseId;
   }
 }

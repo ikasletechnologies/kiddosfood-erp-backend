@@ -17,8 +17,6 @@ export class ProcurementService {
     category?: string;
     paymentTerms?: any;
     status?: any;
-    manualPurchaseAdj?: number; 
-    manualAdvanceAdj?: number 
   }) {
     // 1. Name Validation (Alphabet Only)
     if (!data.name || !/^[A-Za-z\s]+$/.test(data.name)) {
@@ -66,9 +64,7 @@ export class ProcurementService {
           gstNumber: data.gstNumber,
           category: data.category,
           paymentTerms: data.paymentTerms || 'IMMEDIATE',
-          status: data.status || 'ACTIVE',
-          manualPurchaseAdj: data.manualPurchaseAdj || 0,
-          manualAdvanceAdj: data.manualAdvanceAdj || 0
+          status: data.status || 'ACTIVE'
         }
       });
     } catch (err: any) {
@@ -165,8 +161,6 @@ export class ProcurementService {
     category?: string;
     paymentTerms?: any;
     status?: any;
-    manualPurchaseAdj?: number; 
-    manualAdvanceAdj?: number 
   }) {
     if (data.name !== undefined && !/^[A-Za-z\s]+$/.test(data.name)) {
       throw new Error("Vendor Name must contain only alphabets.");

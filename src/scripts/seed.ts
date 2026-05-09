@@ -26,7 +26,7 @@ async function main() {
   console.log('✅ Permissions created');
 
   // 2. Create Roles
-  const roles = ['ADMIN', 'MANAGER', 'FRANCHISEE', 'STAFF', 'DELIVERY'];
+  const roles = ['SUPER_ADMIN', 'FRANCHISE_ADMIN'];
   const createdRoles: any = {};
 
   for (const roleName of roles) {
@@ -38,24 +38,26 @@ async function main() {
   }
   console.log('✅ Roles created');
 
-  // 3. Link Permissions to ADMIN Role (Give everything)
+  // 3. Link Permissions
   const allPermissions = await prisma.permission.findMany();
   for (const p of allPermissions) {
+    // Super Admin gets everything
     await prisma.rolePermission.upsert({
-      where: {
-        roleId_permissionId: {
-          roleId: createdRoles['ADMIN'].id,
-          permissionId: p.id,
-        },
-      },
+      where: { roleId_permissionId: { roleId: createdRoles['SUPER_ADMIN'].id, permissionId: p.id } },
       update: {},
-      create: {
-        roleId: createdRoles['ADMIN'].id,
-        permissionId: p.id,
-      },
+      create: { roleId: createdRoles['SUPER_ADMIN'].id, permissionId: p.id },
     });
+
+    // Franchise Admin gets most things except high-level governance
+    if (p.key !== 'manage_users' && p.key !== 'manage_franchise') {
+      await prisma.rolePermission.upsert({
+        where: { roleId_permissionId: { roleId: createdRoles['FRANCHISE_ADMIN'].id, permissionId: p.id } },
+        update: {},
+        create: { roleId: createdRoles['FRANCHISE_ADMIN'].id, permissionId: p.id },
+      });
+    }
   }
-  console.log('✅ Admin permissions linked');
+  console.log('✅ Role permissions linked');
 
   // 4. Create Default Admin User
   const hashedPassword = await bcrypt.hash('admin123', 10);
@@ -67,7 +69,7 @@ async function main() {
       email: 'admin@fooderp.com',
       phone: '0000000000',
       passwordHash: hashedPassword,
-      roleId: createdRoles['ADMIN'].id,
+      roleId: createdRoles['SUPER_ADMIN'].id,
       is_active: true,
     },
   });

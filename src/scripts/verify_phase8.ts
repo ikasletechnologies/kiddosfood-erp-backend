@@ -12,9 +12,9 @@ async function verify() {
   try {
     // 1. Roles Check
     const superAdminRole = await prisma.role.findUnique({ where: { name: 'SUPER_ADMIN' } });
-    const adminRole = await prisma.role.findUnique({ where: { name: 'ADMIN' } });
-    if (!superAdminRole || !adminRole) {
-        throw new Error('Roles SUPER_ADMIN and ADMIN must exist. Ensure you ran the updated seed script.');
+    const franchiseAdminRole = await prisma.role.findUnique({ where: { name: 'FRANCHISE_ADMIN' } });
+    if (!superAdminRole || !franchiseAdminRole) {
+        throw new Error('Roles SUPER_ADMIN and FRANCHISE_ADMIN must exist. Ensure you ran the updated seed script.');
     }
     console.log('✅ Roles realigned successfully.');
 
@@ -22,7 +22,7 @@ async function verify() {
     console.log('🛡️ Testing Data Isolation Logic...');
     
     const hqUser = { role: 'SUPER_ADMIN', userId: 'sa-1' };
-    const branchUser = { role: 'ADMIN', franchiseId: 'branch-a', userId: 'adm-1' };
+    const branchUser = { role: 'FRANCHISE_ADMIN', franchiseId: 'branch-a', userId: 'adm-1' };
 
     const hqFilter = IsolationUtil.getFranchiseFilter(hqUser as any);
     const branchFilter = IsolationUtil.getFranchiseFilter(branchUser as any);
@@ -38,8 +38,8 @@ async function verify() {
     // 3. Navigation Check
     console.log('🧭 Testing Navigation Generation...');
     
-    // Mock response for Staff and Super Admin
-    let staffNav: any[] = [];
+    // Mock response for Franchise Admin and Super Admin
+    let franchiseNav: any[] = [];
     let saNav: any[] = [];
 
     const mockRes = (setter: any) => ({
@@ -48,16 +48,16 @@ async function verify() {
     } as any);
 
     // Test NavController logic manually for logic check
-    await NavController.getNavigation({ user: { role: 'STAFF' } } as any, mockRes((d: any) => staffNav = d));
+    await NavController.getNavigation({ user: { role: 'FRANCHISE_ADMIN' } } as any, mockRes((d: any) => franchiseNav = d));
     await NavController.getNavigation({ user: { role: 'SUPER_ADMIN' } } as any, mockRes((d: any) => saNav = d));
 
-    const staffHasBranchMgmt = staffNav.some(m => m.title === 'Branch Management');
+    const franchiseHasBranchMgmt = franchiseNav.some(m => m.title === 'Branch Management');
     const saHasBranchMgmt = saNav.some(m => m.title === 'Branch Management');
 
-    console.log('Staff has Branch Management:', staffHasBranchMgmt);
+    console.log('Franchise Admin has Branch Management:', franchiseHasBranchMgmt);
     console.log('Super Admin has Branch Management:', saHasBranchMgmt);
 
-    if (staffHasBranchMgmt || !saHasBranchMgmt) {
+    if (franchiseHasBranchMgmt || !saHasBranchMgmt) {
         throw new Error('Navigation role-filtering mismatch!');
     }
     console.log('✅ Premium Navigation role-filtering verified.');

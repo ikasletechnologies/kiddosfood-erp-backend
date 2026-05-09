@@ -17,12 +17,12 @@ export class FranchiseService {
         }
       });
 
-      // 2. Create Admin User if provided
+      // 2. Create Franchise Admin User if provided
       if (adminUser && adminUser.email) {
-        const role = await tx.role.findUnique({ where: { name: 'ADMIN' } });
-        if (!role) throw new Error('Role [ADMIN] not found. Please seed the database.');
+        const role = await tx.role.findUnique({ where: { name: 'FRANCHISE_ADMIN' } });
+        if (!role) throw new Error('Role [FRANCHISE_ADMIN] not found. Please seed the database.');
 
-        const passwordHash = await AuthService.hashPassword(adminUser.password || 'admin123');
+        const passwordHash = await AuthService.hashPassword(adminUser.password || 'franchise123');
 
         await tx.user.create({
           data: {

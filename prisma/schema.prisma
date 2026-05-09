@@ -51,19 +51,19 @@ model RolePermission {
 }
 
 model Customer {
-  id             String           @id @default(uuid())
-  name           String
-  phone          String?          @unique
-  email          String?          @unique
-  loyaltyPoints  Float            @default(0)
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
-  ledgerEntries  CustomerLedger[]
-  orders         Order[]
-  productions    Production[]
-  quotations     Quotation[]
-  returnOrders   ReturnOrder[]
-  salesOrders    SalesOrder[]
+  id            String           @id @default(uuid())
+  name          String
+  phone         String?          @unique
+  email         String?          @unique
+  loyaltyPoints Float            @default(0)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  ledgerEntries CustomerLedger[]
+  orders        Order[]
+  productions   Production[]
+  quotations    Quotation[]
+  returnOrders  ReturnOrder[]
+  salesOrders   SalesOrder[]
 }
 
 model CustomerLedger {
@@ -149,28 +149,26 @@ model StockMovement {
 }
 
 model Vendor {
-  id              String             @id @default(uuid())
-  vendorCode      String?            @unique
-  name            String
-  contact         String
-  email           String?
-  address            String?
-  remark             String?
-  manualPurchaseAdj  Float              @default(0) // @deprecated: Use VendorLedger for all adjustments
-  manualAdvanceAdj   Float              @default(0) // @deprecated: Use VendorLedger for all advances
-  status             VendorStatus       @default(ACTIVE)
-  paymentTerms       PaymentTerms       @default(IMMEDIATE)
-  gstNumber          String?
-  category           String?
-  rating             Float?             @default(5.0)
-  items           InventoryItem[]
-  orders          ProcurementOrder[]
-  rfqs            PurchaseRFQ[]
-  purchaseReturns PurchaseReturn[]
+  id                String             @id @default(uuid())
+  vendorCode        String?            @unique
+  name              String
+  contact           String
+  email             String?
+  address           String?
+  remark            String?
+  status            VendorStatus       @default(ACTIVE)
+  paymentTerms      PaymentTerms       @default(IMMEDIATE)
+  gstNumber         String?
+  category          String?
+  rating            Float?             @default(5.0)
+  items             InventoryItem[]
+  orders            ProcurementOrder[]
+  rfqs              PurchaseRFQ[]
+  purchaseReturns   PurchaseReturn[]
   suppliedMaterials VendorMaterial[]
-  ledgerEntries   VendorLedger[]
-  invoices        VendorInvoice[]
-  createdAt       DateTime           @default(now())
+  ledgerEntries     VendorLedger[]
+  invoices          VendorInvoice[]
+  createdAt         DateTime           @default(now())
 }
 
 enum VendorStatus {
@@ -187,20 +185,20 @@ enum PaymentTerms {
 }
 
 model VendorLedger {
-  id              String             @id @default(uuid())
-  vendorId        String
-  vendor          Vendor             @relation(fields: [vendorId], references: [id])
-  type            LedgerType
-  amount          Float
-  balanceAfterTransaction Float      @default(0)
-  paymentMode     PaymentMode
-  sourceModule    VendorLedgerSource @default(MANUAL)
-  referenceType   VendorLedgerReferenceType
-  referenceId     String?            // ID of PO, Payment, etc.
-  accountId       String?
-  account         Account?           @relation(fields: [accountId], references: [id])
-  note            String?
-  createdAt       DateTime           @default(now())
+  id                      String                    @id @default(uuid())
+  vendorId                String
+  vendor                  Vendor                    @relation(fields: [vendorId], references: [id])
+  type                    LedgerType
+  amount                  Float
+  balanceAfterTransaction Float                     @default(0)
+  paymentMode             PaymentMode
+  sourceModule            VendorLedgerSource        @default(MANUAL)
+  referenceType           VendorLedgerReferenceType
+  referenceId             String? // ID of PO, Payment, etc.
+  accountId               String?
+  account                 Account?                  @relation(fields: [accountId], references: [id])
+  note                    String?
+  createdAt               DateTime                  @default(now())
 }
 
 enum VendorLedgerSource {
@@ -209,8 +207,6 @@ enum VendorLedgerSource {
   FINANCE
   MANUAL
 }
-
-// Replaced by LedgerType
 
 enum VendorLedgerReferenceType {
   PURCHASE
@@ -243,7 +239,6 @@ model ProcurementOrder {
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   notes                String?
-  items                Json?
   received             Boolean                @default(false)
   createdAt            DateTime               @default(now())
   balance              Float                  @default(0)
@@ -515,41 +510,41 @@ model OrderItem {
 }
 
 model Payment {
-  id             String      @id @default(uuid())
-  paymentNumber  String?     @unique // e.g., PAY-2026-0001
-  type           AccountingPaymentType @default(INVOICE_LINKED)
-  sourceModule   PaymentSourceModule   @default(MANUAL)
-  
+  id            String                @id @default(uuid())
+  paymentNumber String?               @unique // e.g., PAY-2026-0001
+  type          AccountingPaymentType @default(INVOICE_LINKED)
+  sourceModule  PaymentSourceModule   @default(MANUAL)
+
   // Linkages
-  linkedDocType  LinkedDocType?
-  linkedDocId    String?
-  
-  orderId        String?
-  order          Order?      @relation(fields: [orderId], references: [id])
-  invoiceId      String?
-  invoice        Invoice?    @relation(fields: [invoiceId], references: [id])
-  
+  linkedDocType LinkedDocType?
+  linkedDocId   String?
+
+  orderId   String?
+  order     Order?   @relation(fields: [orderId], references: [id])
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+
   paymentMode    PaymentMode @default(CASH)
   paidAmount     Float
   transactionRef String?
   status         String      @default("SUCCESS")
-  
-  accountId      String?
-  account        Account?    @relation(fields: [accountId], references: [id])
-  
-  entityType     String?     // VENDOR, CUSTOMER, EMPLOYEE
-  entityId       String?     // ID of Vendor, Customer, or Employee
-  
+
+  accountId String?
+  account   Account? @relation(fields: [accountId], references: [id])
+
+  entityType String? // VENDOR, CUSTOMER, EMPLOYEE
+  entityId   String? // ID of Vendor, Customer, or Employee
+
   // Reversal / Cancellation
-  isCancelled        Boolean   @default(false)
-  cancelledAt        DateTime?
-  reversalOfPaymentId String?   // Points to original ID if this is a reversal transaction
+  isCancelled         Boolean   @default(false)
+  cancelledAt         DateTime?
+  reversalOfPaymentId String? // Points to original ID if this is a reversal transaction
 
   // Audit
-  createdBy      String?
-  approvedBy     String?
-  
-  createdAt      DateTime    @default(now())
+  createdBy  String?
+  approvedBy String?
+
+  createdAt DateTime @default(now())
 }
 
 enum PaymentSourceModule {
@@ -612,11 +607,11 @@ model Expense {
   expenseNumber   String?           @unique // e.g., EXP-2026-001
   franchiseId     String?
   category        String
-  payee           String?           // e.g., EB Office, Airtel, etc.
+  payee           String? // e.g., EB Office, Airtel, etc.
   amount          Float
   paidAmount      Float             @default(0)
   date            DateTime          @default(now())
-  dueDate         DateTime?         // when payment is expected
+  dueDate         DateTime? // when payment is expected
   description     String?
   status          String            @default("UNPAID") // UNPAID, PARTIAL, PAID
   paymentMode     PaymentMode?      @default(CASH)
@@ -711,7 +706,7 @@ model CRMForm {
   pipeline      Pipeline @relation(fields: [pipelineId], references: [id])
 }
 
- model Employee {
+model Employee {
   id                    String           @id @default(uuid())
   userId                String           @unique
   employeeCode          String           @unique
@@ -1043,15 +1038,6 @@ model ActivityLog {
   user              User       @relation(fields: [userId], references: [id])
 }
 
-model SystemSetting {
-  id          String   @id @default(uuid())
-  key         String   @unique
-  value       String
-  group       String   @default("GENERAL")
-  description String?
-  updatedAt   DateTime @updatedAt
-}
-
 model FranchiseRequest {
   id            String    @id @default(uuid())
   franchiseId   String
@@ -1111,7 +1097,6 @@ enum StockMovementType {
   TRANSFER_OUT
   ADJUSTMENT
 }
-
 
 enum GRNStatus {
   PENDING
@@ -1184,7 +1169,6 @@ enum OrderStatus {
   REFUNDED
 }
 
-
 enum PaymentMode {
   CASH
   UPI
@@ -1212,7 +1196,7 @@ enum LeadStatus {
   DELETED
 }
 
- enum LeaveStatus {
+enum LeaveStatus {
   PENDING
   APPROVED
   REJECTED
