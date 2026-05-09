@@ -78,14 +78,17 @@ export class PayrollService {
     const payroll = await prisma.payroll.findUnique({ where: { id: payrollId } });
     if (!payroll) throw new Error('Payroll not found');
 
+    const monthStart = new Date(payroll.year, payroll.month - 1, 1);
+    const monthEnd = new Date(payroll.year, payroll.month, 0);
+
     const employees = await prisma.employee.findMany({
       include: {
         salaryStructure: { include: { items: { include: { component: true } } } },
         leaves: {
           where: {
             status: 'APPROVED',
-            startDate: { gte: new Date(payroll.year, payroll.month - 1, 1) },
-            endDate: { lte: new Date(payroll.year, payroll.month, 0) }
+            startDate: { lte: monthEnd },
+            endDate: { gte: monthStart }
           },
           include: { leaveType: true }
         }
@@ -95,31 +98,37 @@ export class PayrollService {
     const payslips: object[] = [];
 
     for (const emp of employees) {
-      if (!emp.salaryStructure) continue;
+      const baseSalary = emp.salary ? Number(emp.salary) : 0;
+      if (baseSalary === 0) continue;
 
-      const components: Array<{ name: string; type: string; amount: number }> = [];
-      let totalEarnings = 0;
-      let totalDeductions = 0;
-      let basicSalary = 0;
+      // In a standard 30-day month calculation
+      const workingDays = 30;
+      
+      let unpaidLeaveDays = 0;
+      for (const leave of emp.leaves) {
+        // Only deduct if leave is NOT paid
+        if (leave.leaveType.isPaid) continue;
 
-      for (const item of emp.salaryStructure.items) {
-        const comp = item.component;
-        const value = item.overrideValue ?? comp.value;
-        let amount = value;
-
-        if (comp.calculationType === 'PERCENTAGE' && basicSalary > 0) {
-          amount = (basicSalary * value) / 100;
-        }
-
-        if (comp.name.toLowerCase() === 'basic') basicSalary = amount;
-
-        components.push({ name: comp.name, type: comp.type, amount });
-
-        if (comp.type === 'EARNING') totalEarnings += amount;
-        else totalDeductions += amount;
+        const overlapStart = leave.startDate < monthStart ? monthStart : leave.startDate;
+        const overlapEnd = leave.endDate > monthEnd ? monthEnd : leave.endDate;
+        
+        const diffTime = overlapEnd.getTime() - overlapStart.getTime();
+        const diffDays = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1);
+        unpaidLeaveDays += diffDays;
       }
 
-      const netSalary = totalEarnings - totalDeductions;
+      const payableDays = Math.max(0, workingDays - unpaidLeaveDays);
+      const dailySalary = baseSalary / workingDays;
+      const deductionAmount = Math.round(dailySalary * unpaidLeaveDays);
+      const netSalary = Math.round(dailySalary * payableDays);
+
+      const components = [
+        { name: 'Basic Salary', type: 'EARNING', amount: baseSalary },
+      ];
+
+      if (unpaidLeaveDays > 0) {
+        components.push({ name: `Unpaid Leave (${unpaidLeaveDays} days)`, type: 'DEDUCTION', amount: deductionAmount });
+      }
 
       const existing = await prisma.payslip.findFirst({
         where: { employeeId: emp.id, month: payroll.month, year: payroll.year }
@@ -132,9 +141,9 @@ export class PayrollService {
             employeeId: emp.id,
             month: payroll.month,
             year: payroll.year,
-            basicSalary,
-            totalEarnings,
-            totalDeductions,
+            basicSalary: baseSalary,
+            totalEarnings: baseSalary,
+            totalDeductions: deductionAmount,
             netSalary,
             components
           }

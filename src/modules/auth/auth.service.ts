@@ -146,6 +146,9 @@ export class AuthService {
     }
 
     // 2. Find role
+    if (!data.roleName) {
+        throw new AppError('roleName is required for registration', 400);
+    }
     const role = await prisma.role.findUnique({
       where: { name: data.roleName.toUpperCase() }
     });

@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
 import { UserService } from './user.service';
-import { AuthenticatedRequest } from '../../types/request';
 
 export class UserController {
   static async getAll(req: Request, res: Response) {
@@ -66,10 +65,46 @@ export class UserController {
 
   static async getMe(req: Request, res: Response) {
     try {
-      // User is already attached by authenticate middleware
-      res.json((req as AuthenticatedRequest).user);
+      const user = (req as any).user;
+      if (!user || !user.userId) return res.status(401).json({ error: 'Unauthorized' });
+      
+      const dbUser = await UserService.getById(user.userId);
+      res.json(dbUser);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async updateMe(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      if (!user || !user.userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const { fullName, phone } = req.body;
+      const updated = await UserService.update(user.userId, { fullName, phone });
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async changeOwnPassword(req: Request, res: Response) {
+    try {
+      const { password } = req.body;
+      const user = (req as any).user;
+      
+      if (!password) {
+        return res.status(400).json({ error: 'Password is required' });
+      }
+      
+      if (!user || !user.userId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      await UserService.updatePassword(user.userId, password);
+      res.json({ message: 'Password updated successfully' });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 

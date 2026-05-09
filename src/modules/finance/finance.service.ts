@@ -236,7 +236,7 @@ export class FinanceService {
   }
 
   static async getCashFlow() {
-    // @ts-ignore
+
     const accounts = await prisma.account.findMany();
 
     const totalCash = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);

@@ -3,18 +3,6 @@ import { FinanceService } from './finance.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 
 export class FinanceController {
-  static async addExpense(req: Request, res: Response) {
-    try {
-      const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      
-      const expense = await FinanceService.addExpense({ ...req.body, franchiseId });
-      res.status(201).json(expense);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  }
-
   static async getPL(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -32,7 +20,7 @@ export class FinanceController {
       }
 
       const report = await FinanceService.getFinancialReport({
-        franchiseId,
+        franchiseId: franchiseId as string,
         startDate: startDate ? new Date(startDate as string) : undefined,
         endDate: endDate ? new Date(endDate as string) : undefined
       });
@@ -67,12 +55,13 @@ export class FinanceController {
 
   static async getSalesReport(req: Request, res: Response) {
     try {
-      const { startDate, endDate } = req.query;
+      const { franchiseId, startDate, endDate } = req.query;
       const report = await FinanceService.getFinancialReport({
+        franchiseId: franchiseId as string,
         startDate: startDate ? new Date(startDate as string) : undefined,
         endDate: endDate ? new Date(endDate as string) : undefined
       });
-      res.json({ totalSales: report.revenue });
+      res.json({ totalSales: report.revenue, generatedAt: report.generatedAt });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -80,8 +69,9 @@ export class FinanceController {
 
   static async getExpensesReport(req: Request, res: Response) {
     try {
-      const { startDate, endDate } = req.query;
+      const { franchiseId, startDate, endDate } = req.query;
       const report = await FinanceService.getFinancialReport({
+        franchiseId: franchiseId as string,
         startDate: startDate ? new Date(startDate as string) : undefined,
         endDate: endDate ? new Date(endDate as string) : undefined
       });
@@ -152,6 +142,18 @@ export class FinanceController {
     }
   }
 
+  static async addExpense(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      
+      const expense = await FinanceService.addExpense({ ...req.body, franchiseId });
+      res.status(201).json(expense);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getPayments(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -210,4 +212,5 @@ export class FinanceController {
       res.status(400).json({ error: error.message });
     }
   }
+
 }

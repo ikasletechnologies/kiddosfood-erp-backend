@@ -257,9 +257,8 @@ export class ProcurementService {
 
     const ledgerBalance = await this.getVendorBalance(data.vendorId);
     const existingCredit = Math.max(0, ledgerBalance); 
-    const autoApplied = Math.min(totalAmount, existingCredit);
     const providedAmount = data.advancePaid || 0;
-    const finalPaidOnPO = Math.max(autoApplied, providedAmount);
+    // const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
@@ -334,6 +333,22 @@ export class ProcurementService {
             referenceId: po.id,
             accountId: data.accountId,
             note: `Advance Payment for PO #${po.poNumber}`
+          }
+        });
+
+        // Track Money Movement
+        await AccountService.adjustBalance(tx, data.accountId, newMoneyPayment, 'OUTFLOW');
+
+        // Also record as a Payment entity for audit
+        await tx.payment.create({
+          data: {
+            type: 'ADVANCE',
+            entityType: 'VENDOR',
+            entityId: data.vendorId,
+            paidAmount: newMoneyPayment,
+            accountId: data.accountId,
+            transactionRef: po.id,
+            status: 'SUCCESS'
           }
         });
       }
@@ -709,7 +724,24 @@ export class ProcurementService {
             }
           });
         }
+      } else {
+        // Settle multiple orders if direct payment
+        // (This needs to be updated to use tx client)
+        // For now, let's keep it simple or implement recursive tx settlement
       }
+
+      // 4. Create Audit Payment Entity
+      await tx.payment.create({
+        data: {
+          type: referenceId ? 'INVOICE_LINKED' : 'DIRECT',
+          entityType: 'VENDOR',
+          entityId: vendorId,
+          paidAmount: amount,
+          accountId: accountId,
+          transactionRef: referenceId,
+          status: 'SUCCESS'
+        }
+      });
 
       return ledgerEntry;
     });
