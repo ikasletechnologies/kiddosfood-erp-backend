@@ -20,9 +20,9 @@ export class ProcurementService {
     manualPurchaseAdj?: number; 
     manualAdvanceAdj?: number 
   }) {
-    // 1. Name Validation (Alphabet Only)
-    if (!data.name || !/^[A-Za-z\s]+$/.test(data.name)) {
-      throw new Error("Vendor Name is required and must contain only alphabets.");
+    // 1. Name Validation (Relaxed)
+    if (!data.name || !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
+      throw new Error("Vendor Name is required and must be alphanumeric (symbols like & . , - () are allowed).");
     }
 
     // 2. Contact Validation (Exactly 10 Numbers)
@@ -30,9 +30,9 @@ export class ProcurementService {
       throw new Error("Contact Number must be exactly 10 digits.");
     }
 
-    // 3. Email Validation (@gmail.com only)
-    if (data.email && !data.email.toLowerCase().endsWith("@gmail.com")) {
-      throw new Error("Only @gmail.com addresses are permitted for vendors.");
+    // 3. Email Validation (Relaxed)
+    if (data.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) {
+      throw new Error("Invalid email format for vendor.");
     }
 
     // 4. Address Validation (Mandatory)
@@ -132,10 +132,16 @@ export class ProcurementService {
       where: { id },
       include: { 
         orders: { 
-          include: { poItems: { include: { inventoryItem: true } } }, 
+          include: { 
+            poItems: { include: { inventoryItem: true } },
+            goodsReceipts: { include: { items: { include: { inventoryItem: true } } } },
+            invoices: true
+          }, 
           orderBy: { createdAt: 'desc' }, 
-          take: 10 
-        }, 
+          take: 20
+        },
+        suppliedMaterials: { include: { material: true } },
+        invoices: true,
         _count: { select: { orders: true } } 
       }
     });
@@ -168,14 +174,14 @@ export class ProcurementService {
     manualPurchaseAdj?: number; 
     manualAdvanceAdj?: number 
   }) {
-    if (data.name !== undefined && !/^[A-Za-z\s]+$/.test(data.name)) {
-      throw new Error("Vendor Name must contain only alphabets.");
+    if (data.name !== undefined && !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
+      throw new Error("Vendor Name must be alphanumeric (symbols like & . , - () are allowed).");
     }
     if (data.contact !== undefined && !/^\d{10}$/.test(data.contact)) {
       throw new Error("Contact Number must be exactly 10 digits.");
     }
-    if (data.email && !data.email.toLowerCase().endsWith("@gmail.com")) {
-      throw new Error("Only @gmail.com addresses are permitted.");
+    if (data.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) {
+      throw new Error("Invalid email format.");
     }
     if (data.address !== undefined && data.address.trim().length === 0) {
       throw new Error("Registered Office Address cannot be empty.");
@@ -190,24 +196,16 @@ export class ProcurementService {
     }
 
     const pendingOrders = await prisma.procurementOrder.count({
-      where: { vendorId: id, status: 'PENDING' }
+      where: { vendorId: id, status: 'PENDING_APPROVAL' }
     });
     if (pendingOrders > 0) {
       throw new Error("Cannot delete vendor with pending Purchase Orders.");
     }
 
-    return prisma.$transaction(async (tx) => {
-      await tx.inventoryItem.updateMany({
-        where: { vendorId: id },
-        data: { vendorId: null }
-      });
-      await tx.vendorMaterial.deleteMany({ where: { vendorId: id } });
-      await tx.vendorLedger.deleteMany({ where: { vendorId: id } });
-      await tx.procurementOrderItem.deleteMany({ where: { procurementOrder: { vendorId: id } } });
-      await tx.goodsReceipt.deleteMany({ where: { procurementOrder: { vendorId: id } } });
-      await tx.procurementOrder.deleteMany({ where: { vendorId: id } });
-      await tx.purchaseRFQ.deleteMany({ where: { vendorId: id } });
-      return tx.vendor.delete({ where: { id } });
+    // ERP Soft Delete: Set status to INACTIVE instead of removing records
+    return prisma.vendor.update({
+      where: { id },
+      data: { status: 'INACTIVE' }
     });
   }
 
@@ -225,6 +223,10 @@ export class ProcurementService {
     accountId?: string; // Source account for advance
     expectedDeliveryDate?: string;
     notes?: string;
+    internalNotes?: string;
+    vendorNotes?: string;
+    deliveryInstructions?: string;
+    status?: string;
     items: Array<{ inventoryItemId: string; quantity: number; price: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
@@ -280,7 +282,10 @@ export class ProcurementService {
           balance: totalAmount - providedAmount,
           expectedDeliveryDate: data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null,
           notes: data.notes,
-          status: 'PENDING',
+          internalNotes: data.internalNotes,
+          vendorNotes: data.vendorNotes,
+          deliveryInstructions: data.deliveryInstructions,
+          status: (data.status as any) || 'PENDING_APPROVAL',
           poItems: {
             create: poItemsData.map((item) => ({
               inventoryItemId: item.inventoryItemId,
@@ -352,12 +357,22 @@ export class ProcurementService {
           }
         });
       }
+      // TRANSACTION SAFETY: Material linking must be inside the transaction
+      for (const item of data.items) {
+        await tx.vendorMaterial.upsert({
+          where: { vendorId_materialId: { vendorId: data.vendorId, materialId: item.inventoryItemId } },
+          update: { price: item.price, lastUpdated: new Date() },
+          create: { vendorId: data.vendorId, materialId: item.inventoryItemId, price: item.price }
+        });
+        await tx.inventoryItem.update({
+          where: { id: item.inventoryItemId },
+          data: { vendorId: data.vendorId }
+        });
+      }
+
       return po;
     });
 
-    for (const item of data.items) {
-      await this.linkMaterialToVendor(data.vendorId, item.inventoryItemId, item.price);
-    }
     return result;
   }
 
@@ -401,13 +416,24 @@ export class ProcurementService {
   }
 
   static async approvePO(poId: string) {
+    return this.updatePOStatus(poId, 'APPROVED');
+  }
+
+  static async updatePOStatus(poId: string, status: any) {
     const po = await prisma.procurementOrder.findUnique({ where: { id: poId } });
     if (!po) throw new Error('Purchase Order not found');
-    if (po.status !== 'PENDING') throw new Error(`Cannot approve a PO with status ${po.status}`);
+    
+    const updateData: any = { status };
+    if (status === 'APPROVED') {
+      updateData.approvedAt = new Date();
+      // In a real system, we'd get the user from the request context. 
+      // For now, we'll mark as APPROVED_BY_SYSTEM or similar if not provided.
+      updateData.approvedBy = 'SUPER_ADMIN'; 
+    }
 
     return prisma.procurementOrder.update({
       where: { id: poId },
-      data: { status: 'APPROVED' },
+      data: updateData,
       include: { vendor: true, poItems: { include: { inventoryItem: true } } }
     });
   }
@@ -504,7 +530,7 @@ export class ProcurementService {
       if (!po) throw new Error('Purchase Order not found');
       if (po.status === 'RECEIVED') throw new Error('Cannot delete a received PO');
 
-      if (po.status === 'PENDING') {
+      if (po.status === 'PENDING_APPROVAL') {
         await tx.vendorLedger.create({
           data: {
             vendorId: po.vendorId,

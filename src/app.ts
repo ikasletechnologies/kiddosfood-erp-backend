@@ -38,6 +38,7 @@ import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoic
 import { FranchiseOrderController } from './modules/franchise/franchise-order.controller';
 import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
 import { AccountController } from './modules/finance/account.controller';
+import { PurchaseRequestController } from './modules/purchase-requests/purchase-request.controller';
 
 const app: Express = express();
 
@@ -243,6 +244,7 @@ app.get('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'ADM
 app.post('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.createPO);
 app.get('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getOne);
 app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.approvePO);
+app.patch('/api/purchase-orders/:id/status', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.updatePOStatus);
 app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.recordAdvance);
 app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.cancelPO);
 app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.deletePO);
@@ -411,7 +413,8 @@ app.get('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']),
 app.post('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.createRFQ);
 app.get('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.getRFQ);
 app.patch('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.updateRFQ);
-app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.convertRFQtoPO);
+app.post('/api/purchase/rfqs/:id/quotations', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.addVendorQuotation);
+app.post('/api/purchase/quotations/:id/convert-to-po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.convertQuotationToPO);
 
 app.get('/api/purchase/returns', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.getPurchaseReturns);
 app.post('/api/purchase/returns', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.createPurchaseReturn);
@@ -419,6 +422,11 @@ app.patch('/api/purchase/returns/:id', authenticate, authorizeRole(['ADMIN', 'MA
 
 app.post('/api/purchase/requisitions', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseController.createRequisition);
 
+app.get('/api/purchase-requests', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.getAll);
+app.get('/api/purchase-requests/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.getById);
+app.post('/api/purchase-requests', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.create);
+app.patch('/api/purchase-requests/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseRequestController.updateStatus);
+app.delete('/api/purchase-requests/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseRequestController.deleteRequest);
 // ─── Franchise Orders (Phase 7) ───────────────────────────────────────────────
 app.get('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), FranchiseOrderController.getAll);
 app.post('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN', 'ADMIN']), FranchiseOrderController.create);

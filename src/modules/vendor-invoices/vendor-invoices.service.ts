@@ -58,15 +58,20 @@ export class VendorInvoiceService {
     if (!invoice) throw new Error('Invoice not found');
 
     const poValue = invoice.procurementOrder?.totalAmount ?? 0;
-    // const grnValue = invoice.grn
-    //   ? invoice.grn.items.reduce((s, i) => s + i.acceptedQty * i.price, 0)
-    //   : null;
+    const grnValue = invoice.grn
+      ? invoice.grn.items.reduce((s, i) => s + i.acceptedQty * i.price, 0)
+      : 0;
     const invoiceAmount = invoice.amount;
 
-    // Match logic: invoice must be within 1% of PO value
+    // 3-Way Match Logic: PO vs GRN vs Invoice
+    // All three must match within a 1% tolerance
     const tolerance = poValue * 0.01;
-    const isMatched = Math.abs(invoiceAmount - poValue) <= tolerance;
-    // const variance = invoiceAmount - poValue;
+    
+    const poVsInvoice = Math.abs(invoiceAmount - poValue) <= tolerance;
+    const poVsGrn = Math.abs(grnValue - poValue) <= tolerance;
+    const grnVsInvoice = Math.abs(invoiceAmount - grnValue) <= tolerance;
+
+    const isMatched = poVsInvoice && poVsGrn && grnVsInvoice;
 
     return prisma.vendorInvoice.update({
       where: { id: invoiceId },

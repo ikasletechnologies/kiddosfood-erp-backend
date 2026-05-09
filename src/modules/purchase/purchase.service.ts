@@ -12,11 +12,10 @@ function generateReturnNumber() {
 }
 
 export class PurchaseService {
-  // ─── RFQ ─────────────────────────────────────────────────────────────────────
+  // ─── RFQ (New Enterprise Structure) ──────────────────────────────────────────
 
-  static async getRFQs(filters: { vendorId?: string; status?: string; search?: string }) {
+  static async getRFQs(filters: { status?: string; search?: string }) {
     const where: any = {};
-    if (filters.vendorId) where.vendorId = filters.vendorId;
     if (filters.status) where.status = filters.status;
     if (filters.search) {
       where.OR = [
@@ -24,87 +23,92 @@ export class PurchaseService {
         { notes: { contains: filters.search, mode: 'insensitive' } }
       ];
     }
-    return prisma.purchaseRFQ.findMany({
+    return prisma.requestForQuotation.findMany({
       where,
-      include: { vendor: true, items: true },
+      include: { 
+         purchaseRequest: true,
+         quotations: { include: { vendor: true, items: true } }
+      },
       orderBy: { createdAt: 'desc' }
     });
   }
 
   static async getRFQById(id: string) {
-    return prisma.purchaseRFQ.findUnique({
+    return prisma.requestForQuotation.findUnique({
       where: { id },
-      include: { vendor: true, items: true }
+      include: { 
+         purchaseRequest: true,
+         quotations: { include: { vendor: true, items: true } }
+      }
     });
   }
 
   static async createRFQ(data: {
-    vendorId: string;
-    items: Array<{ itemName: string; quantity: number; unit: string; notes?: string }>;
-    responseDeadline?: string;
+    purchaseRequestId?: string;
+    deadline?: string;
     notes?: string;
     createdBy?: string;
   }) {
-    return prisma.purchaseRFQ.create({
+    return prisma.requestForQuotation.create({
       data: {
         rfqNumber: generateRFQNumber(),
-        vendorId: data.vendorId,
-        responseDeadline: data.responseDeadline ? new Date(data.responseDeadline) : undefined,
+        purchaseRequestId: data.purchaseRequestId,
+        deadline: data.deadline ? new Date(data.deadline) : undefined,
         notes: data.notes,
         createdBy: data.createdBy,
-        items: {
-          create: data.items.map((item) => ({
-            itemName: item.itemName,
-            quantity: item.quantity,
-            unit: item.unit,
-            notes: item.notes
-          }))
-        }
-      },
-      include: { vendor: true, items: true }
+        status: 'OPEN'
+      }
     });
+  }
+
+  static async addVendorQuotation(rfqId: string, data: {
+     vendorId: string;
+     validUntil?: string;
+     notes?: string;
+     items: Array<{ itemName: string; quantity: number; unit: string; quotedRate: number; notes?: string }>;
+  }) {
+     const totalAmount = data.items.reduce((s, i) => s + i.quantity * i.quotedRate, 0);
+
+     return prisma.vendorQuotation.create({
+        data: {
+           rfqId,
+           vendorId: data.vendorId,
+           totalAmount,
+           validUntil: data.validUntil ? new Date(data.validUntil) : null,
+           notes: data.notes,
+           status: 'PENDING',
+           items: {
+              create: data.items.map(item => ({
+                 itemName: item.itemName,
+                 quantity: item.quantity,
+                 unit: item.unit,
+                 quotedRate: item.quotedRate,
+                 notes: item.notes
+              }))
+           }
+        },
+        include: { vendor: true, items: true }
+     });
   }
 
   static async updateRFQ(id: string, data: {
     status?: string;
-    quotedAmount?: number;
     notes?: string;
-    items?: Array<{ id?: string; itemName: string; quantity: number; unit: string; quotedRate?: number; notes?: string }>;
   }) {
-    const updateData: any = {
-      status: data.status as any,
-      quotedAmount: data.quotedAmount,
-      notes: data.notes
-    };
-
-    if (data.items) {
-      await prisma.rFQItem.deleteMany({ where: { rfqId: id } });
-      updateData.items = {
-        create: data.items.map((item) => ({
-          itemName: item.itemName,
-          quantity: item.quantity,
-          unit: item.unit,
-          quotedRate: item.quotedRate,
-          notes: item.notes
-        }))
-      };
-    }
-
-    return prisma.purchaseRFQ.update({
+    return prisma.requestForQuotation.update({
       where: { id },
-      data: updateData,
-      include: { vendor: true, items: true }
+      data: { status: data.status as any, notes: data.notes }
     });
   }
 
-  static async convertRFQtoPO(rfqId: string) {
-    const rfq = await prisma.purchaseRFQ.findUnique({
-      where: { id: rfqId },
-      include: { items: true }
+  static async convertQuotationToPO(quotationId: string) {
+    const quote = await prisma.vendorQuotation.findUnique({
+      where: { id: quotationId },
+      include: { items: true, rfq: true }
     });
-    if (!rfq) throw new Error('RFQ not found');
+    if (!quote) throw new Error('Quotation not found');
 
-    const poItems = rfq.items.map((item) => ({
+    const poItems = quote.items.map((item) => ({
       itemName: item.itemName,
       quantity: item.quantity,
       unit: item.unit,
@@ -112,17 +116,23 @@ export class PurchaseService {
       totalAmount: item.quantity * (item.quotedRate || 0)
     }));
 
-    const totalAmount = poItems.reduce((s, i) => s + i.totalAmount, 0);
-
     const po = await prisma.procurementOrder.create({
       data: {
-        vendorId: rfq.vendorId,
-        totalAmount,
-        items: poItems
+        vendorId: quote.vendorId,
+        totalAmount: quote.totalAmount,
+        status: 'PENDING_APPROVAL',
+        items: poItems // Note: items is a JSON field in PO schema for ad-hoc items
       }
     });
 
-    await prisma.purchaseRFQ.update({ where: { id: rfqId }, data: { status: 'CONVERTED' } });
+    await prisma.vendorQuotation.update({ where: { id: quotationId }, data: { status: 'ACCEPTED' } });
+    await prisma.requestForQuotation.update({ where: { id: quote.rfqId }, data: { status: 'CLOSED' } });
+
+    // Reject other quotes for this RFQ
+    await prisma.vendorQuotation.updateMany({
+       where: { rfqId: quote.rfqId, id: { not: quotationId } },
+       data: { status: 'REJECTED' }
+    });
 
     return po;
   }
@@ -176,11 +186,73 @@ export class PurchaseService {
   }
 
   static async updatePurchaseReturn(id: string, data: { status: string }) {
-    return prisma.purchaseReturn.update({ where: { id }, data });
-  }
+    const { status } = data;
+    
+    return prisma.$transaction(async (tx) => {
+      const existing = await tx.purchaseReturn.findUnique({
+        where: { id },
+        include: { items: true, vendor: true }
+      });
+      if (!existing) throw new Error('Purchase Return not found');
+      if (existing.status === 'COMPLETED') throw new Error('Cannot update a completed return');
 
-  // ─── Purchase Requisition ─────────────────────────────────────────────────────
-  // Reuses ProcurementOrder with status=PENDING as a requisition
+      // 1. If transitioning to APPROVED or COMPLETED, trigger Inventory and Financial adjustments
+      if ((status === 'APPROVED' || status === 'COMPLETED') && existing.status === 'PENDING') {
+        
+        // A. Update Stock (Subtract)
+        for (const item of existing.items) {
+          // Find matching material by name (since returns can be ad-hoc or linked)
+          const material = await tx.inventoryItem.findFirst({
+            where: { name: { equals: item.itemName, mode: 'insensitive' } }
+          });
+
+          if (material) {
+            await tx.inventoryItem.update({
+              where: { id: material.id },
+              data: { currentStock: { decrement: item.quantity } }
+            });
+
+            await tx.stockMovement.create({
+              data: {
+                itemId: material.id,
+                movementType: 'PRODUCTION_OUT', // Using PRODUCTION_OUT as a proxy for stock reduction, or we could add a RETURN_OUT type
+                quantity: -item.quantity,
+                referenceType: 'PURCHASE_RETURN',
+                referenceId: id,
+                note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
+              }
+            });
+          }
+        }
+
+        // B. Update Vendor Ledger (Record Credit to reduce payable)
+        const lastEntry = await tx.vendorLedger.findFirst({
+          where: { vendorId: existing.vendorId },
+          orderBy: { createdAt: 'desc' }
+        });
+        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+        const nextBalance = currentBalance + (existing.refundAmount || 0);
+
+        await tx.vendorLedger.create({
+          data: {
+            vendorId: existing.vendorId,
+            type: 'CREDIT',
+            amount: existing.refundAmount || 0,
+            balanceAfterTransaction: nextBalance,
+            sourceModule: 'PURCHASE',
+            referenceType: 'RETURN',
+            referenceId: id,
+            note: `Purchase Return ${existing.returnNumber} — Liability Reduction`
+          }
+        });
+      }
+
+      return tx.purchaseReturn.update({
+        where: { id },
+        data: { status: status as any }
+      });
+    });
+  }
 
   static async createRequisition(data: {
     vendorId: string;
@@ -194,7 +266,7 @@ export class PurchaseService {
         vendorId: data.vendorId,
         totalAmount,
         items: data.items,
-        status: 'PENDING'
+        status: 'PENDING_APPROVAL'
       },
       include: { vendor: true }
     });

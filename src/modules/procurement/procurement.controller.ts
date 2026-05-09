@@ -101,6 +101,16 @@ export class ProcurementController {
     }
   }
 
+  static async updatePOStatus(req: Request, res: Response) {
+    try {
+      const { status } = req.body;
+      const po = await ProcurementService.updatePOStatus(req.params.id, status);
+      res.json(po);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async cancelPO(req: Request, res: Response) {
     try {
       const po = await ProcurementService.cancelPO(req.params.id);

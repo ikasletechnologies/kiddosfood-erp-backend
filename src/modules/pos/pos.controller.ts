@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { POSService } from './pos.service';
 import prisma from '../../lib/prisma';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class POSController {
   /**

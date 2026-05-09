@@ -54,7 +54,7 @@ export class InventoryService {
     // Calculate "Incoming" stock from Pending/Approved but not yet Received POs
     const pendingOrders = await prisma.procurementOrderItem.findMany({
       where: {
-        procurementOrder: { status: { in: ['PENDING', 'APPROVED'] } },
+        procurementOrder: { status: { in: ['PENDING_APPROVAL', 'APPROVED', 'SENT', 'PARTIALLY_RECEIVED'] } },
         inventoryItem: { franchiseId }
       },
       select: { inventoryItemId: true, quantity: true }
