@@ -10,11 +10,21 @@ export class POSService {
   // --- NEW NATIVE API FLOW (Step-by-Step) ---
 
   // Step 1: Create empty order shell
-  static async createOrder(data: { franchiseId: string, customerId?: string, orderType?: string }) {
+  static async createOrder(data: { franchiseId?: string, customerId?: string, orderType?: string }) {
+    let fid = data.franchiseId || 'hq-001';
+    
+    // Safety check: verify franchise exists, else pick the first one
+    const exists = await prisma.franchise.findUnique({ where: { id: fid } });
+    if (!exists) {
+      const first = await prisma.franchise.findFirst();
+      if (!first) throw new Error('No franchises found in the system. Please create one first.');
+      fid = first.id;
+    }
+
     return prisma.order.create({
       data: {
         invoiceNum: `INV-${Date.now()}`,
-        franchiseId: data.franchiseId || 'root-franchise',
+        franchiseId: fid,
         customerId: data.customerId,
         status: 'PENDING',
         paymentStatus: 'UNPAID',
@@ -240,35 +250,42 @@ export class POSService {
   /**
    * Main POS Checkout Flow (Legacy, wraps old calls)
    */
-  static async checkout(data: {
-    franchiseId: string,
-    customerId?: string,
+  static async checkout(data: { 
+    franchiseId?: string, 
+    customerId?: string, 
     items: { productId: string, quantity: number, price: number }[],
     subTotal: number,
     taxAmount: number,
     discountAmount: number,
     totalAmount: number,
-    paymentMode: 'CASH' | 'UPI' | 'CARD'
+    paymentMode: string
   }) {
+    let fid = data.franchiseId || 'hq-001';
+    const fexists = await prisma.franchise.findUnique({ where: { id: fid } });
+    if (!fexists) {
+      const first = await prisma.franchise.findFirst();
+      fid = first?.id || fid;
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       const order = await tx.order.create({
         data: {
           invoiceNum: `INV-${Date.now()}`,
-          franchiseId: data.franchiseId,
+          franchiseId: fid,
           customerId: data.customerId,
-          subTotal: data.subTotal,
+          subTotal: data.subTotal || (data as any).subtotal || 0,
           taxAmount: data.taxAmount,
           discountAmount: data.discountAmount,
           totalAmount: data.totalAmount,
           status: 'COMPLETED',
           paymentStatus: 'PAID',
           orderItems: {
-            create: data.items.map(item => ({
+            create: data.items.map((item: any) => ({
               productId: item.productId,
               quantity: item.quantity,
-              price: item.price,
-              taxAmount: Number((item.price * 0.05).toFixed(2)),
-              totalAmount: Number((item.price * item.quantity).toFixed(2))
+              price: item.price || item.unitPrice || 0,
+              taxAmount: Number(((item.price || item.unitPrice || 0) * 0.05).toFixed(2)),
+              totalAmount: Number(((item.price || item.unitPrice || 0) * item.quantity).toFixed(2))
             }))
           },
         },
@@ -277,15 +294,21 @@ export class POSService {
       // --- Moved post-creation logic into the transaction block ---
 
     // Handle Payment through central logic
-    // Resolve a default account for legacy checkout (e.g. first CASH account)
-    const defaultAccount = await tx.account.findFirst({ where: { type: 'CASH' } });
+    // Resolve a default account based on payment mode
+    const accountTypeMap: Record<string, 'CASH' | 'BANK' | 'UPI'> = {
+      'CASH': 'CASH',
+      'UPI': 'UPI',
+      'CARD': 'BANK'
+    };
+    const targetType = accountTypeMap[data.paymentMode] || 'CASH';
+    const defaultAccount = await tx.account.findFirst({ where: { type: targetType } });
     
     await FinanceService.createPayment({
       tx,
       amount: data.totalAmount,
       flow: 'IN',
       status: 'PAID',
-      sourceAccount: defaultAccount?.id || 'CASH', // Fallback to key
+      sourceAccount: defaultAccount?.id || targetType, 
       method: data.paymentMode,
       sourceModule: 'POS',
       linkedDocType: 'INVOICE',
@@ -296,30 +319,30 @@ export class POSService {
       createdBy: 'LEGACY_CHECKOUT'
     });
 
-      for (const orderItem of data.items) {
+      for (const item of data.items) {
         const product = await tx.product.findUnique({
-          where: { id: orderItem.productId },
+          where: { id: item.productId },
           include: { recipe: { include: { recipeItems: true } } }
         });
 
         if (product && product.is_menu_item && product.recipe) {
-          const scalar = orderItem.quantity / product.recipe.yieldQty;
-          for (const item of product.recipe.recipeItems) {
-            const quantityToDeduct = item.quantityRequired * scalar;
+          const scalar = item.quantity / product.recipe.yieldQty;
+          for (const ri of product.recipe.recipeItems) {
+            const quantityToDeduct = ri.quantityRequired * scalar;
             
             // Check stock even in legacy checkout if possible
-            const inv = await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } });
+            const inv = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
             if (inv && inv.currentStock < quantityToDeduct) {
                throw new Error(`Out of stock during checkout: ${inv.name}`);
             }
 
             await InventoryService.recordMovement(tx, {
-              itemId: item.inventoryItemId,
+              itemId: ri.inventoryItemId,
               type: 'SALES_OUT',
               quantity: -quantityToDeduct,
               referenceType: 'ORDER',
               referenceId: order.id,
-              note: `Legacy checkout for ${orderItem.quantity}x ${product.name}`
+              note: `Legacy checkout for ${item.quantity}x ${product.name}`
             });
           }
         }

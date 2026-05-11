@@ -113,9 +113,8 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.receivedQty <= 0) continue;
 
-        // Add InventoryBatch in QC_HOLD state for traceability
-        // Usable stock is NOT increased yet.
-        await tx.inventoryBatch.create({
+        // 1. Create Inventory Batch (Directly APPROVED for streamlined flow)
+        const batch = await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
             batchNumber: item.vendorBatchNo || `B-${Date.now()}`,
@@ -123,24 +122,75 @@ export class GRNService {
             mfgDate: item.mfgDate,
             expDate: item.expDate,
             initialQty: item.receivedQty,
-            currentQty: 0, // Not usable yet
-            status: 'QC_HOLD'
+            currentQty: item.receivedQty, // Usable immediately
+            status: 'APPROVED'
           }
+        });
+
+        // 2. Record Stock Movement (Impacts InventoryItem.currentStock)
+        await InventoryService.recordMovement(tx, {
+          itemId: item.materialId!,
+          type: 'PURCHASE_IN',
+          quantity: item.receivedQty,
+          referenceType: 'GRN',
+          referenceId: grnId,
+          note: `Auto-approved via GRN ${grnId}`
         });
 
         await tx.inventoryItem.update({
           where: { id: item.materialId! },
           data: { vendorId: grn.procurementOrder.vendorId }
         });
+
+        // 3. Mark GRN Item as APPROVED
+        await tx.goodsReceiptItem.update({
+          where: { id: item.id },
+          data: { qcStatus: 'APPROVED' }
+        });
+      }
+
+      // 4. Update Financial Ledger (Liability)
+      // Calculate total value of goods received in this GRN
+      const grnSubtotal = grn.items.reduce((acc, it) => acc + (it.receivedQty * it.price), 0);
+      
+      // Approximate tax based on PO's overall tax rate if possible, 
+      // or just use subtotal if the user prefers simple accounting.
+      // Manufacturing ERPs usually record the exact liability from the GRN.
+      const poTotal = grn.procurementOrder.totalAmount;
+      const poSubtotal = grn.procurementOrder.subtotal;
+      const taxFactor = poSubtotal > 0 ? poTotal / poSubtotal : 1;
+      const grnTotalWithTax = grnSubtotal * taxFactor;
+
+      if (grnTotalWithTax > 0) {
+        await tx.vendorLedger.create({
+          data: {
+            vendorId: grn.procurementOrder.vendorId,
+            type: 'DEBIT', // Purchase Liability
+            amount: grnTotalWithTax,
+            paymentMode: 'CASH', // Placeholder
+            sourceModule: 'PROCUREMENT',
+            referenceType: 'PURCHASE',
+            referenceId: grnId,
+            note: `Goods Received via GRN ${grnId} (PO #${grn.procurementOrder.poNumber || grn.poId.slice(0,8)})`
+          }
+        });
       }
 
       // Check PO fulfillment status
       const allGRNsForPO = await tx.goodsReceiptItem.findMany({
-         where: { grn: { poId: grn.poId, status: 'COMPLETED' } }
+         where: { 
+           grn: { 
+             poId: grn.poId, 
+             status: 'COMPLETED',
+             id: { not: grnId } // Exclude current GRN to avoid double counting
+           } 
+         }
       });
       
       const receivedMap = new Map();
+      // Add previous GRNs
       allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
+      // Add current GRN
       grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
 
       for (const poItem of grn.procurementOrder.poItems) {
@@ -171,7 +221,7 @@ export class GRNService {
             module: 'GRN',
             action: 'APPROVE',
             recordId: grnId,
-            newValue: { status: 'COMPLETED', inventoryState: 'QC_HOLD' },
+            newValue: { status: 'COMPLETED', inventoryState: 'APPROVED' },
             performedBy: 'SYSTEM'
          }
       });

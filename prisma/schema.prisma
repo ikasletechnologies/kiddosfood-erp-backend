@@ -1467,3 +1467,12 @@ enum InventoryStockState {
   EXPIRED
   RETURNED
 }
+
+model SystemSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String   @db.Text
+  group       String   @default("GENERAL")
+  description String?
+  updatedAt   DateTime @updatedAt
+}

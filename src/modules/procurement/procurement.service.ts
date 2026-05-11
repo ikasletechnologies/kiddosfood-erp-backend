@@ -463,22 +463,42 @@ export class ProcurementService {
 
   static async getPurchaseOrders() {
     const orders = await prisma.procurementOrder.findMany({
-      include: { vendor: true, poItems: { include: { inventoryItem: true } }, goodsReceipts: true },
+      include: { 
+        vendor: true, 
+        poItems: { include: { inventoryItem: true } }, 
+        goodsReceipts: { include: { items: true } } 
+      },
       orderBy: { createdAt: 'desc' }
     });
     const vendorIds = Array.from(new Set(orders.map(o => o.vendorId)));
     const allLedger = await prisma.vendorLedger.findMany({
       where: { vendorId: { in: vendorIds } }
     });
-    return orders.map((po) => {
+    return orders.map((po: any) => {
       const linkedPayments = allLedger
         .filter(l => l.referenceId === po.id && l.type === 'CREDIT')
         .reduce((sum, l) => sum + l.amount, 0);
       const livePaid = Math.max(po.paid || 0, linkedPayments);
+
+      // Calculate fulfillment stats (Support both structured poItems and legacy JSON items)
+      let totalItemsCount = 0;
+      if (po.poItems && po.poItems.length > 0) {
+        totalItemsCount = po.poItems.reduce((sum: number, item: any) => sum + (item.quantity || 0), 0);
+      } else if (Array.isArray(po.items)) {
+        totalItemsCount = po.items.reduce((sum: number, item: any) => sum + (Number(item.quantity) || 0), 0);
+      }
+
+      const receivedItemsCount = (po.goodsReceipts || []).reduce((sum: number, grn: any) => {
+        const grnTotal = (grn.items || []).reduce((s: number, i: any) => s + (i.receivedQty || 0), 0);
+        return sum + grnTotal;
+      }, 0);
+
       return {
         ...po,
         paid: livePaid,
-        balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2)))
+        balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2))),
+        totalItemsCount,
+        receivedItemsCount
       };
     });
   }
@@ -583,12 +603,32 @@ export class ProcurementService {
         }
       });
 
-      // FINANCIAL TRIGGER REMOVED: In enterprise flow, liability is recognized on INVOICE APPROVAL.
+      // FINANCIAL TRIGGER: Recognize liability on Receipt
+      const totalValue = po.poItems.reduce((acc, it) => acc + (it.quantity * it.price), 0);
+      
+      // Calculate tax factor from PO totals
+      const taxFactor = po.subtotal > 0 ? po.totalAmount / po.subtotal : 1;
+      const totalWithTax = totalValue * taxFactor;
+
+      if (totalWithTax > 0) {
+        await tx.vendorLedger.create({
+          data: {
+            vendorId: po.vendorId,
+            type: 'DEBIT', // Liability
+            amount: totalWithTax,
+            paymentMode: 'CASH',
+            sourceModule: 'PROCUREMENT',
+            referenceType: 'PURCHASE',
+            referenceId: po.id,
+            note: `Direct Receipt for PO #${po.poNumber || po.id.slice(0,8)}`
+          }
+        });
+      }
 
       return tx.procurementOrder.update({
         where: { id: poId },
         data: { status: 'RECEIVED', received: true },
-        include: { poItems: true, goodsReceipts: true }
+        include: { poItems: true, goodsReceipts: { include: { items: true } } }
       });
     });
 

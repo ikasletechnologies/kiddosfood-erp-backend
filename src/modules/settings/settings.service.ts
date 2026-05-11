@@ -5,16 +5,20 @@ export class SettingsService {
    * Get all system settings grouped by group name
    */
   static async getAllSettings() {
-    return {};
+    return prisma.systemSetting.findMany();
   }
 
-  static async setSetting(key: string, value: string, _group?: string, _description?: string) {
-    console.log(`Setting [${key}] to [${value}] (MOCKED - Model deleted)`);
-    return { key, value };
+  static async setSetting(key: string, value: string, group: string = 'GENERAL', description?: string) {
+    return prisma.systemSetting.upsert({
+      where: { key },
+      update: { value, group, description },
+      create: { key, value, group, description },
+    });
   }
 
-  static async getSettingValue(_key: string, defaultValue: string = ''): Promise<string> {
-    return defaultValue;
+  static async getSettingValue(key: string, defaultValue: string = ''): Promise<string> {
+    const setting = await prisma.systemSetting.findUnique({ where: { key } });
+    return setting?.value ?? defaultValue;
   }
 
   /**

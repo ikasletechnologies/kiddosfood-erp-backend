@@ -10,8 +10,9 @@ export class POSController {
    */
   static async checkout(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const {
-        franchiseId,
+        franchiseId: bodyFranchiseId,
         customerId,
         customerName,
         items,
@@ -21,6 +22,8 @@ export class POSController {
         totalAmount,
         paymentMode
       } = req.body;
+
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, bodyFranchiseId);
 
       // Resolve recipeId → productId for each item
       const resolvedItems = await Promise.all(
@@ -42,7 +45,7 @@ export class POSController {
       );
 
       const order = await POSService.checkout({
-        franchiseId: franchiseId || 'root-franchise',
+        franchiseId: franchiseId || 'hq-001',
         customerId,
         items: resolvedItems,
         subTotal: subtotal ?? totalAmount,
