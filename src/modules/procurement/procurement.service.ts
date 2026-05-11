@@ -711,6 +711,7 @@ export class ProcurementService {
       const payment = await FinanceService.createPayment({
         tx,
         amount,
+        type: type === 'ADVANCE' ? 'ADVANCE' : 'INVOICE_LINKED',
         flow: 'OUT',
         status: 'PAID',
         sourceAccount: accountId,
@@ -720,7 +721,7 @@ export class ProcurementService {
         linkedDocId: vendorInvoiceId || referenceId,
         vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',
-        entityId: vendorId,
+        entity: vendorId,
         createdBy: 'PROCUREMENT_MODULE',
         note: note
       });

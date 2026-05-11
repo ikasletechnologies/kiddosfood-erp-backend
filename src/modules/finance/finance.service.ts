@@ -453,6 +453,14 @@ export class FinanceService {
     const linkedDocType = data.linkedDocType || 'DIRECT';
     const linkedDocId = data.linkedDocId;
 
+    // Robust type mapping for cross-module compatibility
+    let paymentType = data.type || 'DIRECT';
+    console.log(`[FinanceService] Incoming payment type: ${data.type}, Resolved to: ${paymentType}`);
+    if (paymentType === 'PAYMENT') {
+      paymentType = 'INVOICE_LINKED';
+      console.log(`[FinanceService] Remapped PAYMENT to INVOICE_LINKED`);
+    }
+
     if (flow !== 'IN' && flow !== 'OUT') {
       throw new Error('Invalid payment direction. Must be IN or OUT.');
     }
@@ -492,7 +500,7 @@ export class FinanceService {
         data: {
           paymentNumber,
           paidAmount:     amount,
-          type:           data.type || 'DIRECT',
+          type:           paymentType as any,
           sourceModule:   sourceModule as any,
           linkedDocType:  linkedDocType as any,
           linkedDocId:    linkedDocId,
