@@ -359,7 +359,7 @@ export class POSService {
 
       for (const item of data.items) {
         const product = await tx.product.findUnique({
-          where: { id: item.productId || item.id },
+          where: { id: item.productId },
           include: { recipe: { include: { recipeItems: true } } }
         });
 
