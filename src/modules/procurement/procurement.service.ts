@@ -236,6 +236,7 @@ export class ProcurementService {
       
       return {
         ...item,
+        itemName: inventoryItem?.name || "Unknown Material",
         gstRate,
         subtotal,
         cgst,
@@ -283,6 +284,7 @@ export class ProcurementService {
           poItems: {
             create: poItemsData.map((item) => ({
               inventoryItemId: item.inventoryItemId,
+              itemName: item.itemName,
               gstRate: item.gstRate,
               quantity: item.quantity,
               price: item.price,

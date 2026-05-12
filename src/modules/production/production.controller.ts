@@ -59,7 +59,8 @@ export class ProductionController {
   static async approveBatch(req: Request, res: Response) {
     try {
       const userId = (req as unknown as { user: { id: string } }).user?.id;
-      const result = await ProductionService.approveProduction(req.params.id, userId);
+      const { actualYield } = req.body;
+      const result = await ProductionService.approveProduction(req.params.id, userId, actualYield ? Number(actualYield) : undefined);
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

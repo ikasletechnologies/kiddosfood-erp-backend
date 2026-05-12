@@ -1,11 +1,37 @@
 import { Request, Response } from 'express';
 import { ProductService } from './product.service';
+import prisma from '../../lib/prisma';
 
 export class ProductController {
   static async getAll(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      let franchiseId = user?.franchiseId || (req.query.franchiseId as string);
+      
+      // Fallback for Super Admins if no franchise context is provided
+      if (!franchiseId && user?.role === 'SUPER_ADMIN') {
+        const hq = await prisma.franchise.findFirst({ 
+          where: { 
+            OR: [
+              { name: { contains: 'HQ', mode: 'insensitive' } },
+              { name: { contains: 'Head', mode: 'insensitive' } },
+              { name: { contains: 'Main', mode: 'insensitive' } },
+              { name: { contains: 'Home', mode: 'insensitive' } }
+            ],
+            status: 'ACTIVE' 
+          } 
+        });
+        const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
+        franchiseId = hq?.id || first?.id;
+      }
+      
+      console.log(`📦 [ProductAPI] Fetching products for Franchise: ${franchiseId || 'NONE'}`);
+      
       const category = req.query.category as string;
-      const products = await ProductService.getAll(category ? { category } : {});
+      const products = await ProductService.getAll(
+        category ? { category } : {},
+        franchiseId
+      );
       res.json(products);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

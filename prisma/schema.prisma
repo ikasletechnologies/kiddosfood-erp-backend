@@ -411,6 +411,7 @@ model Production {
   endTime        DateTime?
   expiryDate     DateTime?
   startTime      DateTime?
+  actualYield    Float?
   batches        ProductBatch[]
   customer       Customer?        @relation(fields: [customerId], references: [id])
   franchise      Franchise        @relation(fields: [franchiseId], references: [id])

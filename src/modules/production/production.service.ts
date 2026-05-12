@@ -86,7 +86,7 @@ export class ProductionService {
     });
   }
 
-  static async approveProduction(id: string, userId?: string) {
+  static async approveProduction(id: string, userId?: string, actualYield?: number) {
     return prisma.$transaction(async tx => {
       const production = await tx.production.findUnique({
         where: { id },
@@ -123,8 +123,8 @@ export class ProductionService {
         });
       }
 
-      // 2. Add finished goods (Total Yield = Runs * Yield per run)
-      const totalYield = production.quantity * recipe.yieldQty;
+      // 2. Add finished goods (Total Yield = Runs * Yield per run, unless actualYield is provided)
+      const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
       await InventoryService.recordMovement(tx, {
         itemId: targetItem.id,
         type: 'PRODUCTION_IN',
@@ -135,21 +135,24 @@ export class ProductionService {
         userId,
       });
 
-      // 3. Create ProductBatch
+      // 3. Create ProductBatch (Actual quantity produced)
       await tx.productBatch.create({
         data: {
           productId: recipe.productId,
           productionId: production.id,
-          quantity: production.quantity,
+          quantity: totalYield,
           expiryDate: production.expiryDate,
           batchCode: `BATCH-${production.id.substring(0, 8).toUpperCase()}`,
         },
       });
 
-      // 4. Finalize status
+      // 4. Finalize status and record actual yield
       return tx.production.update({
         where: { id },
-        data: { status: 'COMPLETED' },
+        data: { 
+          status: 'COMPLETED',
+          actualYield: totalYield
+        },
       });
     });
   }
