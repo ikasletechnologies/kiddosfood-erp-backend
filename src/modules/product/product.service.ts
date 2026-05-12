@@ -4,8 +4,8 @@ export class ProductService {
   /**
    * Fetch all products
    */
-  static async getAll(filters: any = {}) {
-    return prisma.product.findMany({
+  static async getAll(filters: any = {}, franchiseId?: string) {
+    const products = await prisma.product.findMany({
       where: filters,
       include: { 
         recipe: {
@@ -14,6 +14,28 @@ export class ProductService {
       },
       orderBy: { name: 'asc' }
     });
+
+    if (franchiseId) {
+      const skus = products.map(p => p.sku).filter(Boolean) as string[];
+      const inventory = await prisma.inventoryItem.findMany({
+        where: { sku: { in: skus }, franchiseId }
+      });
+      
+      return products.map(p => {
+        const pName = p.name.trim().toLowerCase();
+        // Match by SKU first, then fallback to Name (case-insensitive + trimmed)
+        const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
+                   inventory.find(i => i.name.trim().toLowerCase() === pName);
+        
+        return {
+          ...p,
+          currentStock: inv ? inv.currentStock : 0,
+          inventoryFranchiseId: inv ? inv.franchiseId : (franchiseId || null)
+        };
+      });
+    }
+
+    return products;
   }
 
   /**

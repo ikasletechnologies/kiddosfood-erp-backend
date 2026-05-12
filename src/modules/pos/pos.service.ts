@@ -157,31 +157,59 @@ export class POSService {
          const product = orderItem.product;
 
          // Phase 3: Only menu items will deduct stock
-         if (product && product.is_menu_item && product.recipe) {
-           const scalar = orderItem.quantity / product.recipe.yieldQty;
+         if (product && product.is_menu_item) {
+           if (product.recipe) {
+             const scalar = orderItem.quantity / product.recipe.yieldQty;
 
-           for (const item of product.recipe.recipeItems) {
-             const required = item.quantityRequired * scalar;
+             for (const item of product.recipe.recipeItems) {
+               const required = item.quantityRequired * scalar;
 
-             // Safety 1: Check Stock Before Deduct
-             const inventoryItem = await tx.inventoryItem.findUnique({
-               where: { id: item.inventoryItemId }
-             });
+               // Safety 1: Check Stock Before Deduct
+               const inventoryItem = await tx.inventoryItem.findUnique({
+                 where: { id: item.inventoryItemId }
+               });
 
-             if (!inventoryItem) throw new Error(`Inventory mapping missing for recipe item in ${product.name}`);
-             if (inventoryItem.currentStock < required) {
-               throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${required}, Stock: ${inventoryItem.currentStock}`);
+               if (!inventoryItem) throw new Error(`Inventory mapping missing for recipe item in ${product.name}`);
+               if (inventoryItem.currentStock < required) {
+                 throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${required}, Stock: ${inventoryItem.currentStock}`);
+               }
+
+               // Deduct stock explicitly inside tx
+               await InventoryService.recordMovement(tx, {
+                 itemId: item.inventoryItemId,
+                 type: 'SALES_OUT',
+                 quantity: -required,
+                 referenceType: 'ORDER',
+                 referenceId: order.id,
+                 note: `Auto-deduction for Order ${order.invoiceNum} (Product: ${product.name})`
+               });
              }
-
-             // Deduct stock explicitly inside tx
-             await InventoryService.recordMovement(tx, {
-               itemId: item.inventoryItemId,
-               type: 'SALES_OUT',
-               quantity: -required,
-               referenceType: 'ORDER',
-               referenceId: order.id,
-               note: `Auto-deduction for Order ${order.invoiceNum} (Product: ${product.name})`
+           } else {
+             // FALLBACK: If no recipe exists, try to deduct directly from InventoryItem with matching SKU or Name
+             const inventoryItem = await tx.inventoryItem.findFirst({
+               where: {
+                 OR: [
+                   { sku: product.sku || '___NON_EXISTENT___' },
+                   { name: { equals: product.name, mode: 'insensitive' } }
+                 ],
+                 franchiseId: order.franchiseId
+               }
              });
+
+             if (inventoryItem) {
+                if (inventoryItem.currentStock < orderItem.quantity) {
+                  throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${orderItem.quantity}, Stock: ${inventoryItem.currentStock}`);
+                }
+
+                await InventoryService.recordMovement(tx, {
+                  itemId: inventoryItem.id,
+                  type: 'SALES_OUT',
+                  quantity: -orderItem.quantity,
+                  referenceType: 'ORDER',
+                  referenceId: order.id,
+                  note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
+                });
+             }
            }
          }
        }
@@ -260,11 +288,21 @@ export class POSService {
     totalAmount: number,
     paymentMode: string
   }) {
-    let fid = data.franchiseId || 'hq-001';
-    const fexists = await prisma.franchise.findUnique({ where: { id: fid } });
-    if (!fexists) {
-      const first = await prisma.franchise.findFirst();
-      fid = first?.id || fid;
+    let fid = data.franchiseId;
+    if (!fid) {
+      const hq = await prisma.franchise.findFirst({ 
+        where: { 
+          OR: [
+            { name: { contains: 'HQ', mode: 'insensitive' } },
+            { name: { contains: 'Head', mode: 'insensitive' } },
+            { name: { contains: 'Main', mode: 'insensitive' } },
+            { name: { contains: 'Home', mode: 'insensitive' } }
+          ],
+          status: 'ACTIVE' 
+        } 
+      });
+      const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
+      fid = hq?.id || first?.id || 'hq-001';
     }
 
     const result = await prisma.$transaction(async (tx) => {
@@ -281,7 +319,7 @@ export class POSService {
           paymentStatus: 'PAID',
           orderItems: {
             create: data.items.map((item: any) => ({
-              productId: item.productId,
+              productId: item.productId || item.id,
               quantity: item.quantity,
               price: item.price || item.unitPrice || 0,
               taxAmount: Number(((item.price || item.unitPrice || 0) * 0.05).toFixed(2)),
@@ -321,29 +359,63 @@ export class POSService {
 
       for (const item of data.items) {
         const product = await tx.product.findUnique({
-          where: { id: item.productId },
+          where: { id: item.productId || item.id },
           include: { recipe: { include: { recipeItems: true } } }
         });
 
-        if (product && product.is_menu_item && product.recipe) {
-          const scalar = item.quantity / product.recipe.yieldQty;
-          for (const ri of product.recipe.recipeItems) {
-            const quantityToDeduct = ri.quantityRequired * scalar;
-            
-            // Check stock even in legacy checkout if possible
-            const inv = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
-            if (inv && inv.currentStock < quantityToDeduct) {
-               throw new Error(`Out of stock during checkout: ${inv.name}`);
-            }
+        if (product) {
+          const pName = (product.name || '').trim().toLowerCase();
+          console.log(`📦 [POS] Deducting stock for ${product.name} (recipe: ${!!product.recipe})`);
+          if (product.recipe) {
+            const scalar = item.quantity / product.recipe.yieldQty;
+            for (const ri of product.recipe.recipeItems) {
+              const quantityToDeduct = ri.quantityRequired * scalar;
+              
+              // Check stock even in legacy checkout if possible
+              const inv = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
+              if (inv && inv.currentStock < quantityToDeduct) {
+                 throw new Error(`Out of stock during checkout: ${inv.name}`);
+              }
 
-            await InventoryService.recordMovement(tx, {
-              itemId: ri.inventoryItemId,
-              type: 'SALES_OUT',
-              quantity: -quantityToDeduct,
-              referenceType: 'ORDER',
-              referenceId: order.id,
-              note: `Legacy checkout for ${item.quantity}x ${product.name}`
-            });
+              await InventoryService.recordMovement(tx, {
+                itemId: ri.inventoryItemId,
+                type: 'SALES_OUT',
+                quantity: -quantityToDeduct,
+                referenceType: 'ORDER',
+                referenceId: order.id,
+                note: `Legacy checkout for ${item.quantity}x ${product.name}`
+              });
+            }
+          } else {
+            // FALLBACK: Direct deduction if no recipe
+            console.log(`🔍 [POS] Trying direct deduction for ${product.name}`);
+                const inventoryItem = await tx.inventoryItem.findFirst({
+                  where: {
+                    OR: [
+                      { sku: product.sku || '___NON_EXISTENT___' },
+                      { name: { equals: pName, mode: 'insensitive' } }
+                    ],
+                    franchiseId: fid
+                  }
+                });
+
+            if (inventoryItem) {
+              console.log(`✅ [POS] Match found: ${inventoryItem.name}. Stock before: ${inventoryItem.currentStock}`);
+              if (inventoryItem.currentStock < item.quantity) {
+                throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${item.quantity}, Stock: ${inventoryItem.currentStock}`);
+              }
+
+              await InventoryService.recordMovement(tx, {
+                itemId: inventoryItem.id,
+                type: 'SALES_OUT',
+                quantity: -item.quantity,
+                referenceType: 'ORDER',
+                referenceId: order.id,
+                note: `Direct legacy auto-deduction (No recipe)`
+              });
+            } else {
+              console.log(`❌ [POS] No inventory item found for ${product.name} in franchise ${fid}`);
+            }
           }
         }
       }
