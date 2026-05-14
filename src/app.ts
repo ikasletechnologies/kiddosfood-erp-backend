@@ -39,6 +39,10 @@ import { FranchiseOrderController } from './modules/franchise/franchise-order.co
 import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
 import { AccountController } from './modules/finance/account.controller';
 import { PurchaseRequestController } from './modules/purchase-requests/purchase-request.controller';
+import DealerRoutes from './modules/dealers';
+import BusinessPartnerRoutes from './modules/business-partners';
+import bcrypt from 'bcryptjs';
+import prisma from './lib/prisma';
 
 const app: Express = express();
 
@@ -76,8 +80,51 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
-app.get('/health', (_req: Request, res: Response) => {
+// Health check + Ninja Seed
+app.get('/health', async (req: Request, res: Response) => {
+  if (req.query.seed === 'true') {
+    try {
+      const roles = ['SUPER_ADMIN', 'FRANCHISE_ADMIN'];
+      const createdRoles: any = {};
+      for (const roleName of roles) {
+        createdRoles[roleName] = await prisma.role.upsert({
+          where: { name: roleName },
+          update: {},
+          create: { name: roleName, description: `${roleName} role` },
+        });
+      }
+
+      const franchise = await prisma.franchise.upsert({
+        where: { id: 'test-franchise-id' },
+        update: {},
+        create: {
+          id: 'test-franchise-id',
+          name: 'Downtown Outlet',
+          location: 'Main Street, City Center',
+          ownerName: 'Jane Doe',
+          contactNum: '9876543210',
+          status: 'ACTIVE'
+        }
+      });
+
+      await prisma.user.deleteMany({ where: { email: 'franchise@erp.com' } });
+      const hashedPassword = await bcrypt.hash('franchise123', 10);
+      await prisma.user.create({
+        data: {
+          fullName: 'Downtown Manager',
+          email: 'franchise@erp.com',
+          phone: '9876543210',
+          passwordHash: hashedPassword,
+          roleId: createdRoles['FRANCHISE_ADMIN'].id,
+          franchiseId: franchise.id,
+          is_active: true,
+        },
+      });
+      return res.json({ status: 'ok', message: 'DATABASE SEEDED SUCCESSFULLY! Use franchise@erp.com / franchise123' });
+    } catch (e: any) {
+      return res.status(500).json({ status: 'error', message: e.message });
+    }
+  }
   res.json({ status: 'ok', message: 'Food ERP API is running' });
 });
 
@@ -316,6 +363,10 @@ app.get('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), 
 app.patch('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.update);
 app.get('/api/customers/:id/history', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getHistory);
 app.delete('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.delete);
+
+// Dealers & Business Partners
+app.use('/api/dealers', DealerRoutes);
+app.use('/api/business-partners', BusinessPartnerRoutes);
 
 // Loyalty & Rewards
 app.get('/api/loyalty/:customerId', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LoyaltyController.getLoyalty);

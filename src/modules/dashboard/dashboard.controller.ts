@@ -24,6 +24,7 @@ export class DashboardController {
       });
       res.json(summary);
     } catch (error: any) {
+      console.error("[Dashboard Error]", error);
       res.status(500).json({ error: error.message });
     }
   }

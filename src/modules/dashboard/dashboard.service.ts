@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { Prisma } from '@prisma/client';
+import { Prisma, OrderStatus } from '@prisma/client';
 
 export class DashboardService {
   static async getSummary(params: { franchiseId?: string; startDate?: string; endDate?: string }) {
@@ -31,6 +31,11 @@ export class DashboardService {
       lowStockItems,
       periodExpenses,
       paymentData,
+      cashFlowToday,
+      outstandingData,
+      pendingCheques,
+      returnsData,
+      dealerCount,
     ] = await Promise.all([
       // 0
       prisma.order.count({
@@ -38,12 +43,12 @@ export class DashboardService {
       }),
       // 1
       prisma.order.aggregate({
-        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: today, lte: periodEnd } },
+        where: { ...whereClause, status: OrderStatus.COMPLETED, createdAt: { gte: today, lte: periodEnd } },
         _sum: { totalAmount: true }
       }),
       // 2
       prisma.order.aggregate({
-        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: previousPeriodStart, lte: previousPeriodEnd } },
+        where: { ...whereClause, status: OrderStatus.COMPLETED, createdAt: { gte: previousPeriodStart, lte: previousPeriodEnd } },
         _sum: { totalAmount: true }
       }),
       // 3
@@ -53,7 +58,7 @@ export class DashboardService {
       // 5
       prisma.order.groupBy({
         by: ['status'],
-        where: { ...whereClause, status: { in: ['PENDING', 'PREPARING', 'COMPLETED', 'CANCELLED'] }, createdAt: { gte: today, lte: periodEnd } },
+        where: { ...whereClause, status: { in: [OrderStatus.PENDING, OrderStatus.PREPARING, OrderStatus.COMPLETED, OrderStatus.CANCELLED] }, createdAt: { gte: today, lte: periodEnd } },
         _count: { id: true }
       }),
       // 6
@@ -74,13 +79,50 @@ export class DashboardService {
         },
         _sum: { paidAmount: true }
       }),
-      // 9: Real Accounts & Liquidity
-      prisma.account.findMany(),
       // 10: Cash Flow Today (PAID only)
       prisma.payment.aggregate({
-        where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID' },
+        where: { 
+          createdAt: { gte: today, lte: periodEnd }, 
+          status: 'PAID',
+          ...(franchiseId ? { order: { franchiseId } } : {})
+        },
         _sum: { paidAmount: true }
-      })
+      }),
+      // 11: Outstanding Amount (Orders with remaining balance)
+      prisma.order.aggregate({
+        where: { 
+          ...whereClause, 
+          status: OrderStatus.COMPLETED,
+        },
+        _sum: { totalAmount: true }
+      }).then(async (agg) => {
+        const total = agg._sum.totalAmount || 0;
+        const paid = await prisma.payment.aggregate({
+          where: { 
+            status: 'PAID',
+            order: { ...whereClause, status: OrderStatus.COMPLETED }
+          },
+          _sum: { paidAmount: true }
+        });
+        return total - (paid._sum.paidAmount || 0);
+      }),
+      // 12: Pending Cheques
+      prisma.payment.aggregate({
+        where: {
+          paymentMode: 'CHEQUE',
+          status: 'PENDING',
+          order: whereClause
+        },
+        _sum: { paidAmount: true },
+        _count: { id: true }
+      }),
+      // 13: Sales Returns
+      prisma.returnOrder?.aggregate({
+        where: { ...whereClause, createdAt: { gte: today, lte: periodEnd } },
+        _sum: { refundAmount: true }
+      }) || Promise.resolve({ _sum: { refundAmount: 0 } }),
+      // 14: Dealer Count
+      prisma.dealer.count({ where: itemWhereClause })
     ]);
 
     const accounts = await prisma.account.findMany();
@@ -89,11 +131,21 @@ export class DashboardService {
     const upiBal = accounts.filter(a => a.type === 'UPI').reduce((s, a) => s + a.balance, 0);
 
     const inflowsToday = await prisma.payment.aggregate({
-      where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID', entityType: { not: 'VENDOR' } }, // Simplified inflow
+      where: { 
+        createdAt: { gte: today, lte: periodEnd }, 
+        status: 'PAID', 
+        entityType: { not: 'VENDOR' },
+        ...(franchiseId ? { order: { franchiseId } } : {})
+      }, // Simplified inflow
       _sum: { paidAmount: true }
     });
     const outflowsToday = await prisma.payment.aggregate({
-      where: { createdAt: { gte: today, lte: periodEnd }, status: 'PAID', entityType: 'VENDOR' }, // Simplified outflow
+      where: { 
+        createdAt: { gte: today, lte: periodEnd }, 
+        status: 'PAID', 
+        entityType: 'VENDOR',
+        ...(franchiseId ? { order: { franchiseId } } : {})
+      }, // Simplified outflow
       _sum: { paidAmount: true }
     });
     
@@ -150,32 +202,29 @@ export class DashboardService {
       pct: Math.round((ts.count / maxCount) * 100)
     }));
 
-    // Weekly sales (last 7 days from periodEnd)
-    const weeklyData: { day: string; value: number; height: number }[] = [];
+    // Weekly sales (last 7 days from periodEnd) - OPTIMIZED: Parallel queries
     const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    let weekMax = 0;
+    const weekResults = await Promise.all(
+      Array.from({ length: 7 }, (_, i) => {
+        const dayStart = new Date(periodEnd);
+        dayStart.setDate(dayStart.getDate() - (6 - i));
+        dayStart.setHours(0, 0, 0, 0);
+        const dayEnd = new Date(dayStart);
+        dayEnd.setHours(23, 59, 59, 999);
+        return prisma.order.aggregate({
+          where: { ...whereClause, status: OrderStatus.COMPLETED, createdAt: { gte: dayStart, lte: dayEnd } },
+          _sum: { totalAmount: true }
+        }).then(res => ({
+          day: DAYS[dayStart.getDay()],
+          value: res._sum.totalAmount || 0
+        }));
+      })
+    );
 
-    for (let i = 6; i >= 0; i--) {
-      const dayStart = new Date(periodEnd);
-      dayStart.setDate(dayStart.getDate() - i);
-      dayStart.setHours(0,0,0,0);
-      const dayEnd = new Date(dayStart);
-      dayEnd.setHours(23, 59, 59, 999);
-
-      const revenue = await prisma.order.aggregate({
-        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: dayStart, lte: dayEnd } },
-        _sum: { totalAmount: true }
-      });
-
-      const val = revenue._sum.totalAmount || 0;
-      if (val > weekMax) weekMax = val;
-      weeklyData.push({ day: DAYS[dayStart.getDay()], value: val, height: 0 });
-    }
-
-    // Calculate heights relative to max
-    const weekly = weeklyData.map(d => ({
+    const weekMax = Math.max(...weekResults.map(d => d.value), 1);
+    const weekly = weekResults.map(d => ({
       ...d,
-      height: weekMax > 0 ? Math.round((d.value / weekMax) * 100) : 0
+      height: Math.round((d.value / weekMax) * 100)
     }));
 
     const weekTotal = weekly.reduce((acc, d) => acc + d.value, 0);
@@ -206,6 +255,11 @@ export class DashboardService {
         revenueChangePct,
         expensesToday: expenses,
         profitToday: (inflowsToday._sum.paidAmount || 0) - (outflowsToday._sum.paidAmount || 0),
+        outstandingAmount: outstandingData,
+        pendingChequesValue: pendingCheques._sum.paidAmount || 0,
+        pendingChequesCount: pendingCheques._count.id || 0,
+        salesReturnsToday: (returnsData?._sum as any)?.refundAmount || 0,
+        dealerCount,
         treasury: {
           cash: cashBal,
           bank: bankBal,

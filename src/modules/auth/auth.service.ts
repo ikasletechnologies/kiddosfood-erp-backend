@@ -89,12 +89,21 @@ export class AuthService {
       include: { user: { include: { role: { include: { permissions: { include: { permission: true } } } } } } }
     });
 
-    if (!storedToken || storedToken.isRevoked || storedToken.expiresAt < new Date()) {
+    const now = new Date();
+    const isGracePeriod = storedToken.rotatedAt && (now.getTime() - storedToken.rotatedAt.getTime() < 30000); // 30s grace
+
+    if (!storedToken || (storedToken.isRevoked && !isGracePeriod) || storedToken.expiresAt < now) {
       throw new AppError('Refresh token expired or revoked', 401);
     }
 
-    // 3. Optional: Rotation (Revoke old, issue new)
-    await prisma.refreshToken.deleteMany({ where: { id: storedToken.id } });
+    // 3. Rotation: Mark current as rotated/revoked with timestamp instead of deleting
+    // This allows concurrent requests in the same millisecond/second window to succeed
+    if (!storedToken.isRevoked) {
+      await prisma.refreshToken.update({
+        where: { id: storedToken.id },
+        data: { isRevoked: true, rotatedAt: now }
+      });
+    }
 
     const user = storedToken.user;
     const permissions = user.role.permissions.map(rp => rp.permission.key);

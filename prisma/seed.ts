@@ -2,33 +2,53 @@ import prisma from '../src/lib/prisma';
 import bcrypt from 'bcryptjs';
 
 async function main() {
-  console.log('🌱 Starting fresh database seeding...');
+  console.log('🌱 Starting Clean Enterprise Seeding...');
 
-  // 1. Root Headquarters franchise
-  const rootFranchise = await prisma.franchise.upsert({
+  // 1. Root Headquarters (The Parent)
+  const hq = await prisma.franchise.upsert({
     where: { id: 'hq-001' },
-    update: {},
+    update: {
+      name: 'Kiddos Food Headquarters',
+      location: 'Main Warehouse & Office, Mumbai',
+      status: 'ACTIVE',
+    },
     create: {
       id: 'hq-001',
       name: 'Kiddos Food Headquarters',
-      location: 'Corporate Office, Mumbai',
+      location: 'Main Warehouse & Office, Mumbai',
       ownerName: 'Super Admin',
       contactNum: '9999999999',
       status: 'ACTIVE',
     },
   });
 
-  // 2. Core permissions
+  // 2. Operational Franchises (The Children)
+  const branches = [
+    { id: 'fran-downtown', name: 'Downtown Outlet', location: 'Main Street' },
+    { id: 'fran-airport', name: 'Airport Food Court', location: 'International Airport' },
+    { id: 'fran-cbe', name: 'Coimbatore Branch', location: 'Cross Cut Road' },
+  ];
+
+  for (const b of branches) {
+    await prisma.franchise.upsert({
+      where: { id: b.id },
+      update: { name: b.name, location: b.location },
+      create: {
+        id: b.id,
+        name: b.name,
+        location: b.location,
+        ownerName: 'Branch Manager',
+        contactNum: '8888888888',
+        status: 'ACTIVE',
+        creditLimit: 50000,
+        outstandingAmount: 0,
+      }
+    });
+  }
+
+  // 3. Core Permissions
   const permissionKeys = [
-    '*',
-    'crm:view', 'crm:manage',
-    'sales:view', 'sales:manage',
-    'purchase:view', 'purchase:manage',
-    'inventory:view', 'inventory:manage',
-    'accounts:view', 'accounts:manage',
-    'hr:view', 'hr:manage',
-    'service:view', 'service:manage',
-    'pos:access',
+    '*', 'crm:manage', 'sales:manage', 'inventory:manage', 'accounts:manage', 'purchase:manage', 'pos:access'
   ];
 
   await Promise.all(
@@ -41,92 +61,65 @@ async function main() {
     )
   );
 
-  // 3. Roles — SUPER_ADMIN (home/HQ), ADMIN (franchise admin), STAFF
+  // 4. Standard Roles
   const superAdminRole = await prisma.role.upsert({
     where: { name: 'SUPER_ADMIN' },
     update: {},
     create: {
       name: 'SUPER_ADMIN',
-      description: 'Full access across all franchises and modules.',
-      permissions: {
-        create: { permission: { connect: { key: '*' } } },
-      },
+      description: 'Master control (HQ)',
+      permissions: { create: { permission: { connect: { key: '*' } } } },
     },
   });
 
-  await prisma.role.upsert({
-    where: { name: 'ADMIN' },
-    update: {},
-    create: {
-      name: 'ADMIN',
-      description: 'System admin — manages global configurations.',
-      permissions: {
-        create: [
-          { permission: { connect: { key: '*' } } },
-        ],
-      },
-    },
-  });
-
-  await prisma.role.upsert({
+  const franchiseAdminRole = await prisma.role.upsert({
     where: { name: 'FRANCHISE_ADMIN' },
     update: {},
     create: {
       name: 'FRANCHISE_ADMIN',
-      description: 'Franchise admin — manages one franchise.',
+      description: 'Operational branch admin',
       permissions: {
         create: [
-          { permission: { connect: { key: 'crm:manage' } } },
           { permission: { connect: { key: 'sales:manage' } } },
           { permission: { connect: { key: 'inventory:manage' } } },
-          { permission: { connect: { key: 'hr:manage' } } },
-          { permission: { connect: { key: 'accounts:manage' } } },
-          { permission: { connect: { key: 'purchase:manage' } } },
           { permission: { connect: { key: 'pos:access' } } },
-        ],
+        ]
       },
     },
   });
 
-  await prisma.role.upsert({
-    where: { name: 'STAFF' },
-    update: {},
-    create: {
-      name: 'STAFF',
-      description: 'Restricted operational access.',
-      permissions: {
-        create: [
-          { permission: { connect: { key: 'pos:access' } } },
-          { permission: { connect: { key: 'inventory:view' } } },
-          { permission: { connect: { key: 'sales:view' } } },
-        ],
-      },
-    },
-  });
+  // 5. Default Users
+  const password = await bcrypt.hash('admin123', 10);
 
-  // 4. Super admin user
-  const defaultPassword = await bcrypt.hash('admin123', 10);
-
+  // HQ Admin
   await prisma.user.upsert({
     where: { email: 'admin@kiddosfood.com' },
-    update: {
-      passwordHash: defaultPassword,
-      fullName: 'Super Admin',
-      roleId: superAdminRole.id,
-      franchiseId: rootFranchise.id,
-    },
+    update: { passwordHash: password, roleId: superAdminRole.id, franchiseId: hq.id },
     create: {
       email: 'admin@kiddosfood.com',
-      passwordHash: defaultPassword,
-      fullName: 'Super Admin',
+      passwordHash: password,
+      fullName: 'HQ Super Admin',
       roleId: superAdminRole.id,
-      franchiseId: rootFranchise.id,
+      franchiseId: hq.id,
       is_active: true,
     },
   });
 
-  console.log('✅ Seeding complete.');
-  console.log('   Super Admin: admin@kiddosfood.com / admin123');
+  // Downtown Franchise Admin
+  await prisma.user.upsert({
+    where: { email: 'franchise@erp.com' },
+    update: { passwordHash: password, roleId: franchiseAdminRole.id, franchiseId: 'fran-downtown' },
+    create: {
+      email: 'franchise@erp.com',
+      passwordHash: password,
+      fullName: 'Downtown Manager',
+      roleId: franchiseAdminRole.id,
+      franchiseId: 'fran-downtown',
+      is_active: true,
+    },
+  });
+
+  console.log('✅ Seeding complete: Standardized 2-Level Hierarchy Established.');
 }
 
 main()

@@ -1,10 +1,10 @@
-import prisma from '../lib/prisma';
-import { AnalyticsService } from '../modules/analytics/analytics.service';
-import { POSService } from '../modules/pos/pos.service';
+import prisma from '../../lib/prisma';
+import { AnalyticsService } from '../../modules/analytics/analytics.service';
+import { POSService } from '../../modules/pos/pos.service';
 
 /**
  * Verification Script for Phase 7: Advanced Reporting & Analytics
- * RUN: npx ts-node src/scripts/verify_phase7.ts
+ * RUN: npx ts-node src/tests/sales/order-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 7 Verification...');

@@ -1,10 +1,10 @@
-import prisma from '../lib/prisma';
-import { IsolationUtil } from '../utils/isolation.util';
-import { NavController } from '../modules/users/nav.controller';
+import prisma from '../../lib/prisma';
+import { IsolationUtil } from '../../utils/isolation.util';
+import { NavController } from '../../modules/users/nav.controller';
 
 /**
  * Verification Script for Phase 8: Franchise System & RBAC Isolation
- * RUN: npx ts-node src/scripts/verify_phase8.ts
+ * RUN: npx ts-node src/tests/finance/tax-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 8 Verification...');

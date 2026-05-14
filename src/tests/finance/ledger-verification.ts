@@ -1,10 +1,10 @@
-import prisma from '../lib/prisma';
-import { CRMService } from '../modules/crm/crm.service';
-import { POSService } from '../modules/pos/pos.service';
+import prisma from '../../lib/prisma';
+import { CRMService } from '../../modules/crm/crm.service';
+import { POSService } from '../../modules/pos/pos.service';
 
 /**
  * Verification Script for Phase 6: CRM (Customers & Leads)
- * RUN: npx ts-node src/scripts/verify_phase6.ts
+ * RUN: npx ts-node src/tests/finance/ledger-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 6 Verification...');

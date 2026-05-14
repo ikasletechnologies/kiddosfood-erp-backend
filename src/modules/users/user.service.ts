@@ -43,22 +43,26 @@ export class UserService {
 
       // 2. Find Role
       let roleId = data.roleId;
+      const targetRoleName = (data.roleName || data.roleId || "").toUpperCase();
+
+      // Only allow creation of these two roles
+      const allowedRoles = ['SUPER_ADMIN', 'FRANCHISE_ADMIN'];
       
-      // If roleId is actually a role name (like "FRANCHISE_ADMIN"), resolve it
-      if (roleId && (roleId === 'FRANCHISE_ADMIN' || roleId === 'SUPER_ADMIN' || roleId === 'ADMIN')) {
-        const role = await prisma.role.findUnique({ where: { name: roleId } });
-        if (role) roleId = role.id;
+      const role = await prisma.role.findFirst({ 
+        where: { 
+          OR: [
+            { id: data.roleId },
+            { name: targetRoleName }
+          ]
+        } 
+      });
+
+      if (!role) throw new AppError('Role not found', 404);
+      if (!allowedRoles.includes(role.name)) {
+        throw new AppError(`Creation of role [${role.name}] is not allowed.`, 403);
       }
 
-      if (!roleId && data.roleName) {
-        const role = await prisma.role.findUnique({ where: { name: data.roleName.toUpperCase() } });
-        if (!role) throw new AppError(`Role [${data.roleName}] not found`, 404);
-        roleId = role.id;
-      }
-
-      if (!roleId) {
-        throw new AppError('Role is required (either a valid UUID roleId or a recognized role name)', 400);
-      }
+      roleId = role.id;
 
       // 3. Hash Password (default to admin123 if not provided)
       const passwordHash = await AuthService.hashPassword(data.password || 'admin123');

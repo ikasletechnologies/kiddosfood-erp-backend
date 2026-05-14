@@ -64,6 +64,40 @@ model Customer {
   quotations    Quotation[]
   returnOrders  ReturnOrder[]
   salesOrders   SalesOrder[]
+  franchiseId   String?
+  franchise     Franchise?       @relation(fields: [franchiseId], references: [id])
+}
+
+model Dealer {
+  id            String           @id @default(uuid())
+  name          String
+  phone         String?          @unique
+  email         String?          @unique
+  address       String?
+  status        String           @default("ACTIVE")
+  franchiseId   String
+  franchise     Franchise        @relation(fields: [franchiseId], references: [id])
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+}
+
+model BusinessPartner {
+  id            String           @id @default(uuid())
+  name          String
+  type          PartnerType
+  phone         String?          @unique
+  email         String?          @unique
+  address       String?
+  status        String           @default("ACTIVE")
+  franchiseId   String
+  franchise     Franchise        @relation(fields: [franchiseId], references: [id])
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+}
+
+enum PartnerType {
+  RETAILER
+  BUSINESS_OWNER
 }
 
 model CustomerLedger {
@@ -104,6 +138,13 @@ model Franchise {
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   users             User[]
   returnOrders      ReturnOrder[]
+  customers         Customer[]
+  dealers           Dealer[]
+  businessPartners  BusinessPartner[]
+  ledgerEntries     FranchiseLedger[]
+  creditLimit       Float              @default(0)
+  walletBalance     Float              @default(0)
+  outstandingAmount Float              @default(0)
 }
 
 model InventoryItem {
@@ -123,6 +164,8 @@ model InventoryItem {
   gstRate              Float                  @default(5)
   hsnCode              String?
   isActive             Boolean                @default(true)
+  costPrice            Float?                 @default(0)
+  basePrice            Float?                 @default(0)
   grnItems             GoodsReceiptItem[]
   franchise            Franchise              @relation(fields: [franchiseId], references: [id])
   vendor               Vendor?                @relation(fields: [vendorId], references: [id])
@@ -437,9 +480,13 @@ model FranchiseOrder {
   orderNumber          String               @unique
   franchiseId          String
   status               FranchiseOrderStatus @default(PENDING)
+  subtotal             Float                @default(0)
+  taxAmount            Float                @default(0)
+  deliveryCharges      Float                @default(0)
   totalAmount          Float
-  paymentType          PaymentType          @default(COD)
+  paymentType          PaymentType          @default(CREDIT)
   paymentStatus        String               @default("UNPAID")
+  priority             String               @default("NORMAL")
   notes                String?
   expectedDispatchDate DateTime?
   actualDispatchDate   DateTime?
@@ -690,6 +737,7 @@ model RefreshToken {
   token     String   @unique
   expiresAt DateTime
   isRevoked Boolean  @default(false)
+  rotatedAt DateTime?
   createdAt DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
@@ -1119,6 +1167,27 @@ enum CustomerLedgerRefType {
   OPENING_BALANCE
 }
 
+model FranchiseLedger {
+  id            String                @id @default(uuid())
+  franchiseId   String
+  type          LedgerType
+  amount        Float
+  balanceAfter  Float
+  referenceType FranchiseLedgerRefType
+  referenceId   String?
+  note          String?
+  createdAt     DateTime              @default(now())
+  franchise     Franchise             @relation(fields: [franchiseId], references: [id])
+}
+
+enum FranchiseLedgerRefType {
+  ORDER
+  PAYMENT
+  RETURN
+  ADJUSTMENT
+  OPENING_BALANCE
+}
+
 enum ItemCategory {
   RAW_MATERIAL
   SEMI_FINISHED
@@ -1191,8 +1260,8 @@ enum FranchiseOrderStatus {
 }
 
 enum PaymentType {
-  COD
-  ONLINE
+  CREDIT
+  ADVANCE
 }
 
 enum ProductionStatus {

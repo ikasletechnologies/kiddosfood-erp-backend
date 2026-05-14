@@ -128,19 +128,25 @@ export class InventoryService {
       : `RM-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
     return prisma.$transaction(async tx => {
+      const createData: any = {
+        name: data.name,
+        sku,
+        category: data.category || ItemCategory.RAW_MATERIAL,
+        currentStock: 0,
+        unit: data.unit || 'kg',
+        minimumStock: data.minimumStock || 10,
+        hsnCode: data.hsnCode,
+        gstRate: data.gstRate || 5,
+        franchiseId: data.franchiseId,
+        vendorId: data.vendorId,
+      };
+
+      // Financial fields (Safe injection)
+      if (data.costPrice !== undefined) createData.costPrice = Number(data.costPrice) || 0;
+      if (data.basePrice !== undefined) createData.basePrice = Number(data.basePrice) || 0;
+
       const item = await tx.inventoryItem.create({
-        data: {
-          name: data.name,
-          sku,
-          category: data.category || ItemCategory.RAW_MATERIAL,
-          currentStock: 0,
-          unit: data.unit || 'kg',
-          minimumStock: data.minimumStock || 10,
-          hsnCode: data.hsnCode,
-          gstRate: data.gstRate || 5,
-          franchiseId: data.franchiseId,
-          vendorId: data.vendorId,
-        },
+        data: createData,
       });
 
       if (data.initialStock > 0) {
@@ -154,6 +160,55 @@ export class InventoryService {
         });
       }
 
+      // ─── AUTOMATION: Sync with Product Master if category is FINISHED_GOOD or SEMI_FINISHED at HQ ───
+      const orderableCategories = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+      
+      if (orderableCategories.includes(item.category)) {
+        const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
+        const nameUpper = franchise?.name.toUpperCase() || "";
+        const isHQ = nameUpper.includes('HQ') || 
+                     nameUpper.includes('HEAD') ||
+                     nameUpper.includes('MAIN') ||
+                     nameUpper.includes('CORPORATE') ||
+                     nameUpper.includes('CENTRAL');
+
+        if (isHQ) {
+          const existingProduct = await tx.product.findFirst({
+            where: { 
+              OR: [
+                { sku: item.sku },
+                { name: { equals: item.name, mode: 'insensitive' } }
+              ]
+            }
+          });
+
+          if (!existingProduct) {
+            await tx.product.create({
+              data: {
+                name: item.name,
+                sku: item.sku,
+                basePrice: Number(data.basePrice) || 0,
+                isActive: true,
+                productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
+                category: 'Automated Sync'
+              }
+            });
+            console.log(`✅ [Sync] Created new product for HQ Inventory Item: ${item.name}`);
+          } else {
+            // Update existing product to match inventory (Name/SKU)
+            await tx.product.update({
+              where: { id: existingProduct.id },
+              data: { 
+                name: item.name, 
+                sku: item.sku,
+                basePrice: item.basePrice || 0
+              }
+            });
+            console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
+          }
+        }
+      }
+
       return item;
     });
   }
@@ -161,7 +216,51 @@ export class InventoryService {
   // Only update metadata — never update currentStock directly
   static async updateItem(id: string, data: any) {
     const { currentStock: _currentStock, ...safeData } = data; // strip any stock field
-    return prisma.inventoryItem.update({ where: { id }, data: safeData });
+    
+    const updated = await prisma.inventoryItem.update({ where: { id }, data: safeData });
+
+    // Sync on update as well if category is orderable
+    const orderableCategories = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+    if (orderableCategories.includes(updated.category)) {
+      const franchise = await prisma.franchise.findUnique({ where: { id: updated.franchiseId } });
+      const nameUpper = franchise?.name.toUpperCase() || "";
+      const isHQ = nameUpper.includes('HQ') || 
+                   nameUpper.includes('HEAD') ||
+                   nameUpper.includes('CORPORATE');
+
+      if (isHQ) {
+        const existing = await prisma.product.findFirst({
+          where: { 
+            OR: [
+              { sku: updated.sku },
+              { name: { equals: updated.name, mode: 'insensitive' } }
+            ]
+          }
+        });
+        if (!existing) {
+          await prisma.product.create({
+            data: {
+              name: updated.name,
+              sku: updated.sku,
+              basePrice: 0,
+              isActive: true,
+              productType: updated.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
+              category: 'Automated Sync'
+            }
+          });
+        } else {
+          await prisma.product.update({
+            where: { id: existing.id },
+            data: { 
+              name: updated.name, 
+              sku: updated.sku,
+              basePrice: Number(data.basePrice) || 0
+            }
+          });
+        }
+      }
+    }
+    return updated;
   }
 
   static async deleteItem(id: string) {
@@ -199,7 +298,29 @@ export class InventoryService {
       throw new Error(`Deletion Blocked: This material is linked to pending branch requests or transfers.`);
     }
 
-    return prisma.inventoryItem.delete({ where: { id } });
+    return prisma.$transaction(async tx => {
+      const item = await tx.inventoryItem.findUnique({ where: { id } });
+      
+      if (item && (item.category === 'FINISHED_GOOD' || item.category === 'SEMI_FINISHED')) {
+        const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
+        const nameUpper = franchise?.name.toUpperCase() || "";
+        const isHQ = nameUpper.includes('HQ') || nameUpper.includes('HEAD') || nameUpper.includes('CORPORATE');
+
+        if (isHQ) {
+          const syncedProduct = await tx.product.findUnique({ where: { sku: item.sku || "" } });
+          if (syncedProduct) {
+            // Only delete product if it has no sales history
+            const usageCount = await tx.orderItem.count({ where: { productId: syncedProduct.id } });
+            if (usageCount === 0) {
+              await tx.product.delete({ where: { id: syncedProduct.id } });
+              console.log(`🗑️ [Sync] Deleted synced product master: ${item.name}`);
+            }
+          }
+        }
+      }
+
+      return tx.inventoryItem.delete({ where: { id } });
+    });
   }
 
   static async deactivateItem(id: string) {

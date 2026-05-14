@@ -99,6 +99,8 @@ export class RawMaterialsController {
         initialStock: req.body.initialStock,
         hsnCode: req.body.hsnCode,
         gstRate: req.body.gstRate,
+        costPrice: req.body.costPrice,
+        basePrice: req.body.basePrice,
         userId: user.id
       };
       

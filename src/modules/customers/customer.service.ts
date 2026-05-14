@@ -1,17 +1,18 @@
 import prisma from '../../lib/prisma';
 
 export class CustomerService {
-  static async getAll(search?: string) {
+  static async getAll(search?: string, franchiseId?: string) {
     return prisma.customer.findMany({
-      where: search
-        ? {
-            OR: [
-              { name: { contains: search, mode: 'insensitive' } },
-              { phone: { contains: search } },
-              { email: { contains: search, mode: 'insensitive' } }
-            ]
-          }
-        : undefined,
+      where: {
+        ...(franchiseId && { franchiseId }),
+        ...(search && {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { phone: { contains: search } },
+            { email: { contains: search, mode: 'insensitive' } }
+          ]
+        })
+      },
       include: {
         orders: {
           select: { id: true, totalAmount: true, createdAt: true },
@@ -35,7 +36,7 @@ export class CustomerService {
     });
   }
 
-  static async create(data: { name: string; phone?: string; email?: string }) {
+  static async create(data: { name: string; phone?: string; email?: string; franchiseId?: string }) {
     return prisma.customer.create({ data });
   }
 

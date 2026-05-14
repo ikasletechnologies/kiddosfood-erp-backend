@@ -1,12 +1,12 @@
-import prisma from '../lib/prisma';
-import { FinanceService } from '../modules/finance/finance.service';
-import { ProcurementService } from '../modules/procurement/procurement.service';
-import { POSService } from '../modules/pos/pos.service';
-import { InventoryService } from '../modules/inventory/inventory.service';
+import prisma from '../../lib/prisma';
+import { FinanceService } from '../../modules/finance/finance.service';
+import { ProcurementService } from '../../modules/procurement/procurement.service';
+import { POSService } from '../../modules/pos/pos.service';
+import { InventoryService } from '../../modules/inventory/inventory.service';
 
 /**
  * Verification Script for Phase 5: Accounts Module
- * RUN: npx ts-node src/scripts/verify_phase5.ts
+ * RUN: npx ts-node src/tests/finance/procurement-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 5 Verification...');

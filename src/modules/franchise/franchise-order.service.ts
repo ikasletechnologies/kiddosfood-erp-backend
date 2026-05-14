@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderStatus, PaymentType, ProductType } from '@prisma/client';
+import { FranchiseOrderStatus, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
 
 function generateOrderNumber(): string {
@@ -14,6 +14,7 @@ export class FranchiseOrderService {
     franchiseId: string;
     paymentType?: PaymentType;
     expectedDispatchDate?: string;
+    priority?: string;
     notes?: string;
     items: Array<{ productId: string; quantity: number }>;
   }) {
@@ -39,23 +40,38 @@ export class FranchiseOrderService {
       for (const reqItem of data.items) {
         const product = products.find(p => p.id === reqItem.productId)!;
 
-        // FINISHED_GOOD → check available stock from ProductBatch
+        // FINISHED_GOOD → check available stock from InventoryItem at HQ
         if (product.productType === ProductType.FINISHED_GOOD) {
-          const batches = await tx.productBatch.findMany({
+          console.log(`🔍 [OrderSync] Starting validation for: ${product.name}`);
+          
+          // Find HQ franchise
+          const hq = await tx.franchise.findFirst({
             where: {
-              productId: product.id,
-              quantity: { gt: 0 },
-              OR: [
-                { expiryDate: null },
-                { expiryDate: { gte: new Date() } },
-              ],
-            },
+              OR: [{ id: 'hq-001' }, { name: { contains: 'HQ', mode: 'insensitive' } }, { name: { contains: 'Head', mode: 'insensitive' } }]
+            }
           });
-          const availableStock = batches.reduce((sum, b) => sum + b.quantity, 0);
+
+          if (!hq) {
+            console.error("❌ [OrderSync] Headquarters NOT FOUND in database!");
+            throw new Error("Headquarters stock repository not found. Please contact administrator.");
+          }
+
+          const invItem = await tx.inventoryItem.findFirst({
+            where: {
+              franchiseId: hq.id,
+              OR: [
+                ...(product.sku ? [{ sku: product.sku }] : []),
+                { name: { contains: product.name, mode: 'insensitive' } }
+              ]
+            }
+          });
+
+          const availableStock = invItem?.currentStock || 0;
+          console.log(`📦 [OrderSync] Product: ${product.name} | HQ Found: ${hq.name} | Inv Match: ${invItem?.name || 'NONE'} | Stock: ${availableStock}`);
+          
           if (availableStock < reqItem.quantity) {
             throw new Error(
-              `Insufficient stock for "${product.name}". ` +
-              `Available: ${availableStock}, Requested: ${reqItem.quantity}`
+              `Only ${availableStock} units available in HQ warehouse for "${product.name}". Please reduce quantity or contact HQ.`
             );
           }
         }
@@ -72,14 +88,21 @@ export class FranchiseOrderService {
         });
       }
 
-      const totalAmount = orderItems.reduce((s, i) => s + i.totalAmount, 0);
+      const subtotal    = orderItems.reduce((s, i) => s + i.totalAmount, 0);
+      const taxAmount   = Math.round(subtotal * 0.05); // 5% GST
+      const delivery    = 50; // Flat delivery charge
+      const grandTotal  = subtotal + taxAmount + delivery;
 
       const order = await tx.franchiseOrder.create({
         data: {
           orderNumber: generateOrderNumber(),
           franchiseId: data.franchiseId,
-          paymentType: data.paymentType ?? PaymentType.COD,
-          totalAmount,
+          paymentType: data.paymentType ?? PaymentType.CREDIT,
+          subtotal,
+          taxAmount,
+          deliveryCharges: delivery,
+          totalAmount: grandTotal,
+          priority: data.priority ?? 'NORMAL',
           notes: data.notes,
           expectedDispatchDate: data.expectedDispatchDate
             ? new Date(data.expectedDispatchDate)
@@ -90,6 +113,28 @@ export class FranchiseOrderService {
           items: { include: { product: true } },
           franchise: true,
         },
+      });
+
+      // 3. Create Franchise Ledger Entry (DEBIT)
+      const currentFranchise = await tx.franchise.findUnique({ where: { id: data.franchiseId } });
+      const newOutstanding = (currentFranchise?.outstandingAmount || 0) + grandTotal;
+
+      await tx.franchiseLedger.create({
+        data: {
+          franchiseId: data.franchiseId,
+          type: LedgerType.DEBIT,
+          amount: grandTotal,
+          balanceAfter: newOutstanding,
+          referenceType: FranchiseLedgerRefType.ORDER,
+          referenceId: order.orderNumber,
+          note: `Order ${order.orderNumber} placed`,
+        }
+      });
+
+      // 4. Update Franchise Balance
+      await tx.franchise.update({
+        where: { id: data.franchiseId },
+        data: { outstandingAmount: newOutstanding }
       });
 
       return order;
@@ -193,9 +238,32 @@ export class FranchiseOrderService {
         createdBy: paidBy || 'FRANCHISE_SYSTEM'
       });
 
-      return tx.franchiseOrder.update({
+      await tx.franchiseOrder.update({
         where: { id },
         data: { paymentStatus: 'PAID' },
+      });
+
+      // 2. Create Franchise Ledger Entry (CREDIT)
+      const currentFranchise = await tx.franchise.findUnique({ where: { id: order.franchiseId } });
+      const payAmount = amount || order.totalAmount;
+      const newOutstanding = (currentFranchise?.outstandingAmount || 0) - payAmount;
+
+      await tx.franchiseLedger.create({
+        data: {
+          franchiseId: order.franchiseId,
+          type: LedgerType.CREDIT,
+          amount: payAmount,
+          balanceAfter: newOutstanding,
+          referenceType: FranchiseLedgerRefType.PAYMENT,
+          referenceId: order.orderNumber,
+          note: `Payment for order ${order.orderNumber}`,
+        }
+      });
+
+      // 3. Update Franchise Balance
+      return tx.franchise.update({
+        where: { id: order.franchiseId },
+        data: { outstandingAmount: newOutstanding }
       });
     });
   }
