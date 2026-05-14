@@ -13,7 +13,7 @@ function generateSalesOrderNumber() {
 }
 
 function generateReturnNumber() {
-  return `RMA-${new Date().getFullYear()}-${String(++returnCounter).padStart(5, '0')}`;
+  return `SR${String(++returnCounter).padStart(10, '0')}`;
 }
 
 function calculateTotals<T extends { quantity: number; rate: number; taxPercent?: number }>(items: T[]) {
@@ -271,10 +271,18 @@ export class SalesService {
 
   // ─── Return Orders (RMA) ─────────────────────────────────────────────────────
 
-  static async getReturnOrders(filters: { status?: string; customerId?: string; search?: string }) {
+  static async getReturnOrders(filters: { status?: string; customerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'BUSINESS'; search?: string }) {
     const where: any = {};
     if (filters.status) where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.franchiseId) where.franchiseId = filters.franchiseId;
+    
+    if (filters.source === 'FRANCHISE') {
+      where.franchiseId = { not: null };
+    } else if (filters.source === 'BUSINESS') {
+      where.customerId = { not: null };
+    }
+
     if (filters.search) {
       where.OR = [
         { returnNumber: { contains: filters.search, mode: 'insensitive' } },
@@ -283,14 +291,16 @@ export class SalesService {
     }
     return prisma.returnOrder.findMany({
       where,
-      include: { customer: true, salesOrder: true, items: true },
+      include: { customer: true, salesOrder: true, franchise: true, franchiseOrder: true, items: true },
       orderBy: { createdAt: 'desc' }
     });
   }
 
   static async createReturnOrder(data: {
     salesOrderId?: string;
+    franchiseOrderId?: string;
     customerId?: string;
+    franchiseId?: string;
     reason: string;
     items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string }>;
     refundMethod?: string;
@@ -301,7 +311,9 @@ export class SalesService {
       data: {
         returnNumber: generateReturnNumber(),
         salesOrderId: data.salesOrderId,
+        franchiseOrderId: data.franchiseOrderId,
         customerId: data.customerId,
+        franchiseId: data.franchiseId,
         reason: data.reason,
         refundAmount,
         refundMethod: data.refundMethod,
@@ -316,7 +328,7 @@ export class SalesService {
           }))
         }
       },
-      include: { customer: true, items: true }
+      include: { customer: true, franchise: true, items: true }
     });
   }
 
@@ -339,6 +351,8 @@ export class SalesService {
       if (!ret) throw new Error('Return Order not found');
       if (ret.status !== 'APPROVED') throw new Error('Only approved returns can be refunded');
 
+      const entity = ret.customerId ? 'Customer Refund' : (ret.franchiseId ? 'Franchise Refund' : 'Sales Refund');
+
       const payment = await FinanceService.createPayment({
         tx,
         amount: ret.refundAmount,
@@ -349,7 +363,7 @@ export class SalesService {
         sourceModule: 'POS',
         linkedDocType: 'DIRECT',
         linkedDocId: ret.id,
-        entity: 'Customer Refund',
+        entity,
         createdBy: data.createdBy
       });
 

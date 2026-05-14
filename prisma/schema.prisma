@@ -103,6 +103,7 @@ model Franchise {
   outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   users             User[]
+  returnOrders      ReturnOrder[]
 }
 
 model InventoryItem {
@@ -447,6 +448,7 @@ model FranchiseOrder {
   updatedAt            DateTime             @updatedAt
   franchise            Franchise            @relation(fields: [franchiseId], references: [id])
   items                FranchiseOrderItem[]
+  returnOrders         ReturnOrder[]
 }
 
 model FranchiseOrderItem {
@@ -977,21 +979,25 @@ model SalesOrderItem {
 }
 
 model ReturnOrder {
-  id           String       @id @default(uuid())
-  returnNumber String       @unique
-  salesOrderId String?
-  customerId   String?
-  reason       String
-  status       ReturnStatus @default(PENDING)
-  refundAmount Float
-  refundMethod String?
-  approvedBy   String?
-  approvedAt   DateTime?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  items        ReturnItem[]
-  customer     Customer?    @relation(fields: [customerId], references: [id])
-  salesOrder   SalesOrder?  @relation(fields: [salesOrderId], references: [id])
+  id               String          @id @default(uuid())
+  returnNumber     String          @unique
+  salesOrderId     String?
+  franchiseOrderId String?
+  customerId       String?
+  franchiseId      String?
+  reason           String
+  status           ReturnStatus    @default(PENDING)
+  refundAmount     Float
+  refundMethod     String?
+  approvedBy       String?
+  approvedAt       DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  items            ReturnItem[]
+  customer         Customer?       @relation(fields: [customerId], references: [id])
+  salesOrder       SalesOrder?     @relation(fields: [salesOrderId], references: [id])
+  franchise        Franchise?      @relation(fields: [franchiseId], references: [id])
+  franchiseOrder   FranchiseOrder? @relation(fields: [franchiseOrderId], references: [id])
 }
 
 model ReturnItem {
