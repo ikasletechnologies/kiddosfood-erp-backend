@@ -186,13 +186,17 @@ export class ProductionService {
     return prisma.production.update({ where: { id }, data: { status } });
   }
 
-  // Get all product batches with expiry status
-  static async getProductBatches(productId?: string) {
+  // Get all product batches with expiry status (filtered by franchise if provided)
+  static async getProductBatches(productId?: string, franchiseId?: string) {
     const now = new Date();
     const soonThreshold = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000); // 3 days
 
+    const where: any = {};
+    if (productId) where.productId = productId;
+    if (franchiseId) where.franchiseId = franchiseId;
+
     const batches = await prisma.productBatch.findMany({
-      where: productId ? { productId } : {},
+      where,
       include: { product: true, production: { include: { recipe: true } } },
       orderBy: { createdAt: 'desc' },
     });

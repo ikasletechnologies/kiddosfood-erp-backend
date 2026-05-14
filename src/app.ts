@@ -208,7 +208,11 @@ app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMI
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {
     const { ProductionService } = await import('./modules/production/production.service');
-    const batches = await ProductionService.getProductBatches(req.query.productId as string | undefined);
+    const user = (req as any).user;
+    const batches = await ProductionService.getProductBatches(
+      req.query.productId as string | undefined,
+      user.franchiseId
+    );
     res.json(batches);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });

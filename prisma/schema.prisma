@@ -467,12 +467,14 @@ model ProductBatch {
   id           String      @id @default(uuid())
   productId    String
   productionId String?
+  franchiseId  String?
   quantity     Float
   expiryDate   DateTime?
   batchCode    String?
   createdAt    DateTime    @default(now())
   product      Product     @relation(fields: [productId], references: [id])
   production   Production? @relation(fields: [productionId], references: [id])
+  franchise    Franchise?  @relation(fields: [franchiseId], references: [id])
 }
 
 model FranchiseOrder {
