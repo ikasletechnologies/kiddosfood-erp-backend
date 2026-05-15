@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import prisma from '../../lib/prisma';
 import { JwtUtil, TokenPayload } from '../../lib/jwt.util';
 import { AppError } from '../../middleware/error.middleware';
+import { UserRole } from '@prisma/client';
 
 export class AuthService {
   static async hashPassword(password: string): Promise<string> {
@@ -21,15 +22,6 @@ export class AuthService {
           { email: identifier },
           { phone: identifier }
         ]
-      },
-      include: { 
-        role: {
-          include: {
-            permissions: {
-              include: { permission: true }
-            }
-          }
-        }
       }
     });
 
@@ -41,14 +33,13 @@ export class AuthService {
     if (!isMatch) throw new AppError('Invalid credentials', 401);
 
     // 3. Prepare payload
-    const permissions = user.role.permissions.map(rp => rp.permission.key);
     const payload: TokenPayload = {
       userId: user.id,
       email: user.email || undefined,
-      role: user.role.name,
+      role: user.role,
       franchiseId: user.franchiseId,
       branchId: user.branchId,
-      permissions
+      permissions: [] // Simplified model: permissions are role-based logic in code
     };
 
     // 4. Generate Tokens
@@ -71,9 +62,9 @@ export class AuthService {
         id: user.id,
         fullName: user.fullName,
         email: user.email,
-        role: user.role.name,
+        role: user.role,
         franchiseId: user.franchiseId,
-        permissions
+        permissions: []
       }
     };
   }
@@ -86,18 +77,19 @@ export class AuthService {
     // 2. Check DB
     const storedToken = await prisma.refreshToken.findUnique({
       where: { token: refreshToken },
-      include: { user: { include: { role: { include: { permissions: { include: { permission: true } } } } } } }
+      include: { user: true }
     });
+
+    if (!storedToken) throw new AppError('Refresh token not found', 401);
 
     const now = new Date();
     const isGracePeriod = storedToken.rotatedAt && (now.getTime() - storedToken.rotatedAt.getTime() < 30000); // 30s grace
 
-    if (!storedToken || (storedToken.isRevoked && !isGracePeriod) || storedToken.expiresAt < now) {
+    if ((storedToken.isRevoked && !isGracePeriod) || storedToken.expiresAt < now) {
       throw new AppError('Refresh token expired or revoked', 401);
     }
 
-    // 3. Rotation: Mark current as rotated/revoked with timestamp instead of deleting
-    // This allows concurrent requests in the same millisecond/second window to succeed
+    // 3. Rotation: Mark current as rotated/revoked
     if (!storedToken.isRevoked) {
       await prisma.refreshToken.update({
         where: { id: storedToken.id },
@@ -106,14 +98,13 @@ export class AuthService {
     }
 
     const user = storedToken.user;
-    const permissions = user.role.permissions.map(rp => rp.permission.key);
     const newPayload: TokenPayload = {
       userId: user.id,
       email: user.email || undefined,
-      role: user.role.name,
+      role: user.role,
       franchiseId: user.franchiseId,
       branchId: user.branchId,
-      permissions
+      permissions: []
     };
 
     const newAccessToken = JwtUtil.generateAccessToken(newPayload);
@@ -139,7 +130,7 @@ export class AuthService {
     });
   }
 
-  static async register(data: { fullName: string; email: string; phone?: string; password: string; roleName: string }) {
+  static async register(data: { fullName: string; email: string; phone?: string; password: string; role?: UserRole }) {
     // 1. Check if user exists
     const existing = await prisma.user.findFirst({
       where: {
@@ -154,39 +145,26 @@ export class AuthService {
       throw new AppError('User with this email or phone already exists', 400);
     }
 
-    // 2. Find role
-    if (!data.roleName) {
-        throw new AppError('roleName is required for registration', 400);
-    }
-    const role = await prisma.role.findUnique({
-      where: { name: data.roleName.toUpperCase() }
-    });
-
-    if (!role) {
-      throw new AppError(`Role [${data.roleName}] not found`, 404);
-    }
-
-    // 3. Hash password
+    // 2. Hash password
     const passwordHash = await this.hashPassword(data.password);
 
-    // 4. Create user
+    // 3. Create user
     const user = await prisma.user.create({
       data: {
         fullName: data.fullName,
         email: data.email,
         phone: data.phone,
         passwordHash,
-        roleId: role.id,
+        role: data.role || UserRole.FRANCHISE_ADMIN,
         is_active: true
-      },
-      include: { role: true }
+      }
     });
 
     return {
       id: user.id,
       fullName: user.fullName,
       email: user.email,
-      role: user.role.name
+      role: user.role
     };
   }
 }

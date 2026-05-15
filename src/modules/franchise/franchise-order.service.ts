@@ -195,7 +195,7 @@ export class FranchiseOrderService {
         });
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            await deductBatchStock(tx, item.productId, item.quantity);
+            await deductBatchStock(tx, item.productId, item.quantity, order.franchiseId);
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -334,10 +334,11 @@ export class FranchiseOrderService {
 }
 
 // FIFO batch deduction
-async function deductBatchStock(tx: any, productId: string, quantityNeeded: number) {
+async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, franchiseId?: string) {
   const batches = await tx.productBatch.findMany({
     where: {
       productId,
+      ...(franchiseId ? { franchiseId } : {}),
       quantity: { gt: 0 },
       OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
     },

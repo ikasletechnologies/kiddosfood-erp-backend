@@ -46,60 +46,22 @@ async function main() {
     });
   }
 
-  // 3. Core Permissions
-  const permissionKeys = [
-    '*', 'crm:manage', 'sales:manage', 'inventory:manage', 'accounts:manage', 'purchase:manage', 'pos:access'
-  ];
-
-  await Promise.all(
-    permissionKeys.map(key =>
-      prisma.permission.upsert({
-        where: { key },
-        update: {},
-        create: { key },
-      })
-    )
-  );
-
-  // 4. Standard Roles
-  const superAdminRole = await prisma.role.upsert({
-    where: { name: 'SUPER_ADMIN' },
-    update: {},
-    create: {
-      name: 'SUPER_ADMIN',
-      description: 'Master control (HQ)',
-      permissions: { create: { permission: { connect: { key: '*' } } } },
-    },
-  });
-
-  const franchiseAdminRole = await prisma.role.upsert({
-    where: { name: 'FRANCHISE_ADMIN' },
-    update: {},
-    create: {
-      name: 'FRANCHISE_ADMIN',
-      description: 'Operational branch admin',
-      permissions: {
-        create: [
-          { permission: { connect: { key: 'sales:manage' } } },
-          { permission: { connect: { key: 'inventory:manage' } } },
-          { permission: { connect: { key: 'pos:access' } } },
-        ]
-      },
-    },
-  });
-
-  // 5. Default Users
+  // 3. Default Users
   const password = await bcrypt.hash('admin123', 10);
 
   // HQ Admin
   await prisma.user.upsert({
     where: { email: 'admin@kiddosfood.com' },
-    update: { passwordHash: password, roleId: superAdminRole.id, franchiseId: hq.id },
+    update: { 
+      passwordHash: password, 
+      role: 'SUPER_ADMIN', 
+      franchiseId: hq.id 
+    },
     create: {
       email: 'admin@kiddosfood.com',
       passwordHash: password,
       fullName: 'HQ Super Admin',
-      roleId: superAdminRole.id,
+      role: 'SUPER_ADMIN',
       franchiseId: hq.id,
       is_active: true,
     },
@@ -108,12 +70,16 @@ async function main() {
   // Downtown Franchise Admin
   await prisma.user.upsert({
     where: { email: 'franchise@erp.com' },
-    update: { passwordHash: password, roleId: franchiseAdminRole.id, franchiseId: 'fran-downtown' },
+    update: { 
+      passwordHash: password, 
+      role: 'FRANCHISE_ADMIN', 
+      franchiseId: 'fran-downtown' 
+    },
     create: {
       email: 'franchise@erp.com',
       passwordHash: password,
       fullName: 'Downtown Manager',
-      roleId: franchiseAdminRole.id,
+      role: 'FRANCHISE_ADMIN',
       franchiseId: 'fran-downtown',
       is_active: true,
     },

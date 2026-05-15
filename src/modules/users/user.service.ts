@@ -1,13 +1,14 @@
 import prisma from '../../lib/prisma';
 import { AuthService } from '../auth/auth.service';
 import { AppError } from '../../middleware/error.middleware';
+import { UserRole } from '@prisma/client';
 
 export class UserService {
   static async getAll(skip = 0, take = 20) {
     return prisma.user.findMany({
       skip,
       take,
-      include: { role: true, franchise: true },
+      include: { franchise: true },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -15,14 +16,13 @@ export class UserService {
   static async getById(id: string) {
     return prisma.user.findUnique({
       where: { id },
-      include: { role: true, franchise: true }
+      include: { franchise: true }
     });
   }
 
   static async getByFranchise(franchiseId: string) {
     return prisma.user.findMany({
-      where: { franchiseId },
-      include: { role: true },
+      where: { franchiseId }
     });
   }
 
@@ -31,8 +31,7 @@ export class UserService {
     email: string;
     phone?: string;
     password?: string;
-    roleId?: string;
-    roleName?: string;
+    role?: UserRole;
     franchiseId?: string;
     branchId?: string;
   }) {
@@ -41,33 +40,10 @@ export class UserService {
       const existing = await prisma.user.findUnique({ where: { email: data.email } });
       if (existing) throw new AppError('User with this email already exists', 400);
 
-      // 2. Find Role
-      let roleId = data.roleId;
-      const targetRoleName = (data.roleName || data.roleId || "").toUpperCase();
-
-      // Only allow creation of these two roles
-      const allowedRoles = ['SUPER_ADMIN', 'FRANCHISE_ADMIN'];
-      
-      const role = await prisma.role.findFirst({ 
-        where: { 
-          OR: [
-            { id: data.roleId },
-            { name: targetRoleName }
-          ]
-        } 
-      });
-
-      if (!role) throw new AppError('Role not found', 404);
-      if (!allowedRoles.includes(role.name)) {
-        throw new AppError(`Creation of role [${role.name}] is not allowed.`, 403);
-      }
-
-      roleId = role.id;
-
-      // 3. Hash Password (default to admin123 if not provided)
+      // 2. Hash Password (default to admin123 if not provided)
       const passwordHash = await AuthService.hashPassword(data.password || 'admin123');
 
-      // 4. Create
+      // 3. Cleanup IDs
       const franchiseId = (data.franchiseId && data.franchiseId.trim() !== '' && data.franchiseId !== 'undefined' && data.franchiseId !== 'null') 
         ? data.franchiseId 
         : null;
@@ -76,18 +52,19 @@ export class UserService {
         ? data.branchId
         : null;
 
+      // 4. Create
       return await prisma.user.create({
         data: {
           fullName: data.fullName,
           email: data.email,
           phone: data.phone,
           passwordHash,
-          roleId: roleId,
+          role: data.role || UserRole.FRANCHISE_ADMIN,
           franchiseId: franchiseId,
           branchId: branchId,
           is_active: true
         },
-        include: { role: true, franchise: true }
+        include: { franchise: true }
       });
     } catch (error) {
       console.error('[UserService.create] Detailed Error:', error);
@@ -128,8 +105,7 @@ export class UserService {
 
       return await prisma.user.update({
         where: { id },
-        data: updateData,
-        include: { role: true }
+        data: updateData
       });
     } catch (error) {
       console.error('[UserService.update] Detailed Error:', error);
