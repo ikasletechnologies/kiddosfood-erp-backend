@@ -428,6 +428,12 @@ export class POSService {
       return updated;
     });
 
+    try {
+      SocketService.io.emit('new-order', result);
+    } catch (err) {
+      console.error('[Socket] Failed to emit new-order (legacy)', err);
+    }
+
     // Phase 5: Trigger Invoice for Legacy Checkout
     try {
         await FinanceService.createInvoiceFromOrder(result.id);

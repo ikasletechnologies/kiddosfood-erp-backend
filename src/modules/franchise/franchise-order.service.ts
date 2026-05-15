@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
+import SocketService from '../../lib/socket';
 
 function generateOrderNumber(): string {
   const ts = Date.now().toString(36).toUpperCase();
@@ -137,6 +138,13 @@ export class FranchiseOrderService {
         data: { outstandingAmount: newOutstanding }
       });
 
+      // 5. Real-time Notification
+      try {
+        SocketService.io.emit('new-franchise-order', order);
+      } catch (err) {
+        console.error('[Socket] Failed to emit new-franchise-order', err);
+      }
+
       return order;
     });
   }
@@ -270,11 +278,19 @@ export class FranchiseOrderService {
       });
     }
 
-    return prisma.franchiseOrder.update({
+    const updatedOrder = await prisma.franchiseOrder.update({
       where: { id },
       data: updateData,
       include: { items: { include: { product: true } }, franchise: true },
     });
+
+    try {
+      SocketService.io.emit('franchise-order-updated', updatedOrder);
+    } catch (err) {
+      console.error('[Socket] Failed to emit franchise-order-updated', err);
+    }
+
+    return updatedOrder;
   }
 
   // ─── Payment ───────────────────────────────────────────────────────────────
