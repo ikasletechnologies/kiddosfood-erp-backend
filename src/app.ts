@@ -17,7 +17,6 @@ import { FranchiseController } from './modules/franchise/franchise.controller';
 import { NavController } from './modules/users/nav.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 import { AuditController } from './modules/audit/audit.controller';
-import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { OrderController } from './modules/pos/order.controller';
 import { RecipeController } from './modules/recipes/recipe.controller';
 import { LogisticsController } from './modules/logistics/logistics.controller';
@@ -37,6 +36,8 @@ import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoic
 import { FranchiseOrderController } from './modules/franchise/franchise-order.controller';
 import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
 import { AccountController } from './modules/finance/account.controller';
+import { ChequeController } from './modules/finance/cheque.controller';
+import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { PurchaseRequestController } from './modules/purchase-requests/purchase-request.controller';
 import DealerRoutes from './modules/dealers';
 import BusinessPartnerRoutes from './modules/business-partners';
@@ -272,7 +273,6 @@ app.patch('/api/me/update', authenticate, UserController.updateMe);
 // Profile update route registered correctly.
 
 // Dashboard Metrics
-app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DashboardController.getSummary);
 
 // API Routes (Protected)
 // Admin & Manager: User Management
@@ -385,6 +385,15 @@ app.get('/api/accounting/ledger-summary', authenticate, authorizeRole(['FRANCHIS
 app.get('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.getAll);
 app.post('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.create);
 app.delete('/api/accounts/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.delete);
+
+// Dashboard
+app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DashboardController.getSummary);
+
+// Cheque Registry
+app.get('/api/cheques', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.findAll);
+app.get('/api/cheques/stats', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.getStats);
+app.post('/api/cheques', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.create);
+app.patch('/api/cheques/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.updateStatus);
 
 // Phase 5 & 7 Reports (Consolidated)
 app.get('/api/reports/sales', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalesReport);

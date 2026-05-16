@@ -332,17 +332,18 @@ export class POSService {
       });
 
       // 1. Handle Payment through central logic
-      const accountTypeMap: Record<string, 'CASH' | 'BANK' | 'UPI'> = {
+      const accountTypeMap: Record<string, string> = {
         'CASH': 'CASH',
         'UPI': 'UPI',
-        'CARD': 'BANK'
+        'CARD': 'BANK',
+        'BANK_TRANSFER': 'BANK'
       };
       const targetType = accountTypeMap[data.paymentMode] || 'CASH';
       
       // Use provided accountId or fallback to default for the payment mode
       let finalAccountId = data.accountId;
-      if (!finalAccountId) {
-        const defaultAccount = await tx.account.findFirst({ where: { type: targetType } });
+      if (!finalAccountId || finalAccountId === "") {
+        const defaultAccount = await tx.account.findFirst({ where: { type: targetType as any } });
         finalAccountId = defaultAccount?.id || targetType;
       }
       

@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { AccountService } from './account.service';
 
 export class FinanceService {
   /**
@@ -448,10 +449,11 @@ export class FinanceService {
     const amount    = parseFloat(data.amount);
     const flow      = data.flow as 'IN' | 'OUT';       
     const status    = (data.status || 'PAID') as string;
-    const sourceKey = data.sourceAccount as string;    
+    const sourceId = data.sourceAccount as string;    
     const sourceModule = (data.sourceModule || 'MANUAL');
     const linkedDocType = data.linkedDocType || 'DIRECT';
     const linkedDocId = data.linkedDocId;
+    const entityId = data.entityId || data.entity; // Compatibility with both naming conventions
 
     // Robust type mapping for cross-module compatibility
     let paymentType = data.type || 'DIRECT';
@@ -471,16 +473,21 @@ export class FinanceService {
       UPI_WALLET:   'UPI',
       CASH: 'CASH',
       BANK: 'BANK',
-      UPI: 'UPI'
+      UPI: 'UPI',
+      CARD: 'BANK', // Map CARD to BANK type
+      WALLET: 'UPI'  // Map WALLET to UPI type
     };
-    const accountType = accountTypeMap[sourceKey] ?? 'CASH';
+    const accountType = accountTypeMap[sourceId] ?? accountTypeMap[data.method] ?? 'CASH';
 
     const operation = async (tx: any) => {
       // 1. Resolve account (Prefer ID, fallback to Type mapping)
       let account;
-      if (sourceKey && sourceKey.length > 20) { // Likely a GUID
-         account = await tx.account.findUnique({ where: { id: sourceKey } });
-      } else {
+      if (sourceId && sourceId.length > 20) { // Likely a UUID
+         account = await tx.account.findUnique({ where: { id: sourceId } });
+      } 
+      
+      // Fallback if no account found by ID or if sourceId is a Type string
+      if (!account) {
          account = await tx.account.findFirst({ where: { type: accountType as any } });
       }
 
@@ -506,7 +513,7 @@ export class FinanceService {
           linkedDocId:    linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
-          entityId:       data.entity,
+          entityId:       entityId,
           paymentMode:    data.method as any,
           transactionRef: data.reference || data.note || undefined,
           status,
@@ -517,7 +524,7 @@ export class FinanceService {
 
       // 5. If this is a Vendor Payment, record in VendorLedger (CREDIT)
       if (data.entityType === 'VENDOR' || flow === 'OUT') {
-        const vendorId = data.entity;
+        const vendorId = entityId;
         if (vendorId) {
           const lastEntry = await tx.vendorLedger.findFirst({
             where: { vendorId },
@@ -563,14 +570,12 @@ export class FinanceService {
 
       // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
-        await tx.account.update({
-          where: { id: account.id },
-          data: {
-            balance: {
-              increment: flow === 'IN' ? amount : -amount,
-            },
-          },
-        });
+        await AccountService.adjustBalance(
+          tx, 
+          account.id, 
+          amount, 
+          flow === 'IN' ? 'INFLOW' : 'OUTFLOW'
+        );
       }
 
       return payment;

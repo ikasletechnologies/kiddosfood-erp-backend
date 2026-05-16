@@ -114,6 +114,36 @@ model Franchise {
   outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   users             User[]
+  cheques           Cheque[]
+}
+
+model Cheque {
+  id            String       @id @default(uuid())
+  chequeNumber  String       @unique
+  bankName      String
+  payeeName     String
+  entityBranch  String?
+  amount        Float
+  type          ChequeType   @default(PAYABLE)
+  issueDate     DateTime
+  dueDate       DateTime
+  status        ChequeStatus @default(PENDING)
+  notes         String?
+  franchiseId   String
+  franchise     Franchise    @relation(fields: [franchiseId], references: [id])
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+enum ChequeType {
+  PAYABLE
+  RECEIVABLE
+}
+
+enum ChequeStatus {
+  PENDING
+  CLEARED
+  BOUNCED
 }
 
 model InventoryItem {
