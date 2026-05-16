@@ -125,4 +125,15 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
+  static async fixUnits(req: Request, res: Response) {
+    try {
+      const result = await prisma.inventoryItem.updateMany({
+        where: { category: 'FINISHED_GOOD' },
+        data: { unit: 'PC' }
+      });
+      res.json({ message: `Successfully updated ${result.count} finished goods to PC unit.` });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

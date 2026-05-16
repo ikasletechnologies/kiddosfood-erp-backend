@@ -291,6 +291,7 @@ app.post('/api/inventory/stock-in', authenticate, authorizeRole(['SUPER_ADMIN'])
 app.post('/api/inventory/stock-out', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.stockOut);
 app.post('/api/inventory/adjustment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.adjustment);
 app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getMovements);
+app.post('/api/inventory/fix-units', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.fixUnits);
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getAll);

@@ -133,7 +133,7 @@ export class InventoryService {
         sku,
         category: data.category || ItemCategory.RAW_MATERIAL,
         currentStock: 0,
-        unit: data.unit || 'kg',
+        unit: data.unit || (data.category === 'FINISHED_GOOD' ? 'PC' : 'kg'),
         minimumStock: data.minimumStock || 10,
         hsnCode: data.hsnCode,
         gstRate: data.gstRate || 5,

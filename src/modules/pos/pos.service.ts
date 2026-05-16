@@ -25,7 +25,7 @@ export class POSService {
       data: {
         invoiceNum: `INV-${Date.now()}`,
         franchiseId: fid,
-        customerId: data.customerId,
+        customerId: (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) ? data.customerId : null,
         status: 'PENDING',
         paymentStatus: 'UNPAID',
         orderType: data.orderType || 'TAKEAWAY',
@@ -281,6 +281,7 @@ export class POSService {
   static async checkout(data: { 
     franchiseId?: string, 
     customerId?: string, 
+    accountId?: string,
     items: { productId: string, quantity: number, price: number }[],
     subTotal: number,
     taxAmount: number,
@@ -310,7 +311,7 @@ export class POSService {
         data: {
           invoiceNum: `INV-${Date.now()}`,
           franchiseId: fid,
-          customerId: data.customerId,
+          customerId: (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) ? data.customerId : null,
           subTotal: data.subTotal || (data as any).subtotal || 0,
           taxAmount: data.taxAmount,
           discountAmount: data.discountAmount,
@@ -329,92 +330,81 @@ export class POSService {
         },
         include: { orderItems: true, customer: true }
       });
-      // --- Moved post-creation logic into the transaction block ---
 
-    // Handle Payment through central logic
-    // Resolve a default account based on payment mode
-    const accountTypeMap: Record<string, 'CASH' | 'BANK' | 'UPI'> = {
-      'CASH': 'CASH',
-      'UPI': 'UPI',
-      'CARD': 'BANK'
-    };
-    const targetType = accountTypeMap[data.paymentMode] || 'CASH';
-    const defaultAccount = await tx.account.findFirst({ where: { type: targetType } });
-    
-    await FinanceService.createPayment({
-      tx,
-      amount: data.totalAmount,
-      flow: 'IN',
-      status: 'PAID',
-      sourceAccount: defaultAccount?.id || targetType, 
-      method: data.paymentMode,
-      sourceModule: 'POS',
-      linkedDocType: 'INVOICE',
-      linkedDocId: order.invoiceNum,
-      entityType: 'CUSTOMER',
-      entityId: data.customerId || 'WALK_IN',
-      orderId: order.id,
-      createdBy: 'LEGACY_CHECKOUT'
-    });
+      // 1. Handle Payment through central logic
+      const accountTypeMap: Record<string, 'CASH' | 'BANK' | 'UPI'> = {
+        'CASH': 'CASH',
+        'UPI': 'UPI',
+        'CARD': 'BANK'
+      };
+      const targetType = accountTypeMap[data.paymentMode] || 'CASH';
+      
+      // Use provided accountId or fallback to default for the payment mode
+      let finalAccountId = data.accountId;
+      if (!finalAccountId) {
+        const defaultAccount = await tx.account.findFirst({ where: { type: targetType } });
+        finalAccountId = defaultAccount?.id || targetType;
+      }
+      
+      await FinanceService.createPayment({
+        tx,
+        amount: data.totalAmount,
+        flow: 'IN',
+        status: 'PAID',
+        sourceAccount: finalAccountId, 
+        method: data.paymentMode,
+        sourceModule: 'POS',
+        linkedDocType: 'INVOICE',
+        linkedDocId: order.invoiceNum,
+        entityType: 'CUSTOMER',
+        entityId: data.customerId || 'WALK_IN',
+        orderId: order.id,
+        createdBy: 'POS_CHECKOUT'
+      });
 
+      // 2. Inventory Deduction
       for (const item of data.items) {
         const product = await tx.product.findUnique({
-          where: { id: item.productId },
+          where: { id: item.productId || (item as any).id },
           include: { recipe: { include: { recipeItems: true } } }
         });
 
         if (product) {
-          const pName = (product.name || '').trim().toLowerCase();
-          console.log(`📦 [POS] Deducting stock for ${product.name} (recipe: ${!!product.recipe})`);
-          if (product.recipe) {
+          const pName = (product.name || '').trim();
+          if (product.recipe && product.recipe.recipeItems.length > 0) {
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
               const quantityToDeduct = ri.quantityRequired * scalar;
-              
-              // Check stock even in legacy checkout if possible
-              const inv = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
-              if (inv && inv.currentStock < quantityToDeduct) {
-                 throw new Error(`Out of stock during checkout: ${inv.name}`);
-              }
-
               await InventoryService.recordMovement(tx, {
                 itemId: ri.inventoryItemId,
                 type: 'SALES_OUT',
                 quantity: -quantityToDeduct,
                 referenceType: 'ORDER',
                 referenceId: order.id,
-                note: `Legacy checkout for ${item.quantity}x ${product.name}`
+                note: `POS Sale: ${item.quantity}x ${product.name}`
               });
             }
           } else {
-            // FALLBACK: Direct deduction if no recipe
-            console.log(`🔍 [POS] Trying direct deduction for ${product.name}`);
-                const inventoryItem = await tx.inventoryItem.findFirst({
-                  where: {
-                    OR: [
-                      { sku: product.sku || '___NON_EXISTENT___' },
-                      { name: { equals: pName, mode: 'insensitive' } }
-                    ],
-                    franchiseId: fid
-                  }
-                });
+            // Direct deduction fallback
+            const inventoryItem = await tx.inventoryItem.findFirst({
+              where: {
+                OR: [
+                  { sku: product.sku || '___NONE_EXISTENT___' },
+                  { name: { equals: pName, mode: 'insensitive' } }
+                ],
+                franchiseId: fid
+              }
+            });
 
             if (inventoryItem) {
-              console.log(`✅ [POS] Match found: ${inventoryItem.name}. Stock before: ${inventoryItem.currentStock}`);
-              if (inventoryItem.currentStock < item.quantity) {
-                throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${item.quantity}, Stock: ${inventoryItem.currentStock}`);
-              }
-
               await InventoryService.recordMovement(tx, {
                 itemId: inventoryItem.id,
                 type: 'SALES_OUT',
                 quantity: -item.quantity,
                 referenceType: 'ORDER',
                 referenceId: order.id,
-                note: `Direct legacy auto-deduction (No recipe)`
+                note: `Direct stock reduction: ${item.quantity}x ${product.name}`
               });
-            } else {
-              console.log(`❌ [POS] No inventory item found for ${product.name} in franchise ${fid}`);
             }
           }
         }
