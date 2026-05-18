@@ -129,6 +129,12 @@ export class FinanceService {
       include: { order: { include: { orderItems: { include: { product: { include: { recipe: { include: { recipeItems: { include: { inventoryItem: { include: { vendors: true } } } } } } } } } } } } }
     });
 
+    // Fetch all inventory items for mapping
+    const inventoryItems = await prisma.inventoryItem.findMany({
+      where: filters.franchiseId ? { franchiseId: filters.franchiseId } : {}
+    });
+    const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
+
     let totalRevenue = 0;
     let totalCOGS = 0;
 
@@ -137,13 +143,20 @@ export class FinanceService {
       totalRevenue += inv.finalAmount;
       for (const item of inv.order.orderItems) {
         const product = item.product;
-        if (product && product.recipe) {
-          const scalar = item.quantity / product.recipe.yieldQty;
-          for (const ri of product.recipe.recipeItems) {
-            const qtyUsed = ri.quantityRequired * scalar;
-            // Use last supplied price as cost placeholder
-            const costPerUnit = ri.inventoryItem.vendors[0]?.price || 0; 
-            totalCOGS += (qtyUsed * costPerUnit);
+        if (product) {
+          if (product.recipe) {
+            const scalar = item.quantity / product.recipe.yieldQty;
+            for (const ri of product.recipe.recipeItems) {
+              const qtyUsed = ri.quantityRequired * scalar;
+              // Use last supplied price as cost placeholder
+              const costPerUnit = ri.inventoryItem.vendors[0]?.price || 0; 
+              totalCOGS += (qtyUsed * costPerUnit);
+            }
+          } else {
+            // Direct product: get average buying/purchase cost from InventoryItem with matching SKU
+            const invItem = invItemMap.get(product.sku || '');
+            const costPerUnit = invItem?.costPrice || 0;
+            totalCOGS += (item.quantity * costPerUnit);
           }
         }
       }
@@ -168,6 +181,50 @@ export class FinanceService {
       expenses: totalExpenses,
       netProfit: grossProfit - totalExpenses,
       period: filters
+    };
+  }
+
+  /**
+   * Generates a list of all inventory stock items with their stock value
+   * calculated using their average purchase cost (costPrice).
+   */
+  static async getInventoryValuationReport(franchiseId?: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: franchiseId ? { franchiseId } : {},
+      orderBy: { name: 'asc' }
+    });
+
+    let totalStockValue = 0;
+    const reportItems = items.map(item => {
+      const stockInHand = item.currentStock || 0;
+      const unitCost = item.costPrice || 0;
+      const stockValue = stockInHand * unitCost;
+      totalStockValue += stockValue;
+
+      return {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        hsn: item.hsnCode,
+        unit: item.unit,
+        stockInHand,
+        unitCost,
+        stockValue
+      };
+    });
+
+    // Calculate share of total value
+    const itemsWithShare = reportItems.map(item => ({
+      ...item,
+      shareOfTotalValue: totalStockValue > 0 ? (item.stockValue / totalStockValue) * 100 : 0
+    }));
+
+    return {
+      summary: {
+        totalItemsCount: items.length,
+        totalStockValue
+      },
+      items: itemsWithShare
     };
   }
 

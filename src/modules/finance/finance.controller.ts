@@ -30,6 +30,19 @@ export class FinanceController {
     }
   }
 
+  static async getInventoryValue(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+
+      const report = await FinanceService.getInventoryValuationReport(franchiseId);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getCashFlow(req: Request, res: Response) {
     try {
       const user = (req as any).user;

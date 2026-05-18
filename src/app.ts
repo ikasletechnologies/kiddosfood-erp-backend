@@ -269,6 +269,7 @@ app.get('/api/reports/sales', authenticate, authorizeRole(['FRANCHISE_ADMIN']), 
 app.get('/api/reports/expenses', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getExpensesReport);
 app.get('/api/reports/profit', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPL);
 app.get('/api/reports/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.get('/api/reports/inventory-value', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInventoryValue);
 
 // Phase 7 Analytics
 app.get('/api/analytics/product-performance', authenticate, authorizeRole(['FRANCHISE_ADMIN']), AnalyticsController.getProductPerformance);
