@@ -59,6 +59,13 @@ export class FranchiseOrderController {
   static async recordPayment(req: Request, res: Response) {
     try {
       const user = (req as any).user;
+      const order = await FranchiseOrderService.getOrderById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      if (user.role === 'FRANCHISE_ADMIN' && order.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: You can only pay for your own orders' });
+      }
+
       const { amount, accountId } = req.body;
       const updated = await FranchiseOrderService.recordPayment(
         req.params.id, 

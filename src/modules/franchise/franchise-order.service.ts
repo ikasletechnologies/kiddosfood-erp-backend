@@ -297,12 +297,29 @@ export class FranchiseOrderService {
 
   // ─── Payment ───────────────────────────────────────────────────────────────
   static async recordPayment(id: string, amount: number, accountId?: string, paidBy?: string) {
-    // If no account provided, we'll try to find a default CASH account in FinanceService
-    const effectiveAccountId = accountId || 'CASH'; 
-
     return prisma.$transaction(async (tx) => {
       const order = await tx.franchiseOrder.findUnique({ where: { id } });
       if (!order) throw new Error('Order not found');
+
+      // Determine source account ID
+      let sourceAccountId: string | undefined = accountId;
+      if (!sourceAccountId) {
+        // Find CASH account for the franchise (or HQ if franchiseId is null)
+        const cashAcc = await tx.account.findFirst({
+          where: {
+            type: 'CASH',
+            franchiseId: order.franchiseId || null,
+          },
+          select: { id: true },
+        });
+        if (!cashAcc) throw new Error('Default CASH account not found');
+        sourceAccountId = cashAcc.id;
+      }
+
+      await tx.franchiseOrder.update({
+        where: { id },
+        data: { paymentStatus: 'PAID' },
+      });
 
       // 1. Central Payment & Account Adjustment (Money IN from Franchise)
       await FinanceService.createPayment({
@@ -310,7 +327,7 @@ export class FranchiseOrderService {
         amount: amount || order.totalAmount,
         flow: 'IN',
         status: 'PAID',
-        sourceAccount: effectiveAccountId,
+        sourceAccount: sourceAccountId,
         method: order.paymentType as any,
         sourceModule: 'FRANCHISE',
         linkedDocType: 'INVOICE',
@@ -318,11 +335,6 @@ export class FranchiseOrderService {
         entityType: 'FRANCHISE',
         entityId: order.franchiseId,
         createdBy: paidBy || 'FRANCHISE_SYSTEM'
-      });
-
-      await tx.franchiseOrder.update({
-        where: { id },
-        data: { paymentStatus: 'PAID' },
       });
 
       // 2. Create Franchise Ledger Entry (CREDIT)

@@ -56,7 +56,10 @@ export class RawMaterialsController {
       const items = await prisma.inventoryItem.findMany({
         where: {
           ...(franchiseId ? { franchiseId } : {}),
-          ...(includeInactive ? {} : { isActive: true })
+          ...(includeInactive ? {} : { isActive: true }),
+          category: {
+            in: ['RAW_MATERIAL', 'PACKAGING', 'FINISHED_GOOD', 'SEMI_FINISHED']
+          }
         },
         orderBy: { name: 'asc' }
       });

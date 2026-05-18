@@ -2,6 +2,16 @@ import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType } from '@prisma/client';
 
+function mapCategoryToDb(category?: string): ItemCategory {
+  if (!category) return ItemCategory.RAW_MATERIAL;
+  if (category.startsWith('RAW_')) return ItemCategory.RAW_MATERIAL;
+  if (category.startsWith('PACKAGING_')) return ItemCategory.PACKAGING;
+  if (category === 'SEMI_FINISHED') return ItemCategory.SEMI_FINISHED;
+  if (category === 'FINISHED_GOOD') return ItemCategory.FINISHED_GOOD;
+  if (category === 'PACKAGING') return ItemCategory.PACKAGING;
+  return ItemCategory.RAW_MATERIAL;
+}
+
 export class InventoryService {
   // Compute current stock from movement ledger — single source of truth
   static async computeStock(itemId: string, tx: any = prisma): Promise<number> {
@@ -131,7 +141,7 @@ export class InventoryService {
       const createData: any = {
         name: data.name,
         sku,
-        category: data.category || ItemCategory.RAW_MATERIAL,
+        category: mapCategoryToDb(data.category),
         currentStock: 0,
         unit: data.unit || (data.category === 'FINISHED_GOOD' ? 'PC' : 'kg'),
         minimumStock: data.minimumStock || 10,
@@ -216,7 +226,9 @@ export class InventoryService {
   // Only update metadata — never update currentStock directly
   static async updateItem(id: string, data: any) {
     const { currentStock: _currentStock, ...safeData } = data; // strip any stock field
-    
+    if (safeData.category) {
+      safeData.category = mapCategoryToDb(safeData.category);
+    }
     const updated = await prisma.inventoryItem.update({ where: { id }, data: safeData });
 
     // Sync on update as well if category is orderable

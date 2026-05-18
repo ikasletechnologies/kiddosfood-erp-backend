@@ -44,11 +44,15 @@ export class FranchiseService {
     });
   }
 
-  static async getAll() {
+  static async getAll(franchiseId?: string) {
+    const where: any = {
+      status: { not: 'DELETED' }
+    };
+    if (franchiseId) {
+      where.id = franchiseId;
+    }
     return prisma.franchise.findMany({
-      where: {
-        status: { not: 'DELETED' }
-      },
+      where,
       select: {
         id: true,
         name: true,
@@ -56,6 +60,9 @@ export class FranchiseService {
         ownerName: true,
         contactNum: true,
         status: true,
+        outstandingAmount: true,
+        creditLimit: true,
+        walletBalance: true,
         createdAt: true,
         updatedAt: true,
         _count: {
@@ -71,7 +78,10 @@ export class FranchiseService {
       include: { 
         users: true, 
         orders: true, 
-        expenses: true 
+        expenses: true,
+        ledgerEntries: {
+          orderBy: { createdAt: 'asc' }
+        }
       }
     });
 

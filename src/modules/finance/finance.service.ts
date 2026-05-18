@@ -481,6 +481,19 @@ export class FinanceService {
     };
     const accountType = accountTypeMap[sourceId] ?? accountTypeMap[data.method] ?? 'CASH';
 
+    const paymentModeMap: Record<string, string> = {
+      CASH: 'CASH',
+      UPI: 'UPI',
+      CARD: 'CARD',
+      BANK: 'BANK_TRANSFER',
+      BANK_TRANSFER: 'BANK_TRANSFER',
+      CHEQUE: 'CHEQUE',
+      NEFT: 'NEFT',
+      CREDIT: 'CASH', // Default CREDIT to CASH
+      ADVANCE: 'CASH' // Default ADVANCE to CASH
+    };
+    const resolvedPaymentMode = paymentModeMap[data.method] || paymentModeMap[sourceId] || 'CASH';
+
     const operation = async (tx: any) => {
       // 1. Resolve account (Prefer ID, fallback to Type mapping)
       let account;
@@ -521,7 +534,7 @@ export class FinanceService {
           vendorInvoiceId: data.vendorInvoiceId,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       entityId,
-          paymentMode:    data.method as any,
+          paymentMode:    resolvedPaymentMode as any,
           transactionRef: data.reference || data.note || undefined,
           status,
           accountId:      account?.id ?? undefined,
@@ -549,7 +562,7 @@ export class FinanceService {
               referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
               referenceId: payment.id,
               invoiceId: data.vendorInvoiceId,
-              paymentMode: data.method as any,
+              paymentMode: resolvedPaymentMode as any,
               note: data.note || `Payment #${paymentNumber} recorded`
             }
           });
