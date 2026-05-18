@@ -222,9 +222,11 @@ export class FranchiseOrderService {
           include: { items: { include: { product: true } } },
         });
 
+        // Loop through all order items to fulfill inventory updates
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            // Add stock to the Franchise's local InventoryItem
+            // STOCK IMPACT: Branch Stock INCREASE
+            // Increment/create the Franchise's local InventoryItem for this finished good product.
             const product = item.product;
             const invItem = await tx.inventoryItem.findFirst({
               where: {
