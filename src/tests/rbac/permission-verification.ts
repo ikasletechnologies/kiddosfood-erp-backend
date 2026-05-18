@@ -35,12 +35,12 @@ async function verify() {
     console.log('📊 Testing Global Dashboard Aggregation...');
     // We expect this to run without error for both global (undefined franchiseId) and specific branch
     const globalSummary = await DashboardService.getSummary({});
-    console.log('Global Orders Today:', globalSummary.stats.ordersToday);
+    console.log('Global Orders Today:', globalSummary.stats.orderCountToday);
     
     const firstBranch = await prisma.franchise.findFirst();
     if (firstBranch) {
         const branchSummary = await DashboardService.getSummary({ franchiseId: firstBranch.id });
-        console.log(`Branch [${firstBranch.name}] Orders Today:`, branchSummary.stats.ordersToday);
+        console.log(`Branch [${firstBranch.name}] Orders Today:`, branchSummary.stats.orderCountToday);
     }
     
     console.log('✅ Dashboard aggregation logic verified.');

@@ -4,6 +4,7 @@ export class DealerService {
   static async getAll(franchiseId?: string) {
     return prisma.dealer.findMany({
       where: franchiseId ? { franchiseId } : {},
+      include: { franchise: true },
       orderBy: { createdAt: 'desc' }
     });
   }

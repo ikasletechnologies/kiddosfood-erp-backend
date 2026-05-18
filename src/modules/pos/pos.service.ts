@@ -246,6 +246,7 @@ export class POSService {
       entityType: 'CUSTOMER',
       entityId: order.customerId || 'WALK_IN',
       orderId: order.id,
+      franchiseId: order.franchiseId,
       createdBy: createdBy || 'POS_SYSTEM'
     });
 
@@ -343,7 +344,12 @@ export class POSService {
       // Use provided accountId or fallback to default for the payment mode
       let finalAccountId = data.accountId;
       if (!finalAccountId || finalAccountId === "") {
-        const defaultAccount = await tx.account.findFirst({ where: { type: targetType as any } });
+        const defaultAccount = await tx.account.findFirst({
+          where: { 
+            type: targetType as any,
+            franchiseId: fid || null
+          }
+        });
         finalAccountId = defaultAccount?.id || targetType;
       }
       
@@ -360,6 +366,7 @@ export class POSService {
         entityType: 'CUSTOMER',
         entityId: data.customerId || 'WALK_IN',
         orderId: order.id,
+        franchiseId: fid,
         createdBy: 'POS_CHECKOUT'
       });
 

@@ -1,12 +1,19 @@
-import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
+import prisma from '../lib/prisma';
 
 async function main() {
+  console.log('--- Database Account Check ---');
   const accounts = await prisma.account.findMany();
-  console.log('Accounts:', JSON.stringify(accounts, null, 2));
-  
-  const payments = await prisma.payment.findMany({ take: 10, orderBy: { createdAt: 'desc' } });
-  console.log('Recent Payments:', JSON.stringify(payments, null, 2));
+  console.log(`Total Accounts in DB: ${accounts.length}`);
+  for (const acc of accounts) {
+    console.log(`- ID: ${acc.id}, Code: ${acc.accountCode}, Name: ${acc.name}, Type: ${acc.type}, Balance: ${acc.balance}, Franchise: ${acc.franchiseId || 'HQ (null)'}`);
+  }
 }
 
-main().catch(console.error).finally(() => prisma.$disconnect());
+main()
+  .catch(e => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });

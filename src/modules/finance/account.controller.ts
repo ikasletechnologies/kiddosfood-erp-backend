@@ -1,10 +1,14 @@
 import { Request, Response } from 'express';
 import { AccountService } from './account.service';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class AccountController {
   static async getAll(req: Request, res: Response) {
     try {
-      const accounts = await AccountService.getAccounts();
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId !== undefined ? franchiseFilter.franchiseId : (req.query.franchiseId as string || null);
+      const accounts = await AccountService.getAccounts(franchiseId);
       res.json(accounts);
     } catch (error: any) {
       console.error('[AccountController.getAll] Error:', error);
@@ -14,7 +18,9 @@ export class AccountController {
 
   static async create(req: Request, res: Response) {
     try {
-      const account = await AccountService.createAccount(req.body);
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const account = await AccountService.createAccount({ ...req.body, franchiseId });
       res.status(201).json(account);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

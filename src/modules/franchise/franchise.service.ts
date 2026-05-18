@@ -25,9 +25,6 @@ export class FranchiseService {
 
       // 2. Create Franchise Admin User if provided (requires email or phone)
       if (adminUser && (adminUser.email || franchiseData.contactNum)) {
-        const role = await tx.role.findUnique({ where: { name: 'FRANCHISE_ADMIN' } });
-        if (!role) throw new Error('Role [FRANCHISE_ADMIN] not found. Please seed the database.');
-
         const passwordHash = await AuthService.hashPassword(adminUser.password || 'franchise123');
 
         await tx.user.create({
@@ -36,7 +33,7 @@ export class FranchiseService {
             email: adminUser.email || null,
             phone: franchiseData.contactNum,
             passwordHash,
-            roleId: role.id,
+            role: 'FRANCHISE_ADMIN',
             franchiseId: franchise.id,
             is_active: true
           }
@@ -72,9 +69,7 @@ export class FranchiseService {
     const franchise = await prisma.franchise.findUnique({
       where: { id },
       include: { 
-        users: {
-          include: { role: true }
-        }, 
+        users: true, 
         orders: true, 
         expenses: true 
       }

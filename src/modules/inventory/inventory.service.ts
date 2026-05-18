@@ -161,7 +161,7 @@ export class InventoryService {
       }
 
       // ─── AUTOMATION: Sync with Product Master if category is FINISHED_GOOD or SEMI_FINISHED at HQ ───
-      const orderableCategories = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+      const orderableCategories: ItemCategory[] = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
       
       if (orderableCategories.includes(item.category)) {
         const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
@@ -220,7 +220,7 @@ export class InventoryService {
     const updated = await prisma.inventoryItem.update({ where: { id }, data: safeData });
 
     // Sync on update as well if category is orderable
-    const orderableCategories = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+    const orderableCategories: ItemCategory[] = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
     if (orderableCategories.includes(updated.category)) {
       const franchise = await prisma.franchise.findUnique({ where: { id: updated.franchiseId } });
       const nameUpper = franchise?.name.toUpperCase() || "";

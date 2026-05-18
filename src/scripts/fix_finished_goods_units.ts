@@ -19,11 +19,7 @@ async function main() {
       data: { unit: 'pkt' }
     });
     
-    // Also update the linked product if it exists
-    await prisma.product.updateMany({
-      where: { sku: item.sku },
-      data: { unit: 'pkt' }
-    });
+    // Product model doesn't have a 'unit' field, so skipping product update
   }
 }
 

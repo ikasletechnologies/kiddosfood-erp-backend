@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import bcrypt from 'bcryptjs';
+import { UserRole } from '@prisma/client';
 
 export async function seedUsers(roleMap: Record<string, any>) {
   console.log('👤 Seeding Users...');
@@ -12,7 +13,7 @@ export async function seedUsers(roleMap: Record<string, any>) {
       fullName: 'System Admin',
       phone: '0000000000',
       passwordHash: commonPassword,
-      roleId: roleMap['SUPER_ADMIN'].id,
+      role: 'SUPER_ADMIN' as UserRole,
       is_active: true,
     },
     {
@@ -20,8 +21,8 @@ export async function seedUsers(roleMap: Record<string, any>) {
       fullName: 'Kiddos Super Admin',
       phone: '9999999999',
       passwordHash: commonPassword,
-      roleId: roleMap['SUPER_ADMIN'].id,
-      franchiseId: 'root-franchise',
+      role: 'SUPER_ADMIN' as UserRole,
+      franchiseId: 'hq-001',
       is_active: true,
     },
     {
@@ -29,8 +30,8 @@ export async function seedUsers(roleMap: Record<string, any>) {
       fullName: 'Downtown Manager',
       phone: '9876543210',
       passwordHash: franchisePassword,
-      roleId: roleMap['FRANCHISE_ADMIN'].id,
-      franchiseId: 'test-franchise-id',
+      role: 'FRANCHISE_ADMIN' as UserRole,
+      franchiseId: 'fran-downtown',
       is_active: true,
     },
     {
@@ -38,8 +39,8 @@ export async function seedUsers(roleMap: Record<string, any>) {
       fullName: 'HQ Manager',
       phone: '1112223333',
       passwordHash: commonPassword,
-      roleId: roleMap['FRANCHISE_ADMIN'].id,
-      franchiseId: 'root-franchise',
+      role: 'FRANCHISE_ADMIN' as UserRole,
+      franchiseId: 'hq-001',
       is_active: true,
     }
   ];

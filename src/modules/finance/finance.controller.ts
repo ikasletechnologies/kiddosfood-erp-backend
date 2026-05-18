@@ -32,7 +32,10 @@ export class FinanceController {
 
   static async getCashFlow(req: Request, res: Response) {
     try {
-      const report = await FinanceService.getCashFlow();
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId !== undefined ? franchiseFilter.franchiseId : (req.query.franchiseId as string || null);
+      const report = await FinanceService.getCashFlow(franchiseId);
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

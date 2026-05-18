@@ -13,6 +13,42 @@ export async function seedMasterData() {
     }
   });
 
+  await prisma.account.upsert({
+    where: { accountCode: 'CASH-F01' },
+    update: {},
+    create: {
+      name: 'Franchise Cash Account',
+      accountCode: 'CASH-F01',
+      type: 'CASH',
+      balance: 50000,
+      franchiseId: 'test-franchise-id'
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'BANK-F01' },
+    update: {},
+    create: {
+      name: 'Franchise Bank Account',
+      accountCode: 'BANK-F01',
+      type: 'BANK',
+      balance: 150000,
+      franchiseId: 'test-franchise-id'
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'UPI-F01' },
+    update: {},
+    create: {
+      name: 'Franchise UPI Account',
+      accountCode: 'UPI-F01',
+      type: 'UPI',
+      balance: 20000,
+      franchiseId: 'test-franchise-id'
+    }
+  });
+
   console.log('🏭 Seeding Vendors...');
   const vendors = [
     { name: 'City Wholesale Traders', email: 'city@wholesale.com', contact: '1234567890', vendorCode: 'V-0001' },

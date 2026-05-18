@@ -115,6 +115,7 @@ model Franchise {
   incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
   users             User[]
   cheques           Cheque[]
+  accounts          Account[]
 }
 
 model Cheque {
@@ -285,9 +286,13 @@ model ProcurementOrder {
   vendorNotes          String?
   approvedAt           DateTime?
   approvedBy           String?
+  warehouseId          String?
+  purchaseType         PurchaseType           @default(RAW_MATERIAL)
+  discountAmount       Float                  @default(0)
   expenses             Expense[]
   goodsReceipts        GoodsReceipt[]
   vendor               Vendor                 @relation(fields: [vendorId], references: [id])
+  warehouse            Warehouse?             @relation(fields: [warehouseId], references: [id])
   poItems              ProcurementOrderItem[]
   purchaseReturns      PurchaseReturn[]
   invoices             VendorInvoice[]
@@ -619,6 +624,8 @@ model Account {
   updatedAt       DateTime         @updatedAt
   accountCode     String?          @unique
   status          String           @default("ACTIVE")
+  franchiseId     String?
+  franchise       Franchise?       @relation(fields: [franchiseId], references: [id])
   customerLedgers CustomerLedger[]
   expenses        Expense[]
   payments        Payment[]
@@ -1173,6 +1180,7 @@ model Warehouse {
   grnItems  GoodsReceiptItem[]
   movements StockMovement[]
   bins      WarehouseBin[]
+  orders    ProcurementOrder[]
 }
 
 model WarehouseBin {
@@ -1364,11 +1372,21 @@ enum POStatus {
   DRAFT
   PENDING_APPROVAL
   APPROVED
+  ORDERED
   SENT
   PARTIALLY_RECEIVED
   RECEIVED
+  INVOICED
+  PAID
   CLOSED
   CANCELLED
+}
+
+enum PurchaseType {
+  RAW_MATERIAL
+  PACKAGING
+  ASSET
+  MISC
 }
 
 enum POPaymentStatus {

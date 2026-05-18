@@ -52,7 +52,7 @@ export class AuditService {
         }
       },
       include: {
-        user: { select: { fullName: true, role: { select: { name: true } } } },
+        user: { select: { fullName: true, role: true } },
         franchise: { select: { name: true } }
       },
       orderBy: { createdAt: 'desc' },

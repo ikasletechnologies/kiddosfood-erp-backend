@@ -189,15 +189,20 @@ export class ProductionService {
   // Get all product batches with expiry status (filtered by franchise if provided)
   static async getProductBatches(productId?: string, franchiseId?: string) {
     const now = new Date();
-    const soonThreshold = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000); // 3 days
+    const soonThreshold = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7 days (1 week)
 
-    const where: any = {};
+    const where: any = {
+      OR: [
+        { expiryDate: { not: null } },
+        { production: { expiryDate: { not: null } } }
+      ]
+    };
     if (productId) where.productId = productId;
     if (franchiseId) where.franchiseId = franchiseId;
 
     const batches = await prisma.productBatch.findMany({
       where,
-      include: { product: true, production: { include: { recipe: true } } },
+      include: { product: true, franchise: true, production: { include: { recipe: true } } },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -206,7 +211,7 @@ export class ProductionService {
       return {
         ...b,
         expiryStatus: !effectiveExpiry
-          ? 'NO_EXPIRY'
+          ? 'VALID' // Fallback (should be filtered out by DB query)
           : effectiveExpiry < now
           ? 'EXPIRED'
           : effectiveExpiry < soonThreshold

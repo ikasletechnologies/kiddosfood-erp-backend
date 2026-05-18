@@ -236,9 +236,11 @@ export class FinanceService {
     };
   }
 
-  static async getCashFlow() {
+  static async getCashFlow(franchiseId?: string | null) {
 
-    const accounts = await prisma.account.findMany();
+    const accounts = await prisma.account.findMany({
+      where: franchiseId ? { franchiseId } : { franchiseId: null }
+    });
 
     const totalCash = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);
     const totalBank = accounts.filter(a => a.type === 'BANK').reduce((s, a) => s + a.balance, 0);
@@ -488,7 +490,12 @@ export class FinanceService {
       
       // Fallback if no account found by ID or if sourceId is a Type string
       if (!account) {
-         account = await tx.account.findFirst({ where: { type: accountType as any } });
+         account = await tx.account.findFirst({
+           where: { 
+             type: accountType as any,
+             franchiseId: data.franchiseId || null
+           }
+         });
       }
 
       // 2. Balance check for OUTFLOW + PAID

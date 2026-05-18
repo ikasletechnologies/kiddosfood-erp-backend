@@ -44,6 +44,8 @@ import BusinessPartnerRoutes from './modules/business-partners';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
+console.log('📦 BACKEND APP INITIALIZING...');
+
 const app: Express = express();
 
 app.use(cors());
@@ -84,182 +86,46 @@ app.use((req, res, next) => {
 app.get('/health', async (req: Request, res: Response) => {
   if (req.query.seed === 'true') {
     try {
-      // --- 1. Admin User & Franchise ---
-      const franchise = await prisma.franchise.upsert({
-        where: { id: 'test-franchise-id' },
+      // 1. Ensure HQ exists
+      await prisma.franchise.upsert({
+        where: { id: 'hq-001' },
         update: {},
         create: {
-          id: 'test-franchise-id',
-          name: 'Downtown Outlet',
-          location: 'Main Street, City Center',
-          ownerName: 'Jane Doe',
-          contactNum: '9876543210',
+          id: 'hq-001',
+          name: 'Kiddos Food Headquarters',
+          location: 'Mumbai',
+          ownerName: 'Super Admin',
+          contactNum: '9999999999',
           status: 'ACTIVE'
         }
       });
 
-      // --- 2. Users ---
-      await prisma.user.deleteMany({ where: { email: 'franchise@erp.com' } });
-      const hashedPassword = await bcrypt.hash('franchise123', 10);
-      await prisma.user.create({
-        data: {
-          fullName: 'Downtown Manager',
-          email: 'franchise@erp.com',
-          phone: '9876543210',
-          passwordHash: hashedPassword,
-          roleId: createdRoles['FRANCHISE_ADMIN'].id,
-          franchiseId: franchise.id,
-          is_active: true,
-        },
-      });
-
-      // --- 3. Vendors & Ledger ---
-      const vendor1 = await prisma.vendor.upsert({
-        where: { vendorCode: 'V-0001' },
+      // 2. Ensure basic warehouse exists
+      await prisma.warehouse.upsert({
+        where: { id: 'w-central' },
         update: {},
         create: {
-          vendorCode: 'V-0001',
-          name: 'Global Supplies Inc',
-          contact: '9988776655',
-          email: 'sales@globalsupplies.com',
-          address: 'Industrial Area, Phase 1',
-          category: 'RAW_MATERIALS',
-          status: 'ACTIVE'
+          id: 'w-central',
+          name: 'Central Warehouse',
+          location: 'Mumbai',
+          type: 'MAIN'
         }
       });
 
-      const vendor2 = await prisma.vendor.upsert({
-        where: { vendorCode: 'V-0002' },
-        update: {},
-        create: {
-          vendorCode: 'V-0002',
-          name: 'Quality Packaging Co',
-          contact: '8877665544',
-          email: 'info@qualitypkg.com',
-          address: 'Business Park, Block B',
-          category: 'PACKAGING',
-          status: 'ACTIVE'
-        }
-      });
-
-      // Add some ledger entries for vendors
-      await prisma.vendorLedger.deleteMany({ where: { vendorId: { in: [vendor1.id, vendor2.id] } } });
-      await prisma.vendorLedger.createMany({
-        data: [
-          {
-            vendorId: vendor1.id,
-            type: 'DEBIT',
-            amount: 50000,
-            referenceType: 'PURCHASE',
-            note: 'Initial stock purchase',
-            balanceAfterTransaction: -50000,
-            paymentMode: 'CASH'
-          },
-          {
-            vendorId: vendor1.id,
-            type: 'CREDIT',
-            amount: 20000,
-            referenceType: 'PAYMENT',
-            note: 'Part payment',
-            balanceAfterTransaction: -30000,
-            paymentMode: 'UPI'
-          }
-        ]
-      });
-
-      // --- 4. Products & Inventory ---
-      const product1 = await prisma.product.upsert({
-        where: { id: 'p-1' },
-        update: {},
-        create: {
-          id: 'p-1',
-          name: 'Classic Burger Patties',
-          sku: 'B-001',
-          basePrice: 120,
-          emoji: '🍔',
-          category: 'Food',
-          taxPercent: 5,
-          unit: 'KG',
-        }
-      });
-
-      const product2 = await prisma.product.upsert({
-        where: { id: 'p-2' },
-        update: {},
-        create: {
-          id: 'p-2',
-          name: 'Premium Cheese Slices',
-          sku: 'C-001',
-          basePrice: 450,
-          emoji: '🧀',
-          category: 'Food',
-          taxPercent: 12,
-          unit: 'PKT',
-        }
-      });
-
-      // --- 5. Customers ---
-      const customer = await prisma.customer.upsert({
-        where: { phone: '9000000001' },
-        update: {},
-        create: {
-          name: 'Rahul Kumar',
-          phone: '9000000001',
-          email: 'rahul@gmail.com'
-        }
-      });
-
-      // --- 6. Sales Orders & Invoices (Sample Data) ---
-      // We clear existing to avoid duplication issues on re-seed
-      await prisma.salesOrder.deleteMany({ where: { customerId: customer.id } });
-      const order = await prisma.salesOrder.create({
-        data: {
-          orderNumber: 'INV-2026-001',
-          customerId: customer.id,
-          franchiseId: franchise.id,
-          subTotal: 570,
-          taxAmount: 30,
-          totalAmount: 600,
-          status: 'COMPLETED',
-          paymentMode: 'CASH',
-          orderType: 'counter',
-          items: {
-            create: [
-              { productId: 'p-1', quantity: 2, unitPrice: 120, totalPrice: 240, taxPercent: 5 },
-              { productId: 'p-2', quantity: 1, unitPrice: 330, totalPrice: 330, taxPercent: 12 }
-            ]
-          }
-        }
-      });
-
-      // --- 7. Sales Returns ---
-      await prisma.returnOrder.deleteMany({ where: { customerId: customer.id } });
-      await prisma.returnOrder.create({
-        data: {
-          returnNumber: 'SR-2026-001',
-          customerId: customer.id,
-          salesOrderId: order.id,
-          reason: 'Product damaged during transit',
-          status: 'PENDING',
-          refundAmount: 120,
-          refundMethod: 'CASH',
-          items: [
-            { productId: 'p-1', productName: 'Classic Burger Patties', quantity: 1, rate: 120, condition: 'Damaged' }
-          ]
-        }
-      });
-
-      return res.json({ 
-        status: 'ok', 
-        message: 'DATABASE SEEDED SUCCESSFULLY WITH FULL BUSINESS CYCLE DATA! \n- Vendors & Ledger \n- Products & Inventory \n- Customers \n- Sales Orders (Invoices) \n- Sales Returns' 
-      });
+      return res.json({ status: 'ok', message: 'SEED_SUCCESS' });
     } catch (e: any) {
       console.error('Seed Error:', e);
-      return res.status(500).json({ status: 'error', message: e.message });
+      return res.status(500).json({ error: e.message });
     }
   }
   res.json({ status: 'ok', message: 'Food ERP API is running' });
 });
+
+// Warehouse Management
+app.get('/api/warehouses', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouses);
+app.post('/api/warehouses', (req, res, next) => { console.log('🎯 WAREHOUSE POST ROUTE HIT'); next(); }, authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.createWarehouse);
+app.patch('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.updateWarehouse);
+app.delete('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.deleteWarehouse);
 
 // Auth Routes (Production Flow)
 app.post('/api/auth/register', validate(registerSchema), AuthController.register);
@@ -337,9 +203,12 @@ app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', '
   try {
     const { ProductionService } = await import('./modules/production/production.service');
     const user = (req as any).user;
+    const targetFranchiseId = user.role === 'SUPER_ADMIN'
+      ? (req.query.franchiseId as string || undefined)
+      : user.franchiseId;
     const batches = await ProductionService.getProductBatches(
       req.query.productId as string | undefined,
-      user.franchiseId
+      targetFranchiseId
     );
     res.json(batches);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
