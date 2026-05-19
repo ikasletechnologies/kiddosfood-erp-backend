@@ -1,21 +1,16 @@
 import prisma from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
+import { getStockInPhysicalUnit } from '../inventory/inventory.service';
 
 export class DashboardInventoryService {
   static async getInventoryStats(franchiseId?: string) {
     const itemWhere: Prisma.InventoryItemWhereInput = franchiseId ? { franchiseId } : {};
     const batchWhere: Prisma.ProductBatchWhereInput = franchiseId ? { franchiseId } : {};
 
-    const [inventoryItems, lowStockRawItems, productBatches] = await Promise.all([
+    const [inventoryItems, productBatches] = await Promise.all([
       prisma.inventoryItem.findMany({
         where: itemWhere,
         include: { franchise: true }
-      }),
-      prisma.inventoryItem.findMany({
-        where: {
-          ...itemWhere,
-          currentStock: { lte: 10 }
-        }
       }),
       prisma.productBatch.findMany({
         where: {
@@ -63,23 +58,35 @@ export class DashboardInventoryService {
       };
     });
 
+    // Compute low stock raw items in-memory using physicalStock compared to minimumStock
+    const lowStockRawItems = inventoryItems.filter(item => {
+      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
+      return physicalStock <= item.minimumStock;
+    });
+
     // Build Low Stock raw materials list
     const lowStockAlerts = lowStockRawItems.map(item => {
+      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
       let status = 'GREEN';
-      if (item.currentStock <= 0) {
+      if (physicalStock <= 0) {
         status = 'RED';
-      } else if (item.currentStock <= item.minimumStock) {
+      } else if (physicalStock <= item.minimumStock) {
         status = 'YELLOW';
       }
+
+      const parts = item.sku ? item.sku.split('-') : [];
+      const sizePart = parts.length >= 2 ? parts[parts.length - 1] : "";
+      const match = sizePart.match(/^(\d+(?:\.\d+)?)\s*([A-Z]+)$/i);
+      const displayUnit = (item.category === 'FINISHED_GOOD' && match) ? match[2].toUpperCase() : item.unit;
 
       return {
         id: item.id,
         product: item.name,
-        current: item.currentStock,
+        current: physicalStock,
         required: item.minimumStock,
-        unit: item.unit,
+        unit: displayUnit,
         status,
-        action: item.currentStock <= 0 ? 'Request Refill' : 'Monitor'
+        action: physicalStock <= 0 ? 'Request Refill' : 'Monitor'
       };
     });
 

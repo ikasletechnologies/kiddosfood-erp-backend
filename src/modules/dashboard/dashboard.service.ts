@@ -32,6 +32,7 @@ export class DashboardService {
 
         // General / HQ Compatibility KPIs
         totalSales: ana.totalSales,
+        totalSalesCount: ana.totalSalesCount,
         totalPurchase: ana.totalPurchase,
         revenueChangePct: ana.revenueChangePct,
         expensesToday: ana.expensesToday,

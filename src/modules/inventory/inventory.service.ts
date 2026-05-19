@@ -12,6 +12,24 @@ function mapCategoryToDb(category?: string): ItemCategory {
   return ItemCategory.RAW_MATERIAL;
 }
 
+export function getStockInPhysicalUnit(stock: number, sku: string, category?: string): number {
+  if (!sku || category !== 'FINISHED_GOOD') return stock;
+  const parts = sku.split('-');
+  const sizePart = parts.length >= 2 ? parts[parts.length - 1] : "";
+  const match = sizePart.match(/^(\d+(?:\.\d+)?)\s*([A-Z]+)$/i);
+  if (!match) return stock;
+
+  const weightVal = parseFloat(match[1]);
+  const weightUnit = match[2].toUpperCase();
+
+  const totalVal = stock * weightVal;
+  if (weightUnit === "G" || weightUnit === "ML") {
+    return totalVal / 1000;
+  }
+  return totalVal;
+}
+
+
 export class InventoryService {
   // Compute current stock from movement ledger — single source of truth
   static async computeStock(itemId: string, tx: any = prisma): Promise<number> {
@@ -84,7 +102,8 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => m.quantity > 0).reduce((s, m) => s + m.quantity, 0);
       const outbound = Math.abs(todayMoves.filter(m => m.quantity < 0).reduce((s, m) => s + m.quantity, 0));
 
-      const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
+      const physicalStock = getStockInPhysicalUnit(computedStock, item.sku, item.category);
+      const status = physicalStock <= item.minimumStock ? 'LOW' : 'SAFE';
       
       const incomingStock = pendingMap.get(item.id) || 0;
 
@@ -167,6 +186,7 @@ export class InventoryService {
           referenceType: 'ADJUSTMENT',
           note: 'Opening Stock Balance',
           userId: data.userId,
+          warehouseId: data.warehouseId,
         });
       }
 
@@ -404,6 +424,7 @@ export class InventoryService {
       referenceId?: string;
       note?: string;
       userId?: string;
+      warehouseId?: string;
     }
   ) {
     const updatedItem = await tx.inventoryItem.update({
@@ -420,6 +441,7 @@ export class InventoryService {
         referenceId: data.referenceId,
         note: data.note,
         createdBy: data.userId,
+        warehouseId: data.warehouseId,
       },
     });
 
@@ -436,6 +458,9 @@ export class InventoryService {
 
   static async getAlerts(franchiseId: string) {
     const items = await this.getInventory(franchiseId);
-    return items.filter(item => item.currentStock <= item.minimumStock);
+    return items.filter(item => {
+      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
+      return physicalStock <= item.minimumStock;
+    });
   }
 }

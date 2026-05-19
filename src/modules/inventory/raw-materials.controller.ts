@@ -104,7 +104,8 @@ export class RawMaterialsController {
         gstRate: req.body.gstRate,
         costPrice: req.body.costPrice,
         basePrice: req.body.basePrice,
-        userId: user.id
+        userId: user.id,
+        warehouseId: req.body.binLocation || req.body.warehouseId,
       };
       
       const item = await InventoryService.createItem(data);

@@ -111,11 +111,12 @@ model Franchise {
   productions       Production[]
   returnOrders      ReturnOrder[]
   stockRequests     StockRequest[]
-  outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
-  incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
-  users             User[]
-  cheques           Cheque[]
-  accounts          Account[]
+  outgoingTransfers   StockTransfer[]    @relation("OutgoingTransfers")
+  incomingTransfers   StockTransfer[]    @relation("IncomingTransfers")
+  users               User[]
+  cheques             Cheque[]
+  accounts            Account[]
+  procurementOrders   ProcurementOrder[]
 }
 
 model Cheque {
@@ -287,10 +288,12 @@ model ProcurementOrder {
   approvedAt           DateTime?
   approvedBy           String?
   warehouseId          String?
+  franchiseId          String?
   purchaseType         PurchaseType           @default(RAW_MATERIAL)
   discountAmount       Float                  @default(0)
   expenses             Expense[]
   goodsReceipts        GoodsReceipt[]
+  franchise            Franchise?             @relation(fields: [franchiseId], references: [id])
   vendor               Vendor                 @relation(fields: [vendorId], references: [id])
   warehouse            Warehouse?             @relation(fields: [warehouseId], references: [id])
   poItems              ProcurementOrderItem[]
