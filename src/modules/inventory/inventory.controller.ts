@@ -125,4 +125,64 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
+  static async fixUnits(req: Request, res: Response) {
+    try {
+      const result = await prisma.inventoryItem.updateMany({
+        where: { category: 'FINISHED_GOOD' },
+        data: { unit: 'PC' }
+      });
+      res.json({ message: `Successfully updated ${result.count} finished goods to PC unit.` });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getWarehouses(req: Request, res: Response) {
+    try {
+      const warehouses = await prisma.warehouse.findMany({
+        orderBy: { name: 'asc' }
+      });
+      res.json(warehouses);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async createWarehouse(req: Request, res: Response) {
+    try {
+      const { name, location, type } = req.body;
+      const warehouse = await prisma.warehouse.create({
+        data: { name, location, type }
+      });
+      res.status(201).json(warehouse);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async updateWarehouse(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const { name, location, type } = req.body;
+      const warehouse = await prisma.warehouse.update({
+        where: { id },
+        data: { name, location, type }
+      });
+      res.json(warehouse);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async deleteWarehouse(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      await prisma.warehouse.delete({
+        where: { id }
+      });
+      res.json({ message: 'Warehouse deleted successfully' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

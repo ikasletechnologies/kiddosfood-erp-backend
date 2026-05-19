@@ -47,6 +47,7 @@ export class POSController {
       const order = await POSService.checkout({
         franchiseId: franchiseId || 'hq-001',
         customerId,
+        accountId: req.body.accountId,
         items: resolvedItems,
         subTotal: subtotal ?? totalAmount,
         taxAmount: taxAmount ?? 0,
@@ -61,7 +62,7 @@ export class POSController {
         const existing = await prisma.customer.findFirst({ where: { name: customerName } });
         cid = existing?.id;
       }
-      if (cid) {
+      if (cid && !/walk[-_ ]?in/i.test(cid)) {
         const pts = Math.floor(totalAmount / 10);
         if (pts > 0) {
           await prisma.customer.update({

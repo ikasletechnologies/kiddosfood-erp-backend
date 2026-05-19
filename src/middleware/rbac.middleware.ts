@@ -38,30 +38,3 @@ export const authorizeRole = (allowedRoles: string[]) => {
     next();
   };
 };
-
-export const requirePermission = (permissionKey: string) => {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const user = (req as any).user;
-    if (!user) return next(new AppError('Unauthorized', 401));
-
-    try {
-      // Check if the role has this permission
-      const rolePermission = await prisma.rolePermission.findFirst({
-        where: {
-          roleId: user.roleId,
-          permission: {
-            key: permissionKey
-          }
-        }
-      });
-
-      if (!rolePermission) {
-        return next(new AppError(`Forbidden: Missing permission [${permissionKey}]`, 403));
-      }
-
-      next();
-    } catch (error) {
-      next(error);
-    }
-  };
-};

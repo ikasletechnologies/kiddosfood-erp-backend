@@ -2,6 +2,34 @@ import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType } from '@prisma/client';
 
+function mapCategoryToDb(category?: string): ItemCategory {
+  if (!category) return ItemCategory.RAW_MATERIAL;
+  if (category.startsWith('RAW_')) return ItemCategory.RAW_MATERIAL;
+  if (category.startsWith('PACKAGING_')) return ItemCategory.PACKAGING;
+  if (category === 'SEMI_FINISHED') return ItemCategory.SEMI_FINISHED;
+  if (category === 'FINISHED_GOOD') return ItemCategory.FINISHED_GOOD;
+  if (category === 'PACKAGING') return ItemCategory.PACKAGING;
+  return ItemCategory.RAW_MATERIAL;
+}
+
+export function getStockInPhysicalUnit(stock: number, sku: string, category?: string): number {
+  if (!sku || category !== 'FINISHED_GOOD') return stock;
+  const parts = sku.split('-');
+  const sizePart = parts.length >= 2 ? parts[parts.length - 1] : "";
+  const match = sizePart.match(/^(\d+(?:\.\d+)?)\s*([A-Z]+)$/i);
+  if (!match) return stock;
+
+  const weightVal = parseFloat(match[1]);
+  const weightUnit = match[2].toUpperCase();
+
+  const totalVal = stock * weightVal;
+  if (weightUnit === "G" || weightUnit === "ML") {
+    return totalVal / 1000;
+  }
+  return totalVal;
+}
+
+
 export class InventoryService {
   // Compute current stock from movement ledger — single source of truth
   static async computeStock(itemId: string, tx: any = prisma): Promise<number> {
@@ -74,7 +102,8 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => m.quantity > 0).reduce((s, m) => s + m.quantity, 0);
       const outbound = Math.abs(todayMoves.filter(m => m.quantity < 0).reduce((s, m) => s + m.quantity, 0));
 
-      const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
+      const physicalStock = getStockInPhysicalUnit(computedStock, item.sku, item.category);
+      const status = physicalStock <= item.minimumStock ? 'LOW' : 'SAFE';
       
       const incomingStock = pendingMap.get(item.id) || 0;
 
@@ -128,19 +157,25 @@ export class InventoryService {
       : `RM-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
     return prisma.$transaction(async tx => {
+      const createData: any = {
+        name: data.name,
+        sku,
+        category: mapCategoryToDb(data.category),
+        currentStock: 0,
+        unit: data.unit || (data.category === 'FINISHED_GOOD' ? 'PC' : 'kg'),
+        minimumStock: data.minimumStock || 10,
+        hsnCode: data.hsnCode,
+        gstRate: data.gstRate || 5,
+        franchiseId: data.franchiseId,
+        vendorId: data.vendorId,
+      };
+
+      // Financial fields (Safe injection)
+      if (data.costPrice !== undefined) createData.costPrice = Number(data.costPrice) || 0;
+      if (data.basePrice !== undefined) createData.basePrice = Number(data.basePrice) || 0;
+
       const item = await tx.inventoryItem.create({
-        data: {
-          name: data.name,
-          sku,
-          category: data.category || ItemCategory.RAW_MATERIAL,
-          currentStock: 0,
-          unit: data.unit || 'kg',
-          minimumStock: data.minimumStock || 10,
-          hsnCode: data.hsnCode,
-          gstRate: data.gstRate || 5,
-          franchiseId: data.franchiseId,
-          vendorId: data.vendorId,
-        },
+        data: createData,
       });
 
       if (data.initialStock > 0) {
@@ -151,7 +186,57 @@ export class InventoryService {
           referenceType: 'ADJUSTMENT',
           note: 'Opening Stock Balance',
           userId: data.userId,
+          warehouseId: data.warehouseId,
         });
+      }
+
+      // ─── AUTOMATION: Sync with Product Master if category is FINISHED_GOOD or SEMI_FINISHED at HQ ───
+      const orderableCategories: ItemCategory[] = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+      
+      if (orderableCategories.includes(item.category)) {
+        const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
+        const nameUpper = franchise?.name.toUpperCase() || "";
+        const isHQ = nameUpper.includes('HQ') || 
+                     nameUpper.includes('HEAD') ||
+                     nameUpper.includes('MAIN') ||
+                     nameUpper.includes('CORPORATE') ||
+                     nameUpper.includes('CENTRAL');
+
+        if (isHQ) {
+          const existingProduct = await tx.product.findFirst({
+            where: { 
+              OR: [
+                { sku: item.sku },
+                { name: { equals: item.name, mode: 'insensitive' } }
+              ]
+            }
+          });
+
+          if (!existingProduct) {
+            await tx.product.create({
+              data: {
+                name: item.name,
+                sku: item.sku,
+                basePrice: Number(data.basePrice) || 0,
+                isActive: true,
+                productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
+                category: 'Automated Sync'
+              }
+            });
+            console.log(`✅ [Sync] Created new product for HQ Inventory Item: ${item.name}`);
+          } else {
+            // Update existing product to match inventory (Name/SKU)
+            await tx.product.update({
+              where: { id: existingProduct.id },
+              data: { 
+                name: item.name, 
+                sku: item.sku,
+                basePrice: item.basePrice || 0
+              }
+            });
+            console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
+          }
+        }
       }
 
       return item;
@@ -161,7 +246,53 @@ export class InventoryService {
   // Only update metadata — never update currentStock directly
   static async updateItem(id: string, data: any) {
     const { currentStock: _currentStock, ...safeData } = data; // strip any stock field
-    return prisma.inventoryItem.update({ where: { id }, data: safeData });
+    if (safeData.category) {
+      safeData.category = mapCategoryToDb(safeData.category);
+    }
+    const updated = await prisma.inventoryItem.update({ where: { id }, data: safeData });
+
+    // Sync on update as well if category is orderable
+    const orderableCategories: ItemCategory[] = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
+    if (orderableCategories.includes(updated.category)) {
+      const franchise = await prisma.franchise.findUnique({ where: { id: updated.franchiseId } });
+      const nameUpper = franchise?.name.toUpperCase() || "";
+      const isHQ = nameUpper.includes('HQ') || 
+                   nameUpper.includes('HEAD') ||
+                   nameUpper.includes('CORPORATE');
+
+      if (isHQ) {
+        const existing = await prisma.product.findFirst({
+          where: { 
+            OR: [
+              { sku: updated.sku },
+              { name: { equals: updated.name, mode: 'insensitive' } }
+            ]
+          }
+        });
+        if (!existing) {
+          await prisma.product.create({
+            data: {
+              name: updated.name,
+              sku: updated.sku,
+              basePrice: 0,
+              isActive: true,
+              productType: updated.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
+              category: 'Automated Sync'
+            }
+          });
+        } else {
+          await prisma.product.update({
+            where: { id: existing.id },
+            data: { 
+              name: updated.name, 
+              sku: updated.sku,
+              basePrice: Number(data.basePrice) || 0
+            }
+          });
+        }
+      }
+    }
+    return updated;
   }
 
   static async deleteItem(id: string) {
@@ -199,7 +330,29 @@ export class InventoryService {
       throw new Error(`Deletion Blocked: This material is linked to pending branch requests or transfers.`);
     }
 
-    return prisma.inventoryItem.delete({ where: { id } });
+    return prisma.$transaction(async tx => {
+      const item = await tx.inventoryItem.findUnique({ where: { id } });
+      
+      if (item && (item.category === 'FINISHED_GOOD' || item.category === 'SEMI_FINISHED')) {
+        const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
+        const nameUpper = franchise?.name.toUpperCase() || "";
+        const isHQ = nameUpper.includes('HQ') || nameUpper.includes('HEAD') || nameUpper.includes('CORPORATE');
+
+        if (isHQ) {
+          const syncedProduct = await tx.product.findUnique({ where: { sku: item.sku || "" } });
+          if (syncedProduct) {
+            // Only delete product if it has no sales history
+            const usageCount = await tx.orderItem.count({ where: { productId: syncedProduct.id } });
+            if (usageCount === 0) {
+              await tx.product.delete({ where: { id: syncedProduct.id } });
+              console.log(`🗑️ [Sync] Deleted synced product master: ${item.name}`);
+            }
+          }
+        }
+      }
+
+      return tx.inventoryItem.delete({ where: { id } });
+    });
   }
 
   static async deactivateItem(id: string) {
@@ -271,6 +424,7 @@ export class InventoryService {
       referenceId?: string;
       note?: string;
       userId?: string;
+      warehouseId?: string;
     }
   ) {
     const updatedItem = await tx.inventoryItem.update({
@@ -287,6 +441,7 @@ export class InventoryService {
         referenceId: data.referenceId,
         note: data.note,
         createdBy: data.userId,
+        warehouseId: data.warehouseId,
       },
     });
 
@@ -303,6 +458,9 @@ export class InventoryService {
 
   static async getAlerts(franchiseId: string) {
     const items = await this.getInventory(franchiseId);
-    return items.filter(item => item.currentStock <= item.minimumStock);
+    return items.filter(item => {
+      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
+      return physicalStock <= item.minimumStock;
+    });
   }
 }

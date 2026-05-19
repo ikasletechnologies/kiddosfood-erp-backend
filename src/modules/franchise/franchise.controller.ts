@@ -15,7 +15,9 @@ export class FranchiseController {
 
   static async getAll(req: Request, res: Response) {
     try {
-      const franchises = await FranchiseService.getAll();
+      const user = (req as any).user;
+      const franchiseId = user && user.role !== 'SUPER_ADMIN' ? user.franchiseId : undefined;
+      const franchises = await FranchiseService.getAll(franchiseId);
       res.json(franchises);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -24,6 +26,10 @@ export class FranchiseController {
 
   static async getOne(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      if (user && user.role !== 'SUPER_ADMIN' && user.franchiseId && user.franchiseId !== req.params.id) {
+        return res.status(403).json({ error: 'Access denied to other franchise details' });
+      }
       const franchise = await FranchiseService.getById(req.params.id);
       if (!franchise) return res.status(404).json({ error: 'Franchise not found' });
       res.json(franchise);

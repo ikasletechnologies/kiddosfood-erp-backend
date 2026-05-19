@@ -107,6 +107,8 @@ export class SalesController {
       const returns = await SalesService.getReturnOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
+        franchiseId: req.query.franchiseId as string,
+        source: req.query.source as any,
         search: req.query.search as string
       });
       res.json(returns);

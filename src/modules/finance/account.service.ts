@@ -37,8 +37,9 @@ export class AccountService {
     });
   }
 
-  static async getAccounts() {
+  static async getAccounts(franchiseId?: string | null) {
     const accounts = await prisma.account.findMany({
+      where: franchiseId ? { franchiseId } : { franchiseId: null },
       orderBy: { name: 'asc' },
       include: {
         payments: { orderBy: { createdAt: 'desc' }, take: 1 },
@@ -62,10 +63,13 @@ export class AccountService {
     });
   }
 
-  static async createAccount(data: { name: string, type: 'CASH' | 'BANK' | 'UPI', balance?: number }) {
+  static async createAccount(data: { name: string, type: 'CASH' | 'BANK' | 'UPI', balance?: number, franchiseId?: string }) {
     // 1. Prevent duplicate accounts
     const existing = await prisma.account.findFirst({
-      where: { name: { equals: data.name, mode: 'insensitive' } }
+      where: { 
+        name: { equals: data.name, mode: 'insensitive' },
+        franchiseId: data.franchiseId || null 
+      }
     });
 
     if (existing) {
@@ -82,7 +86,8 @@ export class AccountService {
         type: data.type as any,
         balance: data.balance || 0,
         accountCode,
-        status: 'ACTIVE'
+        status: 'ACTIVE',
+        franchiseId: data.franchiseId || null
       }
     });
   }

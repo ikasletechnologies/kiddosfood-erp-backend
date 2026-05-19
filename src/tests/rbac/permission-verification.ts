@@ -1,11 +1,11 @@
-import prisma from '../lib/prisma';
-import { AuditService } from '../modules/audit/audit.service';
-import { SettingsService } from '../modules/settings/settings.service';
-import { DashboardService } from '../modules/dashboard/dashboard.service';
+import prisma from '../../lib/prisma';
+import { AuditService } from '../../modules/audit/audit.service';
+import { SettingsService } from '../../modules/settings/settings.service';
+import { DashboardService } from '../../modules/dashboard/dashboard.service';
 
 /**
  * Verification Script for Phase 9: Enterprise Governance
- * RUN: npx ts-node src/scripts/verify_phase9.ts
+ * RUN: npx ts-node src/tests/rbac/permission-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 9 Verification...');
@@ -35,12 +35,12 @@ async function verify() {
     console.log('📊 Testing Global Dashboard Aggregation...');
     // We expect this to run without error for both global (undefined franchiseId) and specific branch
     const globalSummary = await DashboardService.getSummary({});
-    console.log('Global Orders Today:', globalSummary.stats.ordersToday);
+    console.log('Global Orders Today:', globalSummary.stats.orderCountToday);
     
     const firstBranch = await prisma.franchise.findFirst();
     if (firstBranch) {
         const branchSummary = await DashboardService.getSummary({ franchiseId: firstBranch.id });
-        console.log(`Branch [${firstBranch.name}] Orders Today:`, branchSummary.stats.ordersToday);
+        console.log(`Branch [${firstBranch.name}] Orders Today:`, branchSummary.stats.orderCountToday);
     }
     
     console.log('✅ Dashboard aggregation logic verified.');

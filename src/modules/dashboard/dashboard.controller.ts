@@ -20,10 +20,12 @@ export class DashboardController {
       const summary = await DashboardService.getSummary({
         franchiseId,
         startDate: startDate as string,
-        endDate: endDate as string
+        endDate: endDate as string,
+        period: (req.query.period as string) || 'month'
       });
       res.json(summary);
     } catch (error: any) {
+      console.error("[Dashboard Error]", error);
       res.status(500).json({ error: error.message });
     }
   }

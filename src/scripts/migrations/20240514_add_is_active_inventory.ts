@@ -1,4 +1,4 @@
-import prisma from '../lib/prisma';
+import prisma from '../../lib/prisma';
 
 async function migrate() {
   console.log('🚀 Running manual schema sync...');

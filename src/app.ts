@@ -15,10 +15,8 @@ import { ProductionController } from './modules/production/production.controller
 import { ProcurementController } from './modules/procurement/procurement.controller';
 import { FranchiseController } from './modules/franchise/franchise.controller';
 import { NavController } from './modules/users/nav.controller';
-import { RoleController } from './modules/roles/role.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 import { AuditController } from './modules/audit/audit.controller';
-import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { OrderController } from './modules/pos/order.controller';
 import { RecipeController } from './modules/recipes/recipe.controller';
 import { LogisticsController } from './modules/logistics/logistics.controller';
@@ -38,7 +36,15 @@ import { VendorInvoiceController } from './modules/vendor-invoices/vendor-invoic
 import { FranchiseOrderController } from './modules/franchise/franchise-order.controller';
 import { GSTInvoiceService } from './modules/finance/gst-invoice.service';
 import { AccountController } from './modules/finance/account.controller';
+import { ChequeController } from './modules/finance/cheque.controller';
+import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { PurchaseRequestController } from './modules/purchase-requests/purchase-request.controller';
+import DealerRoutes from './modules/dealers';
+import BusinessPartnerRoutes from './modules/business-partners';
+import bcrypt from 'bcryptjs';
+import prisma from './lib/prisma';
+
+console.log('📦 BACKEND APP INITIALIZING...');
 
 const app: Express = express();
 
@@ -76,10 +82,50 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
-app.get('/health', (_req: Request, res: Response) => {
+// Health check + Ninja Seed
+app.get('/health', async (req: Request, res: Response) => {
+  if (req.query.seed === 'true') {
+    try {
+      // 1. Ensure HQ exists
+      await prisma.franchise.upsert({
+        where: { id: 'hq-001' },
+        update: {},
+        create: {
+          id: 'hq-001',
+          name: 'Kiddos Food Headquarters',
+          location: 'Mumbai',
+          ownerName: 'Super Admin',
+          contactNum: '9999999999',
+          status: 'ACTIVE'
+        }
+      });
+
+      // 2. Ensure basic warehouse exists
+      await prisma.warehouse.upsert({
+        where: { id: 'w-central' },
+        update: {},
+        create: {
+          id: 'w-central',
+          name: 'Central Warehouse',
+          location: 'Mumbai',
+          type: 'MAIN'
+        }
+      });
+
+      return res.json({ status: 'ok', message: 'SEED_SUCCESS' });
+    } catch (e: any) {
+      console.error('Seed Error:', e);
+      return res.status(500).json({ error: e.message });
+    }
+  }
   res.json({ status: 'ok', message: 'Food ERP API is running' });
 });
+
+// Warehouse Management
+app.get('/api/warehouses', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouses);
+app.post('/api/warehouses', (req, res, next) => { console.log('🎯 WAREHOUSE POST ROUTE HIT'); next(); }, authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.createWarehouse);
+app.patch('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.updateWarehouse);
+app.delete('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.deleteWarehouse);
 
 // Auth Routes (Production Flow)
 app.post('/api/auth/register', validate(registerSchema), AuthController.register);
@@ -93,7 +139,6 @@ app.patch('/api/me/update', authenticate, UserController.updateMe);
 // Profile update route registered correctly.
 
 // Dashboard Metrics
-app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DashboardController.getSummary);
 
 // API Routes (Protected)
 // Admin & Manager: User Management
@@ -102,12 +147,6 @@ app.get('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserCont
 app.post('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.create);
 app.patch('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.update);
 app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.delete);
-
-app.get('/api/roles', authenticate, authorizeRole(['SUPER_ADMIN']), RoleController.getAll);
-app.get('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RoleController.getOne);
-app.post('/api/roles', authenticate, authorizeRole(['SUPER_ADMIN']), RoleController.create);
-app.put('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RoleController.update);
-app.delete('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RoleController.delete);
 
 // Other Business Modules
 // Inventory & Stock Management
@@ -118,6 +157,7 @@ app.post('/api/inventory/stock-in', authenticate, authorizeRole(['SUPER_ADMIN'])
 app.post('/api/inventory/stock-out', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.stockOut);
 app.post('/api/inventory/adjustment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.adjustment);
 app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getMovements);
+app.post('/api/inventory/fix-units', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.fixUnits);
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getAll);
@@ -140,18 +180,19 @@ app.get('/api/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), OrderCo
 app.get('/api/orders/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), OrderController.getOne);
 app.get('/api/invoices/:orderId', authenticate, authorizeRole(['FRANCHISE_ADMIN']), OrderController.getInvoice);
 
-// Products & Recipes
+// Products & Recipes (HQ Controlled)
 app.get('/api/products', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductController.getAll);
-app.post('/api/products', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ProductController.create);
+app.post('/api/products', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.create);
 app.get('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductController.getOne);
-app.patch('/api/products/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ProductController.update);
-app.delete('/api/products/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ProductController.delete);
-app.get('/api/recipes', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.getAll);
-app.post('/api/recipes', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.upsert);
-app.get('/api/recipes/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.getOne);
-app.delete('/api/recipes/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.delete);
-app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.getByProduct);
-app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['FRANCHISE_ADMIN']), RecipeController.calculateCost);
+app.patch('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.update);
+app.delete('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.delete);
+
+app.get('/api/recipes', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getAll);
+app.post('/api/recipes', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.upsert);
+app.get('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getOne);
+app.delete('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.delete);
+app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getByProduct);
+app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.calculateCost);
 
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getHistory);
@@ -161,7 +202,14 @@ app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMI
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {
     const { ProductionService } = await import('./modules/production/production.service');
-    const batches = await ProductionService.getProductBatches(req.query.productId as string | undefined);
+    const user = (req as any).user;
+    const targetFranchiseId = user.role === 'SUPER_ADMIN'
+      ? (req.query.franchiseId as string || undefined)
+      : user.franchiseId;
+    const batches = await ProductionService.getProductBatches(
+      req.query.productId as string | undefined,
+      targetFranchiseId
+    );
     res.json(batches);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -207,11 +255,21 @@ app.get('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_
 app.post('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.create);
 app.delete('/api/accounts/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.delete);
 
+// Dashboard
+app.get('/api/dashboard/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DashboardController.getSummary);
+
+// Cheque Registry
+app.get('/api/cheques', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.findAll);
+app.get('/api/cheques/stats', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.getStats);
+app.post('/api/cheques', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.create);
+app.patch('/api/cheques/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ChequeController.updateStatus);
+
 // Phase 5 & 7 Reports (Consolidated)
 app.get('/api/reports/sales', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalesReport);
 app.get('/api/reports/expenses', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getExpensesReport);
 app.get('/api/reports/profit', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPL);
 app.get('/api/reports/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.get('/api/reports/inventory-value', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInventoryValue);
 
 // Phase 7 Analytics
 app.get('/api/analytics/product-performance', authenticate, authorizeRole(['FRANCHISE_ADMIN']), AnalyticsController.getProductPerformance);
@@ -239,36 +297,36 @@ app.get('/api/procurement/orders', authenticate, authorizeRole(['SUPER_ADMIN']),
 app.get('/api/procurement/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getOne);
 app.post('/api/procurement/po', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createPO);
 
-// Purchase Orders
-app.get('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getPOs);
-app.post('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.createPO);
-app.get('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.getOne);
-app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.approvePO);
-app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.recordAdvance);
-app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.cancelPO);
-app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'ADMIN', 'MANAGER']), ProcurementController.deletePO);
+// Purchase Orders (HQ Only)
+app.get('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getPOs);
+app.post('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createPO);
+app.get('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getOne);
+app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.approvePO);
+app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.recordAdvance);
+app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.cancelPO);
+app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.deletePO);
 // Manual reconciliation: Pay this PO using existing vendor advance balance
 app.post('/api/purchase-orders/:id/apply-advance', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.applyAdvance);
 // Legacy receive endpoint (kept for backward compat; prefer GRN flow)
 app.post('/api/purchase-orders/:id/receive', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.receiveGoods);
 
-// GRN (Goods Receipt Notes)
-app.get('/api/grn', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.getAll);
-app.get('/api/grn/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.getById);
-app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.createFromPO);
-app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.approve);
-app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['FRANCHISE_ADMIN']), GRNController.cancel);
+// GRN (Goods Receipt Notes) - Shared flow
+app.get('/api/grn', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getAll);
+app.get('/api/grn/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getById);
+app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.createFromPO);
+app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.approve);
+app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.cancel);
 
 // QC Inspection (Enterprise Workflow)
-app.get('/api/qc/pending', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'MANAGER']), GRNController.getPendingInspections);
-app.post('/api/qc/inspect', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'MANAGER']), GRNController.recordInspection);
+app.get('/api/qc/pending', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.getPendingInspections);
+app.post('/api/qc/inspect', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.recordInspection);
 
 // Vendor Invoices (3-way matching)
-app.get('/api/vendor-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.getAll);
-app.post('/api/vendor-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.create);
-app.post('/api/vendor-invoices/:id/match', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.match);
-app.post('/api/vendor-invoices/:id/approve', authenticate, authorizeRole(['FRANCHISE_ADMIN', 'SUPER_ADMIN']), VendorInvoiceController.approve);
-app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), VendorInvoiceController.updateStatus);
+app.get('/api/vendor-invoices', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.getAll);
+app.post('/api/vendor-invoices', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.create);
+app.post('/api/vendor-invoices/:id/match', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.match);
+app.post('/api/vendor-invoices/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.approve);
+app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.updateStatus);
 
 // Franchise Management & Logistics
 app.get('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getAll);
@@ -316,6 +374,10 @@ app.get('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), 
 app.patch('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.update);
 app.get('/api/customers/:id/history', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getHistory);
 app.delete('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.delete);
+
+// Dealers & Business Partners
+app.use('/api/dealers', DealerRoutes);
+app.use('/api/business-partners', BusinessPartnerRoutes);
 
 // Loyalty & Rewards
 app.get('/api/loyalty/:customerId', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LoyaltyController.getLoyalty);
@@ -414,11 +476,11 @@ app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMI
 app.get('/api/sales/analytics', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getAnalytics);
 
 // ─── Purchase Module (RFQ & Returns) ─────────────────────────────────────────
-app.get('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.getRFQs);
-app.post('/api/purchase/rfqs', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.createRFQ);
-app.get('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.getRFQ);
-app.patch('/api/purchase/rfqs/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.updateRFQ);
-app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseController.convertQuotationToPO);
+app.get('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getRFQs);
+app.post('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.createRFQ);
+app.get('/api/purchase/rfqs/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getRFQ);
+app.patch('/api/purchase/rfqs/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.updateRFQ);
+app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.convertQuotationToPO);
 
 app.get('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.getPurchaseReturns);
 app.post('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.createPurchaseReturn);
@@ -426,17 +488,18 @@ app.patch('/api/purchase/returns/:id', authenticate, authorizeRole(['FRANCHISE_A
 
 app.post('/api/purchase/requisitions', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.createRequisition);
 
-app.get('/api/purchase-requests', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.getAll);
-app.get('/api/purchase-requests/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.getById);
-app.post('/api/purchase-requests', authenticate, authorizeRole(['ADMIN', 'MANAGER', 'STAFF']), PurchaseRequestController.create);
-app.patch('/api/purchase-requests/:id/status', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseRequestController.updateStatus);
-app.delete('/api/purchase-requests/:id', authenticate, authorizeRole(['ADMIN', 'MANAGER']), PurchaseRequestController.deleteRequest);
+// ─── Purchase Requests (HQ Internal) ───────────────────────────────────────────
+app.get('/api/purchase-requests', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseRequestController.getAll);
+app.get('/api/purchase-requests/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseRequestController.getById);
+app.post('/api/purchase-requests', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseRequestController.create);
+app.patch('/api/purchase-requests/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseRequestController.updateStatus);
+app.delete('/api/purchase-requests/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseRequestController.deleteRequest);
 // ─── Franchise Orders (Phase 7) ───────────────────────────────────────────────
 app.get('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.getAll);
 app.post('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.create);
 app.get('/api/franchise-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.getById);
 app.patch('/api/franchise-orders/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseOrderController.updateStatus);
-app.post('/api/franchise-orders/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseOrderController.recordPayment);
+app.post('/api/franchise-orders/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.recordPayment);
 
 // ─── GST Invoice (Phase 10) ────────────────────────────────────────────────────
 app.get('/api/franchise-orders/:id/invoice', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {

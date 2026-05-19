@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { AccountService } from './account.service';
 
 export class FinanceService {
   /**
@@ -128,6 +129,12 @@ export class FinanceService {
       include: { order: { include: { orderItems: { include: { product: { include: { recipe: { include: { recipeItems: { include: { inventoryItem: { include: { vendors: true } } } } } } } } } } } } }
     });
 
+    // Fetch all inventory items for mapping
+    const inventoryItems = await prisma.inventoryItem.findMany({
+      where: filters.franchiseId ? { franchiseId: filters.franchiseId } : {}
+    });
+    const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
+
     let totalRevenue = 0;
     let totalCOGS = 0;
 
@@ -136,13 +143,20 @@ export class FinanceService {
       totalRevenue += inv.finalAmount;
       for (const item of inv.order.orderItems) {
         const product = item.product;
-        if (product && product.recipe) {
-          const scalar = item.quantity / product.recipe.yieldQty;
-          for (const ri of product.recipe.recipeItems) {
-            const qtyUsed = ri.quantityRequired * scalar;
-            // Use last supplied price as cost placeholder
-            const costPerUnit = ri.inventoryItem.vendors[0]?.price || 0; 
-            totalCOGS += (qtyUsed * costPerUnit);
+        if (product) {
+          if (product.recipe) {
+            const scalar = item.quantity / product.recipe.yieldQty;
+            for (const ri of product.recipe.recipeItems) {
+              const qtyUsed = ri.quantityRequired * scalar;
+              // Use last supplied price as cost placeholder
+              const costPerUnit = ri.inventoryItem.vendors[0]?.price || 0; 
+              totalCOGS += (qtyUsed * costPerUnit);
+            }
+          } else {
+            // Direct product: get average buying/purchase cost from InventoryItem with matching SKU
+            const invItem = invItemMap.get(product.sku || '');
+            const costPerUnit = invItem?.costPrice || 0;
+            totalCOGS += (item.quantity * costPerUnit);
           }
         }
       }
@@ -167,6 +181,50 @@ export class FinanceService {
       expenses: totalExpenses,
       netProfit: grossProfit - totalExpenses,
       period: filters
+    };
+  }
+
+  /**
+   * Generates a list of all inventory stock items with their stock value
+   * calculated using their average purchase cost (costPrice).
+   */
+  static async getInventoryValuationReport(franchiseId?: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: franchiseId ? { franchiseId } : {},
+      orderBy: { name: 'asc' }
+    });
+
+    let totalStockValue = 0;
+    const reportItems = items.map(item => {
+      const stockInHand = item.currentStock || 0;
+      const unitCost = item.costPrice || 0;
+      const stockValue = stockInHand * unitCost;
+      totalStockValue += stockValue;
+
+      return {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        hsn: item.hsnCode,
+        unit: item.unit,
+        stockInHand,
+        unitCost,
+        stockValue
+      };
+    });
+
+    // Calculate share of total value
+    const itemsWithShare = reportItems.map(item => ({
+      ...item,
+      shareOfTotalValue: totalStockValue > 0 ? (item.stockValue / totalStockValue) * 100 : 0
+    }));
+
+    return {
+      summary: {
+        totalItemsCount: items.length,
+        totalStockValue
+      },
+      items: itemsWithShare
     };
   }
 
@@ -235,9 +293,11 @@ export class FinanceService {
     };
   }
 
-  static async getCashFlow() {
+  static async getCashFlow(franchiseId?: string | null) {
 
-    const accounts = await prisma.account.findMany();
+    const accounts = await prisma.account.findMany({
+      where: franchiseId ? { franchiseId } : { franchiseId: null }
+    });
 
     const totalCash = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);
     const totalBank = accounts.filter(a => a.type === 'BANK').reduce((s, a) => s + a.balance, 0);
@@ -448,10 +508,11 @@ export class FinanceService {
     const amount    = parseFloat(data.amount);
     const flow      = data.flow as 'IN' | 'OUT';       
     const status    = (data.status || 'PAID') as string;
-    const sourceKey = data.sourceAccount as string;    
+    const sourceId = data.sourceAccount as string;    
     const sourceModule = (data.sourceModule || 'MANUAL');
     const linkedDocType = data.linkedDocType || 'DIRECT';
     const linkedDocId = data.linkedDocId;
+    const entityId = data.entityId || data.entity; // Compatibility with both naming conventions
 
     // Robust type mapping for cross-module compatibility
     let paymentType = data.type || 'DIRECT';
@@ -471,17 +532,40 @@ export class FinanceService {
       UPI_WALLET:   'UPI',
       CASH: 'CASH',
       BANK: 'BANK',
-      UPI: 'UPI'
+      UPI: 'UPI',
+      CARD: 'BANK', // Map CARD to BANK type
+      WALLET: 'UPI'  // Map WALLET to UPI type
     };
-    const accountType = accountTypeMap[sourceKey] ?? 'CASH';
+    const accountType = accountTypeMap[sourceId] ?? accountTypeMap[data.method] ?? 'CASH';
+
+    const paymentModeMap: Record<string, string> = {
+      CASH: 'CASH',
+      UPI: 'UPI',
+      CARD: 'CARD',
+      BANK: 'BANK_TRANSFER',
+      BANK_TRANSFER: 'BANK_TRANSFER',
+      CHEQUE: 'CHEQUE',
+      NEFT: 'NEFT',
+      CREDIT: 'CASH', // Default CREDIT to CASH
+      ADVANCE: 'CASH' // Default ADVANCE to CASH
+    };
+    const resolvedPaymentMode = paymentModeMap[data.method] || paymentModeMap[sourceId] || 'CASH';
 
     const operation = async (tx: any) => {
       // 1. Resolve account (Prefer ID, fallback to Type mapping)
       let account;
-      if (sourceKey && sourceKey.length > 20) { // Likely a GUID
-         account = await tx.account.findUnique({ where: { id: sourceKey } });
-      } else {
-         account = await tx.account.findFirst({ where: { type: accountType as any } });
+      if (sourceId && sourceId.length > 20) { // Likely a UUID
+         account = await tx.account.findUnique({ where: { id: sourceId } });
+      } 
+      
+      // Fallback if no account found by ID or if sourceId is a Type string
+      if (!account) {
+         account = await tx.account.findFirst({
+           where: { 
+             type: accountType as any,
+             franchiseId: data.franchiseId || null
+           }
+         });
       }
 
       // 2. Balance check for OUTFLOW + PAID
@@ -506,8 +590,8 @@ export class FinanceService {
           linkedDocId:    linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
-          entityId:       data.entity,
-          paymentMode:    data.method as any,
+          entityId:       entityId,
+          paymentMode:    resolvedPaymentMode as any,
           transactionRef: data.reference || data.note || undefined,
           status,
           accountId:      account?.id ?? undefined,
@@ -517,7 +601,7 @@ export class FinanceService {
 
       // 5. If this is a Vendor Payment, record in VendorLedger (CREDIT)
       if (data.entityType === 'VENDOR' || flow === 'OUT') {
-        const vendorId = data.entity;
+        const vendorId = entityId;
         if (vendorId) {
           const lastEntry = await tx.vendorLedger.findFirst({
             where: { vendorId },
@@ -535,7 +619,7 @@ export class FinanceService {
               referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
               referenceId: payment.id,
               invoiceId: data.vendorInvoiceId,
-              paymentMode: data.method as any,
+              paymentMode: resolvedPaymentMode as any,
               note: data.note || `Payment #${paymentNumber} recorded`
             }
           });
@@ -563,14 +647,12 @@ export class FinanceService {
 
       // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
-        await tx.account.update({
-          where: { id: account.id },
-          data: {
-            balance: {
-              increment: flow === 'IN' ? amount : -amount,
-            },
-          },
-        });
+        await AccountService.adjustBalance(
+          tx, 
+          account.id, 
+          amount, 
+          flow === 'IN' ? 'INFLOW' : 'OUTFLOW'
+        );
       }
 
       return payment;

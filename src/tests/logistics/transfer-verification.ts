@@ -1,10 +1,10 @@
-import prisma from '../lib/prisma';
-import { LogisticsService } from '../modules/franchise/logistics.service';
+import prisma from '../../lib/prisma';
+import { LogisticsService } from '../../modules/franchise/logistics.service';
 // import { StockMovementType } from '@prisma/client';
 
 /**
  * Verification Script for Phase 10: Inter-Branch Logistics
- * RUN: npx ts-node src/scripts/verify_phase10.ts
+ * RUN: npx ts-node src/tests/logistics/transfer-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 10 Verification...');

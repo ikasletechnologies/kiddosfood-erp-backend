@@ -2,131 +2,188 @@ import prisma from '../src/lib/prisma';
 import bcrypt from 'bcryptjs';
 
 async function main() {
-  console.log('🌱 Starting fresh database seeding...');
+  console.log('🌱 Starting Clean Enterprise Seeding...');
 
-  // 1. Root Headquarters franchise
-  const rootFranchise = await prisma.franchise.upsert({
+  // 1. Root Headquarters (The Parent)
+  const hq = await prisma.franchise.upsert({
     where: { id: 'hq-001' },
-    update: {},
+    update: {
+      name: 'Kiddos Food Headquarters',
+      location: 'Main Warehouse & Office, Mumbai',
+      status: 'ACTIVE',
+    },
     create: {
       id: 'hq-001',
       name: 'Kiddos Food Headquarters',
-      location: 'Corporate Office, Mumbai',
+      location: 'Main Warehouse & Office, Mumbai',
       ownerName: 'Super Admin',
       contactNum: '9999999999',
       status: 'ACTIVE',
     },
   });
 
-  // 2. Core permissions
-  const permissionKeys = [
-    '*',
-    'crm:view', 'crm:manage',
-    'sales:view', 'sales:manage',
-    'purchase:view', 'purchase:manage',
-    'inventory:view', 'inventory:manage',
-    'accounts:view', 'accounts:manage',
-    'hr:view', 'hr:manage',
-    'service:view', 'service:manage',
-    'pos:access',
+  // 2. Operational Franchises (The Children)
+  const branches = [
+    { id: 'fran-downtown', name: 'Downtown Outlet', location: 'Main Street' },
+    { id: 'fran-airport', name: 'Airport Food Court', location: 'International Airport' },
+    { id: 'fran-cbe', name: 'Coimbatore Branch', location: 'Cross Cut Road' },
   ];
 
-  await Promise.all(
-    permissionKeys.map(key =>
-      prisma.permission.upsert({
-        where: { key },
-        update: {},
-        create: { key },
-      })
-    )
-  );
+  for (const b of branches) {
+    await prisma.franchise.upsert({
+      where: { id: b.id },
+      update: { name: b.name, location: b.location },
+      create: {
+        id: b.id,
+        name: b.name,
+        location: b.location,
+        ownerName: 'Branch Manager',
+        contactNum: '8888888888',
+        status: 'ACTIVE',
+        creditLimit: 50000,
+        outstandingAmount: 0,
+      }
+    });
+  }
 
-  // 3. Roles — SUPER_ADMIN (home/HQ), ADMIN (franchise admin), STAFF
-  const superAdminRole = await prisma.role.upsert({
-    where: { name: 'SUPER_ADMIN' },
-    update: {},
-    create: {
-      name: 'SUPER_ADMIN',
-      description: 'Full access across all franchises and modules.',
-      permissions: {
-        create: { permission: { connect: { key: '*' } } },
-      },
-    },
-  });
+  // 2.5 Warehouses
+  const warehouses = [
+    { name: 'Central Warehouse', location: 'Industrial Area, Mumbai', type: 'MAIN' },
+    { name: 'Cold Storage Unit', location: 'Logistics Park, Navi Mumbai', type: 'COLD' },
+    { name: 'Production Unit A', location: 'Sector 5, Thane', type: 'PRODUCTION' },
+  ];
 
-  await prisma.role.upsert({
-    where: { name: 'ADMIN' },
-    update: {},
-    create: {
-      name: 'ADMIN',
-      description: 'System admin — manages global configurations.',
-      permissions: {
-        create: [
-          { permission: { connect: { key: '*' } } },
-        ],
-      },
-    },
-  });
+  for (const w of warehouses) {
+    await prisma.warehouse.upsert({
+      where: { id: `w-${w.name.toLowerCase().replace(/\s+/g, '-')}` },
+      update: { location: w.location, type: w.type },
+      create: {
+        id: `w-${w.name.toLowerCase().replace(/\s+/g, '-')}`,
+        name: w.name,
+        location: w.location,
+        type: w.type
+      }
+    });
+  }
 
-  await prisma.role.upsert({
-    where: { name: 'FRANCHISE_ADMIN' },
-    update: {},
-    create: {
-      name: 'FRANCHISE_ADMIN',
-      description: 'Franchise admin — manages one franchise.',
-      permissions: {
-        create: [
-          { permission: { connect: { key: 'crm:manage' } } },
-          { permission: { connect: { key: 'sales:manage' } } },
-          { permission: { connect: { key: 'inventory:manage' } } },
-          { permission: { connect: { key: 'hr:manage' } } },
-          { permission: { connect: { key: 'accounts:manage' } } },
-          { permission: { connect: { key: 'purchase:manage' } } },
-          { permission: { connect: { key: 'pos:access' } } },
-        ],
-      },
-    },
-  });
+  // 3. Default Users
+  const password = await bcrypt.hash('admin123', 10);
 
-  await prisma.role.upsert({
-    where: { name: 'STAFF' },
-    update: {},
-    create: {
-      name: 'STAFF',
-      description: 'Restricted operational access.',
-      permissions: {
-        create: [
-          { permission: { connect: { key: 'pos:access' } } },
-          { permission: { connect: { key: 'inventory:view' } } },
-          { permission: { connect: { key: 'sales:view' } } },
-        ],
-      },
-    },
-  });
-
-  // 4. Super admin user
-  const defaultPassword = await bcrypt.hash('admin123', 10);
-
+  // HQ Admin
   await prisma.user.upsert({
     where: { email: 'admin@kiddosfood.com' },
-    update: {
-      passwordHash: defaultPassword,
-      fullName: 'Super Admin',
-      roleId: superAdminRole.id,
-      franchiseId: rootFranchise.id,
+    update: { 
+      passwordHash: password, 
+      role: 'SUPER_ADMIN', 
+      franchiseId: hq.id 
     },
     create: {
       email: 'admin@kiddosfood.com',
-      passwordHash: defaultPassword,
-      fullName: 'Super Admin',
-      roleId: superAdminRole.id,
-      franchiseId: rootFranchise.id,
+      passwordHash: password,
+      fullName: 'HQ Super Admin',
+      role: 'SUPER_ADMIN',
+      franchiseId: hq.id,
       is_active: true,
     },
   });
 
-  console.log('✅ Seeding complete.');
-  console.log('   Super Admin: admin@kiddosfood.com / admin123');
+  // Downtown Franchise Admin
+  await prisma.user.upsert({
+    where: { email: 'franchise@erp.com' },
+    update: { 
+      passwordHash: password, 
+      role: 'FRANCHISE_ADMIN', 
+      franchiseId: 'fran-downtown' 
+    },
+    create: {
+      email: 'franchise@erp.com',
+      passwordHash: password,
+      fullName: 'Downtown Manager',
+      role: 'FRANCHISE_ADMIN',
+      franchiseId: 'fran-downtown',
+      is_active: true,
+    },
+  });
+
+  // 4. Seeding Financial Accounts for Isolation
+  console.log('💰 Seeding Financial Accounts...');
+  
+  // HQ Accounts (Global)
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-001' },
+    update: { balance: 1000000 },
+    create: {
+      id: 'ebd81368-66e8-4de8-b6ca-a672a82c61f4',
+      name: 'HQ Cash Account',
+      accountCode: 'ACC-001',
+      type: 'CASH',
+      balance: 1000000,
+      franchiseId: null
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-002' },
+    update: { balance: 5000000 },
+    create: {
+      name: 'HQ Bank Account',
+      accountCode: 'ACC-002',
+      type: 'BANK',
+      balance: 5000000,
+      franchiseId: null
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-003' },
+    update: { balance: 200000 },
+    create: {
+      name: 'HQ UPI Account',
+      accountCode: 'ACC-003',
+      type: 'UPI',
+      balance: 200000,
+      franchiseId: null
+    }
+  });
+
+  // fran-downtown Accounts
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-D01' },
+    update: { balance: 25000 },
+    create: {
+      name: 'Downtown Cash Account',
+      accountCode: 'ACC-D01',
+      type: 'CASH',
+      balance: 25000,
+      franchiseId: 'fran-downtown'
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-D02' },
+    update: { balance: 120000 },
+    create: {
+      name: 'Downtown Bank Account',
+      accountCode: 'ACC-D02',
+      type: 'BANK',
+      balance: 120000,
+      franchiseId: 'fran-downtown'
+    }
+  });
+
+  await prisma.account.upsert({
+    where: { accountCode: 'ACC-D03' },
+    update: { balance: 15000 },
+    create: {
+      name: 'Downtown UPI Account',
+      accountCode: 'ACC-D03',
+      type: 'UPI',
+      balance: 15000,
+      franchiseId: 'fran-downtown'
+    }
+  });
+
+  console.log('✅ Seeding complete: Standardized 2-Level Hierarchy Established.');
 }
 
 main()

@@ -1,10 +1,10 @@
-import prisma from '../lib/prisma';
-import { ProcurementService } from '../modules/procurement/procurement.service';
-import { InventoryService } from '../modules/inventory/inventory.service';
+import prisma from '../../lib/prisma';
+import { ProcurementService } from '../../modules/procurement/procurement.service';
+import { InventoryService } from '../../modules/inventory/inventory.service';
 
 /**
  * Verification Script for Phase 4: Purchase Module
- * RUN: npx ts-node src/scripts/verify_phase4.ts
+ * RUN: npx ts-node src/tests/inventory/production-verification.ts
  */
 async function verify() {
   console.log('🚀 Starting Phase 3 Verification...');

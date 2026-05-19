@@ -56,7 +56,10 @@ export class RawMaterialsController {
       const items = await prisma.inventoryItem.findMany({
         where: {
           ...(franchiseId ? { franchiseId } : {}),
-          ...(includeInactive ? {} : { isActive: true })
+          ...(includeInactive ? {} : { isActive: true }),
+          category: {
+            in: ['RAW_MATERIAL', 'PACKAGING', 'FINISHED_GOOD', 'SEMI_FINISHED']
+          }
         },
         orderBy: { name: 'asc' }
       });
@@ -99,7 +102,10 @@ export class RawMaterialsController {
         initialStock: req.body.initialStock,
         hsnCode: req.body.hsnCode,
         gstRate: req.body.gstRate,
-        userId: user.id
+        costPrice: req.body.costPrice,
+        basePrice: req.body.basePrice,
+        userId: user.id,
+        warehouseId: req.body.binLocation || req.body.warehouseId,
       };
       
       const item = await InventoryService.createItem(data);

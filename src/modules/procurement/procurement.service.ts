@@ -213,6 +213,7 @@ export class ProcurementService {
 
   static async createPurchaseOrder(data: {
     vendorId: string;
+    franchiseId?: string;
     advancePaid?: number;
     accountId?: string; // Source account for advance
     expectedDeliveryDate?: string;
@@ -267,6 +268,7 @@ export class ProcurementService {
         data: {
           poNumber,
           vendorId: data.vendorId,
+          franchiseId: data.franchiseId || null,
           subtotal: totalSubtotal,
           cgst: totalCGST,
           sgst: totalSGST,

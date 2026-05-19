@@ -8,6 +8,7 @@ export default defineConfig({
     directUrl: env("DIRECT_URL"),
   },
   migrations: {
-    seed: "npx tsx prisma/seed.ts",
+    seed: "node --import tsx prisma/seed.ts",
   },
 });
+

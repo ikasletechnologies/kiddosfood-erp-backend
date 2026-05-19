@@ -1,7 +1,7 @@
-import prisma from '../lib/prisma';
-import { POSService } from '../modules/pos/pos.service';
-import { InventoryService } from '../modules/inventory/inventory.service';
-import { RecipeService } from '../modules/recipes/recipe.service';
+import prisma from '../../lib/prisma';
+import { POSService } from '../../modules/pos/pos.service';
+import { InventoryService } from '../../modules/inventory/inventory.service';
+import { RecipeService } from '../../modules/recipes/recipe.service';
 
 /**
  * Verification Script for Phase 3: Inventory + Recipe

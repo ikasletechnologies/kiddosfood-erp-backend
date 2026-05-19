@@ -17,9 +17,19 @@ export class ProductService {
 
     if (franchiseId) {
       const skus = products.map(p => p.sku).filter(Boolean) as string[];
+      const names = products.map(p => p.name);
+
+      console.log(`🔍 [ProductAPI] Sourcing stock from Franchise: ${franchiseId}`);
       const inventory = await prisma.inventoryItem.findMany({
-        where: { sku: { in: skus }, franchiseId }
+        where: { 
+          franchiseId,
+          OR: [
+            { sku: { in: skus } },
+            { name: { in: names, mode: 'insensitive' } }
+          ]
+        }
       });
+      console.log(`📦 [ProductAPI] Found ${inventory.length} matching inventory items for stock display`);
       
       return products.map(p => {
         const pName = p.name.trim().toLowerCase();

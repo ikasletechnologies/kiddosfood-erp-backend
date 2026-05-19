@@ -1,42 +1,34 @@
-import prisma from '../../lib/prisma';
+import { UserRole } from '@prisma/client';
 
 export class RoleService {
   static async getRoles() {
-    return prisma.role.findMany({
-      orderBy: { name: 'asc' }
-    });
+    return Object.values(UserRole).map(role => ({
+      id: role,
+      name: role,
+      description: `${role} system role`
+    }));
   }
 
   static async getRoleById(id: string) {
-    return prisma.role.findUnique({
-      where: { id }
-    });
+    if (Object.values(UserRole).includes(id as any)) {
+      return {
+        id,
+        name: id,
+        description: `${id} system role`
+      };
+    }
+    return null;
   }
 
   static async createRole(data: any) {
-    return prisma.role.create({
-      data: {
-        name: data.name,
-        description: data.description,
-        permissions: data.permissions || []
-      }
-    });
+    throw new Error('Dynamic roles are not supported in the current schema (using Enum-based RBAC)');
   }
 
   static async updateRole(id: string, data: any) {
-    return prisma.role.update({
-      where: { id },
-      data: {
-        name: data.name,
-        description: data.description,
-        permissions: data.permissions
-      }
-    });
+    throw new Error('Dynamic roles are not supported in the current schema (using Enum-based RBAC)');
   }
 
   static async deleteRole(id: string) {
-    return prisma.role.delete({
-      where: { id }
-    });
+    throw new Error('Dynamic roles are not supported in the current schema (using Enum-based RBAC)');
   }
 }
