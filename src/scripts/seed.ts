@@ -10,7 +10,7 @@ import { seedMasterData } from './seed/master-data';
 async function main() {
   console.log('🌱 Starting Master Seed...');
 
-  // 1. Schema Consistency Check (Temporary until migrations are fully used)//
+  // 1. Schema Consistency Check (Temporary until migrations are fully used)
   console.log('🔄 Checking Schema Consistency...');
   try {
     await prisma.$executeRawUnsafe(`
