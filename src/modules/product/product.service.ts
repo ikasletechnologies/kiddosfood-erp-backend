@@ -40,7 +40,9 @@ export class ProductService {
         return {
           ...p,
           currentStock: inv ? inv.currentStock : 0,
-          inventoryFranchiseId: inv ? inv.franchiseId : (franchiseId || null)
+          inventoryFranchiseId: inv ? inv.franchiseId : (franchiseId || null),
+          inventoryBasePrice: inv ? inv.basePrice : null,
+          inventoryCostPrice: inv ? inv.costPrice : null
         };
       });
     }

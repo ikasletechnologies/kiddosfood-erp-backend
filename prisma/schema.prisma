@@ -167,6 +167,9 @@ model InventoryItem {
   isActive             Boolean                @default(true)
   basePrice            Float?                 @default(0)
   costPrice            Float?                 @default(0)
+  franchisePrice       Float?                 @default(0)
+  dealerPrice          Float?                 @default(0)
+  customerPrice        Float?                 @default(0)
   grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
   franchise            Franchise              @relation(fields: [franchiseId], references: [id])

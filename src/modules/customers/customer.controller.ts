@@ -25,11 +25,18 @@ export class CustomerController {
 
   static async create(req: Request, res: Response) {
     try {
-      // If user is Franchise Admin, force their franchiseId
-      const data = { ...req.body };
-      if ((req as any).user?.role?.name === 'FRANCHISE_ADMIN') {
+      const data: any = {
+        name: req.body.name,
+        phone: req.body.phone || undefined,
+        email: req.body.email || undefined,
+      };
+
+      if ((req as any).user?.role === 'FRANCHISE_ADMIN' || (req as any).user?.role?.name === 'FRANCHISE_ADMIN') {
         data.franchiseId = (req as any).user.franchiseId;
+      } else if (req.body.franchiseId) {
+        data.franchiseId = req.body.franchiseId;
       }
+
       const customer = await CustomerService.create(data);
       res.status(201).json(customer);
     } catch (error: any) {
@@ -39,7 +46,12 @@ export class CustomerController {
 
   static async update(req: Request, res: Response) {
     try {
-      const customer = await CustomerService.update(req.params.id, req.body);
+      const data: any = {};
+      if (req.body.name !== undefined) data.name = req.body.name;
+      if (req.body.phone !== undefined) data.phone = req.body.phone || null;
+      if (req.body.email !== undefined) data.email = req.body.email || null;
+
+      const customer = await CustomerService.update(req.params.id, data);
       res.json(customer);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
