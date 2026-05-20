@@ -1617,3 +1617,13 @@ enum InventoryStockState {
   EXPIRED
   RETURNED
 }
+
+model Draft {
+  id        String   @id @default(uuid())
+  type      String   // e.g. "invoice", "order", "delivery_challan", "estimation", "proforma", "payment_in", "return"
+  userId    String?  // for user tracking
+  data      Json     // raw JSON of form items, customer selections, rates, etc.
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+

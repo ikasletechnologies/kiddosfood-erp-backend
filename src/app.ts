@@ -41,6 +41,7 @@ import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { PurchaseRequestController } from './modules/purchase-requests/purchase-request.controller';
 import DealerRoutes from './modules/dealers';
 import BusinessPartnerRoutes from './modules/business-partners';
+import { DraftsController } from './modules/drafts/drafts.controller';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -238,6 +239,11 @@ app.post('/api/finance/expense', authenticate, authorizeRole(['FRANCHISE_ADMIN']
 app.get('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
 app.post('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.get('/api/finance/cash-flow', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getCashFlow);
+
+// Drafts
+app.get('/api/drafts', authenticate, DraftsController.getDrafts);
+app.post('/api/drafts', authenticate, DraftsController.saveDraft);
+app.delete('/api/drafts/:id', authenticate, DraftsController.deleteDraft);
 
 // Accounting (New Frontend mapping)
 app.get('/api/accounting/expenses', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getExpenses);
