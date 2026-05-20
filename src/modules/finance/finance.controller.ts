@@ -110,6 +110,22 @@ export class FinanceController {
     }
   }
 
+  static async createInvoice(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
+      const invoice = await FinanceService.createInvoice({
+        ...req.body,
+        franchiseId,
+        createdBy: user?.fullName || user?.email || 'System'
+      });
+      res.status(201).json(invoice);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getExpenses(req: Request, res: Response) {
     try {
       const user = (req as any).user;

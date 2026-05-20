@@ -122,7 +122,11 @@ export class RawMaterialsController {
 
   static async update(req: Request, res: Response) {
     try {
-      const item = await InventoryService.updateItem(req.params.id, req.body);
+      const user = (req as any).user;
+      const item = await InventoryService.updateItem(req.params.id, {
+        ...req.body,
+        userId: user?.id
+      });
       res.json(item);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });

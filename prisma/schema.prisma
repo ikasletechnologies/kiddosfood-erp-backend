@@ -167,6 +167,9 @@ model InventoryItem {
   isActive             Boolean                @default(true)
   basePrice            Float?                 @default(0)
   costPrice            Float?                 @default(0)
+  franchisePrice       Float?                 @default(0)
+  dealerPrice          Float?                 @default(0)
+  customerPrice        Float?                 @default(0)
   grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
   franchise            Franchise              @relation(fields: [franchiseId], references: [id])
@@ -555,6 +558,8 @@ model Order {
   discountAmount     Float       @default(0)
   totalAmount        Float
   paymentStatus      String      @default("PAID")
+  paymentType        String      @default("CASH")
+  stateOfSupply      String?
   inventory_deducted Boolean     @default(false)
   createdAt          DateTime    @default(now())
   delivery           Delivery?
@@ -569,8 +574,10 @@ model OrderItem {
   id          String  @id @default(uuid())
   orderId     String
   productId   String
-  quantity    Int
+  quantity    Float
+  unit        String  @default("NONE")
   price       Float
+  discountPct Float   @default(0)
   taxAmount   Float?
   totalAmount Float?
   order       Order   @relation(fields: [orderId], references: [id])
@@ -607,15 +614,19 @@ model Payment {
 }
 
 model Invoice {
-  id          String    @id @default(uuid())
-  orderId     String    @unique
-  totalAmount Float
-  taxAmount   Float
-  finalAmount Float
-  status      String    @default("PAID")
-  createdAt   DateTime  @default(now())
-  order       Order     @relation(fields: [orderId], references: [id])
-  payments    Payment[]
+  id                 String    @id @default(uuid())
+  orderId            String    @unique
+  totalAmount        Float
+  taxAmount          Float
+  finalAmount        Float
+  roundOff           Float     @default(0)
+  status             String    @default("PAID")
+  termsAndConditions String?
+  description        String?
+  notes              String?
+  createdAt          DateTime  @default(now())
+  order              Order     @relation(fields: [orderId], references: [id])
+  payments           Payment[]
 }
 
 model Account {

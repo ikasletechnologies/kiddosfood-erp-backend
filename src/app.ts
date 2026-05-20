@@ -236,6 +236,7 @@ app.post('/api/delivery/verify', authenticate, authorizeRole(['FRANCHISE_ADMIN']
 app.get('/api/finance/pl', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPL);
 app.post('/api/finance/expense', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.addExpense);
 app.get('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.post('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.get('/api/finance/cash-flow', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getCashFlow);
 
 // Accounting (New Frontend mapping)

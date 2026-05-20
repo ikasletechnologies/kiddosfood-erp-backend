@@ -313,7 +313,19 @@ export class FinanceService {
   static async getInvoices(franchiseId?: string) {
     return prisma.invoice.findMany({
       where: franchiseId ? { order: { franchiseId } } : undefined,
-      include: { order: { include: { customer: true } }, payments: true },
+      include: { 
+        order: { 
+          include: { 
+            customer: true,
+            orderItems: {
+              include: {
+                product: true
+              }
+            }
+          } 
+        }, 
+        payments: true 
+      },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -783,6 +795,200 @@ export class FinanceService {
       }
 
       return { success: true };
+    });
+  }
+
+  static async createInvoice(data: {
+    franchiseId: string;
+    customerId: string;
+    items: {
+      productId: string;
+      qty: number;
+      unit?: string;
+      rate: number;
+      gst: number;
+      discount?: number;
+    }[];
+    receivedAmount?: number;
+    paymentMode?: any;
+    discountAmount?: number;
+    roundOff?: number;
+    stateOfSupply?: string;
+    paymentType?: string;
+    termsAndConditions?: string;
+    description?: string;
+    notes?: string;
+    createdBy?: string;
+  }) {
+    return prisma.$transaction(async (tx) => {
+      let subTotal = 0;
+      let totalDiscount = data.discountAmount || 0;
+      let totalTax = 0;
+
+      const orderItemsData: {
+        productId: string;
+        quantity: number;
+        unit: string;
+        price: number;
+        discountPct: number;
+        taxAmount: number;
+        totalAmount: number;
+      }[] = [];
+
+      for (const item of data.items) {
+        const itemSubtotal = item.qty * item.rate;
+        const itemDiscount = itemSubtotal * (item.discount || 0) / 100;
+        const itemTaxableAmount = itemSubtotal - itemDiscount;
+        const itemTax = itemTaxableAmount * (item.gst / 100);
+
+        subTotal += itemSubtotal;
+        if (!data.discountAmount) {
+          totalDiscount += itemDiscount;
+        }
+        totalTax += itemTax;
+
+        orderItemsData.push({
+          productId: item.productId,
+          quantity: item.qty,
+          unit: item.unit || 'NONE',
+          price: item.rate,
+          discountPct: item.discount || 0,
+          taxAmount: itemTax,
+          totalAmount: itemSubtotal - itemDiscount + itemTax
+        });
+      }
+
+      const totalAmount = subTotal + totalTax - totalDiscount;
+      const year = new Date().getFullYear();
+      const orderCount = await tx.order.count({
+        where: { createdAt: { gte: new Date(year, 0, 1) } }
+      });
+      const invoiceNum = `INV-${year}-${(orderCount + 1).toString().padStart(4, '0')}`;
+
+      const received = data.receivedAmount || 0;
+      let paymentStatus = 'UNPAID';
+      if (received >= totalAmount - 0.01) {
+        paymentStatus = 'PAID';
+      } else if (received > 0) {
+        paymentStatus = 'PARTIAL';
+      }
+
+      const roundOff = data.roundOff || 0;
+      const finalAmount = totalAmount + roundOff;
+
+      const order = await tx.order.create({
+        data: {
+          invoiceNum,
+          customerId: data.customerId,
+          franchiseId: data.franchiseId,
+          orderType: 'DINE_IN',
+          status: 'COMPLETED',
+          subTotal,
+          taxAmount: totalTax,
+          discountAmount: totalDiscount,
+          totalAmount: finalAmount,
+          paymentStatus,
+          paymentType: data.paymentType || 'CASH',
+          stateOfSupply: data.stateOfSupply || null,
+          inventory_deducted: false,
+          orderItems: {
+            create: orderItemsData
+          }
+        }
+      });
+
+      const invoice = await tx.invoice.create({
+        data: {
+          orderId: order.id,
+          totalAmount: subTotal - totalDiscount,
+          taxAmount: totalTax,
+          finalAmount,
+          roundOff,
+          status: paymentStatus === 'PAID' ? 'PAID' : 'PENDING',
+          termsAndConditions: data.termsAndConditions || null,
+          description: data.description || null,
+          notes: data.notes || null,
+        }
+      });
+
+      if (received > 0) {
+        const paymentMode = data.paymentMode || 'CASH';
+        const accountTypeMap: Record<string, string> = {
+          'CASH': 'CASH',
+          'UPI': 'UPI',
+          'CARD': 'BANK',
+          'BANK_TRANSFER': 'BANK'
+        };
+        const targetType = accountTypeMap[paymentMode] || 'CASH';
+        const defaultAccount = await tx.account.findFirst({
+          where: { 
+            type: targetType as any,
+            franchiseId: data.franchiseId
+          }
+        });
+
+        const paymentNumber = await tx.payment.count({
+          where: { createdAt: { gte: new Date(year, 0, 1) } }
+        });
+        const pNum = `PAY-${year}-${(paymentNumber + 1).toString().padStart(4, '0')}`;
+
+        await tx.payment.create({
+          data: {
+            orderId: order.id,
+            invoiceId: invoice.id,
+            paymentNumber: pNum,
+            paidAmount: received,
+            paymentMode: paymentMode as any,
+            status: 'PAID',
+            accountId: defaultAccount?.id ?? undefined,
+            entityType: 'CUSTOMER',
+            entityId: data.customerId,
+            type: 'INVOICE_LINKED',
+            sourceModule: 'POS',
+            linkedDocType: 'INVOICE',
+            linkedDocId: invoice.id,
+            createdBy: data.createdBy || 'SYSTEM'
+          }
+        });
+
+        if (defaultAccount) {
+          await tx.account.update({
+            where: { id: defaultAccount.id },
+            data: { balance: { increment: received } }
+          });
+        }
+      }
+
+      await tx.customerLedger.create({
+        data: {
+          customerId: data.customerId,
+          type: 'DEBIT',
+          amount: totalAmount,
+          paymentMode: data.paymentMode || 'CASH',
+          referenceType: 'SALE',
+          referenceId: order.id,
+          note: `Tax Invoice Created — Invoice #${invoiceNum}`
+        }
+      });
+
+      if (received > 0) {
+        await tx.customerLedger.create({
+          data: {
+            customerId: data.customerId,
+            type: 'CREDIT',
+            amount: received,
+            paymentMode: data.paymentMode || 'CASH',
+            referenceType: 'PAYMENT',
+            referenceId: order.id,
+            note: `Payment Received for Invoice #${invoiceNum}`
+          }
+        });
+      }
+
+      return {
+        ...invoice,
+        order
+      };
     });
   }
 

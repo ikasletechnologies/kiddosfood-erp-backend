@@ -43,10 +43,13 @@ export class POSService {
         for (const it of items) {
            // Resolve price if not provided
            let price = it.price;
+           const prod = await tx.product.findUnique({ where: { id: it.productId } });
+           if (!prod) throw new Error(`Product ${it.productId} not found`);
            if (price === undefined) {
-             const prod = await tx.product.findUnique({ where: { id: it.productId } });
-             if (!prod) throw new Error(`Product ${it.productId} not found`);
              price = prod.basePrice;
+           }
+           if (price <= 0) {
+             throw new Error(`Product "${prod.name}" does not have a valid selling price configured. Please update its Customer Retail price in inventory.`);
            }
 
            const tax = Number((price! * 0.05).toFixed(2));
@@ -290,6 +293,16 @@ export class POSService {
     totalAmount: number,
     paymentMode: string
   }) {
+    // Validate prices first before proceeding
+    if (data.items) {
+      for (const item of data.items) {
+        const price = item.price || (item as any).unitPrice || 0;
+        if (price <= 0) {
+          throw new Error(`Cannot checkout. One or more items do not have a valid selling price configured.`);
+        }
+      }
+    }
+
     let fid = data.franchiseId;
     if (!fid) {
       const hq = await prisma.franchise.findFirst({ 
