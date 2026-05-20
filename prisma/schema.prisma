@@ -37,9 +37,10 @@ model Customer {
   ledgerEntries CustomerLedger[]
   orders        Order[]
   productions   Production[]
-  quotations    Quotation[]
-  returnOrders  ReturnOrder[]
-  salesOrders   SalesOrder[]
+  quotations       Quotation[]
+  returnOrders     ReturnOrder[]
+  salesOrders      SalesOrder[]
+  deliveryChallans DeliveryChallan[]
 }
 
 model Dealer {
@@ -1010,6 +1011,43 @@ model ReturnItem {
   totalAmount Float
   condition   String?
   return      ReturnOrder @relation(fields: [returnId], references: [id])
+}
+
+model DeliveryChallan {
+  id             String                @id @default(uuid())
+  challanNumber  String                @unique
+  customerId     String?
+  salesOrderId   String?
+  franchiseId    String?
+  status         String                @default("DRAFT")
+  challanDate    DateTime              @default(now())
+  dueDate        DateTime?
+  vehicleNo      String?
+  driverName     String?
+  stateOfSupply  String?
+  notes          String?
+  termsConditions String?
+  subTotal       Float                 @default(0)
+  taxAmount      Float                 @default(0)
+  totalAmount    Float                 @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  customer       Customer?             @relation(fields: [customerId], references: [id])
+  items          DeliveryChallanItem[]
+}
+
+model DeliveryChallanItem {
+  id          String          @id @default(uuid())
+  challanId   String
+  productId   String?
+  productName String
+  quantity    Float
+  unit        String          @default("NONE")
+  rate        Float           @default(0)
+  taxPercent  Float           @default(0)
+  taxAmount   Float           @default(0)
+  totalAmount Float           @default(0)
+  challan     DeliveryChallan @relation(fields: [challanId], references: [id])
 }
 
 model PurchaseRFQ {

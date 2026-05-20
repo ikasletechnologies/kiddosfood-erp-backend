@@ -476,6 +476,11 @@ app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMI
 
 app.get('/api/sales/analytics', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getAnalytics);
 
+app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.getDeliveryChallans);
+app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.createDeliveryChallan);
+app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.getDeliveryChallan);
+app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.updateDeliveryChallan);
+
 // ─── Purchase Module (RFQ & Returns) ─────────────────────────────────────────
 app.get('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getRFQs);
 app.post('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.createRFQ);
