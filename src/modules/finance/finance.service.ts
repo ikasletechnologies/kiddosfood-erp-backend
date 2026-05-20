@@ -313,7 +313,19 @@ export class FinanceService {
   static async getInvoices(franchiseId?: string) {
     return prisma.invoice.findMany({
       where: franchiseId ? { order: { franchiseId } } : undefined,
-      include: { order: { include: { customer: true } }, payments: true },
+      include: { 
+        order: { 
+          include: { 
+            customer: true,
+            orderItems: {
+              include: {
+                product: true
+              }
+            }
+          } 
+        }, 
+        payments: true 
+      },
       orderBy: { createdAt: 'desc' }
     });
   }
