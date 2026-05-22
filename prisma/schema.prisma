@@ -118,6 +118,7 @@ model Franchise {
   cheques             Cheque[]
   accounts            Account[]
   procurementOrders   ProcurementOrder[]
+  loanAccounts        LoanAccount[]
 }
 
 model Cheque {
@@ -1625,5 +1626,36 @@ model Draft {
   data      Json     // raw JSON of form items, customer selections, rates, etc.
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model LoanAccount {
+  id                 String            @id @default(uuid())
+  accountName        String
+  accountNumber      String?
+  lenderName         String?
+  loanType           String            @default("RECEIVED") // RECEIVED or GIVEN
+  principalAmount    Float             @default(0)
+  interestRate       Float             @default(0)
+  loanDate           DateTime          @default(now())
+  outstandingBalance Float             @default(0)
+  interestPaid       Float             @default(0)
+  principalPaid      Float             @default(0)
+  franchiseId        String
+  franchise          Franchise         @relation(fields: [franchiseId], references: [id])
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  transactions       LoanTransaction[]
+}
+
+model LoanTransaction {
+  id            String      @id @default(uuid())
+  loanAccountId String
+  date          DateTime    @default(now())
+  type          String      // DISBURSEMENT, PRINCIPAL_PAID, INTEREST_CHARGED, INTEREST_PAID
+  amount        Float
+  endingBalance Float
+  note          String?
+  createdAt     DateTime    @default(now())
+  loanAccount   LoanAccount @relation(fields: [loanAccountId], references: [id], onDelete: Cascade)
 }
 

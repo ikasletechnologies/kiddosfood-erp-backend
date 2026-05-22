@@ -63,7 +63,9 @@ export class SalesController {
       const orders = await SalesService.getSalesOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        startDate: req.query.startDate as string,
+        endDate: req.query.endDate as string
       });
       res.json(orders);
     } catch (error) {

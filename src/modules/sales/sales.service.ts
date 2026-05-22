@@ -165,10 +165,24 @@ export class SalesService {
 
   // ─── Sales Orders ────────────────────────────────────────────────────────────
 
-  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string }) {
+  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string; startDate?: string; endDate?: string }) {
     const where: any = {};
-    if (filters.status) where.status = filters.status;
+    if (filters.status && filters.status !== 'ALL') {
+      if (filters.status === 'OPEN') {
+        where.status = { in: ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED'] };
+      } else if (filters.status === 'CLOSED') {
+        where.status = 'DELIVERED';
+      } else {
+        where.status = filters.status as any;
+      }
+    }
     if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.startDate || filters.endDate) {
+      where.createdAt = {
+        ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
+        ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+      };
+    }
     if (filters.search) {
       where.OR = [
         { orderNumber: { contains: filters.search, mode: 'insensitive' } },
