@@ -12,6 +12,15 @@ export class ProcurementService {
     contact: string; 
     email?: string; 
     address?: string; 
+    state?: string;
+    district?: string;
+    city?: string;
+    pincode?: string;
+    shippingAddress?: string;
+    gstType?: string;
+    openingBalance?: number;
+    asOfDate?: string;
+    creditLimit?: number;
     remark?: string;
     gstNumber?: string;
     category?: string;
@@ -53,19 +62,47 @@ export class ProcurementService {
     const vendorCode = `V-${nextNum.toString().padStart(4, '0')}`;
 
     try {
-      return await prisma.vendor.create({
-        data: {
-          vendorCode,
-          name: data.name,
-          contact: data.contact,
-          email: data.email,
-          address: data.address,
-          remark: data.remark,
-          gstNumber: data.gstNumber,
-          category: data.category,
-          paymentTerms: data.paymentTerms || 'IMMEDIATE',
-          status: data.status || 'ACTIVE'
+      return await prisma.$transaction(async (tx) => {
+        const vendor = await tx.vendor.create({
+          data: {
+            vendorCode,
+            name: data.name,
+            contact: data.contact,
+            email: data.email,
+            address: data.address,
+            state: data.state,
+            district: data.district,
+            city: data.city,
+            pincode: data.pincode,
+            shippingAddress: data.shippingAddress,
+            gstType: data.gstType,
+            openingBalance: data.openingBalance || 0,
+            asOfDate: data.asOfDate ? new Date(data.asOfDate) : null,
+            creditLimit: data.creditLimit,
+            remark: data.remark,
+            gstNumber: data.gstNumber,
+            category: data.category,
+            paymentTerms: data.paymentTerms || 'IMMEDIATE',
+            status: data.status || 'ACTIVE'
+          }
+        });
+
+        // Generate opening balance ledger entry if applicable
+        if (data.openingBalance && data.openingBalance > 0) {
+          await tx.vendorLedger.create({
+            data: {
+              vendorId: vendor.id,
+              type: 'CREDIT', // Opening balance = we owe the vendor
+              amount: data.openingBalance,
+              balanceAfterTransaction: data.openingBalance,
+              referenceType: 'OPENING_BALANCE',
+              paymentMode: 'CASH',
+              note: 'Opening Balance'
+            }
+          });
         }
+
+        return vendor;
       });
     } catch (err: any) {
       console.error('[ProcurementService] createVendor Error:', err);
@@ -84,12 +121,36 @@ export class ProcurementService {
       orderBy: { name: 'asc' }
     });
 
-    return vendors.map(v => {
+    return Promise.all(vendors.map(async (v) => {
       // MASTER ACCOUNTING FORMULA
-      const entries = v.ledgerEntries || [];
+      let entries = v.ledgerEntries || [];
+      
+      // AUTO-REPAIR: If openingBalance exists but no ledger entry exists, inject it!
+      const hasOpeningBalanceEntry = entries.some(e => e.referenceType === 'OPENING_BALANCE');
+      if (!hasOpeningBalanceEntry && v.openingBalance !== 0) {
+        const type = v.openingBalance > 0 ? 'CREDIT' : 'DEBIT'; // CREDIT = We owe them
+        const amount = Math.abs(v.openingBalance);
+        
+        // Create the missing entry in the database permanently
+        const newEntry = await prisma.vendorLedger.create({
+          data: {
+            vendorId: v.id,
+            type,
+            amount,
+            balanceAfterTransaction: amount,
+            referenceType: 'OPENING_BALANCE',
+            paymentMode: 'CASH',
+            note: 'Opening Balance (Auto-Repaired)',
+            createdAt: new Date('2000-01-01')
+          }
+        });
+        
+        // Append it to our local array so the math below is correct immediately
+        entries.push(newEntry as any);
+      }
       
       const totalPayments = entries
-        .filter(e => e.type === 'CREDIT' && e.referenceType === 'PAYMENT')
+        .filter(e => e.type === 'DEBIT' && e.referenceType === 'PAYMENT')
         .reduce((s, e) => s + (e.amount || 0), 0);
 
       const totalReturns = entries
@@ -97,30 +158,32 @@ export class ProcurementService {
         .reduce((s, e) => s + (e.amount || 0), 0);
 
       const totalPurchased = entries
-        .filter(e => e.type === 'DEBIT' && e.referenceType === 'PURCHASE')
+        .filter(e => e.type === 'CREDIT' && e.referenceType === 'PURCHASE')
         .reduce((s, e) => s + (e.amount || 0), 0);
       
       const manualCredits = entries
-        .filter(e => e.type === 'CREDIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE'))
+        .filter(e => e.type === 'CREDIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'OPENING_BALANCE'))
         .reduce((s, e) => s + (e.amount || 0), 0);
       
       const manualDebits = entries
-        .filter(e => e.type === 'DEBIT' && e.referenceType === 'ADJUSTMENT')
+        .filter(e => e.type === 'DEBIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE'))
         .reduce((s, e) => s + (e.amount || 0), 0);
 
-      const netPaid = (totalPayments + manualCredits) - (totalReturns + manualDebits);
-      const balance = netPaid - totalPurchased;
+      const totalOwedByUs = totalPurchased + manualCredits; 
+      const totalPaidToThem = totalPayments + totalReturns + manualDebits;
+      
+      const balance = totalOwedByUs - totalPaidToThem; // Positive = We owe them (To Pay), Negative = They owe us (Advance)
 
       return {
         ...v,
         totalPurchased,
-        totalPaid: netPaid, 
+        totalPaid: totalPaidToThem, 
         balance: balance,
-        advance: balance > 0 ? balance : 0,
-        due: balance < 0 ? Math.abs(balance) : 0,
+        due: balance > 0 ? balance : 0,         // We owe them
+        advance: balance < 0 ? Math.abs(balance) : 0, // They owe us
         lastOrderDate: v.orders?.[0]?.createdAt || null
       };
-    });
+    }));
   }
 
   static async getVendorById(id: string) {
@@ -149,11 +212,11 @@ export class ProcurementService {
       select: { type: true, amount: true }
     });
 
-    const totalOrder = entries.filter(e => e.type === 'DEBIT').reduce((s, e) => s + e.amount, 0);
-    const totalAdvance = entries.filter(e => e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
-    const balance = totalAdvance - totalOrder;
+    const totalPaid = entries.filter(e => e.type === 'DEBIT').reduce((s, e) => s + e.amount, 0);
+    const totalLiability = entries.filter(e => e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
+    const balance = totalLiability - totalPaid;
 
-    return { totalOrder, totalAdvance, balance };
+    return { totalPaid, totalLiability, balance };
   }
 
   static async updateVendor(id: string, data: { 
@@ -161,6 +224,15 @@ export class ProcurementService {
     contact?: string; 
     email?: string; 
     address?: string; 
+    state?: string;
+    district?: string;
+    city?: string;
+    pincode?: string;
+    shippingAddress?: string;
+    gstType?: string;
+    openingBalance?: number;
+    asOfDate?: string;
+    creditLimit?: number;
     remark?: string; 
     rating?: number; 
     gstNumber?: string;
@@ -180,7 +252,56 @@ export class ProcurementService {
     if (data.address !== undefined && data.address.trim().length === 0) {
       throw new Error("Registered Office Address cannot be empty.");
     }
-    return prisma.vendor.update({ where: { id }, data });
+    
+    const updateData: any = { ...data };
+    if (data.asOfDate) updateData.asOfDate = new Date(data.asOfDate);
+    
+    // Remove properties that are not part of the Prisma schema
+    delete updateData.openingBalanceType;
+    
+    return prisma.$transaction(async (tx) => {
+      const vendor = await tx.vendor.update({ where: { id }, data: updateData });
+
+      // Synchronize Opening Balance Ledger Entry if it's set
+      if (data.openingBalance !== undefined) {
+        const existingEntry = await tx.vendorLedger.findFirst({
+          where: { vendorId: id, referenceType: 'OPENING_BALANCE' }
+        });
+
+        const amount = Math.abs(data.openingBalance);
+        const type = data.openingBalance >= 0 ? 'CREDIT' : 'DEBIT'; // Credit = we owe them (To Pay)
+
+        if (existingEntry) {
+          if (amount === 0) {
+            await tx.vendorLedger.delete({ where: { id: existingEntry.id } });
+          } else {
+            await tx.vendorLedger.update({
+              where: { id: existingEntry.id },
+              data: { amount, type, balanceAfterTransaction: amount }
+            });
+          }
+        } else if (amount > 0) {
+          await tx.vendorLedger.create({
+            data: {
+              vendorId: id,
+              type,
+              amount,
+              balanceAfterTransaction: amount,
+              referenceType: 'OPENING_BALANCE',
+              paymentMode: 'CASH',
+              note: 'Opening Balance',
+              createdAt: new Date('2000-01-01')
+            }
+          });
+        }
+
+        // Recalculate subsequent balances if needed
+        // (For simplicity, the running balances are usually fetched live via getVendors calculation, 
+        // but to ensure the UI ledger is perfect, we can leave it to the UI or run a migration. 
+        // We update the entry's amount which fixes the getVendors calculation.)
+      }
+      return vendor;
+    });
   }
 
   static async deleteVendor(id: string) {
@@ -615,11 +736,18 @@ export class ProcurementService {
       const totalWithTax = totalValue * taxFactor;
 
       if (totalWithTax > 0) {
+        const lastEntry = await tx.vendorLedger.findFirst({
+          where: { vendorId: po.vendorId },
+          orderBy: { createdAt: 'desc' }
+        });
+        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+
         await tx.vendorLedger.create({
           data: {
             vendorId: po.vendorId,
-            type: 'DEBIT', // Liability
+            type: 'CREDIT', // Liability increases
             amount: totalWithTax,
+            balanceAfterTransaction: currentBalance + totalWithTax,
             paymentMode: 'CASH',
             sourceModule: 'PROCUREMENT',
             referenceType: 'PURCHASE',
@@ -721,7 +849,7 @@ export class ProcurementService {
         sourceAccount: accountId,
         method: paymentMode || 'CASH',
         sourceModule: 'PROCUREMENT',
-        linkedDocType: vendorInvoiceId ? 'VENDOR_INVOICE' : (referenceId ? 'PO' : (type === 'ADVANCE' ? 'ADVANCE' : 'DIRECT')),
+        linkedDocType: vendorInvoiceId ? 'INVOICE' : (referenceId ? 'PO' : 'DIRECT'),
         linkedDocId: vendorInvoiceId || referenceId,
         vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',

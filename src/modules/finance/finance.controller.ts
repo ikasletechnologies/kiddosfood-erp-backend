@@ -163,13 +163,17 @@ export class FinanceController {
 
   static async getExpensesReport(req: Request, res: Response) {
     try {
-      const { franchiseId, startDate, endDate } = req.query;
-      const report = await FinanceService.getFinancialReport({
-        franchiseId: franchiseId as string,
-        startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
-      });
-      res.json({ totalExpenses: report.expenses });
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate, category } = req.query;
+      const report = await FinanceService.getExpensesReportData(
+        franchiseId,
+        startDate as string,
+        endDate as string,
+        category as string
+      );
+      res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -550,6 +554,23 @@ export class FinanceController {
     }
   }
 
+  static async getAllPartiesReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getAllPartiesData(
+        franchiseId,
+        startDate as string,
+        endDate as string
+      );
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getLoans(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -711,7 +732,16 @@ export class FinanceController {
 
   static async getItemDiscountReport(req: Request, res: Response) {
     try {
-      res.json([]);
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getItemDiscountReportData(
+        franchiseId,
+        startDate as string,
+        endDate as string
+      );
+      res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -719,7 +749,16 @@ export class FinanceController {
 
   static async getSalePurchaseByCategoryReport(req: Request, res: Response) {
     try {
-      res.json([]);
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getSalePurchaseByCategoryData(
+        franchiseId,
+        startDate as string,
+        endDate as string
+      );
+      res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -727,7 +766,11 @@ export class FinanceController {
 
   static async getStockByCategoryReport(req: Request, res: Response) {
     try {
-      res.json([]);
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const report = await FinanceService.getStockByCategoryData(franchiseId);
+      res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

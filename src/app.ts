@@ -289,6 +289,8 @@ app.get('/api/reports/party-profit-loss', authenticate, authorizeRole(['FRANCHIS
 app.get('/api/reports/party-by-item', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPartyReportByItem);
 app.get('/api/reports/sale-purchase-by-party', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByParty);
 app.get('/api/reports/sale-purchase-by-party-group', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByPartyGroup);
+app.get('/api/reports/all-parties', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getAllPartiesReport);
+
 
 // Item/Stock Reports
 app.get('/api/reports/item-by-party', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getItemByPartyReport);
