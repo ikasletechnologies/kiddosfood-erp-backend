@@ -37,9 +37,10 @@ model Customer {
   ledgerEntries CustomerLedger[]
   orders        Order[]
   productions   Production[]
-  quotations    Quotation[]
-  returnOrders  ReturnOrder[]
-  salesOrders   SalesOrder[]
+  quotations       Quotation[]
+  returnOrders     ReturnOrder[]
+  salesOrders      SalesOrder[]
+  deliveryChallans DeliveryChallan[]
 }
 
 model Dealer {
@@ -117,6 +118,7 @@ model Franchise {
   cheques             Cheque[]
   accounts            Account[]
   procurementOrders   ProcurementOrder[]
+  loanAccounts        LoanAccount[]
 }
 
 model Cheque {
@@ -1012,6 +1014,43 @@ model ReturnItem {
   return      ReturnOrder @relation(fields: [returnId], references: [id])
 }
 
+model DeliveryChallan {
+  id             String                @id @default(uuid())
+  challanNumber  String                @unique
+  customerId     String?
+  salesOrderId   String?
+  franchiseId    String?
+  status         String                @default("DRAFT")
+  challanDate    DateTime              @default(now())
+  dueDate        DateTime?
+  vehicleNo      String?
+  driverName     String?
+  stateOfSupply  String?
+  notes          String?
+  termsConditions String?
+  subTotal       Float                 @default(0)
+  taxAmount      Float                 @default(0)
+  totalAmount    Float                 @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  customer       Customer?             @relation(fields: [customerId], references: [id])
+  items          DeliveryChallanItem[]
+}
+
+model DeliveryChallanItem {
+  id          String          @id @default(uuid())
+  challanId   String
+  productId   String?
+  productName String
+  quantity    Float
+  unit        String          @default("NONE")
+  rate        Float           @default(0)
+  taxPercent  Float           @default(0)
+  taxAmount   Float           @default(0)
+  totalAmount Float           @default(0)
+  challan     DeliveryChallan @relation(fields: [challanId], references: [id])
+}
+
 model PurchaseRFQ {
   id               String    @id @default(uuid())
   rfqNumber        String    @unique
@@ -1579,3 +1618,44 @@ enum InventoryStockState {
   EXPIRED
   RETURNED
 }
+
+model Draft {
+  id        String   @id @default(uuid())
+  type      String   // e.g. "invoice", "order", "delivery_challan", "estimation", "proforma", "payment_in", "return"
+  userId    String?  // for user tracking
+  data      Json     // raw JSON of form items, customer selections, rates, etc.
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model LoanAccount {
+  id                 String            @id @default(uuid())
+  accountName        String
+  accountNumber      String?
+  lenderName         String?
+  loanType           String            @default("RECEIVED") // RECEIVED or GIVEN
+  principalAmount    Float             @default(0)
+  interestRate       Float             @default(0)
+  loanDate           DateTime          @default(now())
+  outstandingBalance Float             @default(0)
+  interestPaid       Float             @default(0)
+  principalPaid      Float             @default(0)
+  franchiseId        String
+  franchise          Franchise         @relation(fields: [franchiseId], references: [id])
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  transactions       LoanTransaction[]
+}
+
+model LoanTransaction {
+  id            String      @id @default(uuid())
+  loanAccountId String
+  date          DateTime    @default(now())
+  type          String      // DISBURSEMENT, PRINCIPAL_PAID, INTEREST_CHARGED, INTEREST_PAID
+  amount        Float
+  endingBalance Float
+  note          String?
+  createdAt     DateTime    @default(now())
+  loanAccount   LoanAccount @relation(fields: [loanAccountId], references: [id], onDelete: Cascade)
+}
+

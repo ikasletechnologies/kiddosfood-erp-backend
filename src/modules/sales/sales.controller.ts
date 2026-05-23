@@ -63,7 +63,9 @@ export class SalesController {
       const orders = await SalesService.getSalesOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        startDate: req.query.startDate as string,
+        endDate: req.query.endDate as string
       });
       res.json(orders);
     } catch (error) {
@@ -131,6 +133,49 @@ export class SalesController {
       const approverId = (req as any).user?.id;
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  // ─── Delivery Challans ───────────────────────────────────────────────────────
+
+  static async getDeliveryChallans(req: Request, res: Response) {
+    try {
+      const challans = await SalesService.getDeliveryChallans({
+        customerId: req.query.customerId as string,
+        status: req.query.status as string,
+        search: req.query.search as string
+      });
+      res.json(challans);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getDeliveryChallan(req: Request, res: Response) {
+    try {
+      const challan = await SalesService.getDeliveryChallanById(req.params.id);
+      if (!challan) return res.status(404).json({ error: 'Delivery challan not found' });
+      res.json(challan);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async createDeliveryChallan(req: Request, res: Response) {
+    try {
+      const challan = await SalesService.createDeliveryChallan(req.body);
+      res.status(201).json(challan);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async updateDeliveryChallan(req: Request, res: Response) {
+    try {
+      const challan = await SalesService.updateDeliveryChallan(req.params.id, req.body);
+      res.json(challan);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
     }

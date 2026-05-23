@@ -3,6 +3,7 @@ import prisma from '../../lib/prisma';
 let quotationCounter = 1000;
 let salesOrderCounter = 1000;
 let returnCounter = 1000;
+let challanCounter = 1000;
 
 function generateQuotationNumber() {
   return `QT-${new Date().getFullYear()}-${String(++quotationCounter).padStart(5, '0')}`;
@@ -14,6 +15,10 @@ function generateSalesOrderNumber() {
 
 function generateReturnNumber() {
   return `SR${String(++returnCounter).padStart(10, '0')}`;
+}
+
+function generateChallanNumber() {
+  return `DC-${new Date().getFullYear()}-${String(++challanCounter).padStart(5, '0')}`;
 }
 
 function calculateTotals<T extends { quantity: number; rate: number; taxPercent?: number }>(items: T[]) {
@@ -160,10 +165,24 @@ export class SalesService {
 
   // ─── Sales Orders ────────────────────────────────────────────────────────────
 
-  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string }) {
+  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string; startDate?: string; endDate?: string }) {
     const where: any = {};
-    if (filters.status) where.status = filters.status;
+    if (filters.status && filters.status !== 'ALL') {
+      if (filters.status === 'OPEN') {
+        where.status = { in: ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED'] };
+      } else if (filters.status === 'CLOSED') {
+        where.status = 'DELIVERED';
+      } else {
+        where.status = filters.status as any;
+      }
+    }
     if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.startDate || filters.endDate) {
+      where.createdAt = {
+        ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
+        ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+      };
+    }
     if (filters.search) {
       where.OR = [
         { orderNumber: { contains: filters.search, mode: 'insensitive' } },
@@ -409,5 +428,84 @@ export class SalesService {
       totalReturnAmount: totalReturns,
       netRevenue: totalRevenue - totalReturns
     };
+  }
+
+  // ─── Delivery Challans ───────────────────────────────────────────────────────
+
+  static async getDeliveryChallans(filters: { customerId?: string; status?: string; search?: string }) {
+    const where: any = {};
+    if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.status) where.status = filters.status;
+    if (filters.search) {
+      where.OR = [
+        { challanNumber: { contains: filters.search, mode: 'insensitive' } },
+        { vehicleNo: { contains: filters.search, mode: 'insensitive' } }
+      ];
+    }
+    return prisma.deliveryChallan.findMany({
+      where,
+      include: { customer: true, items: true },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  static async getDeliveryChallanById(id: string) {
+    return prisma.deliveryChallan.findUnique({
+      where: { id },
+      include: { customer: true, items: true }
+    });
+  }
+
+  static async createDeliveryChallan(data: {
+    customerId?: string;
+    salesOrderId?: string;
+    franchiseId?: string;
+    challanDate?: string;
+    dueDate?: string;
+    vehicleNo?: string;
+    driverName?: string;
+    stateOfSupply?: string;
+    notes?: string;
+    termsConditions?: string;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number }>;
+  }) {
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(
+      data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 }))
+    );
+    return prisma.deliveryChallan.create({
+      data: {
+        challanNumber: generateChallanNumber(),
+        customerId: data.customerId || null,
+        salesOrderId: data.salesOrderId || null,
+        franchiseId: data.franchiseId || null,
+        challanDate: data.challanDate ? new Date(data.challanDate) : new Date(),
+        dueDate: data.dueDate ? new Date(data.dueDate) : null,
+        vehicleNo: data.vehicleNo || null,
+        driverName: data.driverName || null,
+        stateOfSupply: data.stateOfSupply || null,
+        notes: data.notes || null,
+        termsConditions: data.termsConditions || null,
+        subTotal,
+        taxAmount,
+        totalAmount,
+        items: {
+          create: computed.map((i) => ({
+            productId: i.productId || null,
+            productName: i.productName,
+            quantity: i.quantity,
+            unit: i.unit || 'NONE',
+            rate: i.rate,
+            taxPercent: i.taxPercent || 0,
+            taxAmount: i.taxAmount,
+            totalAmount: i.totalAmount
+          }))
+        }
+      },
+      include: { customer: true, items: true }
+    });
+  }
+
+  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string }) {
+    return prisma.deliveryChallan.update({ where: { id }, data });
   }
 }
