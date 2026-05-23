@@ -90,18 +90,18 @@ export class VendorInvoiceService {
       if (!invoice) throw new Error('Invoice not found');
       if (invoice.status === 'APPROVED' || invoice.status === 'PAID') throw new Error('Invoice already approved');
 
-      // 1. Recognize Liability (DEBIT in Vendor Ledger)
+      // 1. Recognize Liability (CREDIT in Vendor Ledger)
       const lastEntry = await tx.vendorLedger.findFirst({
         where: { vendorId: invoice.vendorId },
         orderBy: { createdAt: 'desc' }
       });
       const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-      const nextBalance = currentBalance - invoice.amount;
+      const nextBalance = currentBalance + invoice.amount;
 
       const ledgerEntry = await tx.vendorLedger.create({
         data: {
           vendorId: invoice.vendorId,
-          type: 'DEBIT',
+          type: 'CREDIT',
           amount: invoice.amount,
           balanceAfterTransaction: nextBalance,
           sourceModule: 'FINANCE',
@@ -114,29 +114,17 @@ export class VendorInvoiceService {
       });
 
       // 2. Advance Utilization Logic
-      // Check if vendor has unutilized advances (CREDIT entries with referenceType ADVANCE)
-      const unutilizedAdvances = await tx.vendorLedger.findMany({
-        where: {
-          vendorId: invoice.vendorId,
-          referenceType: 'ADVANCE',
-          type: 'CREDIT',
-          amount: { gt: 0 }
-          // In a real system, we'd track "remainingAmount" on each ledger entry or use an Allocation model.
-          // For now, we'll check the vendor's overall positive balance.
-        },
-        orderBy: { createdAt: 'asc' }
-      });
-
-      // Simplified Advance Utilization: If balance is positive, we can auto-apply
-      if (currentBalance > 0) {
-        const availableAdvance = Math.min(currentBalance, invoice.amount);
+      // Check if vendor has unutilized advances. In this system, advance payments create a negative (Dr) balance.
+      // So if currentBalance < 0, we have an advance to apply.
+      if (currentBalance < 0) {
+        const availableAdvance = Math.min(Math.abs(currentBalance), invoice.amount);
         if (availableAdvance > 0) {
           await tx.vendorLedger.create({
             data: {
               vendorId: invoice.vendorId,
-              type: 'CREDIT', // Applying advance reduces liability
+              type: 'DEBIT', // Applying advance against the invoice reduces the newly created liability
               amount: availableAdvance,
-              balanceAfterTransaction: nextBalance + availableAdvance,
+              balanceAfterTransaction: nextBalance - availableAdvance,
               sourceModule: 'FINANCE',
               referenceType: 'ADJUSTMENT',
               referenceId: invoice.id,

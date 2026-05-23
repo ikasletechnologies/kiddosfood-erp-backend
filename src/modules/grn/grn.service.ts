@@ -162,11 +162,18 @@ export class GRNService {
       const grnTotalWithTax = grnSubtotal * taxFactor;
 
       if (grnTotalWithTax > 0) {
+        const lastEntry = await tx.vendorLedger.findFirst({
+          where: { vendorId: grn.procurementOrder.vendorId },
+          orderBy: { createdAt: 'desc' }
+        });
+        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+
         await tx.vendorLedger.create({
           data: {
             vendorId: grn.procurementOrder.vendorId,
-            type: 'DEBIT', // Purchase Liability
+            type: 'CREDIT', // Purchase Liability increases
             amount: grnTotalWithTax,
+            balanceAfterTransaction: currentBalance + grnTotalWithTax,
             paymentMode: 'CASH', // Placeholder
             sourceModule: 'PROCUREMENT',
             referenceType: 'PURCHASE',

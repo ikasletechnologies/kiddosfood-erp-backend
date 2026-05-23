@@ -211,6 +211,15 @@ model Vendor {
   contact           String
   email             String?
   address           String?
+  state             String?
+  district          String?
+  city              String?
+  pincode           String?
+  shippingAddress   String?
+  gstType           String?
+  openingBalance    Float              @default(0)
+  asOfDate          DateTime?
+  creditLimit       Float?
   remark            String?
   manualPurchaseAdj Float              @default(0)
   manualAdvanceAdj  Float              @default(0)

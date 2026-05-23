@@ -584,67 +584,63 @@ export class FinanceService {
       };
     }
 
-    const [sales, purchases] = await Promise.all([
+    const [orders, purchases] = await Promise.all([
       prisma.order.findMany({
-        where: {
-          ...(franchiseId ? { franchiseId } : {}),
-          ...dateFilter,
-          status: 'COMPLETED'
-        }
+        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: 'COMPLETED' },
+        include: { orderItems: { include: { product: true } } }
       }),
       prisma.procurementOrder.findMany({
-        where: {
-          ...(franchiseId ? { franchiseId } : {}),
-          ...dateFilter,
-          status: 'DELIVERED'
-        }
+        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: 'DELIVERED' },
+        include: { poItems: true }
       })
     ]);
 
-    // Group sales and purchases into typical brackets (5%, 12%, 18%, 28%)
-    const brackets = [
-      { taxName: "GST 5%", percent: 5 },
-      { taxName: "GST 12%", percent: 12 },
-      { taxName: "GST 18%", percent: 18 },
-      { taxName: "GST 28%", percent: 28 }
-    ];
+    const knownBrackets = [5, 12, 18, 28];
+    const rateMap: Record<number, { taxName: string; taxPercent: number; taxableSaleAmount: number; taxIn: number; taxablePurchaseAmount: number; taxOut: number }> = {};
 
-    const data = brackets.map(b => {
-      let taxableSaleAmount = 0;
-      let taxIn = 0;
-      let taxablePurchaseAmount = 0;
-      let taxOut = 0;
-
-      // Dynamically distribute sales (defaulting most sales to 18% or 5%)
-      sales.forEach(s => {
-        if (b.percent === 18) {
-          taxableSaleAmount += s.subTotal || 0;
-          taxIn += s.taxAmount || 0;
-        }
-      });
-
-      // Dynamically distribute purchases
-      purchases.forEach(p => {
-        if (b.percent === 18) {
-          taxablePurchaseAmount += p.subtotal || 0;
-          taxOut += (p.cgst || 0) + (p.sgst || 0) + (p.igst || 0);
-        }
-      });
-
-      return {
-        taxName: b.taxName,
-        taxPercent: b.percent,
-        taxableSaleAmount,
-        taxIn,
-        taxablePurchaseAmount,
-        taxOut
-      };
+    knownBrackets.forEach(b => {
+      rateMap[b] = { taxName: `GST ${b}%`, taxPercent: b, taxableSaleAmount: 0, taxIn: 0, taxablePurchaseAmount: 0, taxOut: 0 };
     });
 
-    const totalTaxIn = data.reduce((acc, r) => acc + r.taxIn, 0);
-    const totalTaxOut = data.reduce((acc, r) => acc + r.taxOut, 0);
+    const nearestBracket = (rate: number) =>
+      knownBrackets.reduce((prev, curr) => Math.abs(curr - rate) < Math.abs(prev - rate) ? curr : prev, 5);
 
-    return { data, totalTaxIn, totalTaxOut };
+    orders.forEach(o => {
+      o.orderItems.forEach(item => {
+        const rate = item.product?.taxPercent ?? 5;
+        const bracket = nearestBracket(rate);
+        if (rateMap[bracket]) {
+          const itemSubtotal = (item.quantity || 0) * (item.price || 0);
+          rateMap[bracket].taxableSaleAmount += itemSubtotal;
+          rateMap[bracket].taxIn += item.taxAmount || 0;
+        }
+      });
+    });
+
+    purchases.forEach(p => {
+      p.poItems.forEach(item => {
+        const rate = item.gstRate ?? 5;
+        const bracket = nearestBracket(rate);
+        if (rateMap[bracket]) {
+          rateMap[bracket].taxablePurchaseAmount += item.subtotal || 0;
+          rateMap[bracket].taxOut += (item.cgst || 0) + (item.sgst || 0) + (item.igst || 0);
+        }
+      });
+    });
+
+    const data = Object.values(rateMap).map(r => ({
+      ...r,
+      taxableSaleAmount: Number(r.taxableSaleAmount.toFixed(2)),
+      taxIn: Number(r.taxIn.toFixed(2)),
+      taxablePurchaseAmount: Number(r.taxablePurchaseAmount.toFixed(2)),
+      taxOut: Number(r.taxOut.toFixed(2))
+    }));
+
+    return {
+      data,
+      totalTaxIn: Number(data.reduce((acc, r) => acc + r.taxIn, 0).toFixed(2)),
+      totalTaxOut: Number(data.reduce((acc, r) => acc + r.taxOut, 0).toFixed(2))
+    };
   }
 
   static async getTcsReceivableData(franchiseId?: string, startDate?: string, endDate?: string) {
@@ -916,12 +912,13 @@ export class FinanceService {
           });
           const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
           
+          const isOutflow = flow === 'OUT';
           await tx.vendorLedger.create({
             data: {
               vendorId,
-              type: 'CREDIT',
+              type: isOutflow ? 'DEBIT' : 'CREDIT',
               amount: amount,
-              balanceAfterTransaction: currentBalance + amount,
+              balanceAfterTransaction: isOutflow ? currentBalance - amount : currentBalance + amount,
               sourceModule: sourceModule as any,
               referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
               referenceId: payment.id,
@@ -1782,17 +1779,13 @@ export class FinanceService {
       { name: "Outward Duties & Taxes", debit: 0, credit: 0 },
       { name: "Other Current Liabilities", debit: 0, credit: 0 },
       { name: "Other Liabilities", debit: 0, credit: 0 },
-      { name: "Sale (Revenue) Account", debit: 0, credit: totalSales > 0 ? totalSales : 350 },
+      { name: "Sale (Revenue) Account", debit: 0, credit: totalSales },
       { name: "Other Incomes (Direct)", debit: 0, credit: 0 },
       { name: "Other Incomes (Indirect)", debit: 0, credit: 0 },
       { name: "Purchase Accounts", debit: totalPurchases, credit: 0 },
       { name: "Direct Expenses", debit: 0, credit: 0 },
       { name: "Indirect Expenses", debit: totalExpenses, credit: 0 }
     ];
-
-    if (customerRows.length === 0) {
-      result.splice(2, 0, { name: "Mani", debit: 350, credit: 0 });
-    }
 
     return result;
   }
@@ -2034,12 +2027,6 @@ export class FinanceService {
         margin
       };
     });
-
-    if (rows.length === 0) {
-      return [
-        { date: new Date().toISOString().split("T")[0], invoiceNumber: "INV-2026-004", partyName: "Mani", total: 350, cost: 0, profit: 350, margin: 100 }
-      ];
-    }
 
     return rows;
   }
@@ -2324,18 +2311,6 @@ export class FinanceService {
       };
     }).filter(r => r.totalSaleAmount > 0);
 
-    // Fallback if no records
-    if (reportRows.length === 0) {
-      return [
-        {
-          partyName: 'Mani',
-          phoneNo: '9345601619',
-          totalSaleAmount: 350,
-          profit: 350
-        }
-      ];
-    }
-
     return reportRows;
   }
 
@@ -2385,18 +2360,6 @@ export class FinanceService {
       };
     }).filter(r => r.saleAmount > 0);
 
-    if (report.length === 0) {
-      return [
-        {
-          partyName: 'Mani',
-          saleQuantity: 10,
-          saleAmount: 350,
-          purchaseQuantity: 1,
-          purchaseAmount: 0
-        }
-      ];
-    }
-
     return report;
   }
 
@@ -2431,16 +2394,6 @@ export class FinanceService {
         purchaseAmount: 0
       };
     }).filter(r => r.saleAmount > 0);
-
-    if (report.length === 0) {
-      return [
-        {
-          partyName: 'Mani',
-          saleAmount: 350,
-          purchaseAmount: 0
-        }
-      ];
-    }
 
     return report;
   }
@@ -2648,18 +2601,6 @@ export class FinanceService {
       };
     });
 
-    if (data.length === 0) {
-      return [
-        {
-          itemName: 'potato',
-          salePrice: 35.00,
-          purchasePrice: 0.00,
-          stockQty: -9,
-          stockValue: 0.00
-        }
-      ];
-    }
-
     return data;
   }
 
@@ -2682,17 +2623,6 @@ export class FinanceService {
           stockValue
         };
       });
-
-    if (data.length === 0) {
-      return [
-        {
-          itemName: 'potato',
-          minimumStock: 0,
-          stockQty: -9,
-          stockValue: 0.00
-        }
-      ];
-    }
 
     return data;
   }
@@ -2784,48 +2714,141 @@ export class FinanceService {
 
     const data = Object.values(itemMap);
 
-    if (data.length === 0) {
-      return [
-        {
-          itemName: 'potato',
-          sale: 350.00,
-          saleReturn: 0,
-          purchase: 0,
-          purchaseReturn: 0,
-          openingStock: 0,
-          closingStock: 0,
-          taxReceivable: 0,
-          taxPayable: 0,
-          mfgCost: 0,
-          consumptionCost: 0,
-          netProfitLoss: 350.00
-        }
-      ];
-    }
-
     return data;
   }
 
   static async getItemCategoryWiseProfitLoss(franchiseId: string, startDate?: string, endDate?: string) {
-    return [];
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [orders, purchases] = await Promise.all([
+      prisma.order.findMany({
+        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        include: { orderItems: { include: { product: true } } }
+      }),
+      prisma.procurementOrder.findMany({
+        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        include: { poItems: { include: { inventoryItem: true } } }
+      })
+    ]);
+
+    const categoryMap: Record<string, { category: string; sale: number; purchase: number; netProfitLoss: number }> = {};
+
+    orders.forEach(s => {
+      s.orderItems.forEach(item => {
+        const category = item.product?.category || 'Uncategorized';
+        if (!categoryMap[category]) categoryMap[category] = { category, sale: 0, purchase: 0, netProfitLoss: 0 };
+        categoryMap[category].sale += item.totalAmount || 0;
+        categoryMap[category].netProfitLoss += item.totalAmount || 0;
+      });
+    });
+
+    purchases.forEach(p => {
+      p.poItems.forEach(item => {
+        const category = item.inventoryItem?.category || 'Uncategorized';
+        if (!categoryMap[category]) categoryMap[category] = { category, sale: 0, purchase: 0, netProfitLoss: 0 };
+        categoryMap[category].purchase += item.total || 0;
+        categoryMap[category].netProfitLoss -= item.total || 0;
+      });
+    });
+
+    return Object.values(categoryMap);
   }
 
   static async getStockDetailData(franchiseId: string, startDate?: string, endDate?: string) {
-    return [
-      {
-        itemName: "potato",
-        beginningQuantity: 0,
-        quantityIn: 1,
-        purchaseAmount: 0.00,
-        quantityOut: 10,
-        saleAmount: 350.00,
-        closingQuantity: -9
-      }
-    ];
+    const items = await prisma.inventoryItem.findMany({
+      where: { franchiseId, isActive: true },
+      include: {
+        movements: {
+          where: {
+            ...(startDate || endDate ? {
+              createdAt: {
+                ...(startDate ? { gte: new Date(startDate) } : {}),
+                ...(endDate ? { lte: new Date(endDate) } : {})
+              }
+            } : {})
+          }
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    return items.map(item => {
+      const inMovements = item.movements.filter(m =>
+        m.movementType === 'PURCHASE_IN' || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)
+      );
+      const outMovements = item.movements.filter(m =>
+        m.movementType === 'SALES_OUT' || m.movementType === 'PRODUCTION_OUT' || m.movementType === 'WASTE_OUT'
+      );
+      const quantityIn = inMovements.reduce((s, m) => s + m.quantity, 0);
+      const quantityOut = outMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+      const purchasePrice = item.costPrice || 0;
+      const salePrice = item.customerPrice || item.basePrice || 0;
+      const beginningQuantity = item.currentStock - quantityIn + quantityOut;
+
+      return {
+        itemName: item.name,
+        beginningQuantity: Number(beginningQuantity.toFixed(2)),
+        quantityIn: Number(quantityIn.toFixed(2)),
+        purchaseAmount: Number((quantityIn * purchasePrice).toFixed(2)),
+        quantityOut: Number(quantityOut.toFixed(2)),
+        saleAmount: Number((quantityOut * salePrice).toFixed(2)),
+        closingQuantity: Number(item.currentStock.toFixed(2))
+      };
+    });
   }
 
   static async getItemDetailData(franchiseId: string, itemName?: string, startDate?: string, endDate?: string) {
-    return [];
+    const whereClause: any = { franchiseId, isActive: true };
+    if (itemName) whereClause.name = { contains: itemName, mode: 'insensitive' };
+
+    const items = await prisma.inventoryItem.findMany({
+      where: whereClause,
+      include: {
+        vendor: true,
+        movements: {
+          where: {
+            ...(startDate || endDate ? {
+              createdAt: {
+                ...(startDate ? { gte: new Date(startDate) } : {}),
+                ...(endDate ? { lte: new Date(endDate) } : {})
+              }
+            } : {})
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 20
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    return items.map(item => ({
+      id: item.id,
+      name: item.name,
+      sku: item.sku,
+      category: item.category,
+      unit: item.unit,
+      hsnCode: item.hsnCode,
+      gstRate: item.gstRate,
+      currentStock: item.currentStock,
+      minimumStock: item.minimumStock,
+      costPrice: item.costPrice || 0,
+      basePrice: item.basePrice || 0,
+      customerPrice: item.customerPrice || 0,
+      vendorName: item.vendor?.name || '—',
+      recentMovements: item.movements.map(m => ({
+        date: m.createdAt.toISOString().split('T')[0],
+        type: m.movementType,
+        quantity: m.quantity,
+        referenceType: m.referenceType || '—',
+        note: m.note || '—'
+      }))
+    }));
   }
 
   static async getBankStatementData(franchiseId: string, accountId?: string, startDate?: string, endDate?: string) {
@@ -2935,63 +2958,508 @@ export class FinanceService {
   }
 
   static async getGSTR1Data(franchiseId: string, startDate?: string, endDate?: string) {
-    return { sale: [], saleReturn: [] };
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const orders = await prisma.order.findMany({
+      where: {
+        franchiseId,
+        status: { in: ['COMPLETED', 'REFUNDED'] as any },
+        ...dateFilter
+      },
+      include: { customer: true, orderItems: { include: { product: true } } },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const toRow = (o: any) => ({
+      invoiceNo: o.invoiceNum || o.id,
+      date: o.createdAt.toISOString().split('T')[0],
+      partyName: o.customer?.name || 'Cash Customer',
+      taxableValue: o.subTotal || 0,
+      igst: 0,
+      cgst: Number(((o.taxAmount || 0) / 2).toFixed(2)),
+      sgst: Number(((o.taxAmount || 0) / 2).toFixed(2)),
+      totalTax: o.taxAmount || 0,
+      totalAmount: o.totalAmount
+    });
+
+    const sale = orders.filter((o: any) => o.status === 'COMPLETED').map(toRow);
+    const saleReturn = orders.filter((o: any) => o.status === 'REFUNDED').map(toRow);
+
+    return {
+      sale,
+      saleReturn,
+      totalTaxableValue: sale.reduce((s, r) => s + r.taxableValue, 0),
+      totalOutputGST: sale.reduce((s, r) => s + r.totalTax, 0)
+    };
   }
 
   static async getGSTR2Data(franchiseId: string, startDate?: string, endDate?: string) {
-    return [];
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const purchases = await prisma.procurementOrder.findMany({
+      where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+      include: { vendor: true, poItems: true },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const data = purchases.map(po => ({
+      poNumber: po.poNumber || po.id,
+      date: po.createdAt.toISOString().split('T')[0],
+      vendorName: po.vendor?.name || '—',
+      vendorGstin: po.vendor?.gstNumber || '—',
+      taxableValue: po.subtotal || 0,
+      igst: po.igst || 0,
+      cgst: po.cgst || 0,
+      sgst: po.sgst || 0,
+      totalTax: (po.igst || 0) + (po.cgst || 0) + (po.sgst || 0),
+      totalAmount: po.totalAmount,
+      status: po.status
+    }));
+
+    return {
+      data,
+      totalTaxableValue: data.reduce((s, r) => s + r.taxableValue, 0),
+      totalInputGST: data.reduce((s, r) => s + r.totalTax, 0)
+    };
   }
 
   static async getGSTR3BData(franchiseId: string, startDate?: string, endDate?: string) {
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [salesAgg, purchasesAgg] = await Promise.all([
+      prisma.order.aggregate({
+        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        _sum: { subTotal: true, taxAmount: true, totalAmount: true }
+      }),
+      prisma.procurementOrder.aggregate({
+        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
+      })
+    ]);
+
+    const outputTaxable = salesAgg._sum.subTotal || 0;
+    const outputTax = salesAgg._sum.taxAmount || 0;
+    const inputCgst = purchasesAgg._sum.cgst || 0;
+    const inputSgst = purchasesAgg._sum.sgst || 0;
+    const inputIgst = purchasesAgg._sum.igst || 0;
+    const totalInputTax = inputCgst + inputSgst + inputIgst;
+    const netGstPayable = Math.max(0, outputTax - totalInputTax);
+
     return {
-      outwardSupplies: [],
+      outwardSupplies: [
+        {
+          description: 'Outward taxable supplies (other than zero rated, nil rated and exempted)',
+          taxableValue: outputTaxable,
+          igst: 0,
+          cgst: Number((outputTax / 2).toFixed(2)),
+          sgst: Number((outputTax / 2).toFixed(2)),
+          cess: 0
+        }
+      ],
       interStateSupplies: [],
       eligibleITC: {
-        available: [],
+        available: [
+          { description: 'All other ITC', igst: inputIgst, cgst: inputCgst, sgst: inputSgst, cess: 0 }
+        ],
         ineligible: []
       },
-      exemptSupplies: []
+      exemptSupplies: [],
+      summary: { totalOutputTax: outputTax, totalInputTax, netGstPayable }
     };
   }
 
   static async getGSTR9Data(franchiseId: string, financialYear?: string) {
+    const fy = financialYear || '2025-2026';
+    const [startYearStr] = fy.split('-');
+    const startYear = parseInt(startYearStr, 10);
+    const fyStart = new Date(startYear, 3, 1);
+    const fyEnd = new Date(startYear + 1, 2, 31, 23, 59, 59);
+
+    const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId } });
+
+    const [salesAgg, purchasesAgg] = await Promise.all([
+      prisma.order.aggregate({
+        where: { franchiseId, status: 'COMPLETED', createdAt: { gte: fyStart, lte: fyEnd } },
+        _sum: { subTotal: true, taxAmount: true, totalAmount: true }
+      }),
+      prisma.procurementOrder.aggregate({
+        where: { franchiseId, status: { not: 'CANCELLED' as any }, createdAt: { gte: fyStart, lte: fyEnd } },
+        _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
+      })
+    ]);
+
+    const outputTax = salesAgg._sum.taxAmount || 0;
+    const inputTax = (purchasesAgg._sum.cgst || 0) + (purchasesAgg._sum.sgst || 0) + (purchasesAgg._sum.igst || 0);
+
     return {
       basicDetails: {
-        financialYear: financialYear || "2025-2026",
-        gstin: "",
-        legalName: "My Company",
-        tradeName: ""
+        financialYear: fy,
+        gstin: '',
+        legalName: franchise?.name || '',
+        tradeName: franchise?.name || ''
       },
-      outwardAndInwardSupplies: []
+      outwardAndInwardSupplies: [
+        {
+          section: '4A',
+          description: 'Supplies made to registered/unregistered persons',
+          taxableValue: salesAgg._sum.subTotal || 0,
+          centralTax: Number((outputTax / 2).toFixed(2)),
+          stateTax: Number((outputTax / 2).toFixed(2)),
+          integratedTax: 0,
+          cess: 0
+        },
+        {
+          section: '4C',
+          description: 'Inward supplies liable to reverse charge',
+          taxableValue: purchasesAgg._sum.subtotal || 0,
+          centralTax: purchasesAgg._sum.cgst || 0,
+          stateTax: purchasesAgg._sum.sgst || 0,
+          integratedTax: purchasesAgg._sum.igst || 0,
+          cess: 0
+        }
+      ],
+      summary: {
+        totalOutputTax: outputTax,
+        totalInputTax: inputTax,
+        netTaxPayable: Math.max(0, outputTax - inputTax)
+      }
     };
   }
 
   static async getHsnSummaryData(franchiseId: string, startDate?: string, endDate?: string) {
-    return [
-      {
-        hsn: "NA",
-        totalValue: 350.00,
-        taxableValue: 350.00,
-        igstAmount: null,
-        cgstAmount: null,
-        sgstAmount: null,
-        addCess: null
-      }
-    ];
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const orders = await prisma.order.findMany({
+      where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+      include: { orderItems: { include: { product: true } } }
+    });
+
+    const hsnMap: Record<string, {
+      hsn: string; totalValue: number; taxableValue: number;
+      igstAmount: number; cgstAmount: number; sgstAmount: number;
+    }> = {};
+
+    orders.forEach(o => {
+      o.orderItems.forEach(item => {
+        const hsn = item.product?.hsnCode || 'NA';
+        if (!hsnMap[hsn]) hsnMap[hsn] = { hsn, totalValue: 0, taxableValue: 0, igstAmount: 0, cgstAmount: 0, sgstAmount: 0 };
+        const itemSubtotal = (item.quantity || 0) * (item.price || 0);
+        const itemTax = item.taxAmount || 0;
+        hsnMap[hsn].taxableValue += itemSubtotal;
+        hsnMap[hsn].cgstAmount += itemTax / 2;
+        hsnMap[hsn].sgstAmount += itemTax / 2;
+        hsnMap[hsn].totalValue += item.totalAmount || 0;
+      });
+    });
+
+    return Object.values(hsnMap).map(h => ({
+      hsn: h.hsn,
+      totalValue: Number(h.totalValue.toFixed(2)),
+      taxableValue: Number(h.taxableValue.toFixed(2)),
+      igstAmount: 0,
+      cgstAmount: Number(h.cgstAmount.toFixed(2)),
+      sgstAmount: Number(h.sgstAmount.toFixed(2)),
+      addCess: null
+    }));
   }
 
   static async getSacReportData(franchiseId: string, startDate?: string, endDate?: string) {
-    return [];
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.date = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const expenses = await prisma.expense.findMany({
+      where: { franchiseId, isCancelled: false, ...dateFilter },
+      orderBy: { date: 'desc' }
+    });
+
+    const sacMap: Record<string, { sacCode: string; description: string; taxableValue: number; gstAmount: number; totalAmount: number }> = {};
+
+    expenses.forEach(e => {
+      const sac = e.category || 'GENERAL';
+      if (!sacMap[sac]) sacMap[sac] = { sacCode: sac, description: e.category || 'General Service', taxableValue: 0, gstAmount: 0, totalAmount: 0 };
+      sacMap[sac].taxableValue += e.amount;
+      sacMap[sac].totalAmount += e.amount;
+    });
+
+    return Object.values(sacMap);
+  }
+
+  static async getItemDiscountReportData(franchiseId: string, startDate?: string, endDate?: string) {
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const orders = await prisma.order.findMany({
+      where: { franchiseId, discountAmount: { gt: 0 }, status: 'COMPLETED', ...dateFilter },
+      include: { orderItems: { include: { product: true } } },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const itemMap: Record<string, { itemName: string; totalSaleQty: number; totalSaleAmount: number; totalDiscountAmount: number }> = {};
+
+    orders.forEach(o => {
+      o.orderItems.forEach(item => {
+        const name = item.product?.name || item.productId;
+        if (!itemMap[name]) itemMap[name] = { itemName: name, totalSaleQty: 0, totalSaleAmount: 0, totalDiscountAmount: 0 };
+        itemMap[name].totalSaleQty += item.quantity || 0;
+        itemMap[name].totalSaleAmount += item.totalAmount || 0;
+        const itemSubtotal = (item.quantity || 0) * (item.price || 0);
+        itemMap[name].totalDiscountAmount += itemSubtotal * ((item.discountPct || 0) / 100);
+      });
+    });
+
+    const data = Object.values(itemMap).map(r => ({
+      ...r,
+      totalSaleQty: Number(r.totalSaleQty.toFixed(2)),
+      totalSaleAmount: Number(r.totalSaleAmount.toFixed(2)),
+      totalDiscountAmount: Number(r.totalDiscountAmount.toFixed(2))
+    }));
+
+    return { data, totalDiscount: data.reduce((s, r) => s + r.totalDiscountAmount, 0) };
+  }
+
+  static async getSalePurchaseByCategoryData(franchiseId: string, startDate?: string, endDate?: string) {
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [orders, purchases] = await Promise.all([
+      prisma.order.findMany({
+        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        include: { orderItems: { include: { product: true } } }
+      }),
+      prisma.procurementOrder.findMany({
+        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        include: { poItems: { include: { inventoryItem: true } } }
+      })
+    ]);
+
+    const categoryMap: Record<string, { category: string; saleAmount: number; purchaseAmount: number }> = {};
+
+    orders.forEach(o => {
+      o.orderItems.forEach(item => {
+        const category = item.product?.category || 'Uncategorized';
+        if (!categoryMap[category]) categoryMap[category] = { category, saleAmount: 0, purchaseAmount: 0 };
+        categoryMap[category].saleAmount += item.totalAmount || 0;
+      });
+    });
+
+    purchases.forEach(p => {
+      p.poItems.forEach(item => {
+        const category = item.inventoryItem?.category || 'Uncategorized';
+        if (!categoryMap[category]) categoryMap[category] = { category, saleAmount: 0, purchaseAmount: 0 };
+        categoryMap[category].purchaseAmount += item.total || 0;
+      });
+    });
+
+    return Object.values(categoryMap);
+  }
+
+  static async getStockByCategoryData(franchiseId: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: { franchiseId, isActive: true },
+      orderBy: { category: 'asc' }
+    });
+
+    const categoryMap: Record<string, { category: string; itemCount: number; totalStock: number; totalValue: number }> = {};
+
+    items.forEach(item => {
+      const cat = item.category as string;
+      if (!categoryMap[cat]) categoryMap[cat] = { category: cat, itemCount: 0, totalStock: 0, totalValue: 0 };
+      categoryMap[cat].itemCount += 1;
+      categoryMap[cat].totalStock += item.currentStock || 0;
+      categoryMap[cat].totalValue += (item.currentStock || 0) * (item.costPrice || 0);
+    });
+
+    return Object.values(categoryMap).map(r => ({
+      ...r,
+      totalStock: Number(r.totalStock.toFixed(2)),
+      totalValue: Number(r.totalValue.toFixed(2))
+    }));
+  }
+
+  static async getExpensesReportData(franchiseId?: string, startDate?: string, endDate?: string, category?: string) {
+    const where: any = {
+      ...(franchiseId ? { franchiseId } : {}),
+      isCancelled: false
+    };
+    if (startDate || endDate) {
+      where.date = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+    if (category) where.category = category;
+
+    const expenses = await prisma.expense.findMany({
+      where,
+      include: { account: true },
+      orderBy: { date: 'desc' }
+    });
+
+    const categoryMap: Record<string, { category: string; count: number; totalAmount: number; paidAmount: number; unpaidAmount: number }> = {};
+
+    expenses.forEach(e => {
+      const cat = e.category || 'GENERAL';
+      if (!categoryMap[cat]) categoryMap[cat] = { category: cat, count: 0, totalAmount: 0, paidAmount: 0, unpaidAmount: 0 };
+      categoryMap[cat].count += 1;
+      categoryMap[cat].totalAmount += e.amount;
+      categoryMap[cat].paidAmount += e.paidAmount || 0;
+      categoryMap[cat].unpaidAmount += e.amount - (e.paidAmount || 0);
+    });
+
+    const totalAmount = expenses.reduce((s, e) => s + e.amount, 0);
+    const totalPaid = expenses.reduce((s, e) => s + (e.paidAmount || 0), 0);
+
+    return {
+      expenses,
+      categoryBreakdown: Object.values(categoryMap),
+      summary: {
+        totalExpenses: Number(totalAmount.toFixed(2)),
+        totalPaid: Number(totalPaid.toFixed(2)),
+        totalUnpaid: Number((totalAmount - totalPaid).toFixed(2)),
+        count: expenses.length
+      }
+    };
   }
 
   static async getSalePurchaseByPartyGroupData(franchiseId: string, startDate?: string, endDate?: string) {
-    return [
-      {
-        groupName: "General",
-        saleAmount: 350.00,
-        purchaseAmount: 0.00
-      }
-    ];
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [customers, vendors] = await Promise.all([
+      prisma.customer.findMany({
+        where: { franchiseId },
+        include: {
+          orders: {
+            where: { status: { not: 'CANCELLED' as any }, ...dateFilter }
+          }
+        }
+      }),
+      prisma.vendor.findMany({
+        include: {
+          orders: {
+            where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter }
+          }
+        }
+      })
+    ]);
+
+    const groupMap: Record<string, { groupName: string; saleAmount: number; purchaseAmount: number }> = {};
+
+    customers.forEach(c => {
+      const group = 'Customers';
+      if (!groupMap[group]) groupMap[group] = { groupName: group, saleAmount: 0, purchaseAmount: 0 };
+      groupMap[group].saleAmount += c.orders.reduce((s, o) => s + o.totalAmount, 0);
+    });
+
+    vendors.forEach(v => {
+      const group = v.category || 'Vendors';
+      if (!groupMap[group]) groupMap[group] = { groupName: group, saleAmount: 0, purchaseAmount: 0 };
+      groupMap[group].purchaseAmount += v.orders.reduce((s, o) => s + o.totalAmount, 0);
+    });
+
+    return Object.values(groupMap);
+  }
+
+  static async getAllPartiesData(franchiseId?: string, startDate?: string, endDate?: string) {
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [customers, vendors] = await Promise.all([
+      prisma.customer.findMany({
+        where: franchiseId ? { franchiseId } : undefined,
+        include: { ledgerEntries: { where: dateFilter } }
+      }),
+      prisma.vendor.findMany({
+        include: { ledgerEntries: { where: dateFilter } }
+      })
+    ]);
+
+    const parties: any[] = [];
+
+    customers.forEach(c => {
+      const currentBalance = c.ledgerEntries.reduce((sum, entry) => {
+        if (entry.type === 'DEBIT') return sum + entry.amount;
+        if (entry.type === 'CREDIT') return sum - entry.amount;
+        return sum;
+      }, 0);
+
+      parties.push({
+        id: c.id,
+        name: c.name,
+        email: c.email,
+        phone: c.phone,
+        currentBalance,
+        creditLimit: null
+      });
+    });
+
+    vendors.forEach(v => {
+      const currentBalance = v.ledgerEntries.reduce((sum, entry) => {
+        if (entry.type === 'CREDIT') return sum - entry.amount;
+        if (entry.type === 'DEBIT') return sum + entry.amount;
+        return sum;
+      }, 0);
+
+      parties.push({
+        id: v.id,
+        name: v.name,
+        email: v.email,
+        phone: v.contact,
+        currentBalance,
+        creditLimit: v.creditLimit
+      });
+    });
+
+    return parties.sort((a, b) => a.name.localeCompare(b.name));
   }
 }
 
