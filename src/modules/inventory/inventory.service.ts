@@ -33,11 +33,11 @@ export function getStockInPhysicalUnit(stock: number, sku: string, category?: st
 export class InventoryService {
   // Compute current stock from movement ledger — single source of truth
   static async computeStock(itemId: string, tx: any = prisma): Promise<number> {
-    const result = await tx.stockMovement.aggregate({
+    const movements = await tx.stockMovement.findMany({
       where: { itemId },
-      _sum: { quantity: true },
+      select: { quantity: true, baseQty: true }
     });
-    return result._sum.quantity ?? 0;
+    return movements.reduce((acc: number, m: any) => acc + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
   }
 
   static async getInventory(franchiseId: string, includeInactive = false) {
@@ -61,12 +61,15 @@ export class InventoryService {
     });
 
     // Recompute stock from all movements for accuracy
-    const allMovements = await prisma.stockMovement.groupBy({
-      by: ['itemId'],
+    const allMovements = await prisma.stockMovement.findMany({
       where: { item: { franchiseId } },
-      _sum: { quantity: true },
+      select: { itemId: true, quantity: true, baseQty: true },
     });
-    const stockMap = new Map(allMovements.map(m => [m.itemId, m._sum.quantity ?? 0]));
+    const stockMap = new Map<string, number>();
+    allMovements.forEach(m => {
+      const val = m.baseQty !== null ? m.baseQty : m.quantity;
+      stockMap.set(m.itemId, (stockMap.get(m.itemId) || 0) + val);
+    });
 
     // Identify which items have EVER been purchased (from movements or linked vendor)
     const itemsWithPurchaseMovements = await prisma.stockMovement.findMany({
@@ -99,8 +102,8 @@ export class InventoryService {
       const computedStock = hasMovements ? (stockMap.get(item.id) ?? 0) : item.currentStock;
 
       const todayMoves = movementsToday.filter(m => m.itemId === item.id);
-      const inbound = todayMoves.filter(m => m.quantity > 0).reduce((s, m) => s + m.quantity, 0);
-      const outbound = Math.abs(todayMoves.filter(m => m.quantity < 0).reduce((s, m) => s + m.quantity, 0));
+      const inbound = todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) > 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
+      const outbound = Math.abs(todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) < 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0));
 
       const physicalStock = getStockInPhysicalUnit(computedStock, item.sku, item.category);
       const status = physicalStock <= item.minimumStock ? 'LOW' : 'SAFE';
@@ -526,6 +529,8 @@ export class InventoryService {
       itemId: string;
       type: string;
       quantity: number;
+      baseQty?: number;
+      unitId?: string;
       referenceType?: string;
       referenceId?: string;
       note?: string;
@@ -533,9 +538,11 @@ export class InventoryService {
       warehouseId?: string;
     }
   ) {
+    const stockChange = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
+    
     const updatedItem = await tx.inventoryItem.update({
       where: { id: data.itemId },
-      data: { currentStock: { increment: data.quantity } },
+      data: { currentStock: { increment: stockChange } },
     });
 
     await tx.stockMovement.create({
@@ -543,6 +550,8 @@ export class InventoryService {
         itemId: data.itemId,
         movementType: data.type as any,
         quantity: data.quantity,
+        baseQty: data.baseQty,
+        unitId: data.unitId,
         referenceType: data.referenceType,
         referenceId: data.referenceId,
         note: data.note,
@@ -552,6 +561,40 @@ export class InventoryService {
     });
 
     return updatedItem;
+  }
+  
+  // New helper for unit conversion engine
+  static async convertUnitToBase(itemId: string, unitIdOrName: string, enteredQty: number, tx: any = prisma): Promise<{ requiredBaseQty: number; unitId?: string }> {
+    const item = await tx.inventoryItem.findUnique({
+      where: { id: itemId },
+      include: { baseUnit: true, conversions: { include: { unit: true } } }
+    });
+    
+    if (!item) throw new Error("Item not found");
+    
+    // If no unit requested, assume base quantity
+    if (!unitIdOrName || unitIdOrName === "NONE" || unitIdOrName === item.unit) {
+      return { requiredBaseQty: enteredQty };
+    }
+    
+    // Look for conversion
+    const conversion = item.conversions.find((c: any) => c.unitId === unitIdOrName || c.unit.name.toLowerCase() === unitIdOrName.toLowerCase() || c.unit.shortName.toLowerCase() === unitIdOrName.toLowerCase());
+    
+    if (conversion) {
+      return { requiredBaseQty: enteredQty * conversion.multiplier, unitId: conversion.unit.id };
+    }
+    
+    // If requested unit is explicitly the base unit
+    if (item.baseUnit && (item.baseUnit.id === unitIdOrName || item.baseUnit.name.toLowerCase() === unitIdOrName.toLowerCase() || item.baseUnit.shortName.toLowerCase() === unitIdOrName.toLowerCase())) {
+      return { requiredBaseQty: enteredQty, unitId: item.baseUnit.id };
+    }
+    
+    // If no conversion found, fallback to 1:1 if unit strings match, else Error
+    if (item.unit && item.unit.toLowerCase() === unitIdOrName.toLowerCase()) {
+      return { requiredBaseQty: enteredQty };
+    }
+    
+    throw new Error(`No unit conversion found for item ${item.name} to unit ${unitIdOrName}`);
   }
 
   static async getMovements(filters: any) {
