@@ -47,18 +47,43 @@ export class SalesService {
         { customerName: { contains: filters.search, mode: 'insensitive' } }
       ];
     }
-    return prisma.quotation.findMany({
+    const quotations = await prisma.quotation.findMany({
       where,
       include: { customer: true, items: true },
       orderBy: { createdAt: 'desc' }
     });
+
+    const orderIds = quotations.map(q => q.convertedOrderId).filter(Boolean) as string[];
+    if (orderIds.length > 0) {
+      const orders = await prisma.salesOrder.findMany({
+        where: { id: { in: orderIds } },
+        select: { id: true, orderNumber: true }
+      });
+      const orderMap = new Map(orders.map(o => [o.id, o.orderNumber]));
+      return quotations.map(q => ({
+        ...q,
+        convertedOrderNumber: q.convertedOrderId ? orderMap.get(q.convertedOrderId) : null
+      }));
+    }
+    return quotations.map(q => ({ ...q, convertedOrderNumber: null }));
   }
 
   static async getQuotationById(id: string) {
-    return prisma.quotation.findUnique({
+    const quotation = await prisma.quotation.findUnique({
       where: { id },
       include: { customer: true, items: true }
     });
+    if (quotation && quotation.convertedOrderId) {
+      const order = await prisma.salesOrder.findUnique({
+        where: { id: quotation.convertedOrderId },
+        select: { orderNumber: true }
+      });
+      return {
+        ...quotation,
+        convertedOrderNumber: order?.orderNumber || null
+      };
+    }
+    return quotation ? { ...quotation, convertedOrderNumber: null } : null;
   }
 
   static async createQuotation(data: {
@@ -72,18 +97,21 @@ export class SalesService {
     termsConditions?: string;
     notes?: string;
     createdBy?: string;
+    quotationNumber?: string;
+    status?: string;
   }) {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
 
     return prisma.quotation.create({
       data: {
-        quotationNumber: generateQuotationNumber(),
+        quotationNumber: data.quotationNumber || generateQuotationNumber(),
         customerId: data.customerId,
         customerName: data.customerName,
         customerPhone: data.customerPhone,
         customerEmail: data.customerEmail,
         validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
+        status: (data.status as any) || undefined,
         subTotal,
         taxAmount,
         discountAmount: discount,
@@ -108,19 +136,99 @@ export class SalesService {
     });
   }
 
-  static async updateQuotation(id: string, data: { status?: string; notes?: string; termsConditions?: string; validUntil?: string }) {
-    return prisma.quotation.update({
-      where: { id },
-      data: {
-        ...data,
-        status: data.status as any,
-        validUntil: data.validUntil ? new Date(data.validUntil) : undefined
-      },
-      include: { items: true }
+  static async updateQuotation(id: string, data: {
+    customerId?: string;
+    customerName?: string;
+    customerPhone?: string;
+    customerEmail?: string;
+    status?: string;
+    notes?: string;
+    termsConditions?: string;
+    validUntil?: string;
+    items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    discountAmount?: number;
+    quotationNumber?: string;
+    trackingNumber?: string;
+    courierName?: string;
+  }) {
+    const updateData: any = {
+      customerId: data.customerId,
+      customerName: data.customerName,
+      customerPhone: data.customerPhone,
+      customerEmail: data.customerEmail,
+      status: data.status as any,
+      notes: data.notes,
+      termsConditions: data.termsConditions,
+      validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
+      quotationNumber: data.quotationNumber,
+      trackingNumber: data.trackingNumber,
+      courierName: data.courierName
+    };
+
+    return prisma.$transaction(async (tx) => {
+      if (data.items) {
+        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
+        const discount = data.discountAmount || 0;
+        
+        updateData.subTotal = subTotal;
+        updateData.taxAmount = taxAmount;
+        updateData.discountAmount = discount;
+        updateData.totalAmount = totalAmount - discount;
+
+        // Delete old items
+        await tx.quotationItem.deleteMany({ where: { quotationId: id } });
+        
+        // Recreate items
+        updateData.items = {
+          create: computed.map((item) => ({
+            productId: item.productId,
+            productName: item.productName,
+            quantity: item.quantity,
+            unit: item.unit,
+            rate: item.rate,
+            taxPercent: item.taxPercent || 0,
+            taxAmount: item.taxAmount,
+            totalAmount: item.totalAmount
+          }))
+        };
+      }
+
+      const updated = await tx.quotation.update({
+        where: { id },
+        data: updateData,
+        include: { customer: true, items: true }
+      });
+
+      if (updated.convertedOrderId) {
+        await tx.salesOrder.update({
+          where: { id: updated.convertedOrderId },
+          data: {
+            trackingNumber: data.trackingNumber || undefined,
+            courierName: data.courierName || undefined
+          }
+        });
+      }
+      return updated;
     });
   }
 
-  static async convertQuotationToOrder(quotationId: string, createdBy?: string) {
+  static async deleteQuotation(id: string) {
+    return prisma.$transaction(async (tx) => {
+      await tx.quotationItem.deleteMany({ where: { quotationId: id } });
+      return tx.quotation.delete({ where: { id } });
+    });
+  }
+
+  static async convertQuotationToOrder(
+    quotationId: string,
+    createdBy?: string,
+    trackingData?: {
+      trackingNumber?: string;
+      courierName?: string;
+      deliveryDate?: string;
+      deliveryAddress?: string;
+    }
+  ) {
     const quotation = await prisma.quotation.findUnique({
       where: { id: quotationId },
       include: { items: true }
@@ -137,6 +245,10 @@ export class SalesService {
         taxAmount: quotation.taxAmount,
         discountAmount: quotation.discountAmount,
         totalAmount: quotation.totalAmount,
+        deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
+        deliveryAddress: trackingData?.deliveryAddress || undefined,
+        trackingNumber: trackingData?.trackingNumber || undefined,
+        courierName: trackingData?.courierName || undefined,
         notes: quotation.notes,
         createdBy,
         items: {
@@ -157,7 +269,12 @@ export class SalesService {
 
     await prisma.quotation.update({
       where: { id: quotationId },
-      data: { status: 'CONVERTED', convertedOrderId: salesOrder.id }
+      data: {
+        status: 'CONVERTED',
+        convertedOrderId: salesOrder.id,
+        trackingNumber: trackingData?.trackingNumber || undefined,
+        courierName: trackingData?.courierName || undefined
+      }
     });
 
     return salesOrder;

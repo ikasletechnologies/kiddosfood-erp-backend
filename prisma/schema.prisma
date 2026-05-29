@@ -30,6 +30,18 @@ model Customer {
   phone         String?          @unique
   email         String?          @unique
   loyaltyPoints Float            @default(0)
+  address            String?
+  state              String?
+  district           String?
+  city               String?
+  pincode            String?
+  shippingAddress    String?
+  gstNumber          String?
+  gstType            String?
+  openingBalance     Float             @default(0)
+  openingBalanceType String?
+  asOfDate           DateTime?
+  creditLimit        Float?
   createdAt     DateTime         @default(now())
   updatedAt     DateTime         @updatedAt
   franchiseId   String?
@@ -938,6 +950,8 @@ model Quotation {
   notes            String?
   createdBy        String?
   convertedOrderId String?
+  trackingNumber   String?
+  courierName      String?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
   customer         Customer?       @relation(fields: [customerId], references: [id])
@@ -971,6 +985,8 @@ model SalesOrder {
   totalAmount     Float
   deliveryDate    DateTime?
   deliveryAddress String?
+  trackingNumber  String?
+  courierName     String?
   notes           String?
   createdBy       String?
   createdAt       DateTime         @default(now())
