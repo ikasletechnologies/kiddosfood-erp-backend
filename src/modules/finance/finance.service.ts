@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { AccountService } from './account.service';
+import { POSService } from '../pos/pos.service';
 
 export class FinanceService {
   /**
@@ -1111,6 +1112,7 @@ export class FinanceService {
     description?: string;
     notes?: string;
     createdBy?: string;
+    invoiceNumber?: string;
   }) {
     return prisma.$transaction(async (tx) => {
       let subTotal = 0;
@@ -1155,7 +1157,7 @@ export class FinanceService {
       const orderCount = await tx.order.count({
         where: { createdAt: { gte: new Date(year, 0, 1) } }
       });
-      const invoiceNum = `INV-${year}-${(orderCount + 1).toString().padStart(4, '0')}`;
+      const invoiceNum = data.invoiceNumber || `INV-${year}-${(orderCount + 1).toString().padStart(4, '0')}`;
 
       const received = data.receivedAmount || 0;
       let paymentStatus = 'UNPAID';
@@ -1276,6 +1278,9 @@ export class FinanceService {
           }
         });
       }
+
+      // Automatically deduct inventory based on the items sold
+      await POSService.deductInventoryIfNecessary(order.id, tx);
 
       return {
         ...invoice,

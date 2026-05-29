@@ -143,8 +143,8 @@ export class POSService {
   }
 
   // Core Deduction Engine wrapped in DB Transaction
-  static async deductInventoryIfNecessary(orderId: string) {
-    return prisma.$transaction(async (tx) => {
+  static async deductInventoryIfNecessary(orderId: string, externalTx?: any) {
+    const run = async (tx: any) => {
        const order = await tx.order.findUnique({
           where: { id: orderId },
           include: { orderItems: { include: { product: { include: { recipe: { include: { recipeItems: true } } } } } } }
@@ -200,14 +200,21 @@ export class POSService {
              });
 
              if (inventoryItem) {
-                if (inventoryItem.currentStock < orderItem.quantity) {
-                  throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${orderItem.quantity}, Stock: ${inventoryItem.currentStock}`);
+                // Apply unit conversion
+                const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, orderItem.unit || 'NONE', orderItem.quantity, tx);
+                const requiredBaseQty = conversionResult.requiredBaseQty;
+                const unitId = conversionResult.unitId;
+
+                if (inventoryItem.currentStock < requiredBaseQty) {
+                  throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
                 }
 
                 await InventoryService.recordMovement(tx, {
                   itemId: inventoryItem.id,
                   type: 'SALES_OUT',
-                  quantity: -orderItem.quantity,
+                  quantity: -orderItem.quantity, // original selected quantity
+                  baseQty: -requiredBaseQty,     // converted base quantity
+                  unitId: unitId,
                   referenceType: 'ORDER',
                   referenceId: order.id,
                   note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
@@ -223,7 +230,8 @@ export class POSService {
          data: { inventory_deducted: true },
          include: { orderItems: true }
        });
-    });
+    };
+    return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
 
   // Step 5: Finalize Payment
@@ -418,10 +426,21 @@ export class POSService {
             });
 
             if (inventoryItem) {
+              const itemUnit = (item as any).unit || 'NONE';
+              const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, itemUnit, item.quantity, tx);
+              const requiredBaseQty = conversionResult.requiredBaseQty;
+              const unitId = conversionResult.unitId;
+
+              if (inventoryItem.currentStock < requiredBaseQty) {
+                throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
+              }
+
               await InventoryService.recordMovement(tx, {
                 itemId: inventoryItem.id,
                 type: 'SALES_OUT',
                 quantity: -item.quantity,
+                baseQty: -requiredBaseQty,
+                unitId: unitId,
                 referenceType: 'ORDER',
                 referenceId: order.id,
                 note: `Direct stock reduction: ${item.quantity}x ${product.name}`

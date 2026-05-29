@@ -46,10 +46,19 @@ export class SalesController {
     }
   }
 
+  static async deleteQuotation(req: Request, res: Response) {
+    try {
+      await SalesService.deleteQuotation(req.params.id);
+      res.json({ message: 'Quotation deleted successfully' });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
   static async convertQuotation(req: Request, res: Response) {
     try {
       const createdBy = (req as any).user?.id;
-      const salesOrder = await SalesService.convertQuotationToOrder(req.params.id, createdBy);
+      const salesOrder = await SalesService.convertQuotationToOrder(req.params.id, createdBy, req.body);
       res.status(201).json(salesOrder);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

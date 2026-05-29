@@ -30,6 +30,18 @@ model Customer {
   phone         String?          @unique
   email         String?          @unique
   loyaltyPoints Float            @default(0)
+  address            String?
+  state              String?
+  district           String?
+  city               String?
+  pincode            String?
+  shippingAddress    String?
+  gstNumber          String?
+  gstType            String?
+  openingBalance     Float             @default(0)
+  openingBalanceType String?
+  asOfDate           DateTime?
+  creditLimit        Float?
   createdAt     DateTime         @default(now())
   updatedAt     DateTime         @updatedAt
   franchiseId   String?
@@ -184,6 +196,9 @@ model InventoryItem {
   requestItems         StockRequestItem[]
   transferItems        StockTransferItem[]
   vendors              VendorMaterial[]
+  conversions          ItemUnitConversion[]
+  baseUnitId           String?
+  baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
 
   @@unique([sku, franchiseId])
 }
@@ -193,6 +208,8 @@ model StockMovement {
   itemId        String
   movementType  StockMovementType
   quantity      Float
+  baseQty       Float?
+  unitId        String?
   referenceType String?
   referenceId   String?
   note          String?
@@ -203,6 +220,7 @@ model StockMovement {
   bin           WarehouseBin?     @relation(fields: [binId], references: [id])
   item          InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
   warehouse     Warehouse?        @relation(fields: [warehouseId], references: [id])
+  unit          Unit?             @relation(fields: [unitId], references: [id])
 }
 
 model Vendor {
@@ -932,6 +950,8 @@ model Quotation {
   notes            String?
   createdBy        String?
   convertedOrderId String?
+  trackingNumber   String?
+  courierName      String?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
   customer         Customer?       @relation(fields: [customerId], references: [id])
@@ -965,6 +985,8 @@ model SalesOrder {
   totalAmount     Float
   deliveryDate    DateTime?
   deliveryAddress String?
+  trackingNumber  String?
+  courierName     String?
   notes           String?
   createdBy       String?
   createdAt       DateTime         @default(now())
@@ -1595,6 +1617,26 @@ enum PRStatus {
   REJECTED
   CONVERTED_TO_RFQ
   CONVERTED_TO_PO
+}
+
+model Unit {
+  id                  String               @id @default(uuid())
+  name                String
+  shortName           String
+  items               InventoryItem[]
+  conversions         ItemUnitConversion[]
+  stockMovements      StockMovement[]
+}
+
+model ItemUnitConversion {
+  id         String        @id @default(uuid())
+  itemId     String
+  unitId     String
+  multiplier Float
+  item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  unit       Unit          @relation(fields: [unitId], references: [id])
+  
+  @@unique([itemId, unitId])
 }
 
 enum RFQMasterStatus {

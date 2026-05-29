@@ -516,6 +516,7 @@ app.get('/api/sales/quotations', authenticate, authorizeRole(['FRANCHISE_ADMIN']
 app.post('/api/sales/quotations', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createQuotation);
 app.get('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getQuotation);
 app.patch('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateQuotation);
+app.delete('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.deleteQuotation);
 app.post('/api/sales/quotations/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotation);
 
 app.get('/api/sales/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getSalesOrders);

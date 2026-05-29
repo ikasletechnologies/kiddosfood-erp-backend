@@ -27,7 +27,8 @@ export class ProductService {
             { sku: { in: skus } },
             { name: { in: names, mode: 'insensitive' } }
           ]
-        }
+        },
+        include: { baseUnit: true, conversions: { include: { unit: true } } }
       });
       console.log(`📦 [ProductAPI] Found ${inventory.length} matching inventory items for stock display`);
       
@@ -42,7 +43,9 @@ export class ProductService {
           currentStock: inv ? inv.currentStock : 0,
           inventoryFranchiseId: inv ? inv.franchiseId : (franchiseId || null),
           inventoryBasePrice: inv ? inv.basePrice : null,
-          inventoryCostPrice: inv ? inv.costPrice : null
+          inventoryCostPrice: inv ? inv.costPrice : null,
+          baseUnit: inv ? inv.baseUnit : null,
+          conversions: inv ? inv.conversions : []
         };
       });
     }

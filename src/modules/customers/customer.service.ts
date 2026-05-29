@@ -36,12 +36,56 @@ export class CustomerService {
     });
   }
 
-  static async create(data: { name: string; phone?: string; email?: string; franchiseId?: string }) {
-    return prisma.customer.create({ data });
+  static async create(data: {
+    name: string;
+    phone?: string;
+    email?: string;
+    franchiseId?: string;
+    address?: string;
+    state?: string;
+    district?: string;
+    city?: string;
+    pincode?: string;
+    shippingAddress?: string;
+    gstNumber?: string;
+    gstType?: string;
+    openingBalance?: number;
+    openingBalanceType?: string;
+    asOfDate?: string | Date;
+    creditLimit?: number | null;
+  }) {
+    return prisma.customer.create({
+      data: {
+        ...data,
+        asOfDate: data.asOfDate ? new Date(data.asOfDate) : undefined,
+      }
+    });
   }
 
-  static async update(id: string, data: { name?: string; phone?: string; email?: string }) {
-    return prisma.customer.update({ where: { id }, data });
+  static async update(id: string, data: {
+    name?: string;
+    phone?: string;
+    email?: string;
+    address?: string;
+    state?: string;
+    district?: string;
+    city?: string;
+    pincode?: string;
+    shippingAddress?: string;
+    gstNumber?: string;
+    gstType?: string;
+    openingBalance?: number;
+    openingBalanceType?: string;
+    asOfDate?: string | Date | null;
+    creditLimit?: number | null;
+  }) {
+    return prisma.customer.update({
+      where: { id },
+      data: {
+        ...data,
+        asOfDate: data.asOfDate === null ? null : (data.asOfDate ? new Date(data.asOfDate) : undefined),
+      }
+    });
   }
 
   static async delete(id: string) {
