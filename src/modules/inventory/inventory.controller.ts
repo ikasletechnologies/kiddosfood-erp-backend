@@ -185,4 +185,60 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getRawMaterialStockSummary(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+
+      if (!franchiseId) {
+        const franchises = await prisma.franchise.findMany({ take: 1 });
+        franchiseId = franchises[0]?.id || 'hq-001';
+      }
+
+      const summary = await InventoryService.getRawMaterialStockSummary(franchiseId);
+      res.json(summary);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getRawMaterialConsumption(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+
+      if (!franchiseId) {
+        const franchises = await prisma.franchise.findMany({ take: 1 });
+        franchiseId = franchises[0]?.id || 'hq-001';
+      }
+
+      const consumption = await InventoryService.getRawMaterialConsumption(franchiseId);
+      res.json(consumption);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getRawMaterialLedger(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { itemId } = req.query;
+
+      if (!franchiseId) {
+        const franchises = await prisma.franchise.findMany({ take: 1 });
+        franchiseId = franchises[0]?.id || 'hq-001';
+      }
+
+      const ledger = await InventoryService.getRawMaterialLedger(franchiseId, itemId as string | undefined);
+      res.json(ledger);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }
+

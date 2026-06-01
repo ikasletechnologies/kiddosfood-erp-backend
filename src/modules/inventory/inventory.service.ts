@@ -612,4 +612,170 @@ export class InventoryService {
       return physicalStock <= item.minimumStock;
     });
   }
+
+  static async getRawMaterialStockSummary(franchiseId: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: {
+        franchiseId,
+        isActive: true,
+        category: 'RAW_MATERIAL'
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    const thirtyDaysFromNow = new Date();
+    thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
+
+    const summary = await Promise.all(items.map(async item => {
+      const availableStock = await this.computeStock(item.id);
+
+      const reserved = await prisma.productionItem.aggregate({
+        where: {
+          inventoryItemId: item.id,
+          production: {
+            status: { in: ['PENDING', 'IN_PROGRESS'] }
+          }
+        },
+        _sum: { usedQuantity: true }
+      });
+      const reservedStock = reserved._sum.usedQuantity || 0;
+
+      const nearExpiry = await prisma.inventoryBatch.aggregate({
+        where: {
+          inventoryItemId: item.id,
+          expDate: {
+            gte: new Date(),
+            lte: thirtyDaysFromNow
+          },
+          currentQty: { gt: 0 }
+        },
+        _sum: { currentQty: true }
+      });
+      const nearExpiryStock = nearExpiry._sum.currentQty || 0;
+
+      const damaged = await prisma.stockMovement.aggregate({
+        where: {
+          itemId: item.id,
+          movementType: 'WASTE_OUT',
+          OR: [
+            { note: { contains: 'damage', mode: 'insensitive' } },
+            { note: 'WASTE_DAMAGED' }
+          ]
+        },
+        _sum: { quantity: true }
+      });
+      const damagedStock = Math.abs(damaged._sum.quantity || 0);
+
+      return {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        unit: item.unit,
+        minimumStock: item.minimumStock,
+        costPrice: item.costPrice || 0,
+        availableStock,
+        reservedStock,
+        nearExpiryStock,
+        damagedStock
+      };
+    }));
+
+    return summary;
+  }
+
+  static async getRawMaterialConsumption(franchiseId: string) {
+    const movements = await prisma.stockMovement.findMany({
+      where: {
+        item: {
+          franchiseId,
+          category: 'RAW_MATERIAL'
+        },
+        quantity: { lt: 0 }
+      },
+      include: {
+        item: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    return movements.map(m => {
+      let consumptionType = 'Production Consumption';
+      if (m.movementType === 'WASTE_OUT' && m.note?.toLowerCase().includes('expire')) {
+        consumptionType = 'Expiry';
+      } else if (m.movementType === 'WASTE_OUT' && (m.note?.toLowerCase().includes('damage') || m.note === 'WASTE_DAMAGED')) {
+        consumptionType = 'Damage';
+      }
+
+      const qty = Math.abs(m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity);
+      const value = qty * (m.item.costPrice || 0);
+
+      return {
+        id: m.id,
+        date: m.createdAt,
+        itemName: m.item.name,
+        sku: m.item.sku,
+        unit: m.item.unit,
+        quantity: qty,
+        consumptionType,
+        value,
+        notes: m.note || ''
+      };
+    });
+  }
+
+  static async getRawMaterialLedger(franchiseId: string, itemId?: string) {
+    const movements = await prisma.stockMovement.findMany({
+      where: {
+        item: {
+          franchiseId,
+          category: 'RAW_MATERIAL',
+          ...(itemId ? { id: itemId } : {})
+        }
+      },
+      include: {
+        item: true
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const runningBalances = new Map<string, number>();
+    const ledger = movements.map(m => {
+      const qty = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
+      const currentBal = runningBalances.get(m.itemId) || 0;
+      const newBal = currentBal + qty;
+      runningBalances.set(m.itemId, newBal);
+
+      let transactionType = 'Other';
+      if (m.movementType === 'PURCHASE_IN') transactionType = 'GRN Inward';
+      else if (m.movementType === 'PRODUCTION_OUT') transactionType = 'Production Outward';
+      else if (m.movementType === 'PRODUCTION_IN') transactionType = 'Production Inward';
+      else if (m.movementType === 'WASTE_OUT') {
+        if (m.note?.toLowerCase().includes('expire')) transactionType = 'Expiry Outward';
+        else if (m.note?.toLowerCase().includes('damage')) transactionType = 'Damage Outward';
+        else transactionType = 'Waste Disposal';
+      }
+      else if (m.movementType === 'ADJUSTMENT') transactionType = 'Stock Adjustment';
+      else if (m.movementType === 'TRANSFER_IN') transactionType = 'Stock Transfer In';
+      else if (m.movementType === 'TRANSFER_OUT') transactionType = 'Stock Transfer Out';
+
+      return {
+        id: m.id,
+        date: m.createdAt,
+        itemId: m.itemId,
+        itemName: m.item.name,
+        sku: m.item.sku,
+        unit: m.item.unit,
+        transactionType,
+        inwardQty: qty > 0 ? qty : 0,
+        outwardQty: qty < 0 ? Math.abs(qty) : 0,
+        runningBalance: newBal,
+        referenceId: m.referenceId || '',
+        notes: m.note || '',
+        actor: m.createdBy || 'System'
+      };
+    });
+
+    return ledger.reverse();
+  }
 }
+
