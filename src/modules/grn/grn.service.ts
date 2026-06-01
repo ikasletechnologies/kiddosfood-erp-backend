@@ -134,7 +134,8 @@ export class GRNService {
           quantity: item.receivedQty,
           referenceType: 'GRN',
           referenceId: grnId,
-          note: `Auto-approved via GRN ${grnId}`
+          note: `Auto-approved via GRN ${grnId}`,
+          warehouseId: item.warehouseId || undefined
         });
 
         await tx.inventoryItem.update({

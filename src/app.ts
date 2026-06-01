@@ -152,6 +152,9 @@ app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserC
 // Other Business Modules
 // Inventory & Stock Management
 app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getInventory);
+app.get('/api/inventory/raw-materials/summary', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialStockSummary);
+app.get('/api/inventory/raw-materials/consumption', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialConsumption);
+app.get('/api/inventory/raw-materials/ledger', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialLedger);
 app.get('/api/inventory/items/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getItem);
 app.post('/api/inventory/items', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.createItem);
 app.post('/api/inventory/stock-in', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.stockIn);
