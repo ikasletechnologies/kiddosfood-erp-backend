@@ -1101,6 +1101,7 @@ export class FinanceService {
       rate: number;
       gst: number;
       discount?: number;
+      batchNumber?: string;
     }[];
     receivedAmount?: number;
     paymentMode?: any;
@@ -1127,6 +1128,7 @@ export class FinanceService {
         discountPct: number;
         taxAmount: number;
         totalAmount: number;
+        batchNumber: string | null;
       }[] = [];
 
       for (const item of data.items) {
@@ -1148,7 +1150,8 @@ export class FinanceService {
           price: item.rate,
           discountPct: item.discount || 0,
           taxAmount: itemTax,
-          totalAmount: itemSubtotal - itemDiscount + itemTax
+          totalAmount: itemSubtotal - itemDiscount + itemTax,
+          batchNumber: item.batchNumber || null
         });
       }
 
@@ -1353,7 +1356,8 @@ export class FinanceService {
           qty: item.quantity,
           price: item.price,
           taxAmount: item.taxAmount,
-          totalAmount: item.totalAmount
+          totalAmount: item.totalAmount,
+          batchNumber: item.batchNumber || null
         })),
         isCancelled: order.status === 'CANCELLED',
         createdBy: 'System',

@@ -176,7 +176,7 @@ export class ProcurementService {
 
       return {
         ...v,
-        totalPurchased,
+        totalPurchased: totalOwedByUs,
         totalPaid: totalPaidToThem, 
         balance: balance,
         due: balance > 0 ? balance : 0,         // We owe them
@@ -938,8 +938,8 @@ export class ProcurementService {
       return { current: 0, thirtySixty: 0, sixtyNinety: 0, overNinety: 0 };
     }
 
-    let totalCredits = ledger.filter(e => e.type === 'CREDIT').reduce((s, e) => s + e.amount, 0);
-    const debits = ledger.filter(e => e.type === 'DEBIT');
+    let totalDebits = ledger.filter(e => e.type === 'DEBIT').reduce((s, e) => s + (e.amount || 0), 0);
+    const credits = ledger.filter(e => e.type === 'CREDIT');
 
     const buckets = {
       current: 0, // 0-30 days
@@ -950,22 +950,22 @@ export class ProcurementService {
 
     const now = new Date();
 
-    for (const debit of debits) {
-      let remainingDebit = debit.amount;
+    for (const credit of credits) {
+      let remainingCredit = credit.amount;
       
-      // Settle against credits (FIFO)
-      const settlement = Math.min(remainingDebit, totalCredits);
-      remainingDebit -= settlement;
-      totalCredits -= settlement;
+      // Settle against debits (FIFO)
+      const settlement = Math.min(remainingCredit, totalDebits);
+      remainingCredit -= settlement;
+      totalDebits -= settlement;
 
-      if (remainingDebit > 0) {
-        const createdAt = debit.createdAt || new Date();
+      if (remainingCredit > 0) {
+        const createdAt = credit.createdAt || new Date();
         const ageInDays = Math.floor((now.getTime() - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24));
         
-        if (ageInDays <= 30) buckets.current += remainingDebit;
-        else if (ageInDays <= 60) buckets.thirtySixty += remainingDebit;
-        else if (ageInDays <= 90) buckets.sixtyNinety += remainingDebit;
-        else buckets.overNinety += remainingDebit;
+        if (ageInDays <= 30) buckets.current += remainingCredit;
+        else if (ageInDays <= 60) buckets.thirtySixty += remainingCredit;
+        else if (ageInDays <= 90) buckets.sixtyNinety += remainingCredit;
+        else buckets.overNinety += remainingCredit;
       }
     }
 

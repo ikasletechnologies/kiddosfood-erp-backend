@@ -70,14 +70,15 @@ export class GRNService {
             const qty = Number(item.orderedQty ?? poItem?.quantity ?? 0);
             const price = Number(item.price ?? poItem?.price ?? 0);
             const received = Number(item.receivedQty ?? 0);
-            const accepted = Number(item.acceptedQty ?? received); 
+            const rejected = Number(item.rejectedQty ?? 0);
+            const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected)); 
             
             return {
               materialId: item.materialId,
               quantity: qty,
               receivedQty: received,
               acceptedQty: accepted,
-              rejectedQty: Number(item.rejectedQty ?? 0),
+              rejectedQty: rejected,
               price: price,
               qcStatus: (item.qcStatus as any) || 'PENDING',
               vendorBatchNo: item.vendorBatchNo,
@@ -111,7 +112,7 @@ export class GRNService {
       let someReceived = false;
 
       for (const item of grn.items) {
-        if (item.receivedQty <= 0) continue;
+        if (item.acceptedQty <= 0) continue;
 
         // 1. Create Inventory Batch (Directly APPROVED for streamlined flow)
         const batch = await tx.inventoryBatch.create({
@@ -121,8 +122,8 @@ export class GRNService {
             lotNumber: item.lotNumber,
             mfgDate: item.mfgDate,
             expDate: item.expDate,
-            initialQty: item.receivedQty,
-            currentQty: item.receivedQty, // Usable immediately
+            initialQty: item.acceptedQty,
+            currentQty: item.acceptedQty, // Usable immediately
             status: 'APPROVED'
           }
         });
@@ -131,7 +132,7 @@ export class GRNService {
         await InventoryService.recordMovement(tx, {
           itemId: item.materialId!,
           type: 'PURCHASE_IN',
-          quantity: item.receivedQty,
+          quantity: item.acceptedQty,
           referenceType: 'GRN',
           referenceId: grnId,
           note: `Auto-approved via GRN ${grnId}`,
@@ -152,7 +153,7 @@ export class GRNService {
 
       // 4. Update Financial Ledger (Liability)
       // Calculate total value of goods received in this GRN
-      const grnSubtotal = grn.items.reduce((acc, it) => acc + (it.receivedQty * it.price), 0);
+      const grnSubtotal = grn.items.reduce((acc, it) => acc + (it.acceptedQty * it.price), 0);
       
       // Approximate tax based on PO's overall tax rate if possible, 
       // or just use subtotal if the user prefers simple accounting.
