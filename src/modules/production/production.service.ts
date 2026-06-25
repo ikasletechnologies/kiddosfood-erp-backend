@@ -97,56 +97,27 @@ export class ProductionService {
         throw new Error('Production must be stopped before approval');
       }
 
-      // 1. Resolve target inventory item
       const recipe = production.recipe;
-      let targetItem = await tx.inventoryItem.findFirst({
-        where: {
-          franchiseId: production.franchiseId,
-          OR: [
-            { sku: recipe.product.sku ?? undefined },
-            { name: recipe.product.name },
-          ],
-        },
-      });
-
-      if (!targetItem) {
-        targetItem = await tx.inventoryItem.create({
-          data: {
-            name: recipe.product.name,
-            sku: recipe.product?.sku || `PRD-${(recipe.product?.id || Math.random().toString()).substring(0, 5).toUpperCase()}`,
-            category: 'FINISHED_GOOD', // Explicitly mark as finished good for inventory visibility
-            currentStock: 0,
-            unit: recipe.recipeItems[0]?.unit || 'unit', // Fallback to first ingredient unit or 'unit'
-            minimumStock: 5,
-            franchiseId: production.franchiseId,
-          },
-        });
-      }
-
-      // 2. Add finished goods (Total Yield = Runs * Yield per run, unless actualYield is provided)
       const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
-      await InventoryService.recordMovement(tx, {
-        itemId: targetItem.id,
-        type: 'PRODUCTION_IN',
-        quantity: totalYield,
-        referenceType: 'PRODUCTION',
-        referenceId: production.id,
-        note: `Approved production: ${recipe.name} (${production.quantity} batches x ${recipe.yieldQty} yield)`,
-        userId,
-      });
 
-      // 3. Create ProductBatch (Actual quantity produced)
+      // Create ProductBatch with PENDING QC status (does NOT add stock to finished goods inventory yet)
+      const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
       await tx.productBatch.create({
         data: {
           productId: recipe.productId,
           productionId: production.id,
           quantity: totalYield,
           expiryDate: production.expiryDate,
-          batchCode: `BATCH-${production.id.substring(0, 8).toUpperCase()}`,
+          batchCode,
+          franchiseId: production.franchiseId,
+          qcStatus: "PENDING",
+          approvedQty: 0,
+          rejectionQty: 0,
+          packagingStatus: "PENDING",
         },
       });
 
-      // 4. Finalize status and record actual yield
+      // Finalize status and record actual yield
       return tx.production.update({
         where: { id },
         data: { 
@@ -156,6 +127,207 @@ export class ProductionService {
       });
     });
   }
+
+  static async inspectBatch(data: {
+    batchId: string;
+    qcStatus: string;
+    moistureCheck?: number;
+    colorCheck?: string;
+    textureCheck?: string;
+    rejectionQty?: number;
+    userId?: string;
+  }) {
+    return prisma.$transaction(async tx => {
+      const batch = await tx.productBatch.findUnique({
+        where: { id: data.batchId },
+        include: { product: true, production: true },
+      });
+      if (!batch) throw new Error('Product batch not found');
+
+      const rejection = data.rejectionQty || 0;
+      const approvedQty = Math.max(0, batch.quantity - rejection);
+
+      const updatedBatch = await tx.productBatch.update({
+        where: { id: data.batchId },
+        data: {
+          qcStatus: data.qcStatus,
+          moistureCheck: data.moistureCheck,
+          colorCheck: data.colorCheck,
+          textureCheck: data.textureCheck,
+          rejectionQty: rejection,
+          approvedQty: approvedQty,
+        },
+      });
+
+      if (data.qcStatus === 'APPROVED' && approvedQty > 0) {
+        const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+        if (!franchiseId) throw new Error('Franchise ID not found for batch');
+
+        let targetItem = await tx.inventoryItem.findFirst({
+          where: {
+            franchiseId,
+            OR: [
+              { sku: batch.product.sku ?? undefined },
+              { name: batch.product.name },
+            ],
+          },
+        });
+
+        if (!targetItem) {
+          targetItem = await tx.inventoryItem.create({
+            data: {
+              name: batch.product.name,
+              sku: batch.product?.sku || `PRD-${batch.productId.substring(0, 5).toUpperCase()}`,
+              category: 'FINISHED_GOOD',
+              currentStock: 0,
+              unit: 'unit',
+              minimumStock: 5,
+              franchiseId,
+            },
+          });
+        }
+
+        await InventoryService.recordMovement(tx, {
+          itemId: targetItem.id,
+          type: 'PRODUCTION_IN',
+          quantity: approvedQty,
+          referenceType: 'PRODUCTION',
+          referenceId: batch.productionId || batch.id,
+          note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
+          userId: data.userId,
+        });
+      }
+
+      return updatedBatch;
+    });
+  }
+
+  static async packageBatch(data: {
+    batchId: string;
+    packetSize: string;
+    quantityPackets: number;
+    userId?: string;
+  }) {
+    return prisma.$transaction(async tx => {
+      const batch = await tx.productBatch.findUnique({
+        where: { id: data.batchId },
+        include: { product: true, production: true },
+      });
+      if (!batch) throw new Error('Product batch not found');
+      if (batch.qcStatus !== 'APPROVED') throw new Error('Batch must be QC APPROVED before packaging');
+
+      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+      if (!franchiseId) throw new Error('Franchise ID not found for batch');
+
+      let bulkItem = await tx.inventoryItem.findFirst({
+        where: {
+          franchiseId,
+          OR: [
+            { sku: batch.product.sku ?? undefined },
+            { name: batch.product.name },
+          ],
+        },
+      });
+      if (!bulkItem) throw new Error('Bulk inventory item not found');
+
+      const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
+      const totalWeightNeeded = data.quantityPackets * unitMultiplier;
+
+      if (bulkItem.currentStock < totalWeightNeeded) {
+        throw new Error(`Insufficient bulk stock. Needed: ${totalWeightNeeded} ${bulkItem.unit}, Available: ${bulkItem.currentStock} ${bulkItem.unit}`);
+      }
+
+      await InventoryService.recordMovement(tx, {
+        itemId: bulkItem.id,
+        type: 'PRODUCTION_OUT',
+        quantity: -totalWeightNeeded,
+        referenceType: 'PACKAGING',
+        referenceId: batch.id,
+        note: `Packaging conversion: Deducted bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
+        userId: data.userId,
+      });
+
+      const retailSku = `${bulkItem.sku}-${data.packetSize.toUpperCase().replace(/\s+/g, '')}`;
+      const retailName = `${bulkItem.name} (${data.packetSize})`;
+      
+      let retailItem = await tx.inventoryItem.findFirst({
+        where: {
+          franchiseId,
+          sku: retailSku,
+        },
+      });
+
+      if (!retailItem) {
+        retailItem = await tx.inventoryItem.create({
+          data: {
+            name: retailName,
+            sku: retailSku,
+            category: 'FINISHED_GOOD',
+            currentStock: 0,
+            unit: 'packet',
+            minimumStock: 10,
+            franchiseId,
+            basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
+            costPrice: bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0,
+          },
+        });
+      }
+
+      await InventoryService.recordMovement(tx, {
+        itemId: retailItem.id,
+        type: 'PRODUCTION_IN',
+        quantity: data.quantityPackets,
+        referenceType: 'PACKAGING',
+        referenceId: batch.id,
+        note: `Packaging conversion: Created retail stock from batch ${batch.batchCode}`,
+        userId: data.userId,
+      });
+
+      const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
+      const packaging = await tx.productPackaging.create({
+        data: {
+          batchId: batch.id,
+          packetSize: data.packetSize,
+          quantityPackets: data.quantityPackets,
+          totalWeight: totalWeightNeeded,
+          barcode,
+          printedLabels: true,
+        },
+      });
+
+      await tx.productBatch.update({
+        where: { id: batch.id },
+        data: {
+          packagingStatus: 'PACKAGED',
+          packagedQty: { increment: totalWeightNeeded },
+        },
+      });
+
+      return {
+        packaging,
+        retailItem,
+        bulkItem,
+      };
+    });
+  }
+
+  private static parseWeight(size: string, bulkUnit: string): number {
+    const match = size.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
+    if (!match) return 1.0;
+    const val = parseFloat(match[1]);
+    const unit = match[3].toLowerCase();
+    const bUnit = bulkUnit.toLowerCase();
+
+    if (unit === bUnit) return val;
+
+    if (bUnit === 'kg' && unit === 'g') return val / 1000;
+    if (bUnit === 'g' && unit === 'kg') return val * 1000;
+    if (bUnit === 'l' && unit === 'ml') return val / 1000;
+    if (bUnit === 'ml' && unit === 'l') return val * 1000;
+
+    return val;
+  }
+
 
   static async getProductionHistory(franchiseId?: string) {
     return prisma.production.findMany({
@@ -218,6 +390,33 @@ export class ProductionService {
           ? 'EXPIRING_SOON'
           : 'VALID',
       };
+    });
+  }
+
+  static async getPendingQCBatches(franchiseId?: string) {
+    return prisma.productBatch.findMany({
+      where: {
+        qcStatus: 'PENDING',
+        ...(franchiseId ? { franchiseId } : {})
+      },
+      include: { product: true, franchise: true, production: { include: { recipe: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  static async getPackagings(franchiseId?: string) {
+    return prisma.productPackaging.findMany({
+      where: franchiseId ? { batch: { franchiseId } } : {},
+      include: { batch: { include: { product: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  static async getAllProductBatches(franchiseId?: string) {
+    return prisma.productBatch.findMany({
+      where: franchiseId ? { franchiseId } : {},
+      include: { product: true, franchise: true, production: { include: { recipe: true } }, packagings: true },
+      orderBy: { createdAt: 'desc' },
     });
   }
 }

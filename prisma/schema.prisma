@@ -472,18 +472,41 @@ model Production {
 }
 
 model ProductBatch {
-  id           String      @id @default(uuid())
-  productId    String
-  productionId String?
-  quantity     Float
-  expiryDate   DateTime?
-  batchCode    String?
-  createdAt    DateTime    @default(now())
-  franchiseId  String?
-  franchise    Franchise?  @relation(fields: [franchiseId], references: [id])
-  product      Product     @relation(fields: [productId], references: [id])
-  production   Production? @relation(fields: [productionId], references: [id])
+  id              String             @id @default(uuid())
+  productId       String
+  productionId    String?
+  quantity        Float
+  expiryDate      DateTime?
+  batchCode       String?
+  createdAt       DateTime           @default(now())
+  franchiseId     String?
+  mfgDate         DateTime?          @default(now())
+  qcStatus        String?            @default("PENDING") // PENDING, APPROVED, REJECTED, REWORK
+  moistureCheck   Float?
+  colorCheck      String?
+  textureCheck    String?
+  rejectionQty    Float?             @default(0)
+  approvedQty     Float?             @default(0)
+  packagingStatus String?            @default("PENDING") // PENDING, PACKAGED
+  packagedQty     Float?             @default(0)
+  franchise       Franchise?         @relation(fields: [franchiseId], references: [id])
+  product         Product            @relation(fields: [productId], references: [id])
+  production      Production?        @relation(fields: [productionId], references: [id])
+  packagings      ProductPackaging[]
 }
+
+model ProductPackaging {
+  id              String       @id @default(uuid())
+  batchId         String
+  packetSize      String       // e.g. "100g", "500g", "1KG"
+  quantityPackets Int
+  totalWeight     Float        // quantityPackets * size
+  barcode         String       @unique
+  printedLabels   Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+  batch           ProductBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+}
+
 
 model FranchiseOrder {
   id                   String               @id @default(uuid())
@@ -1051,6 +1074,7 @@ model DeliveryChallan {
   customerId     String?
   salesOrderId   String?
   franchiseId    String?
+  sourceFranchiseId String?
   status         String                @default("DRAFT")
   challanDate    DateTime              @default(now())
   dueDate        DateTime?
@@ -1073,6 +1097,7 @@ model DeliveryChallanItem {
   challanId   String
   productId   String?
   productName String
+  batchNumber String?
   quantity    Float
   unit        String          @default("NONE")
   rate        Float           @default(0)

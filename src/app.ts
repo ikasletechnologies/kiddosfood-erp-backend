@@ -217,6 +217,11 @@ app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', '
     res.json(batches);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
+app.get('/api/production/batches-all', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getAllBatches);
+app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPendingQC);
+app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.inspectBatch);
+app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.packageBatch);
+app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
 app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getOne);
 app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.updateStatus);
 
@@ -533,10 +538,10 @@ app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMI
 
 app.get('/api/sales/analytics', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getAnalytics);
 
-app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.getDeliveryChallans);
-app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.createDeliveryChallan);
-app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.getDeliveryChallan);
-app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN']), SalesController.updateDeliveryChallan);
+app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallans);
+app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallan);
+app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallan);
+app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateDeliveryChallan);
 
 // ─── Purchase Module (RFQ & Returns) ─────────────────────────────────────────
 app.get('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getRFQs);

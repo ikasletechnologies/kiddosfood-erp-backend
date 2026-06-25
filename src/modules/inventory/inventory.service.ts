@@ -479,7 +479,7 @@ export class InventoryService {
   }
 
   // Internal: stock-in via GRN / procurement — not exposed as free-form UI edit
-  static async stockIn(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string }, externalTx?: any) {
+  static async stockIn(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string }, externalTx?: any) {
     const run = (tx: any) =>
       this.recordMovement(tx, {
         itemId: data.itemId,
@@ -487,12 +487,14 @@ export class InventoryService {
         quantity: data.quantity,
         note: data.note,
         userId: data.userId,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId,
       });
     return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
 
   // Internal: stock-out via production / waste — not exposed as free-form UI edit
-  static async stockOut(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string }, externalTx?: any) {
+  static async stockOut(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string }, externalTx?: any) {
     const run = (tx: any) =>
       this.recordMovement(tx, {
         itemId: data.itemId,
@@ -500,6 +502,8 @@ export class InventoryService {
         quantity: -data.quantity,
         note: data.note,
         userId: data.userId,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId,
       });
     return externalTx ? run(externalTx) : prisma.$transaction(run);
   }

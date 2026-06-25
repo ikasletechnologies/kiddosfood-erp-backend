@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { InventoryService } from '../inventory/inventory.service';
 
 let quotationCounter = 1000;
 let salesOrderCounter = 1000;
@@ -577,24 +578,33 @@ export class SalesService {
     customerId?: string;
     salesOrderId?: string;
     franchiseId?: string;
+    sourceFranchiseId?: string;
     challanDate?: string;
     dueDate?: string;
     vehicleNo?: string;
     driverName?: string;
     stateOfSupply?: string;
+    status?: string;
     notes?: string;
     termsConditions?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number }>;
-  }) {
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number; batchNumber?: string }>;
+  }, userId: string = 'system') {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(
       data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 }))
     );
-    return prisma.deliveryChallan.create({
+    
+    // Generate sequential challan number from DB count
+    const count = await prisma.deliveryChallan.count();
+    const challanNumber = `DC-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`;
+
+    const newChallan = await prisma.deliveryChallan.create({
       data: {
-        challanNumber: generateChallanNumber(),
+        challanNumber,
         customerId: data.customerId || null,
         salesOrderId: data.salesOrderId || null,
         franchiseId: data.franchiseId || null,
+        sourceFranchiseId: data.sourceFranchiseId || 'hq-001',
+        status: data.status || 'DRAFT',
         challanDate: data.challanDate ? new Date(data.challanDate) : new Date(),
         dueDate: data.dueDate ? new Date(data.dueDate) : null,
         vehicleNo: data.vehicleNo || null,
@@ -609,6 +619,7 @@ export class SalesService {
           create: computed.map((i) => ({
             productId: i.productId || null,
             productName: i.productName,
+            batchNumber: (i as any).batchNumber || null,
             quantity: i.quantity,
             unit: i.unit || 'NONE',
             rate: i.rate,
@@ -620,9 +631,123 @@ export class SalesService {
       },
       include: { customer: true, items: true }
     });
+
+    if (newChallan.status === 'OPEN') {
+      await SalesService.dispatchChallanStock(newChallan, userId);
+    }
+
+    return newChallan;
   }
 
-  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string }) {
-    return prisma.deliveryChallan.update({ where: { id }, data });
+  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string }, userId: string = 'system') {
+    const currentChallan = await prisma.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
+    if (!currentChallan) throw new Error('Delivery challan not found');
+
+    // Block moving away from CLOSED once delivered
+    if (currentChallan.status === 'CLOSED' && data.status && data.status !== 'CLOSED') {
+      throw new Error('Cannot change status of a closed delivery challan');
+    }
+
+    const updated = await prisma.deliveryChallan.update({ where: { id }, data, include: { items: true } });
+
+    // Handle Stock Transitions
+    if (currentChallan.status === 'DRAFT' && updated.status === 'OPEN') {
+      await SalesService.dispatchChallanStock(updated, userId);
+    } else if (currentChallan.status === 'OPEN' && updated.status === 'CLOSED') {
+      await SalesService.receiveChallanStock(updated, userId);
+    } else if (currentChallan.status === 'OPEN' && updated.status === 'CANCELLED') {
+      await SalesService.reverseChallanStock(updated, userId);
+    }
+
+    return updated;
+  }
+
+  // --- Helper Stock Movement methods for DC ---
+  
+  private static async dispatchChallanStock(challan: any, userId: string) {
+    const sourceId = challan.sourceFranchiseId || 'hq-001';
+    for (const item of challan.items) {
+      if (!item.productId) continue;
+      
+      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      if (!product || !product.sku) continue;
+      
+      const sourceItem = await prisma.inventoryItem.findFirst({
+        where: { franchiseId: sourceId, sku: product.sku }
+      });
+      
+      if (sourceItem) {
+        await InventoryService.stockOut({
+          itemId: sourceItem.id,
+          quantity: item.quantity,
+          referenceType: 'DELIVERY_CHALLAN',
+          referenceId: challan.id,
+          note: `Dispatched DC ${challan.challanNumber}`,
+          userId
+        }, prisma as any);
+      }
+    }
+  }
+
+  private static async receiveChallanStock(challan: any, userId: string) {
+    if (!challan.franchiseId) return; // if sent to customer directly, no receipt stock to handle
+
+    for (const item of challan.items) {
+      if (!item.productId) continue;
+      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      if (!product || !product.sku) continue;
+
+      let targetItem = await prisma.inventoryItem.findFirst({
+        where: { franchiseId: challan.franchiseId, sku: product.sku }
+      });
+
+      if (!targetItem) {
+        targetItem = await prisma.inventoryItem.create({
+          data: {
+            franchiseId: challan.franchiseId,
+            sku: product.sku,
+            name: product.name,
+            unit: item.unit || 'NONE',
+            category: 'FINISHED_GOOD',
+            currentStock: 0,
+            minimumStock: 0
+          }
+        });
+      }
+
+      await InventoryService.stockIn({
+        itemId: targetItem.id,
+        quantity: item.quantity,
+        referenceType: 'DELIVERY_CHALLAN',
+        referenceId: challan.id,
+        note: `Received DC ${challan.challanNumber}`,
+        userId
+      }, prisma as any);
+    }
+  }
+
+  private static async reverseChallanStock(challan: any, userId: string) {
+    const sourceId = challan.sourceFranchiseId || 'hq-001';
+    for (const item of challan.items) {
+      if (!item.productId) continue;
+      
+      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      if (!product || !product.sku) continue;
+      
+      const sourceItem = await prisma.inventoryItem.findFirst({
+        where: { franchiseId: sourceId, sku: product.sku }
+      });
+      
+      if (sourceItem) {
+        await InventoryService.stockIn({
+          itemId: sourceItem.id,
+          quantity: item.quantity,
+          referenceType: 'DELIVERY_CHALLAN',
+          referenceId: challan.id,
+          note: `Reversed DC ${challan.challanNumber}`,
+          userId
+        }, prisma as any);
+      }
+    }
   }
 }

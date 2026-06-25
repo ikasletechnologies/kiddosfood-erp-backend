@@ -76,4 +76,78 @@ export class ProductionController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async inspectBatch(req: Request, res: Response) {
+    try {
+      const { qcStatus, moistureCheck, colorCheck, textureCheck, rejectionQty } = req.body;
+      const user = (req as any).user;
+      const result = await ProductionService.inspectBatch({
+        batchId: req.params.id,
+        qcStatus,
+        moistureCheck: moistureCheck !== undefined ? Number(moistureCheck) : undefined,
+        colorCheck,
+        textureCheck,
+        rejectionQty: rejectionQty !== undefined ? Number(rejectionQty) : 0,
+        userId: user?.id
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async packageBatch(req: Request, res: Response) {
+    try {
+      const { packetSize, quantityPackets } = req.body;
+      const user = (req as any).user;
+      const result = await ProductionService.packageBatch({
+        batchId: req.params.id,
+        packetSize,
+        quantityPackets: Number(quantityPackets),
+        userId: user?.id
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getPendingQC(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const targetFranchiseId = user.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string || undefined)
+        : user.franchiseId;
+      const result = await ProductionService.getPendingQCBatches(targetFranchiseId);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getPackagings(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const targetFranchiseId = user.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string || undefined)
+        : user.franchiseId;
+      const result = await ProductionService.getPackagings(targetFranchiseId);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getAllBatches(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const targetFranchiseId = user.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string || undefined)
+        : user.franchiseId;
+      const result = await ProductionService.getAllProductBatches(targetFranchiseId);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

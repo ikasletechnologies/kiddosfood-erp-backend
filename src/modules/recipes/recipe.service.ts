@@ -100,7 +100,7 @@ export class RecipeService {
     let totalCost = 0;
 
     for (const item of recipe.recipeItems) {
-      const unitCost = unitCostMap[item.inventoryItemId] ?? 0;
+      const unitCost = item.inventoryItem.costPrice || item.inventoryItem.basePrice || 0;
       const lineCost = item.quantityRequired * unitCost;
       totalCost += lineCost;
       breakdown.push({
