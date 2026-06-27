@@ -344,6 +344,7 @@ app.get('/api/vendors', authenticate, authorizeRole(['SUPER_ADMIN']), Procuremen
 app.post('/api/vendors', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createVendor);
 app.get('/api/vendors/summary', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getVendorSummary);
 app.get('/api/vendors/filter', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.filterVendors);
+app.get('/api/vendors/next-payment-number', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getNextPaymentNumber);
 app.get('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getVendorById);
 app.patch('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.updateVendor);
 app.delete('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.deleteVendor);

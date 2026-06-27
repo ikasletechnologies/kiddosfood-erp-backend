@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { ProcurementService } from '../procurement/procurement.service';
 
 export class GRNService {
   static async getAll(params: { poId?: string; status?: string } = {}) {
@@ -214,6 +215,9 @@ export class GRNService {
         where: { id: grn.poId },
         data: { status: newPOStatus, received: allReceived }
       });
+
+      // Settle against any available advance
+      await ProcurementService.settleVendorOrders(grn.procurementOrder.vendorId, tx);
 
       const updatedGRN = await tx.goodsReceipt.update({
         where: { id: grnId },

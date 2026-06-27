@@ -881,7 +881,8 @@ export class FinanceService {
       }
 
       // 3. Generate Payment Number
-      const paymentNumber = await this.generatePaymentNumber(tx);
+      const isVendorPayment = data.entityType === 'VENDOR' || flow === 'OUT';
+      const paymentNumber = await this.generatePaymentNumber(tx, isVendorPayment);
 
       // 4. Create the payment record
       const payment = await tx.payment.create({
@@ -1649,8 +1650,25 @@ export class FinanceService {
     };
   }
 
-  private static async generatePaymentNumber(tx: any): Promise<string> {
-    const year = new Date().getFullYear();
+  private static async generatePaymentNumber(tx: any, isVendorPayment?: boolean): Promise<string> {
+    const now = new Date();
+    const year = now.getFullYear();
+    if (isVendorPayment) {
+      const yearStr = year.toString();
+      const monthStr = (now.getMonth() + 1).toString().padStart(2, '0');
+      const dateStr = now.getDate().toString().padStart(2, '0');
+      const dateKey = `${yearStr}${monthStr}${dateStr}`;
+      
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const count = await tx.payment.count({
+        where: {
+          entityType: 'VENDOR',
+          createdAt: { gte: todayStart }
+        }
+      });
+      return `VPAY-${dateKey}-${(count + 1).toString().padStart(4, '0')}`;
+    }
+
     const count = await tx.payment.count({
       where: { createdAt: { gte: new Date(year, 0, 1) } }
     });

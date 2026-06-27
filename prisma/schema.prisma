@@ -1571,6 +1571,8 @@ enum PaymentMode {
   BANK_TRANSFER
   CHEQUE
   NEFT
+  RTGS
+  IMPS
 }
 
 enum AccountType {

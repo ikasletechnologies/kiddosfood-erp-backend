@@ -29,22 +29,22 @@ export class ProcurementService {
   }) {
     // 1. Name Validation (Relaxed)
     if (!data.name || !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
-      throw new Error("Vendor Name is required and must be alphanumeric (symbols like & . , - () are allowed).");
+      throw new Error("Vendor Name is required and must only contain alphanumeric characters, spaces, and the following symbols: & . , - ( )");
     }
 
     // 2. Contact Validation (Exactly 10 Numbers)
     if (!data.contact || !/^\d{10}$/.test(data.contact)) {
-      throw new Error("Contact Number must be exactly 10 digits.");
+      throw new Error("Contact Number must be a valid 10-digit number.");
     }
 
     // 3. Email Validation (Relaxed)
     if (data.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) {
-      throw new Error("Invalid email format for vendor.");
+      throw new Error("Please enter a valid email address.");
     }
 
     // 4. Address Validation (Mandatory)
     if (!data.address || data.address.trim().length === 0) {
-      throw new Error("Registered Office Address is a mandatory field.");
+      throw new Error("Registered Office Address is required.");
     }
 
     // ROBUST CODE GENERATION (Find max to prevent collisions)
@@ -88,16 +88,21 @@ export class ProcurementService {
         });
 
         // Generate opening balance ledger entry if applicable
-        if (data.openingBalance && data.openingBalance > 0) {
+        if (data.openingBalance && data.openingBalance !== 0) {
+          const amount = Math.abs(data.openingBalance);
+          const type = data.openingBalance > 0 ? 'CREDIT' : 'DEBIT';
+          const obNumber = await ProcurementService.generateOpeningBalanceNumber(tx);
           await tx.vendorLedger.create({
             data: {
               vendorId: vendor.id,
-              type: 'CREDIT', // Opening balance = we owe the vendor
-              amount: data.openingBalance,
+              type,
+              amount,
               balanceAfterTransaction: data.openingBalance,
               referenceType: 'OPENING_BALANCE',
+              referenceId: obNumber,
               paymentMode: 'CASH',
-              note: 'Opening Balance'
+              note: 'Vendor Opening Balance',
+              createdAt: data.asOfDate ? new Date(data.asOfDate) : vendor.createdAt
             }
           });
         }
@@ -131,17 +136,22 @@ export class ProcurementService {
         const type = v.openingBalance > 0 ? 'CREDIT' : 'DEBIT'; // CREDIT = We owe them
         const amount = Math.abs(v.openingBalance);
         
+        const obNumber = await prisma.vendorLedger.count({
+          where: { referenceType: 'OPENING_BALANCE' }
+        }).then(c => `OB-${String(c + 1).padStart(4, '0')}`);
+        
         // Create the missing entry in the database permanently
         const newEntry = await prisma.vendorLedger.create({
           data: {
             vendorId: v.id,
             type,
             amount,
-            balanceAfterTransaction: amount,
+            balanceAfterTransaction: v.openingBalance,
             referenceType: 'OPENING_BALANCE',
+            referenceId: obNumber,
             paymentMode: 'CASH',
-            note: 'Opening Balance (Auto-Repaired)',
-            createdAt: new Date('2000-01-01')
+            note: 'Vendor Opening Balance',
+            createdAt: v.asOfDate ? new Date(v.asOfDate) : v.createdAt
           }
         });
         
@@ -166,7 +176,7 @@ export class ProcurementService {
         .reduce((s, e) => s + (e.amount || 0), 0);
       
       const manualDebits = entries
-        .filter(e => e.type === 'DEBIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE'))
+        .filter(e => e.type === 'DEBIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE' || e.referenceType === 'OPENING_BALANCE'))
         .reduce((s, e) => s + (e.amount || 0), 0);
 
       const totalOwedByUs = totalPurchased + manualCredits; 
@@ -241,13 +251,13 @@ export class ProcurementService {
     status?: any;
   }) {
     if (data.name !== undefined && !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
-      throw new Error("Vendor Name must be alphanumeric (symbols like & . , - () are allowed).");
+      throw new Error("Vendor Name must only contain alphanumeric characters, spaces, and the following symbols: & . , - ( )");
     }
     if (data.contact !== undefined && !/^\d{10}$/.test(data.contact)) {
-      throw new Error("Contact Number must be exactly 10 digits.");
+      throw new Error("Contact Number must be a valid 10-digit number.");
     }
     if (data.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) {
-      throw new Error("Invalid email format.");
+      throw new Error("Please enter a valid email address.");
     }
     if (data.address !== undefined && data.address.trim().length === 0) {
       throw new Error("Registered Office Address cannot be empty.");
@@ -262,14 +272,19 @@ export class ProcurementService {
     return prisma.$transaction(async (tx) => {
       const vendor = await tx.vendor.update({ where: { id }, data: updateData });
 
-      // Synchronize Opening Balance Ledger Entry if it's set
-      if (data.openingBalance !== undefined) {
+      // Synchronize Opening Balance Ledger Entry if it's set or if asOfDate is updated
+      if (data.openingBalance !== undefined || data.asOfDate !== undefined) {
         const existingEntry = await tx.vendorLedger.findFirst({
           where: { vendorId: id, referenceType: 'OPENING_BALANCE' }
         });
 
-        const amount = Math.abs(data.openingBalance);
-        const type = data.openingBalance >= 0 ? 'CREDIT' : 'DEBIT'; // Credit = we owe them (To Pay)
+        const currentBal = data.openingBalance !== undefined ? data.openingBalance : vendor.openingBalance;
+        const amount = Math.abs(currentBal);
+        const type = currentBal >= 0 ? 'CREDIT' : 'DEBIT';
+
+        const targetDate = data.asOfDate !== undefined 
+          ? (data.asOfDate ? new Date(data.asOfDate) : vendor.createdAt)
+          : (vendor.asOfDate ? new Date(vendor.asOfDate) : vendor.createdAt);
 
         if (existingEntry) {
           if (amount === 0) {
@@ -277,29 +292,37 @@ export class ProcurementService {
           } else {
             await tx.vendorLedger.update({
               where: { id: existingEntry.id },
-              data: { amount, type, balanceAfterTransaction: amount }
+              data: { 
+                amount, 
+                type, 
+                balanceAfterTransaction: currentBal,
+                note: 'Vendor Opening Balance',
+                createdAt: targetDate
+              }
             });
           }
         } else if (amount > 0) {
+          const obNumber = await ProcurementService.generateOpeningBalanceNumber(tx);
           await tx.vendorLedger.create({
             data: {
               vendorId: id,
               type,
               amount,
-              balanceAfterTransaction: amount,
+              balanceAfterTransaction: currentBal,
               referenceType: 'OPENING_BALANCE',
+              referenceId: obNumber,
               paymentMode: 'CASH',
-              note: 'Opening Balance',
-              createdAt: new Date('2000-01-01')
+              note: 'Vendor Opening Balance',
+              createdAt: targetDate
             }
           });
         }
+      }
 
         // Recalculate subsequent balances if needed
         // (For simplicity, the running balances are usually fetched live via getVendors calculation, 
         // but to ensure the UI ledger is perfect, we can leave it to the UI or run a migration. 
         // We update the entry's amount which fixes the getVendors calculation.)
-      }
       return vendor;
     });
   }
@@ -516,7 +539,7 @@ export class ProcurementService {
       await tx.vendorLedger.create({
         data: {
           vendorId: po.vendorId,
-          type: 'CREDIT',
+          type: 'DEBIT',
           amount: advancePaid,
           paymentMode: 'CASH',
           referenceType: 'ADVANCE',
@@ -526,9 +549,17 @@ export class ProcurementService {
       });
 
       const newAdvancePaid = Math.min(po.totalAmount, po.advancePaid + advancePaid);
+      const newPaid = Math.min(po.totalAmount, po.paid + advancePaid);
+      const newBalance = Math.max(0, po.totalAmount - newPaid);
+
       return tx.procurementOrder.update({
         where: { id: poId },
-        data: { advancePaid: newAdvancePaid },
+        data: { 
+          advancePaid: newAdvancePaid,
+          paid: newPaid,
+          balance: newBalance,
+          status: (newBalance <= 0.01 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+        },
         include: { poItems: { include: { inventoryItem: true } }, vendor: true }
       });
     });
@@ -539,19 +570,31 @@ export class ProcurementService {
   }
 
   static async updatePOStatus(poId: string, status: any) {
-    const po = await prisma.procurementOrder.findUnique({ where: { id: poId } });
-    if (!po) throw new Error('Purchase Order not found');
-    
-    const updateData: any = { status };
-    if (status === 'APPROVED') {
-      updateData.approvedAt = new Date();
-      updateData.approvedBy = 'SUPER_ADMIN'; 
-    }
+    return prisma.$transaction(async (tx) => {
+      const po = await tx.procurementOrder.findUnique({ where: { id: poId } });
+      if (!po) throw new Error('Purchase Order not found');
+      
+      const updateData: any = { status };
+      if (status === 'APPROVED') {
+        updateData.approvedAt = new Date();
+        updateData.approvedBy = 'SUPER_ADMIN'; 
+      }
 
-    return prisma.procurementOrder.update({
-      where: { id: poId },
-      data: updateData,
-      include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+      const updated = await tx.procurementOrder.update({
+        where: { id: poId },
+        data: updateData,
+        include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+      });
+
+      if (status === 'APPROVED' || status === 'RECEIVED') {
+        await this.settleVendorOrders(po.vendorId, tx);
+        return tx.procurementOrder.findUnique({
+          where: { id: poId },
+          include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+        });
+      }
+
+      return updated;
     });
   }
 
@@ -564,14 +607,15 @@ export class ProcurementService {
       if (!po) throw new Error('Purchase Order not found');
 
       const balance = await this.getVendorBalance(po.vendorId);
-      if (balance <= 0) {
+      const availableAdvance = balance < 0 ? Math.abs(balance) : 0;
+      if (availableAdvance <= 0) {
         throw new Error(`Vendor ${po.vendor.name} has no available advance balance (Current: ₹${balance})`);
       }
 
-      const remainingDue = po.totalAmount - po.advancePaid;
+      const remainingDue = po.totalAmount - po.paid;
       if (remainingDue <= 0) throw new Error('This Purchase Order is already fully paid.');
 
-      const amountToApply = Math.min(remainingDue, balance);
+      const amountToApply = Math.min(remainingDue, availableAdvance);
       const newPaid = po.paid + amountToApply;
 
       return tx.procurementOrder.update({
@@ -757,9 +801,16 @@ export class ProcurementService {
         });
       }
 
-      return tx.procurementOrder.update({
+      const updatedPo = await tx.procurementOrder.update({
         where: { id: poId },
         data: { status: 'RECEIVED', received: true },
+        include: { poItems: true, goodsReceipts: { include: { items: true } } }
+      });
+
+      await this.settleVendorOrders(po.vendorId, tx);
+
+      return tx.procurementOrder.findUnique({
+        where: { id: poId },
         include: { poItems: true, goodsReceipts: { include: { items: true } } }
       });
     });
@@ -811,9 +862,20 @@ export class ProcurementService {
       where: { vendorId },
       orderBy: { createdAt: 'asc' }
     });
+
+    const paymentIds = ledger
+      .filter(e => (e.referenceType === 'PAYMENT' || e.referenceType === 'ADVANCE') && e.referenceId)
+      .map(e => e.referenceId as string);
+
+    const payments = paymentIds.length > 0
+      ? await prisma.payment.findMany({
+          where: { id: { in: paymentIds } },
+          select: { id: true, paymentNumber: true, transactionRef: true }
+        })
+      : [];
+
+    const paymentMap = new Map(payments.map(p => [p.id, p]));
     
-    // For older entries that don't have balanceAfterTransaction, we calculate on the fly
-    // but we return the stored value if available.
     let runningBalance = 0;
     return ledger.map(entry => {
       if (entry.balanceAfterTransaction !== 0) {
@@ -821,7 +883,15 @@ export class ProcurementService {
       } else {
         runningBalance += (entry.type === 'CREDIT' ? entry.amount : -entry.amount);
       }
-      return { ...entry, runningBalance };
+
+      const paymentInfo = entry.referenceId ? paymentMap.get(entry.referenceId) : null;
+
+      return { 
+        ...entry, 
+        runningBalance,
+        paymentNumber: paymentInfo?.paymentNumber || null,
+        transactionRef: paymentInfo?.transactionRef || null
+      };
     }).reverse();
   }
 
@@ -834,8 +904,8 @@ export class ProcurementService {
     return type === 'CREDIT' ? currentBalance + amount : currentBalance - amount;
   }
 
-  static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string; vendorInvoiceId?: string }) {
-    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId } = data;
+  static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string }) {
+    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef } = data;
     if (!accountId) throw new Error('Source Account (Cash/Bank) is mandatory for payments.');
 
     return prisma.$transaction(async (tx) => {
@@ -855,7 +925,8 @@ export class ProcurementService {
         entityType: 'VENDOR',
         entity: vendorId,
         createdBy: 'PROCUREMENT_MODULE',
-        note: note
+        note: note,
+        reference: transactionRef
       });
 
       // Update PO Payment status if linked
@@ -874,39 +945,71 @@ export class ProcurementService {
         }
       }
 
+      // Settle against any available advance
+      await this.settleVendorOrders(vendorId, tx);
+
       return payment;
     });
   }
 
-  static async settleVendorOrders(vendorId: string) {
-    return prisma.$transaction(async (tx) => {
-      const vendors = await this.getVendors();
-      const vendor = vendors.find(v => v.id === vendorId);
-      if (!vendor || (vendor.balance || 0) <= 0) return;
-      let availableAdvance = vendor.balance;
+  static async settleVendorOrders(vendorId: string, txParam?: any) {
+    const execute = async (tx: any) => {
+      // 1. Calculate total DEBIT entries (payments, advances, returns)
+      const entries = await tx.vendorLedger.findMany({
+        where: { vendorId }
+      });
+      const totalPaidToThem = entries
+        .filter((e: any) => e.type === 'DEBIT')
+        .reduce((s: number, e: any) => s + (e.amount || 0), 0);
+
+      // 2. Calculate the sum of po.paid for all orders (excluding cancelled)
+      const allPOs = await tx.procurementOrder.findMany({
+        where: { vendorId, status: { not: 'CANCELLED' } }
+      });
+      const totalPOPaid = allPOs.reduce((s: number, p: any) => s + (p.paid || 0), 0);
+
+      // 3. The difference is the unapplied advance/payment balance
+      let availableAdvance = Math.max(0, totalPaidToThem - totalPOPaid);
+
+      if (availableAdvance <= 0.01) return;
+
+      // 4. Find all outstanding orders (APPROVED or RECEIVED, not closed, having remaining balance)
       const outstandingOrders = await tx.procurementOrder.findMany({
-        where: { vendorId, status: { in: ['APPROVED', 'RECEIVED'] } },
+        where: { 
+          vendorId, 
+          status: { in: ['APPROVED', 'RECEIVED'] },
+          balance: { gt: 0 }
+        },
         orderBy: { createdAt: 'asc' }
       });
+
       for (const po of outstandingOrders) {
-        if (availableAdvance <= 0) break;
-        const currentPaid = po.paid || po.advancePaid || 0;
+        if (availableAdvance <= 0.01) break;
+        const currentPaid = po.paid || 0;
         const remainingDue = Math.max(0, po.totalAmount - currentPaid);
         if (remainingDue > 0) {
           const amountToApply = Math.min(remainingDue, availableAdvance);
-          const newPaid = currentPaid + amountToApply;
+          const newPaid = Number((currentPaid + amountToApply).toFixed(2));
+          const newBalance = Math.max(0, Number((po.totalAmount - newPaid).toFixed(2)));
+          
           await tx.procurementOrder.update({
             where: { id: po.id },
             data: {
               paid: newPaid,
-              balance: po.totalAmount - newPaid,
-              status: (po.totalAmount - newPaid <= 0 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+              balance: newBalance,
+              status: (newBalance <= 0.01 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
             }
           });
           availableAdvance -= amountToApply;
         }
       }
-    });
+    };
+
+    if (txParam) {
+      await execute(txParam);
+    } else {
+      await prisma.$transaction(async (tx) => execute(tx));
+    }
   }
 
   static async recordAdjustment(vendorId: string, amount: number, type: 'CREDIT' | 'DEBIT', note: string, referenceType: any = 'ADJUSTMENT', referenceId?: string) {
@@ -970,5 +1073,32 @@ export class ProcurementService {
     }
 
     return buckets;
+  }
+
+  static async getNextPaymentNumber() {
+    const now = new Date();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // Find all payments created today for vendors
+    const count = await prisma.payment.count({
+      where: {
+        createdAt: {
+          gte: today
+        },
+        entityType: 'VENDOR'
+      }
+    });
+
+    const yyyymmdd = today.toISOString().split('T')[0].replace(/-/g, '');
+    const nextSeq = String(count + 1).padStart(4, '0');
+    return { nextPaymentNumber: `VPAY-${yyyymmdd}-${nextSeq}` };
+  }
+
+  private static async generateOpeningBalanceNumber(tx: any): Promise<string> {
+    const obCount = await tx.vendorLedger.count({
+      where: { referenceType: 'OPENING_BALANCE' }
+    });
+    return `OB-${String(obCount + 1).padStart(4, '0')}`;
   }
 }
