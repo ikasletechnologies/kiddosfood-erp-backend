@@ -54,7 +54,7 @@ async function verify() {
       throw new Error('Stock increase failed or incorrect!');
     }
 
-    if (!updatedPO.received || updatedPO.status !== 'RECEIVED') {
+    if (!updatedPO || !updatedPO.received || updatedPO.status !== 'RECEIVED') {
       throw new Error('PO status update failed!');
     }
 
