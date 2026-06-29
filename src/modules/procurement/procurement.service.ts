@@ -949,7 +949,7 @@ export class ProcurementService {
       await this.settleVendorOrders(vendorId, tx);
 
       return payment;
-    });
+    }, { maxWait: 5000, timeout: 20000 });
   }
 
   static async settleVendorOrders(vendorId: string, txParam?: any) {
@@ -1008,14 +1008,14 @@ export class ProcurementService {
     if (txParam) {
       await execute(txParam);
     } else {
-      await prisma.$transaction(async (tx) => execute(tx));
+      await prisma.$transaction(async (tx) => execute(tx), { maxWait: 5000, timeout: 20000 });
     }
   }
 
   static async recordAdjustment(vendorId: string, amount: number, type: 'CREDIT' | 'DEBIT', note: string, referenceType: any = 'ADJUSTMENT', referenceId?: string) {
     const nextBalance = await prisma.$transaction(async (tx) => {
       return this.getNextBalance(tx, vendorId, amount, type);
-    });
+    }, { maxWait: 5000, timeout: 20000 });
     
     return prisma.vendorLedger.create({
       data: {
