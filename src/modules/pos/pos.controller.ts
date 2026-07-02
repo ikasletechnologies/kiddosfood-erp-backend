@@ -37,9 +37,9 @@ export class POSController {
           if (!recipe) throw new Error(`Recipe not found: ${item.recipeId}`);
 
           return {
-            productId: recipe.productId,
+            productId: recipe.productId!,
             quantity: item.quantity,
-            price: item.price ?? recipe.product.basePrice
+            price: item.price ?? recipe.product?.basePrice ?? 0
           };
         })
       );

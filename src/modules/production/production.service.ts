@@ -98,6 +98,9 @@ export class ProductionService {
       }
 
       const recipe = production.recipe;
+      if (!recipe || !recipe.productId) {
+        throw new Error('Recipe or associated product not found');
+      }
       const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
 
       // Create ProductBatch with PENDING QC status (does NOT add stock to finished goods inventory yet)
