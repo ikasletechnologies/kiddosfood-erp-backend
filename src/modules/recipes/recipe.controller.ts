@@ -57,4 +57,24 @@ export class RecipeController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getCategories(req: Request, res: Response) {
+    try {
+      const categories = await RecipeService.getCategories();
+      res.json(categories);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async createCategory(req: Request, res: Response) {
+    try {
+      const { name } = req.body;
+      if (!name) return res.status(400).json({ error: 'Name is required' });
+      const category = await RecipeService.createCategory(name);
+      res.status(201).json(category);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }

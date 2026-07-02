@@ -5,34 +5,52 @@ export class RecipeService {
    * Create or Update a Recipe for a Product
    */
   static async upsertRecipe(data: {
-    productId: string,
+    id?: string,
+    productId?: string,
+    recipeCode?: string,
+    category?: string,
     name: string,
     yieldQty: number,
+    yieldUnit?: string,
     instructions: string,
     items: { inventoryItemId: string, quantityRequired: number, unit: string }[]
   }) {
     return prisma.$transaction(async (tx) => {
-      // 1. Upsert the Recipe header
-      const recipe = await tx.recipe.upsert({
-        where: { productId: data.productId },
-        update: {
-          name: data.name,
-          yieldQty: data.yieldQty,
-          instructions: data.instructions,
-        },
-        create: {
-          productId: data.productId,
-          name: data.name,
-          yieldQty: data.yieldQty,
-          instructions: data.instructions,
-        }
-      });
+      let recipeId = data.id;
+
+      if (recipeId) {
+        await tx.recipe.update({
+          where: { id: recipeId },
+          data: {
+            productId: data.productId || null,
+            recipeCode: data.recipeCode || null,
+            category: data.category || null,
+            name: data.name,
+            yieldQty: data.yieldQty,
+            yieldUnit: data.yieldUnit || "KG",
+            instructions: data.instructions,
+          }
+        });
+      } else {
+        const recipe = await tx.recipe.create({
+          data: {
+            productId: data.productId || null,
+            recipeCode: data.recipeCode || null,
+            category: data.category || null,
+            name: data.name,
+            yieldQty: data.yieldQty,
+            yieldUnit: data.yieldUnit || "KG",
+            instructions: data.instructions,
+          }
+        });
+        recipeId = recipe.id;
+      }
 
       // 2. Clear old recipe items and add new ones
-      await tx.recipeItem.deleteMany({ where: { recipeId: recipe.id } });
+      await tx.recipeItem.deleteMany({ where: { recipeId: recipeId } });
       await tx.recipeItem.createMany({
         data: data.items.map(item => ({
-          recipeId: recipe.id,
+          recipeId: recipeId!,
           inventoryItemId: item.inventoryItemId,
           quantityRequired: item.quantityRequired,
           unit: item.unit
@@ -40,7 +58,7 @@ export class RecipeService {
       });
 
       return tx.recipe.findUnique({
-        where: { id: recipe.id },
+        where: { id: recipeId },
         include: { recipeItems: { include: { inventoryItem: true } } }
       });
     });
@@ -116,9 +134,18 @@ export class RecipeService {
       recipeId,
       recipeName: recipe.name,
       yieldQty: recipe.yieldQty,
+      yieldUnit: recipe.yieldUnit,
       totalCost,
       costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
       breakdown
     };
+  }
+
+  static async getCategories() {
+    return prisma.recipeCategory.findMany({ orderBy: { name: 'asc' } });
+  }
+
+  static async createCategory(name: string) {
+    return prisma.recipeCategory.create({ data: { name } });
   }
 }

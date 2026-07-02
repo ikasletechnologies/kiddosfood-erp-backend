@@ -193,6 +193,8 @@ app.delete('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), Pr
 
 app.get('/api/recipes', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getAll);
 app.post('/api/recipes', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.upsert);
+app.get('/api/recipe-categories', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getCategories);
+app.post('/api/recipe-categories', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.createCategory);
 app.get('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getOne);
 app.delete('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.delete);
 app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getByProduct);
