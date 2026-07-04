@@ -152,7 +152,7 @@ export class GRNService {
         });
       }
 
-      // 4. Update Financial Ledger (Liability)
+      // 4. Update Financial Ledger (Liability) & Generate Purchase Bill (Vendor Invoice)
       // Calculate total value of goods received in this GRN
       const grnSubtotal = grn.items.reduce((acc, it) => acc + (it.acceptedQty * it.price), 0);
       
@@ -165,6 +165,19 @@ export class GRNService {
       const grnTotalWithTax = grnSubtotal * taxFactor;
 
       if (grnTotalWithTax > 0) {
+        // Automatically generate a Purchase Bill (Vendor Invoice)
+        const invoiceNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+        const invoice = await tx.vendorInvoice.create({
+          data: {
+            vendorId: grn.procurementOrder.vendorId,
+            poId: grn.poId,
+            grnId: grnId,
+            invoiceNumber: invoiceNumber,
+            amount: grnTotalWithTax,
+            status: 'PENDING'
+          }
+        });
+
         const lastEntry = await tx.vendorLedger.findFirst({
           where: { vendorId: grn.procurementOrder.vendorId },
           orderBy: { createdAt: 'desc' }
@@ -181,6 +194,7 @@ export class GRNService {
             sourceModule: 'PROCUREMENT',
             referenceType: 'PURCHASE',
             referenceId: grnId,
+            invoiceId: invoice.id,
             note: `Goods Received via GRN ${grnId} (PO #${grn.procurementOrder.poNumber || grn.poId.slice(0,8)})`
           }
         });

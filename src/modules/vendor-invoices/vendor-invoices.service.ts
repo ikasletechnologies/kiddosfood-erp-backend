@@ -18,20 +18,39 @@ export class VendorInvoiceService {
 
   static async create(data: {
     vendorId: string;
-    poId: string;
+    poId?: string;
     grnId?: string;
-    invoiceNumber: string;
+    invoiceNumber?: string;
     amount: number;
+    items?: any[];
   }) {
-    const po = await prisma.procurementOrder.findUnique({ where: { id: data.poId } });
-    if (!po) throw new Error('Purchase Order not found');
+    let actualPoId = data.poId;
+
+    if (!actualPoId) {
+      // Auto-generate a Direct Purchase Order
+      const directPo = await prisma.procurementOrder.create({
+        data: {
+          vendorId: data.vendorId,
+          status: 'RECEIVED', // Direct purchase is already received
+          totalAmount: data.amount,
+          poNumber: `DPO-${Date.now().toString().slice(-6)}`,
+          purchaseType: 'RAW_MATERIAL',
+          received: true,
+          items: data.items || [],
+        }
+      });
+      actualPoId = directPo.id;
+    } else {
+      const po = await prisma.procurementOrder.findUnique({ where: { id: actualPoId } });
+      if (!po) throw new Error('Purchase Order not found');
+    }
 
     return prisma.vendorInvoice.create({
       data: {
         vendorId: data.vendorId,
-        poId: data.poId,
+        poId: actualPoId,
         grnId: data.grnId || null,
-        invoiceNumber: data.invoiceNumber,
+        invoiceNumber: data.invoiceNumber || `BILL-${Date.now().toString().slice(-6)}`,
         amount: data.amount,
         status: 'PENDING'
       },

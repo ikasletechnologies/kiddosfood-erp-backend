@@ -76,7 +76,11 @@ export class RawMaterialsController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
+      let franchiseId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
+      
+      if (!franchiseId) {
+        franchiseId = await RawMaterialsController.getActiveFranchiseId(req.body.franchiseId);
+      }
       
       if (!franchiseId) {
         return res.status(400).json({ error: "Franchise identification is required to create a material." });
@@ -104,7 +108,7 @@ export class RawMaterialsController {
         gstRate: req.body.gstRate,
         costPrice: req.body.costPrice,
         basePrice: req.body.basePrice,
-        userId: user.id,
+        userId: user.userId,
         warehouseId: req.body.binLocation || req.body.warehouseId,
       };
       

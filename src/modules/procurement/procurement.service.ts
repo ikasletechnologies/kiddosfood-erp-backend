@@ -945,6 +945,31 @@ export class ProcurementService {
         }
       }
 
+      // Record Vendor Ledger Debit
+      const nextBalance = await this.getNextBalance(tx, vendorId, amount, 'DEBIT');
+      await tx.vendorLedger.create({
+        data: {
+          vendorId,
+          type: 'DEBIT',
+          amount,
+          balanceAfterTransaction: nextBalance,
+          paymentMode: paymentMode || 'CASH',
+          sourceModule: 'PROCUREMENT',
+          referenceType: 'PAYMENT',
+          referenceId: payment.id,
+          invoiceId: vendorInvoiceId,
+          accountId,
+          note: note || 'Payment to Vendor'
+        }
+      });
+
+      if (vendorInvoiceId) {
+        await tx.vendorInvoice.update({
+          where: { id: vendorInvoiceId },
+          data: { status: 'PAID' }
+        });
+      }
+
       // Settle against any available advance
       await this.settleVendorOrders(vendorId, tx);
 

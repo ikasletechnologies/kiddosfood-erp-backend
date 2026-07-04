@@ -25,11 +25,11 @@ model User {
 }
 
 model Customer {
-  id            String           @id @default(uuid())
-  name          String
-  phone         String?          @unique
-  email         String?          @unique
-  loyaltyPoints Float            @default(0)
+  id                 String            @id @default(uuid())
+  name               String
+  phone              String?           @unique
+  email              String?           @unique
+  loyaltyPoints      Float             @default(0)
   address            String?
   state              String?
   district           String?
@@ -42,17 +42,17 @@ model Customer {
   openingBalanceType String?
   asOfDate           DateTime?
   creditLimit        Float?
-  createdAt     DateTime         @default(now())
-  updatedAt     DateTime         @updatedAt
-  franchiseId   String?
-  franchise     Franchise?       @relation(fields: [franchiseId], references: [id])
-  ledgerEntries CustomerLedger[]
-  orders        Order[]
-  productions   Production[]
-  quotations       Quotation[]
-  returnOrders     ReturnOrder[]
-  salesOrders      SalesOrder[]
-  deliveryChallans DeliveryChallan[]
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  franchiseId        String?
+  franchise          Franchise?        @relation(fields: [franchiseId], references: [id])
+  ledgerEntries      CustomerLedger[]
+  orders             Order[]
+  productions        Production[]
+  quotations         Quotation[]
+  returnOrders       ReturnOrder[]
+  salesOrders        SalesOrder[]
+  deliveryChallans   DeliveryChallan[]
 }
 
 model Dealer {
@@ -124,31 +124,31 @@ model Franchise {
   productions       Production[]
   returnOrders      ReturnOrder[]
   stockRequests     StockRequest[]
-  outgoingTransfers   StockTransfer[]    @relation("OutgoingTransfers")
-  incomingTransfers   StockTransfer[]    @relation("IncomingTransfers")
-  users               User[]
-  cheques             Cheque[]
-  accounts            Account[]
-  procurementOrders   ProcurementOrder[]
-  loanAccounts        LoanAccount[]
+  outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
+  incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
+  users             User[]
+  cheques           Cheque[]
+  accounts          Account[]
+  procurementOrders ProcurementOrder[]
+  loanAccounts      LoanAccount[]
 }
 
 model Cheque {
-  id            String       @id @default(uuid())
-  chequeNumber  String       @unique
-  bankName      String
-  payeeName     String
-  entityBranch  String?
-  amount        Float
-  type          ChequeType   @default(PAYABLE)
-  issueDate     DateTime
-  dueDate       DateTime
-  status        ChequeStatus @default(PENDING)
-  notes         String?
-  franchiseId   String
-  franchise     Franchise    @relation(fields: [franchiseId], references: [id])
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  id           String       @id @default(uuid())
+  chequeNumber String       @unique
+  bankName     String
+  payeeName    String
+  entityBranch String?
+  amount       Float
+  type         ChequeType   @default(PAYABLE)
+  issueDate    DateTime
+  dueDate      DateTime
+  status       ChequeStatus @default(PENDING)
+  notes        String?
+  franchiseId  String
+  franchise    Franchise    @relation(fields: [franchiseId], references: [id])
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 }
 
 enum ChequeType {
@@ -508,15 +508,14 @@ model ProductBatch {
 model ProductPackaging {
   id              String       @id @default(uuid())
   batchId         String
-  packetSize      String       // e.g. "100g", "500g", "1KG"
+  packetSize      String // e.g. "100g", "500g", "1KG"
   quantityPackets Int
-  totalWeight     Float        // quantityPackets * size
+  totalWeight     Float // quantityPackets * size
   barcode         String       @unique
   printedLabels   Boolean      @default(false)
   createdAt       DateTime     @default(now())
   batch           ProductBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
 }
-
 
 model FranchiseOrder {
   id                   String               @id @default(uuid())
@@ -1080,27 +1079,27 @@ model ReturnItem {
 }
 
 model DeliveryChallan {
-  id             String                @id @default(uuid())
-  challanNumber  String                @unique
-  customerId     String?
-  salesOrderId   String?
-  franchiseId    String?
+  id                String                @id @default(uuid())
+  challanNumber     String                @unique
+  customerId        String?
+  salesOrderId      String?
+  franchiseId       String?
   sourceFranchiseId String?
-  status         String                @default("DRAFT")
-  challanDate    DateTime              @default(now())
-  dueDate        DateTime?
-  vehicleNo      String?
-  driverName     String?
-  stateOfSupply  String?
-  notes          String?
-  termsConditions String?
-  subTotal       Float                 @default(0)
-  taxAmount      Float                 @default(0)
-  totalAmount    Float                 @default(0)
-  createdAt      DateTime              @default(now())
-  updatedAt      DateTime              @updatedAt
-  customer       Customer?             @relation(fields: [customerId], references: [id])
-  items          DeliveryChallanItem[]
+  status            String                @default("DRAFT")
+  challanDate       DateTime              @default(now())
+  dueDate           DateTime?
+  vehicleNo         String?
+  driverName        String?
+  stateOfSupply     String?
+  notes             String?
+  termsConditions   String?
+  subTotal          Float                 @default(0)
+  taxAmount         Float                 @default(0)
+  totalAmount       Float                 @default(0)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  customer          Customer?             @relation(fields: [customerId], references: [id])
+  items             DeliveryChallanItem[]
 }
 
 model DeliveryChallanItem {
@@ -1658,12 +1657,12 @@ enum PRStatus {
 }
 
 model Unit {
-  id                  String               @id @default(uuid())
-  name                String
-  shortName           String
-  items               InventoryItem[]
-  conversions         ItemUnitConversion[]
-  stockMovements      StockMovement[]
+  id             String               @id @default(uuid())
+  name           String
+  shortName      String
+  items          InventoryItem[]
+  conversions    ItemUnitConversion[]
+  stockMovements StockMovement[]
 }
 
 model ItemUnitConversion {
@@ -1673,7 +1672,7 @@ model ItemUnitConversion {
   multiplier Float
   item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
   unit       Unit          @relation(fields: [unitId], references: [id])
-  
+
   @@unique([itemId, unitId])
 }
 
@@ -1710,9 +1709,9 @@ enum InventoryStockState {
 
 model Draft {
   id        String   @id @default(uuid())
-  type      String   // e.g. "invoice", "order", "delivery_challan", "estimation", "proforma", "payment_in", "return"
-  userId    String?  // for user tracking
-  data      Json     // raw JSON of form items, customer selections, rates, etc.
+  type      String // e.g. "invoice", "order", "delivery_challan", "estimation", "proforma", "payment_in", "return"
+  userId    String? // for user tracking
+  data      Json // raw JSON of form items, customer selections, rates, etc.
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -1740,11 +1739,10 @@ model LoanTransaction {
   id            String      @id @default(uuid())
   loanAccountId String
   date          DateTime    @default(now())
-  type          String      // DISBURSEMENT, PRINCIPAL_PAID, INTEREST_CHARGED, INTEREST_PAID
+  type          String // DISBURSEMENT, PRINCIPAL_PAID, INTEREST_CHARGED, INTEREST_PAID
   amount        Float
   endingBalance Float
   note          String?
   createdAt     DateTime    @default(now())
   loanAccount   LoanAccount @relation(fields: [loanAccountId], references: [id], onDelete: Cascade)
 }
-
