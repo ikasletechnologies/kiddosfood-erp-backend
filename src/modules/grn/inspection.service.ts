@@ -104,6 +104,24 @@ export class InspectionService {
             note: `QC Approved: ${data.approvedQty} ${item.materialId}`
           });
         }
+
+        // Scrapped material never entered usable inventory — log it as waste for
+        // cost/traceability reporting (previously discarded with no trace at all).
+        // REJECT_RETURN is excluded: that's going back to the vendor, not waste.
+        const scrapQty = data.scrapQty || (data.actionTaken === 'REJECT_SCRAP' ? data.rejectedQty : 0);
+        if (data.actionTaken === 'REJECT_SCRAP' && scrapQty > 0) {
+          const material = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
+          await tx.wasteEntry.create({
+            data: {
+              inventoryItemId: item.materialId!,
+              franchiseId: material?.franchiseId,
+              quantity: scrapQty,
+              reason: 'QC_FAIL',
+              note: `QC scrapped from GRN inspection (item ${item.materialId})`,
+              costAtTime: scrapQty * (material?.costPrice || 0),
+            }
+          });
+        }
       }
 
       return record;

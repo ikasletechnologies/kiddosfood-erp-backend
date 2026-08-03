@@ -120,15 +120,37 @@ export class PayrollService {
       const payableDays = Math.max(0, workingDays - unpaidLeaveDays);
       const dailySalary = baseSalary / workingDays;
       const deductionAmount = Math.round(dailySalary * unpaidLeaveDays);
-      const netSalary = Math.round(dailySalary * payableDays);
 
-      const components = [
+      const components: { name: string; type: string; amount: number }[] = [
         { name: 'Basic Salary', type: 'EARNING', amount: baseSalary },
       ];
 
       if (unpaidLeaveDays > 0) {
         components.push({ name: `Unpaid Leave (${unpaidLeaveDays} days)`, type: 'DEDUCTION', amount: deductionAmount });
       }
+
+      // Previously the "Salary Components & Structures" builder (HRA, PF,
+      // custom allowances/deductions, etc.) was pure reference data — an
+      // employee's assigned SalaryStructure was fetched above but never
+      // actually read here; every payslip only ever paid flat baseSalary.
+      let structureEarnings = 0;
+      let structureDeductions = 0;
+      for (const item of emp.salaryStructure?.items || []) {
+        if (!item.component.isActive) continue;
+        const rawValue = item.overrideValue ?? item.component.value;
+        const amount = item.component.calculationType === 'PERCENTAGE'
+          ? Math.round((baseSalary * rawValue) / 100)
+          : Math.round(rawValue);
+        if (amount === 0) continue;
+
+        components.push({ name: item.component.name, type: item.component.type, amount });
+        if (item.component.type === 'EARNING') structureEarnings += amount;
+        else structureDeductions += amount;
+      }
+
+      const totalEarnings = baseSalary + structureEarnings;
+      const totalDeductions = deductionAmount + structureDeductions;
+      const netSalary = Math.round(dailySalary * payableDays) + structureEarnings - structureDeductions;
 
       const existing = await prisma.payslip.findFirst({
         where: { employeeId: emp.id, month: payroll.month, year: payroll.year }
@@ -142,8 +164,8 @@ export class PayrollService {
             month: payroll.month,
             year: payroll.year,
             basicSalary: baseSalary,
-            totalEarnings: baseSalary,
-            totalDeductions: deductionAmount,
+            totalEarnings,
+            totalDeductions,
             netSalary,
             components
           }

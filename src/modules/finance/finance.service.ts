@@ -149,8 +149,11 @@ export class FinanceService {
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
               const qtyUsed = ri.quantityRequired * scalar;
-              // Use last supplied price as cost placeholder
-              const costPerUnit = ri.inventoryItem.vendors[0]?.price || 0; 
+              // costPrice is a real moving weighted average maintained on every
+              // GRN receipt (see grn.service.ts) — previously this used
+              // whichever VendorMaterial price row happened to be first, an
+              // arbitrary "last supplied price" placeholder.
+              const costPerUnit = ri.inventoryItem.costPrice || ri.inventoryItem.vendors[0]?.price || 0;
               totalCOGS += (qtyUsed * costPerUnit);
             }
           } else {
@@ -881,7 +884,10 @@ export class FinanceService {
       }
 
       // 3. Generate Payment Number
-      const isVendorPayment = data.entityType === 'VENDOR' || flow === 'OUT';
+      // NOTE: was previously `data.entityType === 'VENDOR' || flow === 'OUT'`, which
+      // mislabeled every non-vendor outflow (payroll, expenses, franchise settlements)
+      // as a vendor payment (VPAY-prefixed number sharing the vendor daily counter).
+      const isVendorPayment = data.entityType === 'VENDOR';
       const paymentNumber = await this.generatePaymentNumber(tx, isVendorPayment);
 
       // 4. Create the payment record
@@ -905,7 +911,12 @@ export class FinanceService {
       });
 
       // 5. If this is a Vendor Payment, record in VendorLedger (CREDIT)
-      if (data.entityType === 'VENDOR' || flow === 'OUT') {
+      // NOTE: was previously `data.entityType === 'VENDOR' || flow === 'OUT'`, which
+      // caused any outgoing payment (e.g. payroll, entityType: 'EMPLOYEE') to write an
+      // orphaned VendorLedger row keyed by a non-vendor id. Every real vendor-payment
+      // call site already passes entityType: 'VENDOR' explicitly, so this fallback
+      // was both unnecessary and incorrect.
+      if (data.entityType === 'VENDOR') {
         const vendorId = entityId;
         if (vendorId) {
           const lastEntry = await tx.vendorLedger.findFirst({

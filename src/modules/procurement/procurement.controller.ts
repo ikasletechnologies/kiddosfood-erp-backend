@@ -92,6 +92,15 @@ export class ProcurementController {
     }
   }
 
+  static async updatePO(req: Request, res: Response) {
+    try {
+      const po = await ProcurementService.updatePO(req.params.id, req.body);
+      res.json(po);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async approvePO(req: Request, res: Response) {
     try {
       const po = await ProcurementService.approvePO(req.params.id);

@@ -501,4 +501,52 @@ export class POSService {
   static async addPayment(orderId: string, data: any) {
     return this.payOrder(orderId, data.paymentMode, data.accountId);
   }
+
+  // --- Day Closing / Settlement ---
+  // Previously the "Settle" button on the frontend was a pure UI simulation
+  // (setTimeout + toast, no backend call) — nothing was persisted and nothing
+  // prevented settling the same business day twice. `businessDate` is always
+  // computed server-side (never trusted from the client) to stop that.
+
+  private static startOfToday() {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  }
+
+  static async getTodaySettlement(franchiseId: string) {
+    return prisma.dailySettlement.findUnique({
+      where: { franchiseId_businessDate: { franchiseId, businessDate: this.startOfToday() } }
+    });
+  }
+
+  static async getLatestSettlement(franchiseId: string) {
+    return prisma.dailySettlement.findFirst({
+      where: { franchiseId },
+      orderBy: { businessDate: 'desc' }
+    });
+  }
+
+  static async closeDay(franchiseId: string, data: {
+    cashTotal: number; upiTotal: number; cardTotal: number; grandTotal: number; orderCount: number;
+  }, closedBy?: string) {
+    const businessDate = this.startOfToday();
+
+    const existing = await prisma.dailySettlement.findUnique({
+      where: { franchiseId_businessDate: { franchiseId, businessDate } }
+    });
+    if (existing) throw new Error('Today has already been settled.');
+
+    return prisma.dailySettlement.create({
+      data: {
+        franchiseId,
+        businessDate,
+        cashTotal: data.cashTotal || 0,
+        upiTotal: data.upiTotal || 0,
+        cardTotal: data.cardTotal || 0,
+        grandTotal: data.grandTotal || 0,
+        orderCount: data.orderCount || 0,
+        closedBy
+      }
+    });
+  }
 }

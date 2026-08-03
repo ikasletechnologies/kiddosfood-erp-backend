@@ -175,4 +175,42 @@ export class LogisticsService {
       orderBy: { createdAt: 'desc' }
     });
   }
+
+  /**
+   * Goods currently "in transit": stock was already deducted from the source
+   * branch at initiation but hasn't been credited to the destination yet
+   * (that only happens at completeTransfer). Previously nothing surfaced this
+   * in-between state at all. This is a read-only visibility report — it does
+   * not change the underlying deduct-at-initiate/credit-at-complete lifecycle.
+   */
+  static async getInTransit(franchiseId?: string) {
+    const transfers = await prisma.stockTransfer.findMany({
+      where: {
+        status: { notIn: ['COMPLETED', 'CANCELLED'] },
+        ...(franchiseId ? { OR: [{ fromBranchId: franchiseId }, { toBranchId: franchiseId }] } : {})
+      },
+      include: { fromBranch: true, toBranch: true, items: { include: { inventoryItem: true } } },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const itemTotals = new Map<string, { name: string; sku: string; unit: string; quantity: number }>();
+    for (const transfer of transfers) {
+      for (const item of transfer.items) {
+        const key = item.inventoryItemId;
+        const existing = itemTotals.get(key);
+        itemTotals.set(key, {
+          name: item.inventoryItem.name,
+          sku: item.inventoryItem.sku,
+          unit: item.inventoryItem.unit,
+          quantity: (existing?.quantity || 0) + item.quantity
+        });
+      }
+    }
+
+    return {
+      transfers,
+      totalTransfersInTransit: transfers.length,
+      itemTotals: Array.from(itemTotals.values())
+    };
+  }
 }

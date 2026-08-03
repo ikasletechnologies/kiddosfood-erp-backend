@@ -518,6 +518,106 @@ export class ProcurementService {
     return result;
   }
 
+  /**
+   * Update a Purchase Order in place. Replaces the previous "delete + recreate"
+   * workaround the frontend used (PurchaseFormContent.tsx), which lost the PO's id/
+   * history and could orphan a linked GRN/Invoice. Blocked once the PO has any
+   * GRN or Vendor Invoice against it, or is past the editable-status window —
+   * at that point the commercial record is already in motion and must be
+   * changed via cancellation/return flows instead of a silent edit.
+   */
+  static async updatePO(poId: string, data: {
+    vendorId?: string;
+    franchiseId?: string;
+    expectedDeliveryDate?: string;
+    notes?: string;
+    internalNotes?: string;
+    vendorNotes?: string;
+    deliveryInstructions?: string;
+    items?: Array<{ inventoryItemId: string; quantity: number; price: number }>;
+    manualTax?: { cgst: number, sgst: number, igst: number };
+  }) {
+    return prisma.$transaction(async (tx) => {
+      const po = await tx.procurementOrder.findUnique({ where: { id: poId }, include: { poItems: true } });
+      if (!po) throw new Error('Purchase Order not found');
+
+      if (!['DRAFT', 'PENDING_APPROVAL', 'APPROVED'].includes(po.status)) {
+        throw new Error(`Cannot edit a PO in status ${po.status}. Cancel or return it instead.`);
+      }
+      const [grnCount, invoiceCount] = await Promise.all([
+        tx.goodsReceipt.count({ where: { poId } }),
+        tx.vendorInvoice.count({ where: { poId } })
+      ]);
+      if (grnCount > 0 || invoiceCount > 0) {
+        throw new Error('Cannot edit a PO that already has a Goods Receipt or Vendor Invoice against it.');
+      }
+
+      const updateData: any = {};
+      if (data.vendorId) updateData.vendorId = data.vendorId;
+      if (data.franchiseId !== undefined) updateData.franchiseId = data.franchiseId || null;
+      if (data.expectedDeliveryDate !== undefined) {
+        updateData.expectedDeliveryDate = data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null;
+      }
+      if (data.notes !== undefined) updateData.notes = data.notes;
+      if (data.internalNotes !== undefined) updateData.internalNotes = data.internalNotes;
+      if (data.vendorNotes !== undefined) updateData.vendorNotes = data.vendorNotes;
+      if (data.deliveryInstructions !== undefined) updateData.deliveryInstructions = data.deliveryInstructions;
+
+      if (data.items && data.items.length > 0) {
+        const poItemsData = await Promise.all(data.items.map(async (item) => {
+          const inventoryItem = await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } });
+          const gstRate = inventoryItem?.gstRate || 5;
+          const subtotal = item.quantity * item.price;
+          const gstAmount = (subtotal * gstRate) / 100;
+          return {
+            inventoryItemId: item.inventoryItemId,
+            itemName: inventoryItem?.name || 'Unknown Material',
+            gstRate,
+            quantity: item.quantity,
+            price: item.price,
+            subtotal,
+            cgst: gstAmount / 2,
+            sgst: gstAmount / 2,
+            igst: 0,
+            total: subtotal + gstAmount
+          };
+        }));
+
+        const totalSubtotal = poItemsData.reduce((acc, item) => acc + item.subtotal, 0);
+        const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
+        const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
+        const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
+        const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
+
+        await tx.procurementOrderItem.deleteMany({ where: { poId } });
+
+        updateData.subtotal = totalSubtotal;
+        updateData.cgst = totalCGST;
+        updateData.sgst = totalSGST;
+        updateData.igst = totalIGST;
+        updateData.totalAmount = totalAmount;
+        updateData.balance = Math.max(0, totalAmount - po.paid);
+        updateData.poItems = { create: poItemsData };
+
+        // Item price changes should be reflected in the vendor's price list too,
+        // same as at PO creation time.
+        for (const item of data.items) {
+          await tx.vendorMaterial.upsert({
+            where: { vendorId_materialId: { vendorId: data.vendorId || po.vendorId, materialId: item.inventoryItemId } },
+            update: { price: item.price, lastUpdated: new Date() },
+            create: { vendorId: data.vendorId || po.vendorId, materialId: item.inventoryItemId, price: item.price }
+          });
+        }
+      }
+
+      return tx.procurementOrder.update({
+        where: { id: poId },
+        data: updateData,
+        include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+      });
+    });
+  }
+
   static async linkMaterialToVendor(vendorId: string, materialId: string, price?: number, quantity?: number) {
     await prisma.vendorMaterial.upsert({
       where: { vendorId_materialId: { vendorId, materialId } },
@@ -906,7 +1006,18 @@ export class ProcurementService {
 
   static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string }) {
     const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef } = data;
-    if (!accountId) throw new Error('Source Account (Cash/Bank) is mandatory for payments.');
+    const modeMap: Record<string, string> = {
+      CASH: 'CASH',
+      UPI: 'UPI',
+      CARD: 'CARD',
+      BANK: 'BANK_TRANSFER',
+      BANK_TRANSFER: 'BANK_TRANSFER',
+      CHEQUE: 'CHEQUE',
+      NEFT: 'NEFT',
+      RTGS: 'RTGS',
+      IMPS: 'IMPS'
+    };
+    const resolvedMode = modeMap[String(paymentMode || 'CASH').toUpperCase()] || 'CASH';
 
     return prisma.$transaction(async (tx) => {
       // Centralized Payment & Account Adjustment (FinanceService will handle Ledger)
@@ -917,7 +1028,7 @@ export class ProcurementService {
         flow: 'OUT',
         status: 'PAID',
         sourceAccount: accountId,
-        method: paymentMode || 'CASH',
+        method: resolvedMode,
         sourceModule: 'PROCUREMENT',
         linkedDocType: vendorInvoiceId ? 'INVOICE' : (referenceId ? 'PO' : 'DIRECT'),
         linkedDocId: vendorInvoiceId || referenceId,
@@ -953,7 +1064,7 @@ export class ProcurementService {
           type: 'DEBIT',
           amount,
           balanceAfterTransaction: nextBalance,
-          paymentMode: paymentMode || 'CASH',
+          paymentMode: resolvedMode as any,
           sourceModule: 'PROCUREMENT',
           referenceType: 'PAYMENT',
           referenceId: payment.id,

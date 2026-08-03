@@ -45,11 +45,11 @@ export class ChequeController {
   static async updateStatus(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      const { status } = req.body;
-      const cheque = await ChequeService.updateStatus(id, status as ChequeStatus);
+      const { status, accountId } = req.body;
+      const cheque = await ChequeService.updateStatus(id, status as ChequeStatus, accountId);
       res.json(cheque);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 }

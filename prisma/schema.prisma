@@ -131,6 +131,27 @@ model Franchise {
   accounts          Account[]
   procurementOrders ProcurementOrder[]
   loanAccounts      LoanAccount[]
+  dailySettlements  DailySettlement[]
+  wasteEntries      WasteEntry[]
+  cartons           Carton[]
+  primaryWarehouseId String?
+  primaryWarehouse  Warehouse?         @relation("PrimaryWarehouse", fields: [primaryWarehouseId], references: [id])
+}
+
+model DailySettlement {
+  id           String   @id @default(uuid())
+  franchiseId  String
+  businessDate DateTime
+  cashTotal    Float    @default(0)
+  upiTotal     Float    @default(0)
+  cardTotal    Float    @default(0)
+  grandTotal   Float    @default(0)
+  orderCount   Int      @default(0)
+  closedBy     String?
+  createdAt    DateTime @default(now())
+  franchise    Franchise @relation(fields: [franchiseId], references: [id])
+
+  @@unique([franchiseId, businessDate])
 }
 
 model Cheque {
@@ -147,6 +168,8 @@ model Cheque {
   notes        String?
   franchiseId  String
   franchise    Franchise    @relation(fields: [franchiseId], references: [id])
+  accountId    String?
+  account      Account?     @relation(fields: [accountId], references: [id])
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 }
@@ -199,8 +222,22 @@ model InventoryItem {
   conversions          ItemUnitConversion[]
   baseUnitId           String?
   baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
+  wasteEntries         WasteEntry[]
 
   @@unique([sku, franchiseId])
+}
+
+model WasteEntry {
+  id              String    @id @default(uuid())
+  inventoryItemId String
+  franchiseId     String?
+  quantity        Float
+  reason          String
+  note            String?
+  costAtTime      Float?
+  createdAt       DateTime  @default(now())
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  franchise       Franchise?    @relation(fields: [franchiseId], references: [id])
 }
 
 model StockMovement {
@@ -250,7 +287,6 @@ model Vendor {
   vendorCode        String?            @unique
   items             InventoryItem[]
   orders            ProcurementOrder[]
-  rfqs              PurchaseRFQ[]
   purchaseReturns   PurchaseReturn[]
   invoices          VendorInvoice[]
   ledgerEntries     VendorLedger[]
@@ -474,11 +510,36 @@ model Production {
   expiryDate     DateTime?
   startTime      DateTime?
   actualYield    Float?
+  currentStage   ProductionStage  @default(QUEUED)
+  stageUpdatedAt DateTime?
   batches        ProductBatch[]
   customer       Customer?        @relation(fields: [customerId], references: [id])
   franchise      Franchise        @relation(fields: [franchiseId], references: [id])
   recipe         Recipe           @relation(fields: [recipeId], references: [id])
   items          ProductionItem[]
+  stageLogs      ProductionStageLog[]
+}
+
+model ProductionStageLog {
+  id           String          @id @default(uuid())
+  productionId String
+  stage        ProductionStage
+  enteredAt    DateTime        @default(now())
+  production   Production      @relation(fields: [productionId], references: [id])
+}
+
+enum ProductionStage {
+  QUEUED
+  MIXING
+  COOKING
+  COOLING
+  READY_FOR_QC
+}
+
+enum PackagingStatus {
+  PENDING
+  PARTIALLY_PACKED
+  PACKAGED
 }
 
 model ProductBatch {
@@ -497,12 +558,30 @@ model ProductBatch {
   textureCheck    String?
   rejectionQty    Float?             @default(0)
   approvedQty     Float?             @default(0)
-  packagingStatus String?            @default("PENDING") // PENDING, PACKAGED
+  packagingStatus PackagingStatus?   @default(PENDING)
   packagedQty     Float?             @default(0)
+  cartonedQty     Float?             @default(0)
   franchise       Franchise?         @relation(fields: [franchiseId], references: [id])
   product         Product            @relation(fields: [productId], references: [id])
   production      Production?        @relation(fields: [productionId], references: [id])
   packagings      ProductPackaging[]
+  cartons         Carton[]
+}
+
+model Carton {
+  id              String       @id @default(uuid())
+  cartonCode      String       @unique
+  batchId         String
+  cartonSize      String
+  unitsPerCarton  Int
+  cartonCount     Int
+  totalUnits      Int
+  weightPerCarton Float?
+  franchiseId     String?
+  createdBy       String?
+  createdAt       DateTime     @default(now())
+  batch           ProductBatch @relation(fields: [batchId], references: [id])
+  franchise       Franchise?   @relation(fields: [franchiseId], references: [id])
 }
 
 model ProductPackaging {
@@ -629,6 +708,7 @@ model Order {
   franchise          Franchise   @relation(fields: [franchiseId], references: [id])
   orderItems         OrderItem[]
   payments           Payment[]
+  returns            ReturnOrder[]
 }
 
 model OrderItem {
@@ -706,6 +786,7 @@ model Account {
   expenses        Expense[]
   payments        Payment[]
   vendorLedgers   VendorLedger[]
+  cheques         Cheque[]
 }
 
 model Expense {
@@ -864,14 +945,44 @@ model Employee {
   shifts                EmployeeShift[]
   leaves                Leave[]
   payslips              Payslip[]
+  attendanceLogs        AttendanceLog[]
+  leaveBalances         LeaveBalance[]
+}
+
+model AttendanceLog {
+  id         String    @id @default(uuid())
+  employeeId String
+  date       DateTime
+  clockIn    DateTime?
+  clockOut   DateTime?
+  source     String?   @default("MANUAL")
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  employee   Employee  @relation(fields: [employeeId], references: [id])
+
+  @@unique([employeeId, date])
 }
 
 model LeaveType {
-  id      String  @id @default(uuid())
-  name    String
-  maxDays Int
-  isPaid  Boolean @default(true)
-  leaves  Leave[]
+  id       String         @id @default(uuid())
+  name     String
+  maxDays  Int
+  isPaid   Boolean        @default(true)
+  leaves   Leave[]
+  balances LeaveBalance[]
+}
+
+model LeaveBalance {
+  id         String    @id @default(uuid())
+  employeeId String
+  leaveTypeId String
+  year       Int
+  allocated  Int
+  used       Int       @default(0)
+  employee   Employee  @relation(fields: [employeeId], references: [id])
+  leaveType  LeaveType @relation(fields: [leaveTypeId], references: [id])
+
+  @@unique([employeeId, leaveTypeId, year])
 }
 
 model Leave {
@@ -1059,11 +1170,13 @@ model ReturnOrder {
   updatedAt        DateTime        @updatedAt
   franchiseId      String?
   franchiseOrderId String?
+  posOrderId       String?
   items            ReturnItem[]
   customer         Customer?       @relation(fields: [customerId], references: [id])
   franchise        Franchise?      @relation(fields: [franchiseId], references: [id])
   franchiseOrder   FranchiseOrder? @relation(fields: [franchiseOrderId], references: [id])
   salesOrder       SalesOrder?     @relation(fields: [salesOrderId], references: [id])
+  posOrder         Order?          @relation(fields: [posOrderId], references: [id])
 }
 
 model ReturnItem {
@@ -1117,32 +1230,6 @@ model DeliveryChallanItem {
   challan     DeliveryChallan @relation(fields: [challanId], references: [id])
 }
 
-model PurchaseRFQ {
-  id               String    @id @default(uuid())
-  rfqNumber        String    @unique
-  vendorId         String
-  status           RFQStatus @default(SENT)
-  responseDeadline DateTime?
-  notes            String?
-  quotedAmount     Float?
-  createdBy        String?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
-  vendor           Vendor    @relation(fields: [vendorId], references: [id])
-  items            RFQItem[]
-}
-
-model RFQItem {
-  id         String      @id @default(uuid())
-  rfqId      String
-  itemName   String
-  quantity   Float
-  unit       String
-  quotedRate Float?
-  notes      String?
-  rfq        PurchaseRFQ @relation(fields: [rfqId], references: [id])
-}
-
 model PurchaseReturn {
   id                 String               @id @default(uuid())
   returnNumber       String               @unique
@@ -1193,22 +1280,6 @@ model FranchiseRequest {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   franchise     Franchise @relation(fields: [franchiseId], references: [id])
-}
-
-model FinancialPayment {
-  id          String   @id @default(uuid())
-  date        DateTime @default(now())
-  entity      String
-  entityType  String
-  flowType    String
-  amount      Float
-  method      String
-  status      String   @default("PAID")
-  reference   String?
-  description String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  type        String?
 }
 
 model FranchiseLedger {
@@ -1300,6 +1371,7 @@ model Warehouse {
   movements StockMovement[]
   bins      WarehouseBin[]
   orders    ProcurementOrder[]
+  primaryForFranchises Franchise[] @relation("PrimaryWarehouse")
 }
 
 model WarehouseBin {
@@ -1321,6 +1393,7 @@ model InventoryBatch {
   expDate         DateTime?
   initialQty      Float
   currentQty      Float
+  unitCost        Float?
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
   status          InventoryStockState @default(QC_HOLD)
@@ -1637,14 +1710,6 @@ enum ReturnStatus {
   APPROVED
   REJECTED
   COMPLETED
-}
-
-enum RFQStatus {
-  SENT
-  RESPONDED
-  ACCEPTED
-  REJECTED
-  CONVERTED
 }
 
 enum PRStatus {

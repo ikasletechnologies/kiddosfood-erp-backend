@@ -47,7 +47,13 @@ export class ProductionService {
           startTime: new Date(),
           producedBy: data.userId,
           expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
+          currentStage: 'QUEUED',
+          stageUpdatedAt: new Date(),
         },
+      });
+
+      await tx.productionStageLog.create({
+        data: { productionId: production.id, stage: 'QUEUED' },
       });
 
       // 4. Deduct raw materials
@@ -83,6 +89,40 @@ export class ProductionService {
         status: 'STOPPED',
         endTime: new Date(),
       },
+    });
+  }
+
+  /**
+   * Advance a run's physical stage (Queued -> Mixing -> Cooking -> Cooling ->
+   * Ready for QC). Previously the Active Runs UI showed a hardcoded "Current
+   * Stage: Mixing" and a hardcoded elapsed-time/completion% regardless of
+   * what was actually happening — this makes that data real.
+   */
+  static async advanceStage(id: string, stage: string) {
+    return prisma.$transaction(async tx => {
+      const production = await tx.production.findUnique({ where: { id } });
+      if (!production) throw new Error('Production run not found');
+      if (production.status !== 'IN_PROGRESS') {
+        throw new Error('Can only update stage while the run is in progress');
+      }
+
+      const updated = await tx.production.update({
+        where: { id },
+        data: { currentStage: stage as any, stageUpdatedAt: new Date() },
+      });
+
+      await tx.productionStageLog.create({
+        data: { productionId: id, stage: stage as any },
+      });
+
+      return updated;
+    });
+  }
+
+  static async getStageHistory(id: string) {
+    return prisma.productionStageLog.findMany({
+      where: { productionId: id },
+      orderBy: { enteredAt: 'asc' },
     });
   }
 
@@ -162,7 +202,9 @@ export class ProductionService {
         },
       });
 
-      if (data.qcStatus === 'APPROVED' && approvedQty > 0) {
+      const needsTargetItem = (data.qcStatus === 'APPROVED' && approvedQty > 0) || rejection > 0;
+
+      if (needsTargetItem) {
         const franchiseId = batch.franchiseId || batch.production?.franchiseId;
         if (!franchiseId) throw new Error('Franchise ID not found for batch');
 
@@ -190,15 +232,34 @@ export class ProductionService {
           });
         }
 
-        await InventoryService.recordMovement(tx, {
-          itemId: targetItem.id,
-          type: 'PRODUCTION_IN',
-          quantity: approvedQty,
-          referenceType: 'PRODUCTION',
-          referenceId: batch.productionId || batch.id,
-          note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
-          userId: data.userId,
-        });
+        if (data.qcStatus === 'APPROVED' && approvedQty > 0) {
+          await InventoryService.recordMovement(tx, {
+            itemId: targetItem.id,
+            type: 'PRODUCTION_IN',
+            quantity: approvedQty,
+            referenceType: 'PRODUCTION',
+            referenceId: batch.productionId || batch.id,
+            note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
+            userId: data.userId,
+          });
+        }
+
+        // Rejected quantity never entered inventory, so this is a WasteEntry
+        // record only (for cost/traceability reporting) — not a stock movement,
+        // since there's no stock to deduct. Previously the rejected quantity was
+        // simply discarded with no trace at all.
+        if (rejection > 0) {
+          await tx.wasteEntry.create({
+            data: {
+              inventoryItemId: targetItem.id,
+              franchiseId,
+              quantity: rejection,
+              reason: 'QC_FAIL',
+              note: `QC rejected from batch ${batch.batchCode}`,
+              costAtTime: rejection * (targetItem.costPrice || 0),
+            },
+          });
+        }
       }
 
       return updatedBatch;
@@ -238,6 +299,14 @@ export class ProductionService {
 
       if (bulkItem.currentStock < totalWeightNeeded) {
         throw new Error(`Insufficient bulk stock. Needed: ${totalWeightNeeded} ${bulkItem.unit}, Available: ${bulkItem.currentStock} ${bulkItem.unit}`);
+      }
+
+      // Cap against this batch's own QC-approved quantity — only approved
+      // output ever became usable stock, so that's the real packaging ceiling
+      // (not the raw batch.quantity, which includes anything QC rejected).
+      const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
+      if (totalWeightNeeded > remainingInBatch + 0.001) {
+        throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch} ${bulkItem.unit} left).`);
       }
 
       await InventoryService.recordMovement(tx, {
@@ -298,11 +367,18 @@ export class ProductionService {
         },
       });
 
+      // A batch can be packaged across multiple runs — only mark it fully
+      // PACKAGED once the cumulative packaged weight covers the batch quantity,
+      // otherwise it's PARTIALLY_PACKED (previously this was hardcoded to
+      // PACKAGED on every single packaging run, even a partial one).
+      const newPackagedQty = (batch.packagedQty || 0) + totalWeightNeeded;
+      const newPackagingStatus = newPackagedQty >= (batch.approvedQty || 0) - 0.001 ? 'PACKAGED' : 'PARTIALLY_PACKED';
+
       await tx.productBatch.update({
         where: { id: batch.id },
         data: {
-          packagingStatus: 'PACKAGED',
-          packagedQty: { increment: totalWeightNeeded },
+          packagingStatus: newPackagingStatus,
+          packagedQty: newPackagedQty,
         },
       });
 

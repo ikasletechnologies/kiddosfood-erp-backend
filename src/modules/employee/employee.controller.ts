@@ -108,13 +108,23 @@ export class EmployeeController {
 
   static async approveLeave(req: Request, res: Response) {
     try {
-      const approverId = (req as any).user?.id;
+      const approverId = (req as any).user?.userId;
       const { status } = req.body;
       const leave = await EmployeeService.approveLeave(req.params.id, status, approverId);
       res.json(leave);
     } catch (error: any) {
       const status = error.statusCode || 500;
       res.status(status).json({ error: error.message });
+    }
+  }
+
+  static async getLeaveBalances(req: Request, res: Response) {
+    try {
+      const year = req.query.year ? Number(req.query.year) : undefined;
+      const balances = await EmployeeService.getLeaveBalances(req.params.id, year);
+      res.json(balances);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
   }
 
@@ -157,6 +167,38 @@ export class EmployeeController {
     } catch (error: any) {
       const status = error.statusCode || 500;
       res.status(status).json({ error: error.message });
+    }
+  }
+
+  static async clockIn(req: Request, res: Response) {
+    try {
+      const result = await EmployeeService.clockIn(req.params.id, req.body.source);
+      res.status(201).json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async clockOut(req: Request, res: Response) {
+    try {
+      const result = await EmployeeService.clockOut(req.params.id);
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async getAttendance(req: Request, res: Response) {
+    try {
+      const { employeeId, startDate, endDate } = req.query;
+      const result = await EmployeeService.getAttendance({
+        employeeId: employeeId as string,
+        startDate: startDate as string,
+        endDate: endDate as string
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
   }
 }

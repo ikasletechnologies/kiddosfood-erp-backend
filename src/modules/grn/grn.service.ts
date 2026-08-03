@@ -115,6 +115,12 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
+        // Snapshot stock/cost BEFORE this receipt so the weighted-average
+        // below reflects "what we had" vs "what just arrived", not the
+        // post-receipt total.
+        const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
+        const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
+
         // 1. Create Inventory Batch (Directly APPROVED for streamlined flow)
         const batch = await tx.inventoryBatch.create({
           data: {
@@ -125,6 +131,7 @@ export class GRNService {
             expDate: item.expDate,
             initialQty: item.acceptedQty,
             currentQty: item.acceptedQty, // Usable immediately
+            unitCost: item.price,
             status: 'APPROVED'
           }
         });
@@ -140,9 +147,17 @@ export class GRNService {
           warehouseId: item.warehouseId || undefined
         });
 
+        // 3. Recompute costPrice as a moving weighted average, instead of it
+        // being a single static number that's only ever set/edited by hand.
+        const priorQty = Math.max(0, preReceiptStock);
+        const priorCost = invItemBefore?.costPrice || 0;
+        const newCostPrice = priorQty + item.acceptedQty > 0
+          ? ((priorQty * priorCost) + (item.acceptedQty * item.price)) / (priorQty + item.acceptedQty)
+          : item.price;
+
         await tx.inventoryItem.update({
           where: { id: item.materialId! },
-          data: { vendorId: grn.procurementOrder.vendorId }
+          data: { vendorId: grn.procurementOrder.vendorId, costPrice: newCostPrice }
         });
 
         // 3. Mark GRN Item as APPROVED
@@ -165,9 +180,13 @@ export class GRNService {
       const grnTotalWithTax = grnSubtotal * taxFactor;
 
       if (grnTotalWithTax > 0) {
-        // Automatically generate a Purchase Bill (Vendor Invoice)
+        // Automatically generate a Purchase Bill (Vendor Invoice).
+        // NOTE: Liability is intentionally NOT posted to the VendorLedger here.
+        // VendorInvoiceService.approve() is the single point where liability is
+        // recognized in the ledger (see its doc-comment) — posting it here too
+        // used to double-count every GRN-generated invoice once it was approved.
         const invoiceNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
-        const invoice = await tx.vendorInvoice.create({
+        await tx.vendorInvoice.create({
           data: {
             vendorId: grn.procurementOrder.vendorId,
             poId: grn.poId,
@@ -175,27 +194,6 @@ export class GRNService {
             invoiceNumber: invoiceNumber,
             amount: grnTotalWithTax,
             status: 'PENDING'
-          }
-        });
-
-        const lastEntry = await tx.vendorLedger.findFirst({
-          where: { vendorId: grn.procurementOrder.vendorId },
-          orderBy: { createdAt: 'desc' }
-        });
-        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: grn.procurementOrder.vendorId,
-            type: 'CREDIT', // Purchase Liability increases
-            amount: grnTotalWithTax,
-            balanceAfterTransaction: currentBalance + grnTotalWithTax,
-            paymentMode: 'CASH', // Placeholder
-            sourceModule: 'PROCUREMENT',
-            referenceType: 'PURCHASE',
-            referenceId: grnId,
-            invoiceId: invoice.id,
-            note: `Goods Received via GRN ${grnId} (PO #${grn.procurementOrder.poNumber || grn.poId.slice(0,8)})`
           }
         });
       }

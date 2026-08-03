@@ -92,6 +92,33 @@ export class CustomerService {
     return prisma.customer.delete({ where: { id } });
   }
 
+  /**
+   * Bulk per-customer ledger totals for the Customer Ledger list page — avoids an
+   * N+1 call per customer to the party-statement report. DEBIT = sale/invoice
+   * (increases what the customer owes), CREDIT = payment received (reduces it).
+   */
+  static async getLedgerSummary(franchiseId?: string) {
+    const customers = await prisma.customer.findMany({
+      where: franchiseId ? { franchiseId } : undefined,
+      include: { ledgerEntries: true }
+    });
+
+    return customers.map((c) => {
+      let totalSales = 0;
+      let totalPaid = 0;
+      for (const entry of c.ledgerEntries) {
+        if (entry.type === 'DEBIT') totalSales += entry.amount;
+        else totalPaid += entry.amount;
+      }
+      return {
+        customerId: c.id,
+        totalSales,
+        totalPaid,
+        balance: totalSales - totalPaid
+      };
+    });
+  }
+
   static async getLoyalty(customerId: string) {
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },

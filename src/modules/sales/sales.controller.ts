@@ -29,7 +29,7 @@ export class SalesController {
 
   static async createQuotation(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.id;
+      const createdBy = (req as any).user?.userId;
       const quotation = await SalesService.createQuotation({ ...req.body, createdBy });
       res.status(201).json(quotation);
     } catch (error) {
@@ -57,7 +57,7 @@ export class SalesController {
 
   static async convertQuotation(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.id;
+      const createdBy = (req as any).user?.userId;
       const salesOrder = await SalesService.convertQuotationToOrder(req.params.id, createdBy, req.body);
       res.status(201).json(salesOrder);
     } catch (error) {
@@ -94,7 +94,7 @@ export class SalesController {
 
   static async createSalesOrder(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.id;
+      const createdBy = (req as any).user?.userId;
       const order = await SalesService.createSalesOrder({ ...req.body, createdBy });
       res.status(201).json(order);
     } catch (error) {
@@ -139,7 +139,7 @@ export class SalesController {
 
   static async updateReturnOrder(req: Request, res: Response) {
     try {
-      const approverId = (req as any).user?.id;
+      const approverId = (req as any).user?.userId;
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
     } catch (error) {

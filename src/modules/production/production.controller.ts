@@ -16,7 +16,7 @@ export class ProductionController {
         customerId,
         productionType,
         expiryDate,
-        userId: user?.id
+        userId: user?.userId
       });
       res.status(201).json(result);
     } catch (error) {
@@ -56,9 +56,27 @@ export class ProductionController {
     }
   }
 
+  static async advanceStage(req: Request, res: Response) {
+    try {
+      const result = await ProductionService.advanceStage(req.params.id, req.body.stage);
+      res.json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getStageHistory(req: Request, res: Response) {
+    try {
+      const result = await ProductionService.getStageHistory(req.params.id);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
   static async approveBatch(req: Request, res: Response) {
     try {
-      const userId = (req as unknown as { user: { id: string } }).user?.id;
+      const userId = (req as any).user?.userId;
       const { actualYield } = req.body;
       const result = await ProductionService.approveProduction(req.params.id, userId, actualYield ? Number(actualYield) : undefined);
       res.json(result);
@@ -88,7 +106,7 @@ export class ProductionController {
         colorCheck,
         textureCheck,
         rejectionQty: rejectionQty !== undefined ? Number(rejectionQty) : 0,
-        userId: user?.id
+        userId: user?.userId
       });
       res.json(result);
     } catch (error: any) {
@@ -104,7 +122,7 @@ export class ProductionController {
         batchId: req.params.id,
         packetSize,
         quantityPackets: Number(quantityPackets),
-        userId: user?.id
+        userId: user?.userId
       });
       res.json(result);
     } catch (error: any) {

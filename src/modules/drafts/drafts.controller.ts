@@ -4,7 +4,7 @@ import { DraftsService } from './drafts.service';
 export class DraftsController {
   static async getDrafts(req: Request, res: Response) {
     try {
-      const userId = (req as any).user?.id;
+      const userId = (req as any).user?.userId;
       const type = req.query.type as string;
       const drafts = await DraftsService.getDrafts(userId, type);
       res.json(drafts);
@@ -15,7 +15,7 @@ export class DraftsController {
 
   static async saveDraft(req: Request, res: Response) {
     try {
-      const userId = (req as any).user?.id;
+      const userId = (req as any).user?.userId;
       const draft = req.body; // { id?, type, data }
       const saved = await DraftsService.saveDraft(userId, draft);
       res.json(saved);

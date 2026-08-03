@@ -55,7 +55,7 @@ export class InventoryController {
         quantity,
         type,
         note,
-        userId: (req as any).user?.id
+        userId: (req as any).user?.userId
       });
       res.json(result);
     } catch (error: any) {
@@ -71,7 +71,7 @@ export class InventoryController {
         quantity,
         type,
         note,
-        userId: (req as any).user?.id
+        userId: (req as any).user?.userId
       });
       res.json(result);
     } catch (error: any) {
@@ -86,11 +86,35 @@ export class InventoryController {
         itemId,
         newQuantity,
         note,
-        userId: (req as any).user?.id
+        userId: (req as any).user?.userId
       });
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getReconciliationSheet(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      if (!franchiseId) return res.status(400).json({ error: 'franchiseId is required' });
+
+      const sheet = await InventoryService.getReconciliationSheet(franchiseId);
+      res.json(sheet);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async submitReconciliation(req: Request, res: Response) {
+    try {
+      const { entries } = req.body;
+      const results = await InventoryService.submitReconciliation(entries, (req as any).user?.userId);
+      res.json(results);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
     }
   }
 
@@ -125,18 +149,6 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
-  static async fixUnits(req: Request, res: Response) {
-    try {
-      const result = await prisma.inventoryItem.updateMany({
-        where: { category: 'FINISHED_GOOD' },
-        data: { unit: 'PC' }
-      });
-      res.json({ message: `Successfully updated ${result.count} finished goods to PC unit.` });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  }
-
   static async getWarehouses(req: Request, res: Response) {
     try {
       const warehouses = await prisma.warehouse.findMany({
@@ -145,6 +157,15 @@ export class InventoryController {
       res.json(warehouses);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getWarehouseStock(req: Request, res: Response) {
+    try {
+      const report = await InventoryService.getWarehouseStockReport(req.params.id);
+      res.json(report);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
     }
   }
 

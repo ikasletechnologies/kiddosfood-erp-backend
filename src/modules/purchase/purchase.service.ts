@@ -1,14 +1,20 @@
 import prisma from '../../lib/prisma';
+import { ProcurementService } from '../procurement/procurement.service';
 
-let rfqCounter = 1000;
-let returnCounter = 1000;
-
-function generateRFQNumber() {
-  return `RFQ-${new Date().getFullYear()}-${String(++rfqCounter).padStart(5, '0')}`;
+async function generateRFQNumber() {
+  const year = new Date().getFullYear();
+  const count = await prisma.requestForQuotation.count({
+    where: { createdAt: { gte: new Date(year, 0, 1) } }
+  });
+  return `RFQ-${year}-${(count + 1).toString().padStart(5, '0')}`;
 }
 
-function generateReturnNumber() {
-  return `PR-${new Date().getFullYear()}-${String(++returnCounter).padStart(5, '0')}`;
+async function generateReturnNumber() {
+  const year = new Date().getFullYear();
+  const count = await prisma.purchaseReturn.count({
+    where: { createdAt: { gte: new Date(year, 0, 1) } }
+  });
+  return `PR-${year}-${(count + 1).toString().padStart(5, '0')}`;
 }
 
 export class PurchaseService {
@@ -51,7 +57,7 @@ export class PurchaseService {
   }) {
     return prisma.requestForQuotation.create({
       data: {
-        rfqNumber: generateRFQNumber(),
+        rfqNumber: await generateRFQNumber(),
         purchaseRequestId: data.purchaseRequestId,
         deadline: data.deadline ? new Date(data.deadline) : undefined,
         notes: data.notes,
@@ -104,24 +110,53 @@ export class PurchaseService {
   static async convertQuotationToPO(quotationId: string) {
     const quote = await prisma.vendorQuotation.findUnique({
       where: { id: quotationId },
-      include: { items: true, rfq: true }
+      include: {
+        items: true,
+        rfq: { include: { purchaseRequest: { include: { items: { include: { inventoryItem: true } } } } } }
+      }
     });
     if (!quote) throw new Error('Quotation not found');
 
-    const poItems = quote.items.map((item) => ({
-      itemName: item.itemName,
-      quantity: item.quantity,
-      unit: item.unit,
-      rate: item.quotedRate || 0,
-      totalAmount: item.quantity * (item.quotedRate || 0)
-    }));
+    // VendorQuotationItem only stores a free-text itemName (it isn't linked to a
+    // real InventoryItem), but a normal PO requires a real inventoryItemId on every
+    // line so GST/costing can be computed. Resolve each quoted item to a real
+    // InventoryItem: prefer a name match against the RFQ's linked Purchase Request
+    // (if any), then fall back to a direct case-insensitive name match. If a line
+    // can't be resolved, fail loudly instead of creating a PO with no real items —
+    // that's what silently produced the previous broken (poNumber-less) PO.
+    const prItemsByName = new Map(
+      (quote.rfq?.purchaseRequest?.items || []).map((pi) => [pi.inventoryItem.name.toLowerCase(), pi.inventoryItem])
+    );
 
-    const po = await prisma.procurementOrder.create({
-      data: {
-        vendorId: quote.vendorId,
-        totalAmount: quote.totalAmount,
-        items: poItems
-      }
+    const resolvedItems = await Promise.all(
+      quote.items.map(async (item) => {
+        const key = item.itemName.trim().toLowerCase();
+        let inventoryItem = prItemsByName.get(key);
+        if (!inventoryItem) {
+          inventoryItem = await prisma.inventoryItem.findFirst({
+            where: { name: { equals: item.itemName, mode: 'insensitive' } }
+          }) || undefined;
+        }
+        if (!inventoryItem) {
+          throw new Error(
+            `Cannot convert quotation to PO: "${item.itemName}" is not linked to any Inventory item. Add it to Inventory first, then retry.`
+          );
+        }
+        return {
+          inventoryItemId: inventoryItem.id,
+          quantity: item.quantity,
+          price: item.quotedRate || 0
+        };
+      })
+    );
+
+    // Delegate to the real PO-creation path so GST computation, poNumber
+    // generation, and structured poItems all match a normally-created PO.
+    const po = await ProcurementService.createPurchaseOrder({
+      vendorId: quote.vendorId,
+      status: 'PENDING_APPROVAL',
+      notes: `Converted from Quotation (RFQ ${quote.rfq?.rfqNumber || quote.rfqId})`,
+      items: resolvedItems
     });
 
     await prisma.vendorQuotation.update({ where: { id: quotationId }, data: { status: 'ACCEPTED' } });
@@ -165,7 +200,7 @@ export class PurchaseService {
 
     return prisma.purchaseReturn.create({
       data: {
-        returnNumber: generateReturnNumber(),
+        returnNumber: await generateReturnNumber(),
         procurementOrderId: data.procurementOrderId,
         vendorId: data.vendorId,
         reason: data.reason,
@@ -224,18 +259,22 @@ export class PurchaseService {
           }
         }
 
-        // B. Update Vendor Ledger (Record Credit to reduce payable)
+        // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor).
+        // NOTE: this must be a DEBIT, not a CREDIT — ProcurementService.getVendors()
+        // only counts RETURN entries as liability-reducing when type === 'DEBIT'.
+        // Posting a CREDIT here previously made an approved return *increase* the
+        // vendor's computed payable balance instead of decreasing it.
         const lastEntry = await tx.vendorLedger.findFirst({
           where: { vendorId: existing.vendorId },
           orderBy: { createdAt: 'desc' }
         });
         const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-        const nextBalance = currentBalance + (existing.refundAmount || 0);
+        const nextBalance = currentBalance - (existing.refundAmount || 0);
 
         await tx.vendorLedger.create({
           data: {
             vendorId: existing.vendorId,
-            type: 'CREDIT',
+            type: 'DEBIT',
             amount: existing.refundAmount || 0,
             balanceAfterTransaction: nextBalance,
             sourceModule: 'PROCUREMENT',

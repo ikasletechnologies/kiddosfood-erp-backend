@@ -40,6 +40,88 @@ export class InventoryService {
     return movements.reduce((acc: number, m: any) => acc + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
   }
 
+  /**
+   * Per-warehouse balance for one item. `Warehouse`/`WarehouseBin` previously
+   * existed only as tags on StockMovement with no real per-warehouse balance
+   * anywhere. Movements that don't carry a warehouseId (POS/Production
+   * currently don't tag one) are attributed to the item's franchise's
+   * `primaryWarehouseId` for this aggregate, rather than retrofitting every
+   * movement-creation call site to always pass a warehouse.
+   */
+  static async computeWarehouseStock(itemId: string, warehouseId: string, tx: any = prisma): Promise<number> {
+    const item = await tx.inventoryItem.findUnique({
+      where: { id: itemId },
+      include: { franchise: { select: { primaryWarehouseId: true } } }
+    });
+    const primaryWarehouseId = item?.franchise?.primaryWarehouseId;
+
+    const movements = await tx.stockMovement.findMany({
+      where: { itemId },
+      select: { quantity: true, baseQty: true, warehouseId: true }
+    });
+
+    return movements.reduce((acc: number, m: any) => {
+      const effectiveWarehouseId = m.warehouseId || primaryWarehouseId;
+      if (effectiveWarehouseId !== warehouseId) return acc;
+      return acc + (m.baseQty !== null ? m.baseQty : m.quantity);
+    }, 0);
+  }
+
+  /**
+   * Balances for every item that has ever moved through this warehouse
+   * (directly or via the franchise's primary-warehouse default).
+   */
+  static async getWarehouseStockReport(warehouseId: string) {
+    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
+    if (!warehouse) throw new Error('Warehouse not found');
+
+    const franchisesUsingAsPrimary = await prisma.franchise.findMany({
+      where: { primaryWarehouseId: warehouseId },
+      select: { id: true }
+    });
+    const primaryFranchiseIds = franchisesUsingAsPrimary.map((f) => f.id);
+
+    // Candidate items: anything tagged directly on a movement to this
+    // warehouse, plus everything belonging to a franchise whose primary
+    // warehouse is this one (movements there might not tag a warehouse at all).
+    const [directItemIds, franchiseItems] = await Promise.all([
+      prisma.stockMovement.findMany({
+        where: { warehouseId },
+        select: { itemId: true },
+        distinct: ['itemId']
+      }),
+      primaryFranchiseIds.length > 0
+        ? prisma.inventoryItem.findMany({
+            where: { franchiseId: { in: primaryFranchiseIds } },
+            select: { id: true, name: true, sku: true, unit: true }
+          })
+        : Promise.resolve([])
+    ]);
+
+    const itemIds = new Set<string>(directItemIds.map((m) => m.itemId));
+    franchiseItems.forEach((i) => itemIds.add(i.id));
+
+    const items = await prisma.inventoryItem.findMany({
+      where: { id: { in: Array.from(itemIds) } },
+      select: { id: true, name: true, sku: true, unit: true }
+    });
+
+    const balances = await Promise.all(
+      items.map(async (item) => ({
+        itemId: item.id,
+        name: item.name,
+        sku: item.sku,
+        unit: item.unit,
+        balance: await this.computeWarehouseStock(item.id, warehouseId)
+      }))
+    );
+
+    return {
+      warehouse: { id: warehouse.id, name: warehouse.name },
+      balances: balances.filter((b) => Math.abs(b.balance) > 0.001)
+    };
+  }
+
   static async getInventory(franchiseId: string, includeInactive = false) {
     const items = await prisma.inventoryItem.findMany({
       where: {
@@ -526,6 +608,54 @@ export class InventoryService {
     });
   }
 
+  /**
+   * Physical count sheet: system-computed stock per item, next to a blank
+   * column the reviewer fills in during a stock count. Previously the only
+   * reconciliation tool was adjusting one item at a time with no structured
+   * "what should I even be counting" worksheet.
+   */
+  static async getReconciliationSheet(franchiseId: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: { franchiseId, isActive: true },
+      orderBy: { name: 'asc' }
+    });
+
+    return Promise.all(
+      items.map(async (item) => ({
+        itemId: item.id,
+        name: item.name,
+        sku: item.sku,
+        category: item.category,
+        unit: item.unit,
+        systemStock: await this.computeStock(item.id)
+      }))
+    );
+  }
+
+  /**
+   * Apply a batch of physical counts from a filled-in reconciliation sheet.
+   * Each line goes through the same ledger-safe adjustStock() used for a
+   * single-item adjustment — this just lets a reviewer submit a whole sheet
+   * at once instead of one item at a time.
+   */
+  static async submitReconciliation(
+    entries: { itemId: string; physicalCount: number; note?: string }[],
+    userId?: string
+  ) {
+    const results: { itemId: string; systemStockBefore: number; physicalCount: number; variance: number; result: any }[] = [];
+    for (const entry of entries) {
+      const before = await this.computeStock(entry.itemId);
+      const result = await this.adjustStock({
+        itemId: entry.itemId,
+        newQuantity: entry.physicalCount,
+        note: entry.note || 'Stock reconciliation count',
+        userId
+      });
+      results.push({ itemId: entry.itemId, systemStockBefore: before, physicalCount: entry.physicalCount, variance: entry.physicalCount - before, result });
+    }
+    return results;
+  }
+
   // Core engine: record movement and keep currentStock in sync as cache
   static async recordMovement(
     tx: any,
@@ -564,9 +694,45 @@ export class InventoryService {
       },
     });
 
+    // Every outbound movement (Production/POS/Packaging/etc.) deducts from the
+    // oldest non-expired batch first. This used to not exist at all — batches
+    // were only ever written at GRN time and never depleted by consumption, so
+    // InventoryBatch.currentQty was disconnected from real stock movement. This
+    // is best-effort: not all stock is batch-tracked (e.g. opening balances),
+    // so it depletes whatever tracked batches exist and silently stops there.
+    if (stockChange < 0) {
+      await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange));
+    }
+
     return updatedItem;
   }
-  
+
+  static async depleteBatchesFIFO(tx: any, itemId: string, quantity: number) {
+    let remaining = quantity;
+    const batches = await tx.inventoryBatch.findMany({
+      where: {
+        inventoryItemId: itemId,
+        currentQty: { gt: 0 },
+        OR: [{ expDate: null }, { expDate: { gte: new Date() } }]
+      },
+      orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }]
+    });
+
+    let totalCost = 0;
+    for (const batch of batches) {
+      if (remaining <= 0) break;
+      const consumeQty = Math.min(batch.currentQty, remaining);
+      await tx.inventoryBatch.update({
+        where: { id: batch.id },
+        data: { currentQty: batch.currentQty - consumeQty }
+      });
+      totalCost += consumeQty * (batch.unitCost || 0);
+      remaining -= consumeQty;
+    }
+
+    return { consumedFromBatches: quantity - remaining, totalCost };
+  }
+
   // New helper for unit conversion engine
   static async convertUnitToBase(itemId: string, unitIdOrName: string, enteredQty: number, tx: any = prisma): Promise<{ requiredBaseQty: number; unitId?: string }> {
     const item = await tx.inventoryItem.findUnique({

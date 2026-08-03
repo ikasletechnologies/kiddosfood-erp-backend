@@ -91,6 +91,16 @@ export class CustomerController {
     }
   }
 
+  static async getLedgerSummary(req: Request, res: Response) {
+    try {
+      const { franchiseId } = req.query;
+      const summary = await CustomerService.getLedgerSummary(franchiseId as string);
+      res.json(summary);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getHistory(req: Request, res: Response) {
     try {
       const history = await CRMService.getCustomerSummary(req.params.id);

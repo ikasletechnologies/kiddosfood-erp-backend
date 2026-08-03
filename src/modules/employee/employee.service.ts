@@ -217,6 +217,24 @@ export class EmployeeService {
     });
   }
 
+  // LeaveType.maxDays was previously stored but never enforced against actual
+  // usage — there was no balance/accrual tracking at all. One LeaveBalance row
+  // per employee+leaveType+calendar year, lazily created from maxDays the
+  // first time it's needed.
+  private static async getOrCreateLeaveBalance(tx: any, employeeId: string, leaveTypeId: string, year: number) {
+    const existing = await tx.leaveBalance.findUnique({
+      where: { employeeId_leaveTypeId_year: { employeeId, leaveTypeId, year } }
+    });
+    if (existing) return existing;
+
+    const leaveType = await tx.leaveType.findUnique({ where: { id: leaveTypeId } });
+    if (!leaveType) throw new Error('Leave type not found');
+
+    return tx.leaveBalance.create({
+      data: { employeeId, leaveTypeId, year, allocated: leaveType.maxDays, used: 0 }
+    });
+  }
+
   static async applyLeave(data: {
     employeeId: string;
     leaveTypeId: string;
@@ -225,29 +243,72 @@ export class EmployeeService {
     days: number;
     reason: string;
   }) {
-    return prisma.leave.create({
-      data: {
-        employeeId: data.employeeId,
-        leaveTypeId: data.leaveTypeId,
-        startDate: new Date(data.startDate),
-        endDate: new Date(data.endDate),
-        days: data.days,
-        reason: data.reason
-      },
-      include: { employee: { include: { user: { select: { fullName: true } } } }, leaveType: true }
+    return prisma.$transaction(async (tx) => {
+      const year = new Date(data.startDate).getFullYear();
+      const balance = await this.getOrCreateLeaveBalance(tx, data.employeeId, data.leaveTypeId, year);
+      const remaining = balance.allocated - balance.used;
+      if (data.days > remaining) {
+        throw new Error(`Requested ${data.days} day(s) exceeds remaining leave balance (${remaining} day(s) left for this type in ${year}).`);
+      }
+
+      return tx.leave.create({
+        data: {
+          employeeId: data.employeeId,
+          leaveTypeId: data.leaveTypeId,
+          startDate: new Date(data.startDate),
+          endDate: new Date(data.endDate),
+          days: data.days,
+          reason: data.reason
+        },
+        include: { employee: { include: { user: { select: { fullName: true } } } }, leaveType: true }
+      });
     });
   }
 
   static async approveLeave(id: string, status: 'APPROVED' | 'REJECTED', approvedBy: string) {
-    return prisma.leave.update({
-      where: { id },
-      data: {
-        status,
-        approvedBy,
-        approvedAt: new Date()
-      },
-      include: { leaveType: true }
+    return prisma.$transaction(async (tx) => {
+      const leave = await tx.leave.findUnique({ where: { id } });
+      if (!leave) throw new Error('Leave not found');
+      if (leave.status !== 'PENDING') throw new Error('Only pending leaves can be approved or rejected');
+
+      if (status === 'APPROVED') {
+        const year = leave.startDate.getFullYear();
+        const balance = await this.getOrCreateLeaveBalance(tx, leave.employeeId, leave.leaveTypeId, year);
+        await tx.leaveBalance.update({
+          where: { id: balance.id },
+          data: { used: balance.used + leave.days }
+        });
+      }
+
+      return tx.leave.update({
+        where: { id },
+        data: {
+          status,
+          approvedBy,
+          approvedAt: new Date()
+        },
+        include: { leaveType: true }
+      });
     });
+  }
+
+  static async getLeaveBalances(employeeId: string, year?: number) {
+    const targetYear = year || new Date().getFullYear();
+    const leaveTypes = await prisma.leaveType.findMany();
+    return Promise.all(
+      leaveTypes.map(async (lt) => {
+        const balance = await prisma.$transaction((tx) => this.getOrCreateLeaveBalance(tx, employeeId, lt.id, targetYear));
+        return {
+          leaveTypeId: lt.id,
+          leaveTypeName: lt.name,
+          isPaid: lt.isPaid,
+          year: targetYear,
+          allocated: balance.allocated,
+          used: balance.used,
+          remaining: balance.allocated - balance.used
+        };
+      })
+    );
   }
 
   // ─── Shifts ──────────────────────────────────────────────────────────────────
@@ -275,6 +336,60 @@ export class EmployeeService {
     return prisma.employeeShift.findMany({
       where: { employeeId },
       include: { shift: true },
+      orderBy: { date: 'desc' }
+    });
+  }
+
+  // --- Attendance (clock-in/out) ---
+  // Previously "attendance" was represented only by the hasAttendanceAccess
+  // boolean flag on Employee — no actual clock-in/out record existed anywhere.
+  // This is the minimum viable version: manual clock-in/out, one row per
+  // employee per day.
+
+  private static startOfDay(d: Date = new Date()) {
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+
+  static async clockIn(employeeId: string, source?: string) {
+    const date = this.startOfDay();
+    const existing = await prisma.attendanceLog.findUnique({
+      where: { employeeId_date: { employeeId, date } }
+    });
+    if (existing?.clockIn) throw new Error('Already clocked in today');
+
+    return prisma.attendanceLog.upsert({
+      where: { employeeId_date: { employeeId, date } },
+      update: { clockIn: new Date(), source: source || 'MANUAL' },
+      create: { employeeId, date, clockIn: new Date(), source: source || 'MANUAL' }
+    });
+  }
+
+  static async clockOut(employeeId: string) {
+    const date = this.startOfDay();
+    const existing = await prisma.attendanceLog.findUnique({
+      where: { employeeId_date: { employeeId, date } }
+    });
+    if (!existing || !existing.clockIn) throw new Error('Must clock in before clocking out');
+    if (existing.clockOut) throw new Error('Already clocked out today');
+
+    return prisma.attendanceLog.update({
+      where: { employeeId_date: { employeeId, date } },
+      data: { clockOut: new Date() }
+    });
+  }
+
+  static async getAttendance(filters: { employeeId?: string; startDate?: string; endDate?: string }) {
+    return prisma.attendanceLog.findMany({
+      where: {
+        ...(filters.employeeId ? { employeeId: filters.employeeId } : {}),
+        ...(filters.startDate || filters.endDate ? {
+          date: {
+            ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
+            ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+          }
+        } : {})
+      },
+      include: { employee: { include: { user: { select: { fullName: true } } } } },
       orderBy: { date: 'desc' }
     });
   }

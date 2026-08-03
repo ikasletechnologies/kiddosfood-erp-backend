@@ -129,7 +129,7 @@ export class RawMaterialsController {
       const user = (req as any).user;
       const item = await InventoryService.updateItem(req.params.id, {
         ...req.body,
-        userId: user?.id
+        userId: user?.userId
       });
       res.json(item);
     } catch (error) {

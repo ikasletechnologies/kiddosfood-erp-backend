@@ -28,7 +28,7 @@ export class PurchaseController {
 
   static async createRFQ(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.id;
+      const createdBy = (req as any).user?.userId;
       const rfq = await PurchaseService.createRFQ({ ...req.body, createdBy });
       res.status(201).json(rfq);
     } catch (error) {

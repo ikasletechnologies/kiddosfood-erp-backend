@@ -67,7 +67,7 @@ export class CRMController {
 
   static async createLead(req: Request, res: Response) {
     try {
-      const creatorId = (req as any).user?.id;
+      const creatorId = (req as any).user?.userId;
       const lead = await CRMService.createLead({ ...req.body, creatorId });
       res.status(201).json(lead);
     } catch (error: any) {
@@ -108,7 +108,7 @@ export class CRMController {
 
   static async createForm(req: Request, res: Response) {
     try {
-      const creatorId = (req as any).user?.id;
+      const creatorId = (req as any).user?.userId;
       const form = await CRMService.createForm({ ...req.body, creatorId });
       res.status(201).json(form);
     } catch (error: any) {

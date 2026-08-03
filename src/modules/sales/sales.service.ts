@@ -1,25 +1,23 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 
-let quotationCounter = 1000;
-let salesOrderCounter = 1000;
-let returnCounter = 1000;
-let challanCounter = 1000;
-
-function generateQuotationNumber() {
-  return `QT-${new Date().getFullYear()}-${String(++quotationCounter).padStart(5, '0')}`;
+// Number generators are DB-count-based (not in-memory counters) so they can't
+// collide against their @unique DB columns after a server restart.
+async function generateQuotationNumber() {
+  const year = new Date().getFullYear();
+  const count = await prisma.quotation.count({ where: { createdAt: { gte: new Date(year, 0, 1) } } });
+  return `QT-${year}-${(count + 1).toString().padStart(5, '0')}`;
 }
 
-function generateSalesOrderNumber() {
-  return `SO-${new Date().getFullYear()}-${String(++salesOrderCounter).padStart(5, '0')}`;
+async function generateSalesOrderNumber() {
+  const year = new Date().getFullYear();
+  const count = await prisma.salesOrder.count({ where: { createdAt: { gte: new Date(year, 0, 1) } } });
+  return `SO-${year}-${(count + 1).toString().padStart(5, '0')}`;
 }
 
-function generateReturnNumber() {
-  return `SR${String(++returnCounter).padStart(10, '0')}`;
-}
-
-function generateChallanNumber() {
-  return `DC-${new Date().getFullYear()}-${String(++challanCounter).padStart(5, '0')}`;
+async function generateReturnNumber() {
+  const count = await prisma.returnOrder.count();
+  return `SR${(count + 1).toString().padStart(10, '0')}`;
 }
 
 function calculateTotals<T extends { quantity: number; rate: number; taxPercent?: number }>(items: T[]) {
@@ -106,7 +104,7 @@ export class SalesService {
 
     return prisma.quotation.create({
       data: {
-        quotationNumber: data.quotationNumber || generateQuotationNumber(),
+        quotationNumber: data.quotationNumber || await generateQuotationNumber(),
         customerId: data.customerId,
         customerName: data.customerName,
         customerPhone: data.customerPhone,
@@ -238,7 +236,7 @@ export class SalesService {
 
     const salesOrder = await prisma.salesOrder.create({
       data: {
-        orderNumber: generateSalesOrderNumber(),
+        orderNumber: await generateSalesOrderNumber(),
         quotationId,
         customerId: quotation.customerId,
         customerName: quotation.customerName,
@@ -336,7 +334,7 @@ export class SalesService {
 
     return prisma.salesOrder.create({
       data: {
-        orderNumber: generateSalesOrderNumber(),
+        orderNumber: await generateSalesOrderNumber(),
         customerId: data.customerId,
         customerName: data.customerName,
         subTotal,
@@ -408,16 +406,18 @@ export class SalesService {
 
   // ─── Return Orders (RMA) ─────────────────────────────────────────────────────
 
-  static async getReturnOrders(filters: { status?: string; customerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'BUSINESS'; search?: string }) {
+  static async getReturnOrders(filters: { status?: string; customerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'BUSINESS' | 'POS'; search?: string }) {
     const where: any = {};
     if (filters.status) where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
     if (filters.franchiseId) where.franchiseId = filters.franchiseId;
-    
+
     if (filters.source === 'FRANCHISE') {
       where.franchiseId = { not: null };
     } else if (filters.source === 'BUSINESS') {
       where.customerId = { not: null };
+    } else if (filters.source === 'POS') {
+      where.posOrderId = { not: null };
     }
 
     if (filters.search) {
@@ -428,7 +428,7 @@ export class SalesService {
     }
     return prisma.returnOrder.findMany({
       where,
-      include: { customer: true, salesOrder: true, franchise: true, franchiseOrder: true, items: true },
+      include: { customer: true, salesOrder: true, franchise: true, franchiseOrder: true, posOrder: true, items: true },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -436,6 +436,7 @@ export class SalesService {
   static async createReturnOrder(data: {
     salesOrderId?: string;
     franchiseOrderId?: string;
+    posOrderId?: string;
     customerId?: string;
     franchiseId?: string;
     reason: string;
@@ -446,9 +447,10 @@ export class SalesService {
 
     return prisma.returnOrder.create({
       data: {
-        returnNumber: generateReturnNumber(),
+        returnNumber: await generateReturnNumber(),
         salesOrderId: data.salesOrderId,
         franchiseOrderId: data.franchiseOrderId,
+        posOrderId: data.posOrderId,
         customerId: data.customerId,
         franchiseId: data.franchiseId,
         reason: data.reason,
@@ -465,7 +467,7 @@ export class SalesService {
           }))
         }
       },
-      include: { customer: true, franchise: true, items: true }
+      include: { customer: true, franchise: true, posOrder: true, items: true }
     });
   }
 

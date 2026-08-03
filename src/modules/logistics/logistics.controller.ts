@@ -9,7 +9,7 @@ export class LogisticsController {
     try {
       const result = await LogisticsService.createRequest({
         ...req.body,
-        userId: (req as any).user?.id
+        userId: (req as any).user?.userId
       });
       res.status(201).json(result);
     } catch (error: any) {
@@ -23,7 +23,7 @@ export class LogisticsController {
       const result = await LogisticsService.approveRequest(
         req.params.id, 
         approvedItems, 
-        (req as any).user?.id
+        (req as any).user?.userId
       );
       res.json(result);
     } catch (error: any) {
@@ -48,7 +48,7 @@ export class LogisticsController {
     try {
       const result = await LogisticsService.initiateTransfer({
         ...req.body,
-        userId: (req as any).user?.id
+        userId: (req as any).user?.userId
       });
       res.status(201).json(result);
     } catch (error: any) {
@@ -60,7 +60,7 @@ export class LogisticsController {
     try {
       const result = await LogisticsService.completeTransfer(
         req.params.id, 
-        (req as any).user?.id
+        (req as any).user?.userId
       );
       res.json(result);
     } catch (error: any) {
@@ -72,6 +72,16 @@ export class LogisticsController {
     try {
       const franchiseId = req.query.franchiseId as string;
       const result = await LogisticsService.getTransfers(franchiseId);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getInTransit(req: Request, res: Response) {
+    try {
+      const franchiseId = req.query.franchiseId as string;
+      const result = await LogisticsService.getInTransit(franchiseId);
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

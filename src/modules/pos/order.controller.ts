@@ -45,7 +45,7 @@ export class OrderController {
       // Ensure 'method' maps to enum ('CASH', 'UPI', 'CARD')
       const method = req.body.method || req.body.paymentMode || 'CASH';
       const accountId = req.body.accountId;
-      const order = await POSService.payOrder(req.params.id, method, accountId, (req as any).user?.id);
+      const order = await POSService.payOrder(req.params.id, method, accountId, (req as any).user?.userId);
       res.status(200).json(order);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

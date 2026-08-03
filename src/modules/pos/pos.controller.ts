@@ -82,7 +82,7 @@ export class POSController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      
+
       const filters: any = { ...franchiseFilter };
       if (req.query.franchiseId && user.role === 'SUPER_ADMIN') filters.franchiseId = req.query.franchiseId as string;
       if (req.query.status) filters.status = req.query.status as string;
@@ -91,6 +91,39 @@ export class POSController {
       res.json(orders);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getTodaySettlement(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
+      const settlement = await POSService.getTodaySettlement(franchiseId || 'hq-001');
+      res.json(settlement);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getLatestSettlement(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
+      const settlement = await POSService.getLatestSettlement(franchiseId || 'hq-001');
+      res.json(settlement);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async closeDay(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const settlement = await POSService.closeDay(franchiseId || 'hq-001', req.body, user?.email || user?.userId);
+      res.status(201).json(settlement);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
     }
   }
 }
