@@ -250,13 +250,38 @@ export class InventoryService {
       : `RM-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
     return prisma.$transaction(async tx => {
-      const franchise = await tx.franchise.findUnique({ where: { id: data.franchiseId } });
-      const nameUpper = franchise?.name.toUpperCase() || "";
-      const isHQ = nameUpper.includes('HQ') || 
-                   nameUpper.includes('HEAD') ||
-                   nameUpper.includes('MAIN') ||
-                   nameUpper.includes('CORPORATE') ||
-                   nameUpper.includes('CENTRAL');
+      const targetFranchiseId = (data.franchiseId && typeof data.franchiseId === 'string' && data.franchiseId.trim().length > 0)
+        ? data.franchiseId.trim()
+        : null;
+
+      let nameUpper = "";
+      let isHQ = true;
+
+      if (targetFranchiseId) {
+        let franchise = await tx.franchise.findUnique({ where: { id: targetFranchiseId } });
+        if (!franchise) {
+          console.log(`⚠️ Franchise '${targetFranchiseId}' not found in DB. Auto-creating default franchise record...`);
+          franchise = await tx.franchise.create({
+            data: {
+              id: targetFranchiseId,
+              name: targetFranchiseId === 'hq-001' ? 'Main Headquarters' : `Franchise ${targetFranchiseId}`,
+              location: 'Default Location',
+              ownerName: 'Super Admin',
+              contactNum: '0000000000',
+              status: 'ACTIVE'
+            }
+          });
+        }
+        data.franchiseId = franchise.id;
+        nameUpper = franchise.name.toUpperCase();
+        isHQ = nameUpper.includes('HQ') || 
+                     nameUpper.includes('HEAD') ||
+                     nameUpper.includes('MAIN') ||
+                     nameUpper.includes('CORPORATE') ||
+                     nameUpper.includes('CENTRAL');
+      } else {
+        data.franchiseId = null;
+      }
 
       const createData: any = {
         name: data.name,
@@ -525,7 +550,7 @@ export class InventoryService {
       const item = await tx.inventoryItem.findUnique({ where: { id } });
 
       if (item && (item.category === 'FINISHED_GOOD' || item.category === 'SEMI_FINISHED')) {
-        const franchise = await tx.franchise.findUnique({ where: { id: item.franchiseId } });
+        const franchise = item.franchiseId ? await tx.franchise.findUnique({ where: { id: item.franchiseId } }) : null;
         const nameUpper = franchise?.name.toUpperCase() || "";
         const isHQ = nameUpper.includes('HQ') || nameUpper.includes('HEAD') || nameUpper.includes('CORPORATE');
 

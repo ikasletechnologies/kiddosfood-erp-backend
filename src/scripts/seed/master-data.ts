@@ -67,7 +67,7 @@ export async function seedMasterData() {
   
   // Inventory Item (Batter)
   const material = await prisma.inventoryItem.upsert({
-    where: { sku_franchiseId: { sku: 'BATTER-001', franchiseId: 'root-franchise' } },
+    where: { sku: 'BATTER-001' },
     update: {},
     create: {
       name: 'Test Batter',
@@ -80,11 +80,11 @@ export async function seedMasterData() {
   });
 
   await prisma.inventoryItem.upsert({
-    where: { sku_franchiseId: { sku: 'BATTER-001', franchiseId: 'distribution-branch' } },
+    where: { sku: 'BATTER-002' },
     update: {},
     create: {
-      name: 'Test Batter',
-      sku: 'BATTER-001',
+      name: 'Test Batter 2',
+      sku: 'BATTER-002',
       category: 'RAW_MATERIAL',
       currentStock: 0,
       unit: 'g',

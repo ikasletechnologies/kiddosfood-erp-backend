@@ -2,7 +2,7 @@ import prisma from '../../lib/prisma';
 
 export class VendorInvoiceService {
   static async getAll(params: { vendorId?: string; status?: string } = {}) {
-    return prisma.vendorInvoice.findMany({
+    const invoices = await prisma.vendorInvoice.findMany({
       where: {
         ...(params.vendorId ? { vendorId: params.vendorId } : {}),
         ...(params.status ? { status: params.status as any } : {})
@@ -14,6 +14,28 @@ export class VendorInvoiceService {
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    // Deduplicate any existing PENDING invoices with the same grnId (keep the newest/manual bill)
+    const seenGrnIds = new Set<string>();
+    const cleanedInvoices: typeof invoices = [];
+    const duplicateIdsToDelete: string[] = [];
+
+    for (const inv of invoices) {
+      if (inv.grnId && inv.status === 'PENDING') {
+        if (seenGrnIds.has(inv.grnId)) {
+          duplicateIdsToDelete.push(inv.id);
+          continue;
+        }
+        seenGrnIds.add(inv.grnId);
+      }
+      cleanedInvoices.push(inv);
+    }
+
+    if (duplicateIdsToDelete.length > 0) {
+      prisma.vendorInvoice.deleteMany({ where: { id: { in: duplicateIdsToDelete } } }).catch(e => console.error("Error deduplicating vendor invoices", e));
+    }
+
+    return cleanedInvoices;
   }
 
   static async create(data: {
@@ -43,6 +65,44 @@ export class VendorInvoiceService {
     } else {
       const po = await prisma.procurementOrder.findUnique({ where: { id: actualPoId } });
       if (!po) throw new Error('Purchase Order not found');
+    }
+
+    if (data.grnId) {
+      const existingInvoices = await prisma.vendorInvoice.findMany({
+        where: { grnId: data.grnId },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      if (existingInvoices.length > 0) {
+        // Find existing PENDING invoice to update instead of creating a duplicate
+        const targetInvoice = existingInvoices.find(inv => inv.status === 'PENDING') || existingInvoices[0];
+
+        // Delete any extra duplicate PENDING invoices for this same GRN
+        const extraPendingIds = existingInvoices
+          .filter(inv => inv.status === 'PENDING' && inv.id !== targetInvoice.id)
+          .map(inv => inv.id);
+
+        if (extraPendingIds.length > 0) {
+          await prisma.vendorInvoice.deleteMany({
+            where: { id: { in: extraPendingIds } }
+          });
+        }
+
+        return prisma.vendorInvoice.update({
+          where: { id: targetInvoice.id },
+          data: {
+            vendorId: data.vendorId,
+            poId: actualPoId || targetInvoice.poId,
+            invoiceNumber: data.invoiceNumber || targetInvoice.invoiceNumber,
+            amount: data.amount,
+          },
+          include: {
+            vendor: true,
+            procurementOrder: true,
+            grn: true
+          }
+        });
+      }
     }
 
     return prisma.vendorInvoice.create({

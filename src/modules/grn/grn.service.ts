@@ -180,22 +180,23 @@ export class GRNService {
       const grnTotalWithTax = grnSubtotal * taxFactor;
 
       if (grnTotalWithTax > 0) {
-        // Automatically generate a Purchase Bill (Vendor Invoice).
-        // NOTE: Liability is intentionally NOT posted to the VendorLedger here.
-        // VendorInvoiceService.approve() is the single point where liability is
-        // recognized in the ledger (see its doc-comment) — posting it here too
-        // used to double-count every GRN-generated invoice once it was approved.
-        const invoiceNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
-        await tx.vendorInvoice.create({
-          data: {
-            vendorId: grn.procurementOrder.vendorId,
-            poId: grn.poId,
-            grnId: grnId,
-            invoiceNumber: invoiceNumber,
-            amount: grnTotalWithTax,
-            status: 'PENDING'
-          }
+        // Automatically generate a Purchase Bill (Vendor Invoice) only if one doesn't exist yet.
+        const existingInvoice = await tx.vendorInvoice.findFirst({
+          where: { grnId: grnId }
         });
+        if (!existingInvoice) {
+          const invoiceNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+          await tx.vendorInvoice.create({
+            data: {
+              vendorId: grn.procurementOrder.vendorId,
+              poId: grn.poId,
+              grnId: grnId,
+              invoiceNumber: invoiceNumber,
+              amount: grnTotalWithTax,
+              status: 'PENDING'
+            }
+          });
+        }
       }
 
       // Check PO fulfillment status

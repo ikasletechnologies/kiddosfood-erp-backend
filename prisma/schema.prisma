@@ -195,7 +195,7 @@ model InventoryItem {
   minimumStock         Float                  @default(10)
   batchNo              String?
   expiryDate           DateTime?
-  franchiseId          String
+  franchiseId          String?
   vendorId             String?
   createdAt            DateTime               @default(now())
   updatedAt            DateTime               @updatedAt
@@ -209,7 +209,7 @@ model InventoryItem {
   customerPrice        Float?                 @default(0)
   grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
-  franchise            Franchise              @relation(fields: [franchiseId], references: [id])
+  franchise            Franchise?             @relation(fields: [franchiseId], references: [id])
   vendor               Vendor?                @relation(fields: [vendorId], references: [id])
   poItems              ProcurementOrderItem[]
   productionItems      ProductionItem[]
@@ -224,7 +224,7 @@ model InventoryItem {
   baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
   wasteEntries         WasteEntry[]
 
-  @@unique([sku, franchiseId])
+  @@unique([sku])
 }
 
 model WasteEntry {

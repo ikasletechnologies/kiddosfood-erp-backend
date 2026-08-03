@@ -76,22 +76,15 @@ export class RawMaterialsController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      let franchiseId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
-      
-      if (!franchiseId) {
-        franchiseId = await RawMaterialsController.getActiveFranchiseId(req.body.franchiseId);
-      }
-      
-      if (!franchiseId) {
-        return res.status(400).json({ error: "Franchise identification is required to create a material." });
-      }
+      const enforcedId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = enforcedId || req.body.franchiseId || null;
 
-      console.log(`[RawMaterials] Creating material for franchise: ${franchiseId}`);
+      console.log(`[RawMaterials] Creating global/franchise item (franchise: ${franchiseId || 'GLOBAL'})`);
 
       let sku = req.body.sku || ('RM-' + Math.random().toString(36).substring(7).toUpperCase());
       
-      // Ensure SKU is unique within this franchise
-      const existing = await prisma.inventoryItem.findFirst({ where: { sku, franchiseId } });
+      // Ensure SKU is unique globally across item masters
+      const existing = await prisma.inventoryItem.findFirst({ where: { sku } });
       if (existing) {
         sku += '-' + Math.random().toString(36).substring(9).toUpperCase();
       }
