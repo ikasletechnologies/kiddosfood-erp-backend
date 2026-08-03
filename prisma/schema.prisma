@@ -472,6 +472,7 @@ model Recipe {
   yieldQty     Float        @default(1)
   yieldUnit    String       @default("KG")
   instructions String?
+  estimatedDurationMinutes Int?
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
   productions  Production[]
@@ -512,6 +513,9 @@ model Production {
   actualYield    Float?
   currentStage   ProductionStage  @default(QUEUED)
   stageUpdatedAt DateTime?
+  operatorId     String?
+  remarks        String?
+  operator       Employee?        @relation(fields: [operatorId], references: [id])
   batches        ProductBatch[]
   customer       Customer?        @relation(fields: [customerId], references: [id])
   franchise      Franchise        @relation(fields: [franchiseId], references: [id])
@@ -947,6 +951,7 @@ model Employee {
   payslips              Payslip[]
   attendanceLogs        AttendanceLog[]
   leaveBalances         LeaveBalance[]
+  productionsOperated   Production[]
 }
 
 model AttendanceLog {

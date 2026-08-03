@@ -11,6 +11,7 @@ export class ProductionService {
     productionType: string;
     expiryDate?: string;
     userId?: string;
+    operatorId?: string;
   }) {
     return prisma.$transaction(async tx => {
       // 1. Fetch recipe
@@ -46,6 +47,7 @@ export class ProductionService {
           status: 'IN_PROGRESS',
           startTime: new Date(),
           producedBy: data.userId,
+          operatorId: data.operatorId || null,
           expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
           currentStage: 'QUEUED',
           stageUpdatedAt: new Date(),
@@ -126,7 +128,7 @@ export class ProductionService {
     });
   }
 
-  static async approveProduction(id: string, userId?: string, actualYield?: number) {
+  static async approveProduction(id: string, userId?: string, actualYield?: number, remarks?: string) {
     return prisma.$transaction(async tx => {
       const production = await tx.production.findUnique({
         where: { id },
@@ -165,7 +167,8 @@ export class ProductionService {
         where: { id },
         data: { 
           status: 'COMPLETED',
-          actualYield: totalYield
+          actualYield: totalYield,
+          ...(remarks ? { remarks } : {}),
         },
       });
     });
@@ -412,10 +415,11 @@ export class ProductionService {
     return prisma.production.findMany({
       where: franchiseId ? { franchiseId } : {},
       include: {
-        recipe: { include: { product: true } },
+        recipe: { include: { product: true, recipeItems: { include: { inventoryItem: true } } } },
         items: { include: { inventoryItem: true } },
         batches: true,
         customer: true,
+        operator: { include: { user: true } },
       },
       orderBy: { producedAt: 'desc' },
     });
@@ -425,10 +429,11 @@ export class ProductionService {
     return prisma.production.findUnique({
       where: { id },
       include: {
-        recipe: { include: { product: true } },
+        recipe: { include: { product: true, recipeItems: { include: { inventoryItem: true } } } },
         items: { include: { inventoryItem: true } },
         batches: true,
         customer: true,
+        operator: { include: { user: true } },
       },
     });
   }

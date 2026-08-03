@@ -13,6 +13,7 @@ export class RecipeService {
     yieldQty: number,
     yieldUnit?: string,
     instructions: string,
+    estimatedDurationMinutes?: number | null,
     items: { inventoryItemId: string, quantityRequired: number, unit: string }[]
   }) {
     return prisma.$transaction(async (tx) => {
@@ -29,6 +30,7 @@ export class RecipeService {
             yieldQty: data.yieldQty,
             yieldUnit: data.yieldUnit || "KG",
             instructions: data.instructions,
+            estimatedDurationMinutes: data.estimatedDurationMinutes ?? null,
           }
         });
       } else {
@@ -41,6 +43,7 @@ export class RecipeService {
             yieldQty: data.yieldQty,
             yieldUnit: data.yieldUnit || "KG",
             instructions: data.instructions,
+            estimatedDurationMinutes: data.estimatedDurationMinutes ?? null,
           }
         });
         recipeId = recipe.id;

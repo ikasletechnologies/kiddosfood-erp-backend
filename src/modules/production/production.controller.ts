@@ -5,7 +5,7 @@ import { IsolationUtil } from '../../utils/isolation.util';
 export class ProductionController {
   static async startBatch(req: Request, res: Response) {
     try {
-      const { recipeId, quantity, franchiseId, customerId, productionType, expiryDate } = req.body;
+      const { recipeId, quantity, franchiseId, customerId, productionType, expiryDate, operatorId } = req.body;
       const user = (req as any).user;
       const enforcedFranchiseId = IsolationUtil.enforceFranchiseMatch(user, franchiseId);
 
@@ -16,7 +16,8 @@ export class ProductionController {
         customerId,
         productionType,
         expiryDate,
-        userId: user?.userId
+        userId: user?.userId,
+        operatorId
       });
       res.status(201).json(result);
     } catch (error) {
@@ -77,8 +78,8 @@ export class ProductionController {
   static async approveBatch(req: Request, res: Response) {
     try {
       const userId = (req as any).user?.userId;
-      const { actualYield } = req.body;
-      const result = await ProductionService.approveProduction(req.params.id, userId, actualYield ? Number(actualYield) : undefined);
+      const { actualYield, remarks } = req.body;
+      const result = await ProductionService.approveProduction(req.params.id, userId, actualYield ? Number(actualYield) : undefined, remarks);
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
