@@ -2,6 +2,24 @@ import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType } from '@prisma/client';
 
+export interface FifoConsumption {
+  batchId: string;
+  // The purchase bill this batch was received under (see grn.service.ts) —
+  // what the business actually identifies a lot by, not an internal id.
+  billNumber: string;
+  productBatchId: string | null;
+  qty: number;
+  unitCost: number;
+  totalCost: number;
+}
+
+export interface FifoConsumptionResult {
+  consumptions: FifoConsumption[];
+  consumedFromBatches: number;
+  totalCost: number;
+  unitCost: number;
+}
+
 function mapCategoryToDb(category?: string): ItemCategory {
   if (!category) return ItemCategory.RAW_MATERIAL;
   if (category.startsWith('RAW_')) return ItemCategory.RAW_MATERIAL;
@@ -695,10 +713,24 @@ export class InventoryService {
       note?: string;
       userId?: string;
       warehouseId?: string;
+      // Inbound-only: when set on a positive movement, a new InventoryBatch is
+      // created at this cost (mirrors what GRN does for raw materials) instead
+      // of just bumping currentStock, and the item's costPrice moving average
+      // is updated the same way. Lets non-GRN inflows (e.g. finished goods
+      // coming out of Production/QC) carry a real lot cost for FIFO to consume
+      // later, instead of silently going untracked.
+      receiveAtCost?: {
+        unitCost: number;
+        batchNumber?: string;
+        lotNumber?: string;
+        mfgDate?: Date | null;
+        expDate?: Date | null;
+        productBatchId?: string;
+      };
     }
-  ) {
+  ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
     const stockChange = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
-    
+
     const updatedItem = await tx.inventoryItem.update({
       where: { id: data.itemId },
       data: { currentStock: { increment: stockChange } },
@@ -725,25 +757,65 @@ export class InventoryService {
     // InventoryBatch.currentQty was disconnected from real stock movement. This
     // is best-effort: not all stock is batch-tracked (e.g. opening balances),
     // so it depletes whatever tracked batches exist and silently stops there.
+    let fifo: FifoConsumptionResult | undefined;
     if (stockChange < 0) {
-      await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange));
+      fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+    } else if (stockChange > 0 && data.receiveAtCost) {
+      const priorStock = updatedItem.currentStock - stockChange;
+      const priorQty = Math.max(0, priorStock);
+      const priorCost = updatedItem.costPrice || 0;
+      const newCostPrice = priorQty + stockChange > 0
+        ? ((priorQty * priorCost) + (stockChange * data.receiveAtCost.unitCost)) / (priorQty + stockChange)
+        : data.receiveAtCost.unitCost;
+
+      await tx.inventoryBatch.create({
+        data: {
+          inventoryItemId: data.itemId,
+          batchNumber: data.receiveAtCost.batchNumber || `B-${Date.now()}`,
+          lotNumber: data.receiveAtCost.lotNumber,
+          mfgDate: data.receiveAtCost.mfgDate,
+          expDate: data.receiveAtCost.expDate,
+          initialQty: stockChange,
+          currentQty: stockChange,
+          unitCost: data.receiveAtCost.unitCost,
+          productBatchId: data.receiveAtCost.productBatchId,
+          warehouseId: data.warehouseId || null,
+          status: 'APPROVED',
+        },
+      });
+
+      await tx.inventoryItem.update({
+        where: { id: data.itemId },
+        data: { costPrice: newCostPrice },
+      });
     }
 
-    return updatedItem;
+    return { item: updatedItem, fifo };
   }
 
-  static async depleteBatchesFIFO(tx: any, itemId: string, quantity: number) {
+  // Consumes the oldest non-expired batches first and reports exactly which
+  // batches (and at what cost) covered the requested quantity, so callers can
+  // persist the real lot cost instead of losing it once currentQty is decremented.
+  // When warehouseId is given, only batches received into that warehouse (or
+  // legacy batches with no warehouse on record, kept available everywhere so
+  // pre-existing stock doesn't just disappear) are eligible — production in
+  // warehouse A can't silently draw from stock that's physically in warehouse B.
+  static async depleteBatchesFIFO(tx: any, itemId: string, quantity: number, warehouseId?: string): Promise<FifoConsumptionResult> {
     let remaining = quantity;
     const batches = await tx.inventoryBatch.findMany({
       where: {
         inventoryItemId: itemId,
         currentQty: { gt: 0 },
-        OR: [{ expDate: null }, { expDate: { gte: new Date() } }]
+        AND: [
+          { OR: [{ expDate: null }, { expDate: { gte: new Date() } }] },
+          ...(warehouseId ? [{ OR: [{ warehouseId }, { warehouseId: null }] }] : [])
+        ]
       },
       orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }]
     });
 
     let totalCost = 0;
+    const consumptions: FifoConsumption[] = [];
     for (const batch of batches) {
       if (remaining <= 0) break;
       const consumeQty = Math.min(batch.currentQty, remaining);
@@ -751,11 +823,30 @@ export class InventoryService {
         where: { id: batch.id },
         data: { currentQty: batch.currentQty - consumeQty }
       });
-      totalCost += consumeQty * (batch.unitCost || 0);
+      const unitCost = batch.unitCost || 0;
+      const lineCost = consumeQty * unitCost;
+      totalCost += lineCost;
       remaining -= consumeQty;
+      consumptions.push({
+        batchId: batch.id,
+        billNumber: batch.batchNumber,
+        productBatchId: batch.productBatchId,
+        qty: consumeQty,
+        unitCost,
+        totalCost: lineCost,
+      });
     }
 
-    return { consumedFromBatches: quantity - remaining, totalCost };
+    const consumedFromBatches = quantity - remaining;
+    return {
+      consumptions,
+      consumedFromBatches,
+      totalCost,
+      // Blended cost per unit across whatever batches were actually drawn from.
+      // Untracked remainder (no batch left to draw from) is excluded — callers
+      // that need a full-quantity cost should fall back to costPrice for it.
+      unitCost: consumedFromBatches > 0 ? totalCost / consumedFromBatches : 0,
+    };
   }
 
   // New helper for unit conversion engine
@@ -808,21 +899,64 @@ export class InventoryService {
     });
   }
 
-  static async getRawMaterialStockSummary(franchiseId: string) {
+  // Storage lives at the warehouse level, not the franchise level — franchiseId
+  // is only an optional extra filter (multi-tenant safety), never required.
+  // When warehouseId is given, stock is scoped to that warehouse (matching
+  // what a GRN actually tagged its received quantity with); otherwise it's
+  // the item's total across every warehouse, same number Item Master shows.
+  static async getRawMaterialStockSummary(warehouseId?: string, franchiseId?: string) {
     const items = await prisma.inventoryItem.findMany({
       where: {
-        franchiseId,
+        ...(franchiseId ? { franchiseId } : {}),
         isActive: true,
         category: 'RAW_MATERIAL'
       },
       orderBy: { name: 'asc' }
     });
+    const itemIds = items.map(i => i.id);
+
+    // Pulled once for every item instead of one computeWarehouseStock() call
+    // per item per warehouse — same "which warehouse actually has this
+    // stock" logic, just batched so the page stays fast with a real catalog.
+    const [allMovements, allWarehouses, allFranchises] = await Promise.all([
+      prisma.stockMovement.findMany({
+        where: { itemId: { in: itemIds } },
+        select: { itemId: true, quantity: true, baseQty: true, warehouseId: true }
+      }),
+      warehouseId ? Promise.resolve([]) : prisma.warehouse.findMany({ select: { id: true, name: true } }),
+      prisma.franchise.findMany({ select: { id: true, primaryWarehouseId: true } })
+    ]);
+    const primaryWarehouseByFranchise = new Map(allFranchises.map(f => [f.id, f.primaryWarehouseId]));
+    const movementsByItem = new Map<string, typeof allMovements>();
+    for (const m of allMovements) {
+      if (!movementsByItem.has(m.itemId)) movementsByItem.set(m.itemId, []);
+      movementsByItem.get(m.itemId)!.push(m);
+    }
 
     const thirtyDaysFromNow = new Date();
     thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
 
     const summary = await Promise.all(items.map(async item => {
-      const availableStock = await this.computeStock(item.id);
+      const itemMovements = movementsByItem.get(item.id) || [];
+      const primaryWarehouseId = item.franchiseId ? primaryWarehouseByFranchise.get(item.franchiseId) : undefined;
+      const sumFor = (targetWarehouseId?: string) => itemMovements.reduce((acc, m) => {
+        if (targetWarehouseId) {
+          const effectiveWarehouseId = m.warehouseId || primaryWarehouseId;
+          if (effectiveWarehouseId !== targetWarehouseId) return acc;
+        }
+        return acc + (m.baseQty !== null ? m.baseQty : m.quantity);
+      }, 0);
+
+      const availableStock = sumFor(warehouseId);
+
+      // Only computed for the "all warehouses" view — tells you exactly
+      // which warehouse(s) this item's stock is actually sitting in, instead
+      // of having to flip through every warehouse filter to find it.
+      const warehouseBreakdown = warehouseId
+        ? undefined
+        : allWarehouses
+            .map(w => ({ warehouseId: w.id, warehouseName: w.name, qty: sumFor(w.id) }))
+            .filter(b => Math.abs(b.qty) > 0.001);
 
       const reserved = await prisma.productionItem.aggregate({
         where: {
@@ -871,21 +1005,25 @@ export class InventoryService {
         availableStock,
         reservedStock,
         nearExpiryStock,
-        damagedStock
+        damagedStock,
+        warehouseBreakdown
       };
     }));
 
     return summary;
   }
 
-  static async getRawMaterialConsumption(franchiseId: string) {
+  // Scoped by warehouse (where the material actually left from), not
+  // franchise. franchiseId is kept as an optional secondary filter only.
+  static async getRawMaterialConsumption(warehouseId?: string, franchiseId?: string) {
     const movements = await prisma.stockMovement.findMany({
       where: {
         item: {
-          franchiseId,
+          ...(franchiseId ? { franchiseId } : {}),
           category: 'RAW_MATERIAL'
         },
-        quantity: { lt: 0 }
+        quantity: { lt: 0 },
+        ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {})
       },
       include: {
         item: true

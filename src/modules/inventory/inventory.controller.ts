@@ -3,6 +3,10 @@ import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 import prisma from '../../lib/prisma';
 
+function normalizeWarehouseName(s: string) {
+  return s.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 export class InventoryController {
   static async getInventory(req: Request, res: Response) {
     try {
@@ -172,11 +176,31 @@ export class InventoryController {
   static async createWarehouse(req: Request, res: Response) {
     try {
       const { name, location, type } = req.body;
+      if (!name || !name.trim()) {
+        return res.status(400).json({ error: 'Warehouse name is required' });
+      }
+
+      // Warehouse selection elsewhere in the app is name-driven (dropdowns,
+      // stock lookups) — a near-duplicate name like "Home (Hopes)" next to
+      // "Home" silently splits stock across two records with no way to tell
+      // them apart. `nameKey` carries a DB-level unique constraint (see
+      // schema) so this is enforced even under concurrent requests, not just
+      // by this pre-check — the pre-check only exists to give a friendlier
+      // error than a raw constraint violation in the common (non-racing) case.
+      const nameKey = normalizeWarehouseName(name);
+      const clash = await prisma.warehouse.findUnique({ where: { nameKey } });
+      if (clash) {
+        return res.status(400).json({ error: `A warehouse named "${clash.name}" already exists. Use that one instead of creating a near-duplicate.` });
+      }
+
       const warehouse = await prisma.warehouse.create({
-        data: { name, location, type }
+        data: { name: name.trim(), nameKey, location, type }
       });
       res.status(201).json(warehouse);
     } catch (error: any) {
+      if (error.code === 'P2002') {
+        return res.status(400).json({ error: 'A warehouse with that name already exists.' });
+      }
       res.status(500).json({ error: error.message });
     }
   }
@@ -185,12 +209,28 @@ export class InventoryController {
     try {
       const { id } = req.params;
       const { name, location, type } = req.body;
+
+      let nameKey: string | undefined;
+      if (name !== undefined) {
+        if (!name.trim()) {
+          return res.status(400).json({ error: 'Warehouse name is required' });
+        }
+        nameKey = normalizeWarehouseName(name);
+        const clash = await prisma.warehouse.findUnique({ where: { nameKey } });
+        if (clash && clash.id !== id) {
+          return res.status(400).json({ error: `A warehouse named "${clash.name}" already exists. Use that one instead of creating a near-duplicate.` });
+        }
+      }
+
       const warehouse = await prisma.warehouse.update({
         where: { id },
-        data: { name, location, type }
+        data: { name: name !== undefined ? name.trim() : undefined, nameKey, location, type }
       });
       res.json(warehouse);
     } catch (error: any) {
+      if (error.code === 'P2002') {
+        return res.status(400).json({ error: 'A warehouse with that name already exists.' });
+      }
       res.status(500).json({ error: error.message });
     }
   }
@@ -211,14 +251,13 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      // No franchise = no filter (see everything), same rule raw-materials.controller.ts
+      // already uses — previously this substituted an arbitrary franchise
+      // instead, which silently hid stock that lives under a different one.
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
+      const warehouseId = (req.query.warehouseId as string) || undefined;
 
-      if (!franchiseId) {
-        const franchises = await prisma.franchise.findMany({ take: 1 });
-        franchiseId = franchises[0]?.id || 'hq-001';
-      }
-
-      const summary = await InventoryService.getRawMaterialStockSummary(franchiseId);
+      const summary = await InventoryService.getRawMaterialStockSummary(warehouseId, franchiseId);
       res.json(summary);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -229,14 +268,10 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
+      const warehouseId = (req.query.warehouseId as string) || undefined;
 
-      if (!franchiseId) {
-        const franchises = await prisma.franchise.findMany({ take: 1 });
-        franchiseId = franchises[0]?.id || 'hq-001';
-      }
-
-      const consumption = await InventoryService.getRawMaterialConsumption(franchiseId);
+      const consumption = await InventoryService.getRawMaterialConsumption(warehouseId, franchiseId);
       res.json(consumption);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

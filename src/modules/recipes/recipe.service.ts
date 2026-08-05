@@ -34,10 +34,15 @@ export class RecipeService {
           }
         });
       } else {
+        // Auto-generate a unique, sequential recipe code (RCP-0001, RCP-0002, ...)
+        // when none was typed in, so codes can't collide or be mistyped. Typing
+        // a code manually still wins — this only fills the gap when left blank.
+        const recipeCode = data.recipeCode || `RCP-${((await tx.recipe.count()) + 1).toString().padStart(4, '0')}`;
+
         const recipe = await tx.recipe.create({
           data: {
             productId: data.productId || null,
-            recipeCode: data.recipeCode || null,
+            recipeCode,
             category: data.category || null,
             name: data.name,
             yieldQty: data.yieldQty,

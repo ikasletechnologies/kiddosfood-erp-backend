@@ -143,16 +143,23 @@ export class FinanceService {
       if (!inv.order) continue;
       totalRevenue += inv.finalAmount;
       for (const item of inv.order.orderItems) {
+        // `totalCost` is captured at sale time (see pos.service.ts) from the
+        // actual FIFO lot(s)/production batch this line drew from — the real
+        // cost of THIS sale, frozen at the moment it happened. Prefer it over
+        // recomputing from today's live costPrice, which drifts every time a
+        // new purchase lands and would silently re-cost old, already-booked sales.
+        if (item.totalCost !== null && item.totalCost !== undefined) {
+          totalCOGS += item.totalCost;
+          continue;
+        }
+
+        // Fallback for orders recorded before cost capture existed.
         const product = item.product;
         if (product) {
           if (product.recipe) {
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
               const qtyUsed = ri.quantityRequired * scalar;
-              // costPrice is a real moving weighted average maintained on every
-              // GRN receipt (see grn.service.ts) — previously this used
-              // whichever VendorMaterial price row happened to be first, an
-              // arbitrary "last supplied price" placeholder.
               const costPerUnit = ri.inventoryItem.costPrice || ri.inventoryItem.vendors[0]?.price || 0;
               totalCOGS += (qtyUsed * costPerUnit);
             }
@@ -2038,6 +2045,12 @@ export class FinanceService {
     const rows = orders.map(order => {
       let cost = 0;
       for (const item of order.orderItems) {
+        // Prefer the real cost captured at sale time (see pos.service.ts) over
+        // a live recompute from today's costPrice.
+        if (item.totalCost !== null && item.totalCost !== undefined) {
+          cost += item.totalCost;
+          continue;
+        }
         let itemCost = 0;
         const recipeItems = item.product?.recipe?.recipeItems || [];
         if (recipeItems.length > 0) {
@@ -2325,6 +2338,10 @@ export class FinanceService {
       for (const order of cust.orders) {
         totalSaleAmount += order.totalAmount;
         for (const item of order.orderItems) {
+          if (item.totalCost !== null && item.totalCost !== undefined) {
+            totalCost += item.totalCost;
+            continue;
+          }
           let itemCost = 0;
           const recipeItems = item.product?.recipe?.recipeItems || [];
           if (recipeItems.length > 0) {

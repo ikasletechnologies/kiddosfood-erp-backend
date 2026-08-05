@@ -163,6 +163,10 @@ export class POSService {
          if (product && product.is_menu_item) {
            if (product.recipe) {
              const scalar = orderItem.quantity / product.recipe.yieldQty;
+             // Actual FIFO cost of whatever this line item consumed, summed
+             // across its recipe ingredients, instead of relying on a live
+             // recipe-average recompute at P&L time.
+             let lineCost = 0;
 
              for (const item of product.recipe.recipeItems) {
                const required = item.quantityRequired * scalar;
@@ -178,7 +182,7 @@ export class POSService {
                }
 
                // Deduct stock explicitly inside tx
-               await InventoryService.recordMovement(tx, {
+               const { fifo } = await InventoryService.recordMovement(tx, {
                  itemId: item.inventoryItemId,
                  type: 'SALES_OUT',
                  quantity: -required,
@@ -186,7 +190,18 @@ export class POSService {
                  referenceId: order.id,
                  note: `Auto-deduction for Order ${order.invoiceNum} (Product: ${product.name})`
                });
+
+               const untracked = required - (fifo?.consumedFromBatches || 0);
+               lineCost += (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
              }
+
+             await tx.orderItem.update({
+               where: { id: orderItem.id },
+               data: {
+                 unitCost: orderItem.quantity > 0 ? lineCost / orderItem.quantity : 0,
+                 totalCost: lineCost,
+               },
+             });
            } else {
              // FALLBACK: If no recipe exists, try to deduct directly from InventoryItem with matching SKU or Name
              const inventoryItem = await tx.inventoryItem.findFirst({
@@ -209,7 +224,10 @@ export class POSService {
                   throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
                 }
 
-                await InventoryService.recordMovement(tx, {
+                // This is the path finished goods sold as-is (produced via the
+                // Production module) take — so `fifo` here reflects the exact
+                // ProductBatch(es) this sale drew from (see InventoryBatch.productBatchId).
+                const { fifo } = await InventoryService.recordMovement(tx, {
                   itemId: inventoryItem.id,
                   type: 'SALES_OUT',
                   quantity: -orderItem.quantity, // original selected quantity
@@ -218,6 +236,16 @@ export class POSService {
                   referenceType: 'ORDER',
                   referenceId: order.id,
                   note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
+                });
+
+                const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
+                const totalCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+                await tx.orderItem.update({
+                  where: { id: orderItem.id },
+                  data: {
+                    unitCost: orderItem.quantity > 0 ? totalCost / orderItem.quantity : 0,
+                    totalCost,
+                  },
                 });
              }
            }
@@ -392,7 +420,11 @@ export class POSService {
       });
 
       // 2. Inventory Deduction
-      for (const item of data.items) {
+      for (let i = 0; i < data.items.length; i++) {
+        const item = data.items[i];
+        // orderItems was created from data.items in the same order above, so
+        // index-align to attach real FIFO cost back onto the matching line.
+        const orderItem = order.orderItems[i];
         const product = await tx.product.findUnique({
           where: { id: item.productId || (item as any).id },
           include: { recipe: { include: { recipeItems: true } } }
@@ -400,11 +432,13 @@ export class POSService {
 
         if (product) {
           const pName = (product.name || '').trim();
+          let lineCost = 0;
           if (product.recipe && product.recipe.recipeItems.length > 0) {
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
               const quantityToDeduct = ri.quantityRequired * scalar;
-              await InventoryService.recordMovement(tx, {
+              const invItem = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
+              const { fifo } = await InventoryService.recordMovement(tx, {
                 itemId: ri.inventoryItemId,
                 type: 'SALES_OUT',
                 quantity: -quantityToDeduct,
@@ -412,6 +446,8 @@ export class POSService {
                 referenceId: order.id,
                 note: `POS Sale: ${item.quantity}x ${product.name}`
               });
+              const untracked = quantityToDeduct - (fifo?.consumedFromBatches || 0);
+              lineCost += (fifo?.totalCost || 0) + untracked * (invItem?.costPrice || 0);
             }
           } else {
             // Direct deduction fallback
@@ -435,7 +471,7 @@ export class POSService {
                 throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
               }
 
-              await InventoryService.recordMovement(tx, {
+              const { fifo } = await InventoryService.recordMovement(tx, {
                 itemId: inventoryItem.id,
                 type: 'SALES_OUT',
                 quantity: -item.quantity,
@@ -445,7 +481,19 @@ export class POSService {
                 referenceId: order.id,
                 note: `Direct stock reduction: ${item.quantity}x ${product.name}`
               });
+              const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
+              lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
             }
+          }
+
+          if (orderItem) {
+            await tx.orderItem.update({
+              where: { id: orderItem.id },
+              data: {
+                unitCost: item.quantity > 0 ? lineCost / item.quantity : 0,
+                totalCost: lineCost,
+              },
+            });
           }
         }
       }

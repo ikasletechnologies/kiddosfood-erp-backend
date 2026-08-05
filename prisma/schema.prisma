@@ -98,57 +98,57 @@ model CustomerLedger {
 }
 
 model Franchise {
-  id                String             @id @default(uuid())
-  name              String
-  location          String
-  ownerName         String
-  contactNum        String
-  status            String             @default("ACTIVE")
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-  dashboardPassword String?
-  creditLimit       Float              @default(0)
-  outstandingAmount Float              @default(0)
-  walletBalance     Float              @default(0)
-  activityLogs      ActivityLog[]
-  businessPartners  BusinessPartner[]
-  customers         Customer[]
-  dealers           Dealer[]
-  expenses          Expense[]
-  ledgerEntries     FranchiseLedger[]
-  franchiseOrders   FranchiseOrder[]
-  franchiseRequests FranchiseRequest[]
-  inventory         InventoryItem[]
-  orders            Order[]
-  productBatches    ProductBatch[]
-  productions       Production[]
-  returnOrders      ReturnOrder[]
-  stockRequests     StockRequest[]
-  outgoingTransfers StockTransfer[]    @relation("OutgoingTransfers")
-  incomingTransfers StockTransfer[]    @relation("IncomingTransfers")
-  users             User[]
-  cheques           Cheque[]
-  accounts          Account[]
-  procurementOrders ProcurementOrder[]
-  loanAccounts      LoanAccount[]
-  dailySettlements  DailySettlement[]
-  wasteEntries      WasteEntry[]
-  cartons           Carton[]
+  id                 String             @id @default(uuid())
+  name               String
+  location           String
+  ownerName          String
+  contactNum         String
+  status             String             @default("ACTIVE")
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  dashboardPassword  String?
+  creditLimit        Float              @default(0)
+  outstandingAmount  Float              @default(0)
+  walletBalance      Float              @default(0)
+  activityLogs       ActivityLog[]
+  businessPartners   BusinessPartner[]
+  customers          Customer[]
+  dealers            Dealer[]
+  expenses           Expense[]
+  ledgerEntries      FranchiseLedger[]
+  franchiseOrders    FranchiseOrder[]
+  franchiseRequests  FranchiseRequest[]
+  inventory          InventoryItem[]
+  orders             Order[]
+  productBatches     ProductBatch[]
+  productions        Production[]
+  returnOrders       ReturnOrder[]
+  stockRequests      StockRequest[]
+  outgoingTransfers  StockTransfer[]    @relation("OutgoingTransfers")
+  incomingTransfers  StockTransfer[]    @relation("IncomingTransfers")
+  users              User[]
+  cheques            Cheque[]
+  accounts           Account[]
+  procurementOrders  ProcurementOrder[]
+  loanAccounts       LoanAccount[]
+  dailySettlements   DailySettlement[]
+  wasteEntries       WasteEntry[]
+  cartons            Carton[]
   primaryWarehouseId String?
-  primaryWarehouse  Warehouse?         @relation("PrimaryWarehouse", fields: [primaryWarehouseId], references: [id])
+  primaryWarehouse   Warehouse?         @relation("PrimaryWarehouse", fields: [primaryWarehouseId], references: [id])
 }
 
 model DailySettlement {
-  id           String   @id @default(uuid())
+  id           String    @id @default(uuid())
   franchiseId  String
   businessDate DateTime
-  cashTotal    Float    @default(0)
-  upiTotal     Float    @default(0)
-  cardTotal    Float    @default(0)
-  grandTotal   Float    @default(0)
-  orderCount   Int      @default(0)
+  cashTotal    Float     @default(0)
+  upiTotal     Float     @default(0)
+  cardTotal    Float     @default(0)
+  grandTotal   Float     @default(0)
+  orderCount   Int       @default(0)
   closedBy     String?
-  createdAt    DateTime @default(now())
+  createdAt    DateTime  @default(now())
   franchise    Franchise @relation(fields: [franchiseId], references: [id])
 
   @@unique([franchiseId, businessDate])
@@ -228,14 +228,14 @@ model InventoryItem {
 }
 
 model WasteEntry {
-  id              String    @id @default(uuid())
+  id              String        @id @default(uuid())
   inventoryItemId String
   franchiseId     String?
   quantity        Float
   reason          String
   note            String?
   costAtTime      Float?
-  createdAt       DateTime  @default(now())
+  createdAt       DateTime      @default(now())
   inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
   franchise       Franchise?    @relation(fields: [franchiseId], references: [id])
 }
@@ -464,20 +464,20 @@ model Product {
 }
 
 model Recipe {
-  id           String       @id @default(uuid())
-  productId    String?      @unique
-  recipeCode   String?      @unique
-  category     String?
-  name         String
-  yieldQty     Float        @default(1)
-  yieldUnit    String       @default("KG")
-  instructions String?
+  id                       String       @id @default(uuid())
+  productId                String?      @unique
+  recipeCode               String?      @unique
+  category                 String?
+  name                     String
+  yieldQty                 Float        @default(1)
+  yieldUnit                String       @default("KG")
+  instructions             String?
   estimatedDurationMinutes Int?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  productions  Production[]
-  product      Product?     @relation(fields: [productId], references: [id])
-  recipeItems  RecipeItem[]
+  createdAt                DateTime     @default(now())
+  updatedAt                DateTime     @updatedAt
+  productions              Production[]
+  product                  Product?     @relation(fields: [productId], references: [id])
+  recipeItems              RecipeItem[]
 }
 
 model RecipeCategory {
@@ -498,28 +498,38 @@ model RecipeItem {
 }
 
 model Production {
-  id             String           @id @default(uuid())
+  id             String               @id @default(uuid())
   productionType String
   recipeId       String
   quantity       Float
   franchiseId    String
-  status         ProductionStatus @default(PENDING)
+  status         ProductionStatus     @default(PENDING)
   producedBy     String?
-  producedAt     DateTime         @default(now())
+  producedAt     DateTime             @default(now())
   customerId     String?
   endTime        DateTime?
   expiryDate     DateTime?
   startTime      DateTime?
   actualYield    Float?
-  currentStage   ProductionStage  @default(QUEUED)
+  currentStage   ProductionStage      @default(QUEUED)
   stageUpdatedAt DateTime?
   operatorId     String?
   remarks        String?
-  operator       Employee?        @relation(fields: [operatorId], references: [id])
+  materialCost   Float?
+  laborCost      Float?               @default(0)
+  overheadCost   Float?               @default(0)
+  totalCost      Float?
+  // The actual scoping unit for stock: which warehouse this run drew its raw
+  // materials from and validated availability against. franchiseId remains
+  // required by the schema (other reports still key off it) but stock
+  // validation no longer looks at it — see production.service.ts.
+  warehouseId    String?
+  operator       Employee?            @relation(fields: [operatorId], references: [id])
   batches        ProductBatch[]
-  customer       Customer?        @relation(fields: [customerId], references: [id])
-  franchise      Franchise        @relation(fields: [franchiseId], references: [id])
-  recipe         Recipe           @relation(fields: [recipeId], references: [id])
+  customer       Customer?            @relation(fields: [customerId], references: [id])
+  franchise      Franchise            @relation(fields: [franchiseId], references: [id])
+  recipe         Recipe               @relation(fields: [recipeId], references: [id])
+  warehouse      Warehouse?           @relation(fields: [warehouseId], references: [id])
   items          ProductionItem[]
   stageLogs      ProductionStageLog[]
 }
@@ -547,29 +557,32 @@ enum PackagingStatus {
 }
 
 model ProductBatch {
-  id              String             @id @default(uuid())
-  productId       String
-  productionId    String?
-  quantity        Float
-  expiryDate      DateTime?
-  batchCode       String?
-  createdAt       DateTime           @default(now())
-  franchiseId     String?
-  mfgDate         DateTime?          @default(now())
-  qcStatus        String?            @default("PENDING") // PENDING, APPROVED, REJECTED, REWORK
-  moistureCheck   Float?
-  colorCheck      String?
-  textureCheck    String?
-  rejectionQty    Float?             @default(0)
-  approvedQty     Float?             @default(0)
-  packagingStatus PackagingStatus?   @default(PENDING)
-  packagedQty     Float?             @default(0)
-  cartonedQty     Float?             @default(0)
-  franchise       Franchise?         @relation(fields: [franchiseId], references: [id])
-  product         Product            @relation(fields: [productId], references: [id])
-  production      Production?        @relation(fields: [productionId], references: [id])
-  packagings      ProductPackaging[]
-  cartons         Carton[]
+  id               String             @id @default(uuid())
+  productId        String
+  productionId     String?
+  quantity         Float
+  expiryDate       DateTime?
+  batchCode        String?
+  createdAt        DateTime           @default(now())
+  franchiseId      String?
+  mfgDate          DateTime?          @default(now())
+  qcStatus         String?            @default("PENDING") // PENDING, APPROVED, REJECTED, REWORK
+  moistureCheck    Float?
+  colorCheck       String?
+  textureCheck     String?
+  rejectionQty     Float?             @default(0)
+  approvedQty      Float?             @default(0)
+  packagingStatus  PackagingStatus?   @default(PENDING)
+  packagedQty      Float?             @default(0)
+  cartonedQty      Float?             @default(0)
+  unitCost         Float?
+  totalCost        Float?
+  franchise        Franchise?         @relation(fields: [franchiseId], references: [id])
+  product          Product            @relation(fields: [productId], references: [id])
+  production       Production?        @relation(fields: [productionId], references: [id])
+  packagings       ProductPackaging[]
+  cartons          Carton[]
+  inventoryBatches InventoryBatch[]
 }
 
 model Carton {
@@ -640,6 +653,9 @@ model ProductionItem {
   productionId    String
   inventoryItemId String
   usedQuantity    Float
+  unitCost        Float?
+  totalCost       Float?
+  batchBreakdown  Json?
   inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   production      Production    @relation(fields: [productionId], references: [id])
 }
@@ -690,26 +706,26 @@ model StockTransferItem {
 }
 
 model Order {
-  id                 String      @id @default(uuid())
-  invoiceNum         String      @unique
+  id                 String        @id @default(uuid())
+  invoiceNum         String        @unique
   customerId         String?
   branchId           String?
   franchiseId        String
-  orderType          String      @default("DINE_IN")
-  status             OrderStatus @default(COMPLETED)
+  orderType          String        @default("DINE_IN")
+  status             OrderStatus   @default(COMPLETED)
   subTotal           Float
   taxAmount          Float
-  discountAmount     Float       @default(0)
+  discountAmount     Float         @default(0)
   totalAmount        Float
-  paymentStatus      String      @default("PAID")
-  paymentType        String      @default("CASH")
+  paymentStatus      String        @default("PAID")
+  paymentType        String        @default("CASH")
   stateOfSupply      String?
-  inventory_deducted Boolean     @default(false)
-  createdAt          DateTime    @default(now())
+  inventory_deducted Boolean       @default(false)
+  createdAt          DateTime      @default(now())
   delivery           Delivery?
   invoice            Invoice?
-  customer           Customer?   @relation(fields: [customerId], references: [id])
-  franchise          Franchise   @relation(fields: [franchiseId], references: [id])
+  customer           Customer?     @relation(fields: [customerId], references: [id])
+  franchise          Franchise     @relation(fields: [franchiseId], references: [id])
   orderItems         OrderItem[]
   payments           Payment[]
   returns            ReturnOrder[]
@@ -726,6 +742,8 @@ model OrderItem {
   taxAmount   Float?
   totalAmount Float?
   batchNumber String?
+  unitCost    Float?
+  totalCost   Float?
   order       Order   @relation(fields: [orderId], references: [id])
   product     Product @relation(fields: [productId], references: [id])
 }
@@ -978,14 +996,14 @@ model LeaveType {
 }
 
 model LeaveBalance {
-  id         String    @id @default(uuid())
-  employeeId String
+  id          String    @id @default(uuid())
+  employeeId  String
   leaveTypeId String
-  year       Int
-  allocated  Int
-  used       Int       @default(0)
-  employee   Employee  @relation(fields: [employeeId], references: [id])
-  leaveType  LeaveType @relation(fields: [leaveTypeId], references: [id])
+  year        Int
+  allocated   Int
+  used        Int       @default(0)
+  employee    Employee  @relation(fields: [employeeId], references: [id])
+  leaveType   LeaveType @relation(fields: [leaveTypeId], references: [id])
 
   @@unique([employeeId, leaveTypeId, year])
 }
@@ -1366,17 +1384,25 @@ model VendorQuotationItem {
 }
 
 model Warehouse {
-  id        String             @id @default(uuid())
-  name      String
-  location  String?
-  type      String?
-  createdAt DateTime           @default(now())
-  updatedAt DateTime           @updatedAt
-  grnItems  GoodsReceiptItem[]
-  movements StockMovement[]
-  bins      WarehouseBin[]
-  orders    ProcurementOrder[]
-  primaryForFranchises Franchise[] @relation("PrimaryWarehouse")
+  id                   String             @id @default(uuid())
+  name                 String
+  // Normalized form of `name` (lowercased, punctuation/whitespace stripped),
+  // computed and maintained by the application. The @unique constraint is
+  // the real guarantee against duplicate warehouses like "Home" vs "Home
+  // (Hopes)" — an app-level pre-check alone can't close the race window
+  // between two concurrent create requests; this can.
+  nameKey              String             @unique
+  location             String?
+  type                 String?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  grnItems             GoodsReceiptItem[]
+  movements            StockMovement[]
+  bins                 WarehouseBin[]
+  orders               ProcurementOrder[]
+  primaryForFranchises Franchise[]        @relation("PrimaryWarehouse")
+  inventoryBatches     InventoryBatch[]
+  productions          Production[]
 }
 
 model WarehouseBin {
@@ -1399,10 +1425,18 @@ model InventoryBatch {
   initialQty      Float
   currentQty      Float
   unitCost        Float?
+  productBatchId  String?
+  // Which physical warehouse this lot was received into / belongs to. FIFO
+  // consumption filters by this so production only draws from the warehouse
+  // actually selected, not just "somewhere in the business." Nullable because
+  // batches created before this existed have no warehouse on record.
+  warehouseId     String?
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
   status          InventoryStockState @default(QC_HOLD)
   inventoryItem   InventoryItem       @relation(fields: [inventoryItemId], references: [id])
+  productBatch    ProductBatch?       @relation(fields: [productBatchId], references: [id])
+  warehouse       Warehouse?          @relation(fields: [warehouseId], references: [id])
 }
 
 model AuditLog {

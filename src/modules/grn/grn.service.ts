@@ -112,6 +112,12 @@ export class GRNService {
       let allReceived = true;
       let someReceived = false;
 
+      // Computed once up front so every batch created below AND the vendor
+      // invoice generated later carry the exact same reference — FIFO
+      // consumption should trace back to "which bill this stock came from,
+      // at what price," not an arbitrary internal lot code.
+      const billNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
@@ -121,17 +127,20 @@ export class GRNService {
         const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
         const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
 
-        // 1. Create Inventory Batch (Directly APPROVED for streamlined flow)
+        // 1. Create Inventory Batch (Directly APPROVED for streamlined flow).
+        // Tagged with the purchase bill number, not a generic lot code — the
+        // vendor's own batch/lot reference (if they gave one) still wins when present.
         const batch = await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
-            batchNumber: item.vendorBatchNo || `B-${Date.now()}`,
+            batchNumber: item.vendorBatchNo || billNumber,
             lotNumber: item.lotNumber,
             mfgDate: item.mfgDate,
             expDate: item.expDate,
             initialQty: item.acceptedQty,
             currentQty: item.acceptedQty, // Usable immediately
             unitCost: item.price,
+            warehouseId: item.warehouseId || null,
             status: 'APPROVED'
           }
         });
@@ -185,13 +194,12 @@ export class GRNService {
           where: { grnId: grnId }
         });
         if (!existingInvoice) {
-          const invoiceNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
           await tx.vendorInvoice.create({
             data: {
               vendorId: grn.procurementOrder.vendorId,
               poId: grn.poId,
               grnId: grnId,
-              invoiceNumber: invoiceNumber,
+              invoiceNumber: billNumber,
               amount: grnTotalWithTax,
               status: 'PENDING'
             }

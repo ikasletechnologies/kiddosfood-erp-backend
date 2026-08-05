@@ -6,7 +6,8 @@ export class ProductionService {
   static async startProduction(data: {
     recipeId: string;
     quantity: number;
-    franchiseId: string;
+    franchiseId?: string;
+    warehouseId?: string;
     customerId?: string;
     productionType: string;
     expiryDate?: string;
@@ -21,18 +22,55 @@ export class ProductionService {
       });
       if (!recipe) throw new Error('Recipe not found');
 
+      // franchiseId is a required column on Production (other reports still
+      // key off it) but no longer a user-facing concept for production —
+      // resolve it server-side instead of trusting every caller to always
+      // supply one (a SUPER_ADMIN with no franchise assigned + a frontend
+      // fetch that hasn't resolved yet was hitting this and crashing the launch).
+      let franchiseId = data.franchiseId;
+      if (!franchiseId) {
+        let fallbackFranchise = await tx.franchise.findFirst({ orderBy: { createdAt: 'asc' } });
+        if (!fallbackFranchise) {
+          // Genuinely none exist — this is internal bookkeeping the user
+          // never sees or manages for production, so self-heal instead of
+          // blocking the run on a setup step that shouldn't matter to them.
+          fallbackFranchise = await tx.franchise.create({
+            data: {
+              name: 'Default',
+              location: 'N/A',
+              ownerName: 'N/A',
+              contactNum: 'N/A',
+              status: 'ACTIVE',
+            },
+          });
+        }
+        franchiseId = fallbackFranchise.id;
+      }
+
       // Calculate scalar based on batches (frontend sends number of batches/runs)
       // If recipe yield is 5 and we run it 2 times, scalar is 2.
       const scalar = data.quantity;
 
-      // 2. Check ingredients
+      // 2. Check ingredients. Stock is a warehouse concept, not a franchise
+      // one — when a warehouse is given, availability is checked against
+      // what's actually in THAT warehouse (matching what Formula Scaling /
+      // Production Planning show on screen), not the item's franchise-wide
+      // total. franchiseId is only a fallback for callers that predate
+      // warehouse selection.
       for (const item of recipe.recipeItems) {
         const amountNeeded = item.quantityRequired * scalar;
-        const inv = await tx.inventoryItem.findFirst({
-          where: { id: item.inventoryItemId, franchiseId: data.franchiseId },
-        });
-        if (!inv || inv.currentStock < amountNeeded) {
-          throw new Error(`Insufficient stock for "${inv?.name ?? 'ingredient'}"`);
+        if (data.warehouseId) {
+          const available = await InventoryService.computeWarehouseStock(item.inventoryItemId, data.warehouseId, tx);
+          if (available < amountNeeded) {
+            throw new Error(`Insufficient stock for "${item.inventoryItem.name}" in the selected warehouse`);
+          }
+        } else {
+          const inv = await tx.inventoryItem.findFirst({
+            where: { id: item.inventoryItemId, franchiseId },
+          });
+          if (!inv || inv.currentStock < amountNeeded) {
+            throw new Error(`Insufficient stock for "${inv?.name ?? 'ingredient'}"`);
+          }
         }
       }
 
@@ -41,7 +79,8 @@ export class ProductionService {
         data: {
           recipeId: data.recipeId,
           quantity: data.quantity,
-          franchiseId: data.franchiseId,
+          franchiseId,
+          warehouseId: data.warehouseId || null,
           customerId: data.customerId,
           productionType: data.productionType,
           status: 'IN_PROGRESS',
@@ -58,10 +97,13 @@ export class ProductionService {
         data: { productionId: production.id, stage: 'QUEUED' },
       });
 
-      // 4. Deduct raw materials
+      // 4. Deduct raw materials, capturing the real FIFO lot cost of whatever
+      // was actually consumed (oldest/cheapest purchase lot first) instead of
+      // letting it get discarded once the batch rows are decremented.
+      let materialCost = 0;
       for (const item of recipe.recipeItems) {
         const amountNeeded = item.quantityRequired * scalar;
-        await InventoryService.recordMovement(tx, {
+        const { fifo } = await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PRODUCTION_OUT',
           quantity: -amountNeeded,
@@ -69,16 +111,55 @@ export class ProductionService {
           referenceId: production.id,
           note: `Production started: ${recipe.name}`,
           userId: data.userId,
+          warehouseId: data.warehouseId,
         });
+
+        // Fall back to the item's moving-average costPrice for any portion
+        // that had no tracked batch to draw from (e.g. opening stock), so a
+        // gap in batch tracking doesn't just silently zero out the cost.
+        const untracked = amountNeeded - (fifo?.consumedFromBatches || 0);
+        const fallbackCost = untracked > 0
+          ? untracked * (item.inventoryItem.costPrice || 0)
+          : 0;
+        const totalCost = (fifo?.totalCost || 0) + fallbackCost;
+        const unitCost = amountNeeded > 0 ? totalCost / amountNeeded : 0;
+        materialCost += totalCost;
+
+        // Every kilogram accounted for in totalCost needs to be visible in
+        // the breakdown, not just the portion that had a tracked purchase
+        // batch — otherwise the UI shows a blended unit cost with no way to
+        // see where part of it came from.
+        const breakdown = fifo?.consumptions ? [...fifo.consumptions] : [];
+        if (untracked > 0) {
+          breakdown.push({
+            batchId: null,
+            billNumber: 'Weighted avg. (no purchase batch on record)',
+            productBatchId: null,
+            qty: untracked,
+            unitCost: item.inventoryItem.costPrice || 0,
+            totalCost: fallbackCost,
+          } as any);
+        }
 
         await tx.productionItem.create({
           data: {
             productionId: production.id,
             inventoryItemId: item.inventoryItemId,
             usedQuantity: amountNeeded,
+            unitCost,
+            totalCost,
+            batchBreakdown: breakdown.length ? (breakdown as any) : undefined,
           },
         });
       }
+
+      await tx.production.update({
+        where: { id: production.id },
+        data: {
+          materialCost,
+          totalCost: materialCost + (production.laborCost || 0) + (production.overheadCost || 0),
+        },
+      });
 
       return production;
     });
@@ -135,8 +216,13 @@ export class ProductionService {
         include: { recipe: { include: { product: true, recipeItems: true } } },
       });
 
-      if (!production || production.status !== 'STOPPED') {
-        throw new Error('Production must be stopped before approval');
+      // The normal path is Queued -> Mixing -> Cooking -> Cooling -> QC while
+      // status stays IN_PROGRESS the whole time (advanceStage only touches
+      // currentStage, never status) — "STOPPED" is a separate manual pause
+      // action, not something every run passes through. Requiring it here
+      // made completing a run that was never paused always fail.
+      if (!production || (production.status !== 'STOPPED' && production.status !== 'IN_PROGRESS')) {
+        throw new Error('Production must be in progress or stopped before approval');
       }
 
       const recipe = production.recipe;
@@ -144,6 +230,13 @@ export class ProductionService {
         throw new Error('Recipe or associated product not found');
       }
       const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
+
+      // The batch's real unit cost: whatever raw materials this specific run
+      // actually consumed (FIFO lot cost, see startProduction), spread over
+      // the yield. Two runs of the same recipe can land on different unit
+      // costs if the second one drew from a pricier purchase lot.
+      const totalCost = production.totalCost ?? production.materialCost ?? 0;
+      const unitCost = totalYield > 0 ? totalCost / totalYield : 0;
 
       // Create ProductBatch with PENDING QC status (does NOT add stock to finished goods inventory yet)
       const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
@@ -159,6 +252,8 @@ export class ProductionService {
           approvedQty: 0,
           rejectionQty: 0,
           packagingStatus: "PENDING",
+          unitCost,
+          totalCost,
         },
       });
 
@@ -236,6 +331,10 @@ export class ProductionService {
         }
 
         if (data.qcStatus === 'APPROVED' && approvedQty > 0) {
+          // Carries the batch's real FIFO-derived material cost into a fresh
+          // InventoryBatch for the finished good, so a later sale draws from
+          // (and gets costed at) this batch's actual cost — not a generic
+          // average — exactly like raw materials already do off GRN batches.
           await InventoryService.recordMovement(tx, {
             itemId: targetItem.id,
             type: 'PRODUCTION_IN',
@@ -244,6 +343,14 @@ export class ProductionService {
             referenceId: batch.productionId || batch.id,
             note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
             userId: data.userId,
+            warehouseId: batch.production?.warehouseId || undefined,
+            receiveAtCost: {
+              unitCost: batch.unitCost || 0,
+              batchNumber: batch.batchCode || undefined,
+              mfgDate: batch.mfgDate,
+              expDate: batch.expiryDate,
+              productBatchId: batch.id,
+            },
           });
         }
 
@@ -259,7 +366,7 @@ export class ProductionService {
               quantity: rejection,
               reason: 'QC_FAIL',
               note: `QC rejected from batch ${batch.batchCode}`,
-              costAtTime: rejection * (targetItem.costPrice || 0),
+              costAtTime: rejection * (batch.unitCost || targetItem.costPrice || 0),
             },
           });
         }
@@ -458,7 +565,16 @@ export class ProductionService {
 
     const batches = await prisma.productBatch.findMany({
       where,
-      include: { product: true, franchise: true, production: { include: { recipe: true } } },
+      include: {
+        product: true,
+        franchise: true,
+        production: {
+          include: {
+            recipe: true,
+            items: { include: { inventoryItem: true } },
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     });
 

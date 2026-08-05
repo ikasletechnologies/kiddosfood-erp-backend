@@ -54,10 +54,35 @@ app.use(cors());
 app.use(express.json());
 
 // Advanced API Flow Logger
+const REDACTED_KEYS = ['password', 'accessToken', 'refreshToken', 'token'];
+function redact(obj: any) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const copy: any = Array.isArray(obj) ? [...obj] : { ...obj };
+  for (const key of Object.keys(copy)) {
+    if (REDACTED_KEYS.includes(key)) copy[key] = '********';
+  }
+  return copy;
+}
+// Response bodies get logged truncated — full payloads (e.g. big list
+// endpoints) would flood the console and make the log unreadable.
+const MAX_LOGGED_BODY_CHARS = 2000;
+function formatBody(body: any) {
+  let str: string;
+  try {
+    str = JSON.stringify(redact(body));
+  } catch {
+    return '[unserializable]';
+  }
+  if (!str) return str;
+  return str.length > MAX_LOGGED_BODY_CHARS
+    ? `${str.slice(0, MAX_LOGGED_BODY_CHARS)}… (${str.length} chars total)`
+    : str;
+}
+
 app.use((req, res, next) => {
   const start = Date.now();
   const requestId = Math.random().toString(36).substring(7);
-  
+
   // Format based on method
   const methodColors: any = {
     GET: '🟢',
@@ -70,17 +95,23 @@ app.use((req, res, next) => {
   console.log(`\n🚀 [${icon} ${req.method}] ${req.url} (ID: ${requestId})`);
   if (req.query && Object.keys(req.query).length > 0) console.log(`   🔸 Query:`, req.query);
   if (req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
-    const safeBody = { ...req.body };
-    if (safeBody.password) safeBody.password = '********';
-    console.log(`   🔸 Body:`, safeBody);
+    console.log(`   🔸 Body:`, redact(req.body));
   }
+
+  // Capture whatever gets sent out, whichever of these the route handler calls.
+  let responseBody: any;
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+  res.json = (body: any) => { responseBody = body; return originalJson(body); };
+  res.send = (body: any) => { if (responseBody === undefined) responseBody = body; return originalSend(body); };
 
   res.on('finish', () => {
     const duration = Date.now() - start;
     const statusIcon = res.statusCode >= 400 ? '❌' : '✅';
     console.log(`${statusIcon} [RESPONSE] ${res.statusCode} - ${duration}ms (ID: ${requestId})`);
+    if (responseBody !== undefined) console.log(`   🔹 Response:`, formatBody(responseBody));
   });
-  
+
   next();
 });
 
@@ -109,6 +140,7 @@ app.get('/health', async (req: Request, res: Response) => {
         create: {
           id: 'w-central',
           name: 'Central Warehouse',
+          nameKey: 'centralwarehouse',
           location: 'Mumbai',
           type: 'MAIN'
         }

@@ -5,14 +5,15 @@ import { IsolationUtil } from '../../utils/isolation.util';
 export class ProductionController {
   static async startBatch(req: Request, res: Response) {
     try {
-      const { recipeId, quantity, franchiseId, customerId, productionType, expiryDate, operatorId } = req.body;
+      const { recipeId, quantity, franchiseId, warehouseId, customerId, productionType, expiryDate, operatorId } = req.body;
       const user = (req as any).user;
       const enforcedFranchiseId = IsolationUtil.enforceFranchiseMatch(user, franchiseId);
 
       const result = await ProductionService.startProduction({
         recipeId,
         quantity: Number(quantity),
-        franchiseId: enforcedFranchiseId as string,
+        franchiseId: enforcedFranchiseId || undefined,
+        warehouseId: warehouseId || undefined,
         customerId,
         productionType,
         expiryDate,
