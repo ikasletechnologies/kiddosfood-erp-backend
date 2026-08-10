@@ -566,12 +566,13 @@ model ProductBatch {
   createdAt        DateTime           @default(now())
   franchiseId      String?
   mfgDate          DateTime?          @default(now())
-  qcStatus         String?            @default("PENDING") // PENDING, APPROVED, REJECTED, REWORK
+  qcStatus         String?            @default("PENDING") // PENDING, APPROVED, PARTIALLY_APPROVED, REJECTED, REWORK
   moistureCheck    Float?
   colorCheck       String?
   textureCheck     String?
   rejectionQty     Float?             @default(0)
   approvedQty      Float?             @default(0)
+  qcRemarks        String?
   packagingStatus  PackagingStatus?   @default(PENDING)
   packagedQty      Float?             @default(0)
   cartonedQty      Float?             @default(0)

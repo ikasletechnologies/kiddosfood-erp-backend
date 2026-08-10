@@ -99,20 +99,20 @@ export class ProductionController {
 
   static async inspectBatch(req: Request, res: Response) {
     try {
-      const { qcStatus, moistureCheck, colorCheck, textureCheck, rejectionQty } = req.body;
+      const { moistureCheck, colorCheck, textureCheck, rejectionQty, qcRemarks } = req.body;
       const user = (req as any).user;
       const result = await ProductionService.inspectBatch({
         batchId: req.params.id,
-        qcStatus,
         moistureCheck: moistureCheck !== undefined ? Number(moistureCheck) : undefined,
         colorCheck,
         textureCheck,
         rejectionQty: rejectionQty !== undefined ? Number(rejectionQty) : 0,
+        qcRemarks,
         userId: user?.userId
       });
       res.json(result);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 
@@ -128,7 +128,7 @@ export class ProductionController {
       });
       res.json(result);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 

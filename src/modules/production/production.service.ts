@@ -257,12 +257,15 @@ export class ProductionService {
         },
       });
 
-      // Finalize status and record actual yield
+      // Finalize status and record actual yield. endTime previously only
+      // ever got set by stopProduction (a pause) — a run that finished
+      // normally had no recorded completion time at all.
       return tx.production.update({
         where: { id },
-        data: { 
+        data: {
           status: 'COMPLETED',
           actualYield: totalYield,
+          endTime: new Date(),
           ...(remarks ? { remarks } : {}),
         },
       });
@@ -271,40 +274,59 @@ export class ProductionService {
 
   static async inspectBatch(data: {
     batchId: string;
-    qcStatus: string;
     moistureCheck?: number;
     colorCheck?: string;
     textureCheck?: string;
     rejectionQty?: number;
+    qcRemarks?: string;
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
       const batch = await tx.productBatch.findUnique({
         where: { id: data.batchId },
-        include: { product: true, production: true },
+        include: { product: true, production: { include: { recipe: true } } },
       });
       if (!batch) throw new Error('Product batch not found');
 
       const rejection = data.rejectionQty || 0;
+      // Enforced here, not just in the UI — accepted + rejected must equal
+      // what was actually produced. Approved quantity is always derived from
+      // that, never entered separately, so the two can't drift apart.
+      if (rejection < 0 || rejection > batch.quantity) {
+        throw new Error(`Rejected quantity must be between 0 and the produced quantity (${batch.quantity})`);
+      }
       const approvedQty = Math.max(0, batch.quantity - rejection);
+      // Status is derived from the actual split, not trusted from the
+      // caller — a batch is only fully APPROVED when nothing was rejected,
+      // only fully REJECTED when nothing was approved, otherwise it's a
+      // genuine partial outcome.
+      const qcStatus = rejection <= 0 ? 'APPROVED' : approvedQty <= 0 ? 'REJECTED' : 'PARTIALLY_APPROVED';
 
       const updatedBatch = await tx.productBatch.update({
         where: { id: data.batchId },
         data: {
-          qcStatus: data.qcStatus,
+          qcStatus,
           moistureCheck: data.moistureCheck,
           colorCheck: data.colorCheck,
           textureCheck: data.textureCheck,
           rejectionQty: rejection,
           approvedQty: approvedQty,
+          qcRemarks: data.qcRemarks || null,
         },
       });
 
-      const needsTargetItem = (data.qcStatus === 'APPROVED' && approvedQty > 0) || rejection > 0;
+      const needsTargetItem = approvedQty > 0 || rejection > 0;
 
       if (needsTargetItem) {
         const franchiseId = batch.franchiseId || batch.production?.franchiseId;
         if (!franchiseId) throw new Error('Franchise ID not found for batch');
+
+        // The finished-good's real unit is whatever the recipe yields it in
+        // (e.g. "KG") — packageBatch's weight parser converts packet sizes
+        // relative to this unit, so a generic placeholder here silently
+        // broke that conversion (a "unit"-labeled bulk item can't be told
+        // apart from grams/kilograms, producing wildly wrong stock math).
+        const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
 
         let targetItem = await tx.inventoryItem.findFirst({
           where: {
@@ -323,14 +345,21 @@ export class ProductionService {
               sku: batch.product?.sku || `PRD-${batch.productId.substring(0, 5).toUpperCase()}`,
               category: 'FINISHED_GOOD',
               currentStock: 0,
-              unit: 'unit',
+              unit: finishedGoodUnit,
               minimumStock: 5,
               franchiseId,
             },
           });
+        } else if (targetItem.unit === 'unit' && finishedGoodUnit !== 'unit') {
+          // Self-heal an item created before this fix — the quantity stored
+          // was always correct, only the unit label was wrong.
+          targetItem = await tx.inventoryItem.update({
+            where: { id: targetItem.id },
+            data: { unit: finishedGoodUnit },
+          });
         }
 
-        if (data.qcStatus === 'APPROVED' && approvedQty > 0) {
+        if (approvedQty > 0) {
           // Carries the batch's real FIFO-derived material cost into a fresh
           // InventoryBatch for the finished good, so a later sale draws from
           // (and gets costed at) this batch's actual cost — not a generic
@@ -365,7 +394,7 @@ export class ProductionService {
               franchiseId,
               quantity: rejection,
               reason: 'QC_FAIL',
-              note: `QC rejected from batch ${batch.batchCode}`,
+              note: data.qcRemarks || `QC rejected from batch ${batch.batchCode}`,
               costAtTime: rejection * (batch.unitCost || targetItem.costPrice || 0),
             },
           });
@@ -385,7 +414,7 @@ export class ProductionService {
     return prisma.$transaction(async tx => {
       const batch = await tx.productBatch.findUnique({
         where: { id: data.batchId },
-        include: { product: true, production: true },
+        include: { product: true, production: { include: { recipe: true } } },
       });
       if (!batch) throw new Error('Product batch not found');
       if (batch.qcStatus !== 'APPROVED') throw new Error('Batch must be QC APPROVED before packaging');
@@ -404,11 +433,27 @@ export class ProductionService {
       });
       if (!bulkItem) throw new Error('Bulk inventory item not found');
 
+      // Self-heal a bulk item still carrying the old generic 'unit' label
+      // (from before finished-goods items recorded their real yield unit) —
+      // this is the actual point where a wrong unit breaks the g/kg
+      // conversion below, not just at creation time in inspectBatch, so a
+      // batch that was already QC-approved before that fix shipped needs
+      // correcting here too.
+      if (bulkItem.unit === 'unit') {
+        const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
+        if (finishedGoodUnit !== 'unit') {
+          bulkItem = await tx.inventoryItem.update({
+            where: { id: bulkItem.id },
+            data: { unit: finishedGoodUnit },
+          });
+        }
+      }
+
       const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
       const totalWeightNeeded = data.quantityPackets * unitMultiplier;
 
       if (bulkItem.currentStock < totalWeightNeeded) {
-        throw new Error(`Insufficient bulk stock. Needed: ${totalWeightNeeded} ${bulkItem.unit}, Available: ${bulkItem.currentStock} ${bulkItem.unit}`);
+        throw new Error(`Insufficient bulk stock. Needed: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}`);
       }
 
       // Cap against this batch's own QC-approved quantity — only approved
@@ -416,7 +461,7 @@ export class ProductionService {
       // (not the raw batch.quantity, which includes anything QC rejected).
       const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
       if (totalWeightNeeded > remainingInBatch + 0.001) {
-        throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch} ${bulkItem.unit} left).`);
+        throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
 
       await InventoryService.recordMovement(tx, {
@@ -502,7 +547,13 @@ export class ProductionService {
 
   private static parseWeight(size: string, bulkUnit: string): number {
     const match = size.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
-    if (!match) return 1.0;
+    // Silently treating an unparseable size as "1 KG per packet" let a typo
+    // (missing/garbled unit) produce a wrong-but-plausible stock deduction
+    // with no warning. Fail loudly instead — this is what actually decides
+    // how much bulk stock gets consumed.
+    if (!match) {
+      throw new Error(`Invalid packet size "${size}" — expected a number with a unit, e.g. "250 g" or "1 Kg".`);
+    }
     const val = parseFloat(match[1]);
     const unit = match[3].toLowerCase();
     const bUnit = bulkUnit.toLowerCase();
@@ -572,6 +623,7 @@ export class ProductionService {
           include: {
             recipe: true,
             items: { include: { inventoryItem: true } },
+            stageLogs: { orderBy: { enteredAt: 'asc' } },
           },
         },
       },
