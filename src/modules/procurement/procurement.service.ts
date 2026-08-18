@@ -243,12 +243,14 @@ export class ProcurementService {
     openingBalance?: number;
     asOfDate?: string;
     creditLimit?: number;
-    remark?: string; 
-    rating?: number; 
+    remark?: string;
+    rating?: number;
     gstNumber?: string;
     category?: string;
     paymentTerms?: any;
     status?: any;
+    paymentReminderEnabled?: boolean;
+    paymentReminderDays?: number;
   }) {
     if (data.name !== undefined && !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
       throw new Error("Vendor Name must only contain alphanumeric characters, spaces, and the following symbols: & . , - ( )");
@@ -1216,22 +1218,24 @@ export class ProcurementService {
     return buckets;
   }
 
-  static async getNextPaymentNumber() {
-    const now = new Date();
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    // Find all payments created today for vendors
+  static async getNextPaymentNumber(dateStr?: string) {
+    // Build the day boundaries from local calendar components (not toISOString(),
+    // which renders in UTC and silently shifts the date by a day whenever the
+    // server's local timezone has a non-zero UTC offset — e.g. IST). The ID should
+    // reflect the actual transaction date the user selected, not a UTC-shifted one.
+    const target = dateStr ? new Date(dateStr) : new Date();
+    const startOfDay = new Date(target.getFullYear(), target.getMonth(), target.getDate(), 0, 0, 0, 0);
+    const endOfDay = new Date(target.getFullYear(), target.getMonth(), target.getDate(), 23, 59, 59, 999);
+
+    // Find all payments created on that date for vendors
     const count = await prisma.payment.count({
       where: {
-        createdAt: {
-          gte: today
-        },
+        createdAt: { gte: startOfDay, lte: endOfDay },
         entityType: 'VENDOR'
       }
     });
 
-    const yyyymmdd = today.toISOString().split('T')[0].replace(/-/g, '');
+    const yyyymmdd = `${target.getFullYear()}${String(target.getMonth() + 1).padStart(2, '0')}${String(target.getDate()).padStart(2, '0')}`;
     const nextSeq = String(count + 1).padStart(4, '0');
     return { nextPaymentNumber: `VPAY-${yyyymmdd}-${nextSeq}` };
   }

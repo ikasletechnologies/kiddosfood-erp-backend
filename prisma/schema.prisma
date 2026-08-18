@@ -285,6 +285,8 @@ model Vendor {
   paymentTerms      PaymentTerms       @default(IMMEDIATE)
   status            VendorStatus       @default(ACTIVE)
   vendorCode        String?            @unique
+  paymentReminderEnabled Boolean       @default(false)
+  paymentReminderDays    Int           @default(1)
   items             InventoryItem[]
   orders            ProcurementOrder[]
   purchaseReturns   PurchaseReturn[]
