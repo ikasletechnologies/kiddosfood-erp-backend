@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderStatus, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
+import { FranchiseOrderStatus, FranchiseOrderType, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
 import SocketService from '../../lib/socket';
 
@@ -9,16 +9,104 @@ function generateOrderNumber(): string {
   return `FO-${ts}-${rnd}`;
 }
 
+async function getHqFranchise(tx: any) {
+  return tx.franchise.findFirst({
+    where: {
+      OR: [{ id: 'hq-001' }, { name: { contains: 'HQ', mode: 'insensitive' } }, { name: { contains: 'Head', mode: 'insensitive' } }]
+    }
+  });
+}
+
+async function findHqStockItem(tx: any, hqId: string, product: { sku: string | null; name: string }) {
+  return tx.inventoryItem.findFirst({
+    where: {
+      franchiseId: hqId,
+      OR: [
+        ...(product.sku ? [{ sku: product.sku }] : []),
+        { name: { contains: product.name, mode: 'insensitive' } }
+      ]
+    }
+  });
+}
+
+// Decides whether an order can be pulled straight from HQ's finished-goods stock,
+// or needs to go through production — and if so, whether the raw materials for the
+// shortfall are actually on hand. Production is a fulfillment path, not a mandatory
+// status: an order only needs it when HQ doesn't already have enough finished stock.
+async function computeFulfillment(tx: any, orderId: string) {
+  const fullOrder = await tx.franchiseOrder.findUnique({
+    where: { id: orderId },
+    include: {
+      items: {
+        include: {
+          product: {
+            include: { recipe: { include: { recipeItems: { include: { inventoryItem: true } } } } }
+          }
+        }
+      }
+    }
+  });
+
+  const hq = await getHqFranchise(tx);
+  let allInStock = true;
+  const shortfalls: Array<{
+    product: string;
+    neededFromProduction: number;
+    recipeConfigured: boolean;
+    materials: Array<{ name: string; unit: string; required: number; available: number; shortBy: number }>;
+  }> = [];
+
+  for (const item of fullOrder.items) {
+    const product = item.product;
+    const isFinishedGood = item.productType === ProductType.FINISHED_GOOD;
+
+    // MADE_TO_ORDER items are never carried as HQ finished stock — they always route to production.
+    const invItem = isFinishedGood && hq ? await findHqStockItem(tx, hq.id, product) : null;
+    const available = invItem?.currentStock || 0;
+    const shortBy = Math.max(0, item.quantity - available);
+
+    if (shortBy <= 0) continue;
+    allInStock = false;
+
+    const recipe = product.recipe;
+    if (!recipe || recipe.recipeItems.length === 0) {
+      shortfalls.push({ product: product.name, neededFromProduction: shortBy, recipeConfigured: false, materials: [] });
+      continue;
+    }
+
+    const materials = recipe.recipeItems.map((ri: any) => {
+      const required = Math.round((ri.quantityRequired / (recipe.yieldQty || 1)) * shortBy * 100) / 100;
+      const availableQty = ri.inventoryItem.currentStock || 0;
+      return {
+        name: ri.inventoryItem.name,
+        unit: ri.unit,
+        required,
+        available: availableQty,
+        shortBy: Math.max(0, Math.round((required - availableQty) * 100) / 100),
+      };
+    });
+
+    shortfalls.push({ product: product.name, neededFromProduction: shortBy, recipeConfigured: true, materials });
+  }
+
+  const fulfillmentPath = allInStock ? 'STOCK' : 'PRODUCTION';
+  const materialsReady = allInStock || shortfalls.every(s => s.recipeConfigured && s.materials.every(m => m.shortBy <= 0));
+
+  return { fulfillmentPath, materialsReady, materialsShortfall: allInStock ? null : shortfalls };
+}
+
 export class FranchiseOrderService {
   // ─── Create Order ──────────────────────────────────────────────────────────
   static async createOrder(data: {
     franchiseId: string;
+    orderType?: FranchiseOrderType;
     paymentType?: PaymentType;
     expectedDispatchDate?: string;
     priority?: string;
     notes?: string;
     items: Array<{ productId: string; quantity: number }>;
   }) {
+    const orderType = data.orderType ?? FranchiseOrderType.STOCK;
     return prisma.$transaction(async tx => {
       // Load products to validate and price them
       const productIds = data.items.map(i => i.productId);
@@ -41,42 +129,29 @@ export class FranchiseOrderService {
       for (const reqItem of data.items) {
         const product = products.find(p => p.id === reqItem.productId)!;
 
-        // FINISHED_GOOD → check available stock from InventoryItem at HQ
-        if (product.productType === ProductType.FINISHED_GOOD) {
+        // FINISHED_GOOD under a STOCK order → check available stock from InventoryItem at HQ.
+        // REQUEST orders (Make to Order) skip this check entirely: the franchise is asking
+        // HQ to fulfill regardless of current availability, and HQ decides how/when to produce it.
+        if (product.productType === ProductType.FINISHED_GOOD && orderType === FranchiseOrderType.STOCK) {
           console.log(`🔍 [OrderSync] Starting validation for: ${product.name}`);
-          
-          // Find HQ franchise
-          const hq = await tx.franchise.findFirst({
-            where: {
-              OR: [{ id: 'hq-001' }, { name: { contains: 'HQ', mode: 'insensitive' } }, { name: { contains: 'Head', mode: 'insensitive' } }]
-            }
-          });
 
+          const hq = await getHqFranchise(tx);
           if (!hq) {
             console.error("❌ [OrderSync] Headquarters NOT FOUND in database!");
             throw new Error("Headquarters stock repository not found. Please contact administrator.");
           }
 
-          const invItem = await tx.inventoryItem.findFirst({
-            where: {
-              franchiseId: hq.id,
-              OR: [
-                ...(product.sku ? [{ sku: product.sku }] : []),
-                { name: { contains: product.name, mode: 'insensitive' } }
-              ]
-            }
-          });
-
+          const invItem = await findHqStockItem(tx, hq.id, product);
           const availableStock = invItem?.currentStock || 0;
           console.log(`📦 [OrderSync] Product: ${product.name} | HQ Found: ${hq.name} | Inv Match: ${invItem?.name || 'NONE'} | Stock: ${availableStock}`);
-          
+
           if (availableStock < reqItem.quantity) {
             throw new Error(
-              `Only ${availableStock} units available in HQ warehouse for "${product.name}". Please reduce quantity or contact HQ.`
+              `Only ${availableStock} units available in HQ warehouse for "${product.name}". Please reduce quantity or place this as a Request / Make to Order instead.`
             );
           }
         }
-        // MADE_TO_ORDER → allowed without stock check
+        // MADE_TO_ORDER products, and any item on a REQUEST order → allowed without stock check
 
         const unitPrice   = product.basePrice;
         const totalAmount = unitPrice * reqItem.quantity;
@@ -98,6 +173,7 @@ export class FranchiseOrderService {
         data: {
           orderNumber: generateOrderNumber(),
           franchiseId: data.franchiseId,
+          orderType,
           paymentType: data.paymentType ?? PaymentType.CREDIT,
           subtotal,
           taxAmount,
@@ -182,6 +258,22 @@ export class FranchiseOrderService {
 
     const updateData: any = { status };
 
+    // On approval, decide the fulfillment path (straight from stock vs. needs production)
+    // and, if production is needed, whether the raw materials for the shortfall are on hand.
+    // Re-checked on the move into production too, in case stock shifted since approval.
+    if (status === FranchiseOrderStatus.APPROVED || status === FranchiseOrderStatus.IN_PRODUCTION) {
+      const fulfillment = await computeFulfillment(prisma, id);
+      updateData.fulfillmentPath = fulfillment.fulfillmentPath;
+      updateData.materialsReady = fulfillment.materialsReady;
+      updateData.materialsShortfall = fulfillment.materialsShortfall;
+
+      // Production can't start on a shortfall the system can't back up with raw materials —
+      // this mirrors the disabled state in the UI, but enforced here so it can't be bypassed.
+      if (status === FranchiseOrderStatus.IN_PRODUCTION && !fulfillment.materialsReady) {
+        throw new Error('Cannot start production: raw materials are insufficient (or no recipe is configured) for this order.');
+      }
+    }
+
     if (status === FranchiseOrderStatus.DISPATCHED) {
       const actual = extra?.actualDispatchDate
         ? new Date(extra.actualDispatchDate)
@@ -244,11 +336,21 @@ export class FranchiseOrderService {
                 data: { currentStock: { increment: item.quantity } }
               });
             } else {
-              // Create new inventory item for the franchise if it doesn't exist
+              // Create new inventory item for the franchise if it doesn't exist.
+              // InventoryItem.sku is unique across the whole system, so a branch-level
+              // row can't just reuse the master product's SKU once HQ already owns it —
+              // scope it to this franchise, with a random fallback on the (rare) collision.
+              let sku = product.sku
+                ? `${product.sku}-${order.franchiseId.substring(0, 6).toUpperCase()}`
+                : `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+              if (await tx.inventoryItem.findUnique({ where: { sku } })) {
+                sku = `${sku}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
+              }
+
               await tx.inventoryItem.create({
                 data: {
                   name: product.name,
-                  sku: product.sku || `SKU-${Math.random().toString(36).substring(7)}`,
+                  sku,
                   category: 'FINISHED_GOOD',
                   currentStock: item.quantity,
                   unit: 'PC', // Default or fetch from product

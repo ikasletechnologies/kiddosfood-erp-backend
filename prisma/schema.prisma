@@ -619,6 +619,10 @@ model FranchiseOrder {
   orderNumber          String               @unique
   franchiseId          String
   status               FranchiseOrderStatus @default(PENDING)
+  orderType            FranchiseOrderType   @default(STOCK)
+  fulfillmentPath      FranchiseOrderFulfillment?
+  materialsReady       Boolean?
+  materialsShortfall   Json?
   totalAmount          Float
   paymentType          PaymentType          @default(CREDIT)
   paymentStatus        String               @default("UNPAID")
@@ -1647,6 +1651,16 @@ enum FranchiseOrderStatus {
   DISPATCHED
   DELIVERED
   CANCELLED
+}
+
+enum FranchiseOrderType {
+  STOCK
+  REQUEST
+}
+
+enum FranchiseOrderFulfillment {
+  STOCK
+  PRODUCTION
 }
 
 enum PaymentType {

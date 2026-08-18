@@ -398,7 +398,10 @@ export class ProcurementService {
     const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
 
     const ledgerBalance = await this.getVendorBalance(data.vendorId);
-    const existingCredit = Math.max(0, ledgerBalance); 
+    // Ledger balance follows this system's own convention: negative = HQ holds advance/credit
+    // with the vendor, positive = HQ owes the vendor. Existing usable credit is therefore the
+    // negated balance, not the raw (usually-negative) value clamped at zero.
+    const existingCredit = Math.max(0, -ledgerBalance);
     const providedAmount = data.advancePaid || 0;
     // const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
@@ -466,12 +469,14 @@ export class ProcurementService {
           createdBy: 'SYSTEM_PO'
         });
 
-        // 2. Vendor Ledger Entry
-        const nextBalance = await this.getNextBalance(tx, data.vendorId, newMoneyPayment, 'CREDIT');
+        // 2. Vendor Ledger Entry — a payment to the vendor is a DEBIT (reduces payable /
+        // builds advance), matching the convention recordPayment() uses for every other
+        // vendor payment in this module.
+        const nextBalance = await this.getNextBalance(tx, data.vendorId, newMoneyPayment, 'DEBIT');
         await tx.vendorLedger.create({
           data: {
             vendorId: data.vendorId,
-            type: 'CREDIT',
+            type: 'DEBIT',
             amount: newMoneyPayment,
             balanceAfterTransaction: nextBalance,
             paymentMode: 'CASH',
