@@ -254,10 +254,21 @@ model StockMovement {
   createdAt     DateTime          @default(now())
   binId         String?
   warehouseId   String?
+  // The specific lot this transaction drew from (outbound) or created
+  // (inbound), so the ledger can show a Batch ID per line instead of only
+  // an item-level total. Null for movements with no traceable batch (e.g.
+  // opening balances, or outbound quantity that spanned more than one lot).
+  batchId       String?
+  // Unit cost at the time of this transaction — the FIFO-consumed cost for
+  // outbound movements, the receipt cost for inbound ones, or a fallback to
+  // the item's moving-average costPrice. Stored on the movement itself so
+  // the ledger doesn't need to re-derive historical cost on every read.
+  unitCost      Float?
   bin           WarehouseBin?     @relation(fields: [binId], references: [id])
   item          InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
   warehouse     Warehouse?        @relation(fields: [warehouseId], references: [id])
   unit          Unit?             @relation(fields: [unitId], references: [id])
+  batch         InventoryBatch?   @relation(fields: [batchId], references: [id])
 }
 
 model Vendor {
@@ -1444,6 +1455,7 @@ model InventoryBatch {
   inventoryItem   InventoryItem       @relation(fields: [inventoryItemId], references: [id])
   productBatch    ProductBatch?       @relation(fields: [productBatchId], references: [id])
   warehouse       Warehouse?          @relation(fields: [warehouseId], references: [id])
+  stockMovements  StockMovement[]
 }
 
 model AuditLog {
@@ -1590,6 +1602,7 @@ enum StockMovementType {
   TRANSFER_IN
   TRANSFER_OUT
   ADJUSTMENT
+  RETURN_OUT
 }
 
 enum GRNStatus {

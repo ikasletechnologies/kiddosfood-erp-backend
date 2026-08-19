@@ -375,12 +375,19 @@ export class ProcurementService {
       const inventoryItem = await prisma.inventoryItem.findUnique({
         where: { id: item.inventoryItemId }
       });
+      // A Finished Good is only ever created by Production/QC (see
+      // ProductionService.inspectBatch) — receiving one on a vendor PO would
+      // credit its stock outside that workflow, bypassing the batch/QC trail
+      // and silently inflating Finished Goods that were never manufactured.
+      if (inventoryItem?.category === 'FINISHED_GOOD') {
+        throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
+      }
       const gstRate = inventoryItem?.gstRate || 5;
       const subtotal = item.quantity * item.price;
       const gstAmount = (subtotal * gstRate) / 100;
       const cgst = gstAmount / 2;
       const sgst = gstAmount / 2;
-      
+
       return {
         ...item,
         itemName: inventoryItem?.name || "Unknown Material",
@@ -573,6 +580,11 @@ export class ProcurementService {
       if (data.items && data.items.length > 0) {
         const poItemsData = await Promise.all(data.items.map(async (item) => {
           const inventoryItem = await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } });
+          // Same guard as createPurchaseOrder — a Finished Good must never
+          // be added to a vendor PO, on creation or on a later edit.
+          if (inventoryItem?.category === 'FINISHED_GOOD') {
+            throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
+          }
           const gstRate = inventoryItem?.gstRate || 5;
           const subtotal = item.quantity * item.price;
           const gstAmount = (subtotal * gstRate) / 100;

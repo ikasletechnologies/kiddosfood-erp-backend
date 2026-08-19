@@ -53,16 +53,20 @@ export class RawMaterialsController {
       const franchiseFilter = DataIsolator.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
       const includeInactive = req.query.includeInactive === 'true';
-      const items = await prisma.inventoryItem.findMany({
-        where: {
-          ...(franchiseId ? { franchiseId } : {}),
-          ...(includeInactive ? {} : { isActive: true }),
-          category: {
-            in: ['RAW_MATERIAL', 'PACKAGING', 'FINISHED_GOOD', 'SEMI_FINISHED']
-          }
-        },
-        orderBy: { name: 'asc' }
-      });
+      // Callers picking a material to buy or to use as a recipe ingredient
+      // (Purchase Orders, GRN's "Add Material", Recipe builder) pass this to
+      // keep Finished Goods out of that list — a FG item isn't something HQ
+      // procures from a vendor or feeds into another recipe. Item Master's
+      // own listing omits it to keep showing every category for reconciliation.
+      const excludeCategory = req.query.excludeCategory as string | undefined;
+      const excludeCategories = excludeCategory ? excludeCategory.split(',') as any[] : undefined;
+      // Item Master must show the same stock figure the ledger would compute
+      // (InventoryItem.currentStock is only a cache and can drift if some
+      // code path ever updates it without a StockMovement) — so this reuses
+      // InventoryService.getInventory(), which recomputes currentStock from
+      // StockMovement on every read, instead of trusting the cached column
+      // directly the way a plain findMany() here previously did.
+      const items = await InventoryService.getInventory(franchiseId as any, includeInactive, excludeCategories);
       res.json(items);
     } catch (error) {
       console.error('[RawMaterialsController.getAll] Error:', error);

@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
+import { InventoryService } from '../inventory/inventory.service';
 import SocketService from '../../lib/socket';
 
 function generateOrderNumber(): string {
@@ -295,7 +296,7 @@ export class FranchiseOrderService {
         });
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            await deductBatchStock(tx, item.productId, item.quantity, order.franchiseId);
+            await deductBatchStock(tx, item.productId, item.quantity, order.franchiseId, id, fullOrder!.orderNumber);
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -331,9 +332,17 @@ export class FranchiseOrderService {
             });
 
             if (invItem) {
-              await tx.inventoryItem.update({
-                where: { id: invItem.id },
-                data: { currentStock: { increment: item.quantity } }
+              // Every stock change must leave a ledger trail — this used to
+              // increment currentStock directly with no StockMovement row,
+              // so the received quantity was invisible to the ledger and to
+              // computeStock()-based reads (getInventory/getItemById).
+              await InventoryService.recordMovement(tx, {
+                itemId: invItem.id,
+                type: 'TRANSFER_IN',
+                quantity: item.quantity,
+                referenceType: 'FRANCHISE_ORDER',
+                referenceId: id,
+                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
               });
             } else {
               // Create new inventory item for the franchise if it doesn't exist.
@@ -347,17 +356,29 @@ export class FranchiseOrderService {
                 sku = `${sku}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
               }
 
-              await tx.inventoryItem.create({
+              const newInvItem = await tx.inventoryItem.create({
                 data: {
                   name: product.name,
                   sku,
                   category: 'FINISHED_GOOD',
-                  currentStock: item.quantity,
+                  currentStock: 0,
                   unit: 'PC', // Default or fetch from product
                   franchiseId: order.franchiseId,
                   basePrice: product.basePrice,
                   isActive: true
                 }
+              });
+
+              // Opening balance for this branch item goes through the ledger
+              // too, same as every other inflow, instead of being baked into
+              // the create() call with no corresponding movement.
+              await InventoryService.recordMovement(tx, {
+                itemId: newInvItem.id,
+                type: 'TRANSFER_IN',
+                quantity: item.quantity,
+                referenceType: 'FRANCHISE_ORDER',
+                referenceId: id,
+                note: `Initial stock received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
               });
             }
 
@@ -466,7 +487,7 @@ export class FranchiseOrderService {
 }
 
 // FIFO batch deduction
-async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, franchiseId?: string) {
+async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, franchiseId?: string, orderId?: string, orderNumber?: string) {
   const batches = await tx.productBatch.findMany({
     where: {
       productId,
@@ -507,9 +528,16 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
       });
 
       if (invItem) {
-        await tx.inventoryItem.update({
-          where: { id: invItem.id },
-          data: { currentStock: { decrement: quantityNeeded } }
+        // Ledger-backed decrement — this used to bypass StockMovement
+        // entirely, so HQ's dispatch to a franchise never appeared in the
+        // ledger even though currentStock changed.
+        await InventoryService.recordMovement(tx, {
+          itemId: invItem.id,
+          type: 'TRANSFER_OUT',
+          quantity: -quantityNeeded,
+          referenceType: 'FRANCHISE_ORDER',
+          referenceId: orderId,
+          note: orderNumber ? `Dispatched to franchise (Order ${orderNumber})` : 'Dispatched to franchise',
         });
       }
     }

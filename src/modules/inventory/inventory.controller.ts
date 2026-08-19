@@ -256,8 +256,9 @@ export class InventoryController {
       // instead, which silently hid stock that lives under a different one.
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
       const warehouseId = (req.query.warehouseId as string) || undefined;
+      const category = (req.query.category as any) || undefined;
 
-      const summary = await InventoryService.getRawMaterialStockSummary(warehouseId, franchiseId);
+      const summary = await InventoryService.getRawMaterialStockSummary(warehouseId, franchiseId, category);
       res.json(summary);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -270,27 +271,35 @@ export class InventoryController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
       const warehouseId = (req.query.warehouseId as string) || undefined;
+      const category = (req.query.category as any) || undefined;
 
-      const consumption = await InventoryService.getRawMaterialConsumption(warehouseId, franchiseId);
+      const consumption = await InventoryService.getRawMaterialConsumption(warehouseId, franchiseId, category);
       res.json(consumption);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   }
 
+  // Chronological ledger across every item category by default (Raw
+  // Material, Packaging, Semi-Finished, Finished Good) — pass ?category=
+  // to narrow it back down to one, same as the old raw-materials-only view.
   static async getRawMaterialLedger(req: Request, res: Response) {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { itemId } = req.query;
+      const { itemId, category } = req.query;
 
       if (!franchiseId) {
         const franchises = await prisma.franchise.findMany({ take: 1 });
         franchiseId = franchises[0]?.id || 'hq-001';
       }
 
-      const ledger = await InventoryService.getRawMaterialLedger(franchiseId, itemId as string | undefined);
+      const ledger = await InventoryService.getInventoryLedger(
+        franchiseId,
+        itemId as string | undefined,
+        category as any
+      );
       res.json(ledger);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

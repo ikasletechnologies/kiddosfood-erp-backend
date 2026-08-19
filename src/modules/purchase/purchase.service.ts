@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { ProcurementService } from '../procurement/procurement.service';
+import { InventoryService } from '../inventory/inventory.service';
 
 async function generateRFQNumber() {
   const year = new Date().getFullYear();
@@ -241,20 +242,13 @@ export class PurchaseService {
           });
 
           if (material) {
-            await tx.inventoryItem.update({
-              where: { id: material.id },
-              data: { currentStock: { decrement: item.quantity } }
-            });
-
-            await tx.stockMovement.create({
-              data: {
-                itemId: material.id,
-                movementType: 'PRODUCTION_OUT', // Using PRODUCTION_OUT as a proxy for stock reduction, or we could add a RETURN_OUT type
-                quantity: -item.quantity,
-                referenceType: 'PURCHASE_RETURN',
-                referenceId: id,
-                note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
-              }
+            await InventoryService.recordMovement(tx, {
+              itemId: material.id,
+              type: 'RETURN_OUT',
+              quantity: -item.quantity,
+              referenceType: 'PURCHASE_RETURN',
+              referenceId: id,
+              note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
             });
           }
         }

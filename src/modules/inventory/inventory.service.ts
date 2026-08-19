@@ -140,11 +140,12 @@ export class InventoryService {
     };
   }
 
-  static async getInventory(franchiseId: string, includeInactive = false) {
+  static async getInventory(franchiseId: string, includeInactive = false, excludeCategories?: ItemCategory[]) {
     const items = await prisma.inventoryItem.findMany({
       where: {
         franchiseId,
-        ...(includeInactive ? {} : { isActive: true })
+        ...(includeInactive ? {} : { isActive: true }),
+        ...(excludeCategories && excludeCategories.length > 0 ? { category: { notIn: excludeCategories } } : {})
       },
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
@@ -727,6 +728,11 @@ export class InventoryService {
         expDate?: Date | null;
         productBatchId?: string;
       };
+      // Explicit passthrough for callers that already know the batch/cost
+      // (e.g. an adjustment against a specific lot). Ignored when the FIFO
+      // depletion or receiveAtCost branches below derive their own values.
+      batchId?: string;
+      unitCost?: number;
     }
   ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
     const stockChange = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
@@ -736,30 +742,27 @@ export class InventoryService {
       data: { currentStock: { increment: stockChange } },
     });
 
-    await tx.stockMovement.create({
-      data: {
-        itemId: data.itemId,
-        movementType: data.type as any,
-        quantity: data.quantity,
-        baseQty: data.baseQty,
-        unitId: data.unitId,
-        referenceType: data.referenceType,
-        referenceId: data.referenceId,
-        note: data.note,
-        createdBy: data.userId,
-        warehouseId: data.warehouseId ? (data.warehouseId.trim() || null) : null,
-      },
-    });
-
     // Every outbound movement (Production/POS/Packaging/etc.) deducts from the
     // oldest non-expired batch first. This used to not exist at all — batches
     // were only ever written at GRN time and never depleted by consumption, so
     // InventoryBatch.currentQty was disconnected from real stock movement. This
     // is best-effort: not all stock is batch-tracked (e.g. opening balances),
     // so it depletes whatever tracked batches exist and silently stops there.
+    //
+    // The batch/cost this movement resolves to is computed BEFORE the ledger
+    // row is written so the row can carry a real Batch ID and unit cost
+    // instead of the ledger having to re-derive history on every read.
     let fifo: FifoConsumptionResult | undefined;
+    let movementBatchId: string | undefined = data.batchId;
+    let movementUnitCost: number | undefined = data.unitCost;
+
     if (stockChange < 0) {
       fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+      // Only unambiguous when everything came from a single lot — a
+      // movement that spans multiple batches has no single Batch ID to
+      // report, so it's left null rather than picking one arbitrarily.
+      if (fifo.consumptions.length === 1) movementBatchId = fifo.consumptions[0].batchId;
+      movementUnitCost = fifo.consumedFromBatches > 0 ? fifo.unitCost : (updatedItem.costPrice || 0);
     } else if (stockChange > 0 && data.receiveAtCost) {
       const priorStock = updatedItem.currentStock - stockChange;
       const priorQty = Math.max(0, priorStock);
@@ -768,7 +771,7 @@ export class InventoryService {
         ? ((priorQty * priorCost) + (stockChange * data.receiveAtCost.unitCost)) / (priorQty + stockChange)
         : data.receiveAtCost.unitCost;
 
-      await tx.inventoryBatch.create({
+      const newBatch = await tx.inventoryBatch.create({
         data: {
           inventoryItemId: data.itemId,
           batchNumber: data.receiveAtCost.batchNumber || `B-${Date.now()}`,
@@ -783,12 +786,36 @@ export class InventoryService {
           status: 'APPROVED',
         },
       });
+      movementBatchId = newBatch.id;
+      movementUnitCost = data.receiveAtCost.unitCost;
 
       await tx.inventoryItem.update({
         where: { id: data.itemId },
         data: { costPrice: newCostPrice },
       });
+    } else if (movementUnitCost === undefined) {
+      // No FIFO consumption and no fresh receipt (e.g. a plain ADJUSTMENT or
+      // an opening balance) — fall back to the item's own moving-average
+      // cost so the ledger still has a usable valuation figure.
+      movementUnitCost = updatedItem.costPrice || 0;
     }
+
+    await tx.stockMovement.create({
+      data: {
+        itemId: data.itemId,
+        movementType: data.type as any,
+        quantity: data.quantity,
+        baseQty: data.baseQty,
+        unitId: data.unitId,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId,
+        note: data.note,
+        createdBy: data.userId,
+        warehouseId: data.warehouseId ? (data.warehouseId.trim() || null) : null,
+        batchId: movementBatchId || null,
+        unitCost: movementUnitCost,
+      },
+    });
 
     return { item: updatedItem, fifo };
   }
@@ -904,12 +931,14 @@ export class InventoryService {
   // When warehouseId is given, stock is scoped to that warehouse (matching
   // what a GRN actually tagged its received quantity with); otherwise it's
   // the item's total across every warehouse, same number Item Master shows.
-  static async getRawMaterialStockSummary(warehouseId?: string, franchiseId?: string) {
+  // category defaults to RAW_MATERIAL to preserve this endpoint's original
+  // behavior for existing callers; pass 'ALL' to see every category instead.
+  static async getRawMaterialStockSummary(warehouseId?: string, franchiseId?: string, category?: ItemCategory | 'ALL') {
     const items = await prisma.inventoryItem.findMany({
       where: {
         ...(franchiseId ? { franchiseId } : {}),
         isActive: true,
-        category: 'RAW_MATERIAL'
+        ...(category === 'ALL' ? {} : { category: category || ItemCategory.RAW_MATERIAL })
       },
       orderBy: { name: 'asc' }
     });
@@ -1015,12 +1044,13 @@ export class InventoryService {
 
   // Scoped by warehouse (where the material actually left from), not
   // franchise. franchiseId is kept as an optional secondary filter only.
-  static async getRawMaterialConsumption(warehouseId?: string, franchiseId?: string) {
+  // Same 'ALL' opt-out convention as getRawMaterialStockSummary above.
+  static async getRawMaterialConsumption(warehouseId?: string, franchiseId?: string, category?: ItemCategory | 'ALL') {
     const movements = await prisma.stockMovement.findMany({
       where: {
         item: {
           ...(franchiseId ? { franchiseId } : {}),
-          category: 'RAW_MATERIAL'
+          ...(category === 'ALL' ? {} : { category: category || ItemCategory.RAW_MATERIAL })
         },
         quantity: { lt: 0 },
         ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {})
@@ -1056,17 +1086,24 @@ export class InventoryService {
     });
   }
 
-  static async getRawMaterialLedger(franchiseId: string, itemId?: string) {
+  // Chronological stock ledger across every item category (Raw Material,
+  // Packaging, Semi-Finished, Finished Good) — previously hardcoded to
+  // RAW_MATERIAL only, which meant finished-goods stock movements (e.g. QC
+  // acceptance into inventory) never showed up here. `category` is now an
+  // optional narrowing filter, not a fixed scope.
+  static async getInventoryLedger(franchiseId: string, itemId?: string, category?: ItemCategory) {
     const movements = await prisma.stockMovement.findMany({
       where: {
         item: {
           franchiseId,
-          category: 'RAW_MATERIAL',
+          ...(category ? { category } : {}),
           ...(itemId ? { id: itemId } : {})
         }
       },
       include: {
-        item: true
+        item: true,
+        warehouse: { select: { id: true, name: true } },
+        batch: { select: { id: true, batchNumber: true, lotNumber: true } }
       },
       orderBy: { createdAt: 'asc' }
     });
@@ -1081,7 +1118,7 @@ export class InventoryService {
       let transactionType = 'Other';
       if (m.movementType === 'PURCHASE_IN') transactionType = 'GRN Inward';
       else if (m.movementType === 'PRODUCTION_OUT') transactionType = 'Production Outward';
-      else if (m.movementType === 'PRODUCTION_IN') transactionType = 'Production Inward';
+      else if (m.movementType === 'PRODUCTION_IN') transactionType = 'Production Inward (QC Approved)';
       else if (m.movementType === 'WASTE_OUT') {
         if (m.note?.toLowerCase().includes('expire')) transactionType = 'Expiry Outward';
         else if (m.note?.toLowerCase().includes('damage')) transactionType = 'Damage Outward';
@@ -1090,6 +1127,8 @@ export class InventoryService {
       else if (m.movementType === 'ADJUSTMENT') transactionType = 'Stock Adjustment';
       else if (m.movementType === 'TRANSFER_IN') transactionType = 'Stock Transfer In';
       else if (m.movementType === 'TRANSFER_OUT') transactionType = 'Stock Transfer Out';
+      else if (m.movementType === 'SALES_OUT') transactionType = 'Sales Outward';
+      else if (m.movementType === 'RETURN_OUT') transactionType = 'Purchase Return Outward';
 
       return {
         id: m.id,
@@ -1097,18 +1136,32 @@ export class InventoryService {
         itemId: m.itemId,
         itemName: m.item.name,
         sku: m.item.sku,
+        category: m.item.category,
         unit: m.item.unit,
         transactionType,
         inwardQty: qty > 0 ? qty : 0,
         outwardQty: qty < 0 ? Math.abs(qty) : 0,
         runningBalance: newBal,
+        batchId: m.batchId || null,
+        batchNumber: m.batch?.batchNumber || null,
+        warehouseId: m.warehouseId || null,
+        warehouseName: m.warehouse?.name || null,
+        unitCost: m.unitCost ?? 0,
+        totalValue: Math.abs(qty) * (m.unitCost ?? 0),
         referenceId: m.referenceId || '',
+        referenceType: m.referenceType || '',
         notes: m.note || '',
         actor: m.createdBy || 'System'
       };
     });
 
     return ledger.reverse();
+  }
+
+  // Kept as a thin, backward-compatible alias — existing callers that only
+  // ever wanted Raw Material rows still get exactly that.
+  static async getRawMaterialLedger(franchiseId: string, itemId?: string) {
+    return this.getInventoryLedger(franchiseId, itemId, ItemCategory.RAW_MATERIAL);
   }
 }
 

@@ -238,7 +238,9 @@ export class ProductionService {
       const totalCost = production.totalCost ?? production.materialCost ?? 0;
       const unitCost = totalYield > 0 ? totalCost / totalYield : 0;
 
-      // Create ProductBatch with PENDING QC status (does NOT add stock to finished goods inventory yet)
+      // Create ProductBatch with PENDING QC status. Deliberately does NOT
+      // touch stock — finished-good stock is credited exactly once, at QC
+      // acceptance (inspectBatch, guarded against re-inspection), never here.
       const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
       await tx.productBatch.create({
         data: {
@@ -287,6 +289,15 @@ export class ProductionService {
         include: { product: true, production: { include: { recipe: true } } },
       });
       if (!batch) throw new Error('Product batch not found');
+
+      // Finished-good stock is credited exactly once, at QC acceptance —
+      // approveProduction() deliberately never touches stock (it only creates
+      // this batch as PENDING). Without this guard, re-submitting QC on the
+      // same batch would call recordMovement() again below and double the
+      // stock increase, since nothing else prevents re-inspection.
+      if (batch.qcStatus !== 'PENDING') {
+        throw new Error(`Batch ${batch.batchCode} has already been QC inspected (status: ${batch.qcStatus}). Stock was credited once at that time and cannot be re-applied.`);
+      }
 
       const rejection = data.rejectionQty || 0;
       // Enforced here, not just in the UI — accepted + rejected must equal
