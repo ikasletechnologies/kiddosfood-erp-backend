@@ -368,7 +368,7 @@ export class ProcurementService {
     vendorNotes?: string;
     deliveryInstructions?: string;
     status?: string;
-    items: Array<{ inventoryItemId: string; quantity: number; price: number }>;
+    items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     const poItemsData = await Promise.all(data.items.map(async (item) => {
@@ -382,7 +382,11 @@ export class ProcurementService {
       if (inventoryItem?.category === 'FINISHED_GOOD') {
         throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
       }
-      const gstRate = inventoryItem?.gstRate || 5;
+      // Prefer whatever GST% the line item actually shows on the PO (the
+      // user can override it there); fall back to the item master's own
+      // rate, then 5% as a last resort. `??` matters here — `|| 5` would
+      // silently turn a genuine 0%-GST item into 5%, since 0 is falsy.
+      const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
       const subtotal = item.quantity * item.price;
       const gstAmount = (subtotal * gstRate) / 100;
       const cgst = gstAmount / 2;
@@ -414,6 +418,12 @@ export class ProcurementService {
     const providedAmount = data.advancePaid || 0;
     // const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
+    // The rest of providedAmount (up to what existing credit covers) isn't
+    // new money — it's previously-received advance being spent on this PO.
+    // That consumption still has to be written to the ledger below, or
+    // getVendorBalance() keeps reporting it as available and the same
+    // credit could be "applied" to every future PO forever.
+    const appliedFromCredit = Math.min(providedAmount, existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
       const year = new Date().getFullYear();
@@ -513,6 +523,30 @@ export class ProcurementService {
           }
         });
       }
+
+      // Existing credit spent on this PO — a CREDIT entry retiring that much
+      // of the advance, mirroring the DEBIT that built it. getPurchaseOrders()
+      // already looks for CREDIT rows keyed by referenceId=po.id to compute
+      // each PO's "live paid" figure; without this write that lookup always
+      // found nothing, which is how the same ₹1,000 kept showing as available
+      // no matter how many POs had already consumed it.
+      if (appliedFromCredit > 0) {
+        const nextCreditBalance = await this.getNextBalance(tx, data.vendorId, appliedFromCredit, 'CREDIT');
+        await tx.vendorLedger.create({
+          data: {
+            vendorId: data.vendorId,
+            type: 'CREDIT',
+            amount: appliedFromCredit,
+            balanceAfterTransaction: nextCreditBalance,
+            paymentMode: 'CASH',
+            sourceModule: 'PROCUREMENT',
+            referenceType: 'ADVANCE',
+            referenceId: po.id,
+            note: `Existing advance applied to PO #${po.poNumber}`
+          }
+        });
+      }
+
       // TRANSACTION SAFETY: Material linking must be inside the transaction
       for (const item of data.items) {
         await tx.vendorMaterial.upsert({
@@ -548,7 +582,7 @@ export class ProcurementService {
     internalNotes?: string;
     vendorNotes?: string;
     deliveryInstructions?: string;
-    items?: Array<{ inventoryItemId: string; quantity: number; price: number }>;
+    items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     return prisma.$transaction(async (tx) => {
@@ -585,7 +619,9 @@ export class ProcurementService {
           if (inventoryItem?.category === 'FINISHED_GOOD') {
             throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
           }
-          const gstRate = inventoryItem?.gstRate || 5;
+          // Same `??` fix as createPurchaseOrder — a real 0%-GST item must
+          // not get silently bumped to 5% by a falsy-zero fallback.
+          const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
           const subtotal = item.quantity * item.price;
           const gstAmount = (subtotal * gstRate) / 100;
           return {
@@ -655,11 +691,17 @@ export class ProcurementService {
       if (!po) throw new Error('Purchase Order not found');
       if (po.status === 'CANCELLED') throw new Error('Cannot record advance on a cancelled PO');
 
+      // balanceAfterTransaction must be computed, not left to its schema
+      // default of 0 — getNextBalance() reads the most recent ledger row's
+      // balanceAfterTransaction as the running balance, so a row with a bare
+      // 0 here would corrupt every balance computed after it.
+      const nextBalance = await this.getNextBalance(tx, po.vendorId, advancePaid, 'DEBIT');
       await tx.vendorLedger.create({
         data: {
           vendorId: po.vendorId,
           type: 'DEBIT',
           amount: advancePaid,
+          balanceAfterTransaction: nextBalance,
           paymentMode: 'CASH',
           referenceType: 'ADVANCE',
           referenceId: po.id,
@@ -736,6 +778,24 @@ export class ProcurementService {
 
       const amountToApply = Math.min(remainingDue, availableAdvance);
       const newPaid = po.paid + amountToApply;
+
+      // Same fix as createPurchaseOrder's appliedFromCredit — record this
+      // advance as spent, or getVendorBalance() (and this same action, on a
+      // second PO) will keep seeing it as untouched.
+      const nextCreditBalance = await this.getNextBalance(tx, po.vendorId, amountToApply, 'CREDIT');
+      await tx.vendorLedger.create({
+        data: {
+          vendorId: po.vendorId,
+          type: 'CREDIT',
+          amount: amountToApply,
+          balanceAfterTransaction: nextCreditBalance,
+          paymentMode: 'CASH',
+          sourceModule: 'PROCUREMENT',
+          referenceType: 'ADVANCE',
+          referenceId: po.id,
+          note: `Advance applied to PO #${po.poNumber}`
+        }
+      });
 
       return tx.procurementOrder.update({
         where: { id: poId },
