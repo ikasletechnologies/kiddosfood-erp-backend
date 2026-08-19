@@ -115,6 +115,17 @@ app.use((req, res, next) => {
   next();
 });
 
+// Root Route
+app.get('/', (_req: Request, res: Response) => {
+  res.json({
+    status: 'online',
+    name: 'Kiddos Food ERP Backend API',
+    message: 'Backend server is running successfully.',
+    healthCheck: '/health',
+    frontendUrl: 'http://localhost:3000'
+  });
+});
+
 // Health check + Ninja Seed
 app.get('/health', async (req: Request, res: Response) => {
   if (req.query.seed === 'true') {
