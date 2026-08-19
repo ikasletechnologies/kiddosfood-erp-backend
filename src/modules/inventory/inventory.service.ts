@@ -1108,6 +1108,44 @@ export class InventoryService {
       orderBy: { createdAt: 'asc' }
     });
 
+    // Resolve createdBy (a raw User.id) to a display name, and referenceId to
+    // a human document number, in a handful of batched lookups instead of
+    // showing the stored UUIDs directly — this is purely a read-time
+    // presentation step and doesn't touch what recordMovement() writes.
+    const userIds = Array.from(new Set(
+      movements.map(m => m.createdBy).filter((id): id is string => !!id && id.toLowerCase() !== 'system')
+    ));
+    const users = userIds.length
+      ? await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, fullName: true } })
+      : [];
+    const userNameById = new Map(users.map(u => [u.id, u.fullName]));
+
+    const grnIds = Array.from(new Set(
+      movements.filter(m => m.referenceType === 'GRN').map(m => m.referenceId).filter((id): id is string => !!id)
+    ));
+    const grns = grnIds.length
+      ? await prisma.goodsReceipt.findMany({ where: { id: { in: grnIds } }, select: { id: true, procurementOrder: { select: { poNumber: true } } } })
+      : [];
+    const poNumberByGrnId = new Map(grns.map(g => [g.id, g.procurementOrder?.poNumber]));
+
+    const franchiseOrderIds = Array.from(new Set(
+      movements.filter(m => m.referenceType === 'FRANCHISE_ORDER').map(m => m.referenceId).filter((id): id is string => !!id)
+    ));
+    const franchiseOrders = franchiseOrderIds.length
+      ? await prisma.franchiseOrder.findMany({ where: { id: { in: franchiseOrderIds } }, select: { id: true, orderNumber: true } })
+      : [];
+    const orderNumberById = new Map(franchiseOrders.map(o => [o.id, o.orderNumber]));
+
+    const returnIds = Array.from(new Set(
+      movements.filter(m => m.referenceType === 'PURCHASE_RETURN' || m.referenceType === 'RETURN').map(m => m.referenceId).filter((id): id is string => !!id)
+    ));
+    const returns = returnIds.length
+      ? await prisma.purchaseReturn.findMany({ where: { id: { in: returnIds } }, select: { id: true, returnNumber: true } })
+      : [];
+    const returnNumberById = new Map(returns.map(r => [r.id, r.returnNumber]));
+
+    const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
     const runningBalances = new Map<string, number>();
     const ledger = movements.map(m => {
       const qty = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
@@ -1130,6 +1168,40 @@ export class InventoryService {
       else if (m.movementType === 'SALES_OUT') transactionType = 'Sales Outward';
       else if (m.movementType === 'RETURN_OUT') transactionType = 'Purchase Return Outward';
 
+      // Operator: resolve createdBy to a name; a bare "system" sentinel or a
+      // missing value both mean an automatic transaction, never "unknown".
+      const actor = !m.createdBy || m.createdBy.toLowerCase() === 'system'
+        ? 'System'
+        : (userNameById.get(m.createdBy) || 'Unknown User');
+
+      // Reference: a short human document number instead of the raw
+      // referenceId UUID. GRN/franchise-order/return resolve to their real
+      // business number; PRODUCTION and PACKAGING don't have one on the
+      // Production record itself, so a deterministic PRD-/PKG- short code is
+      // derived the same way ProductionService already derives ProductBatch
+      // codes (`BATCH-${id.slice(0,8)}`) — display-only, never stored.
+      let reference = '';
+      if (m.referenceType === 'GRN' && m.referenceId) {
+        reference = poNumberByGrnId.get(m.referenceId) || '';
+      } else if (m.referenceType === 'FRANCHISE_ORDER' && m.referenceId) {
+        reference = orderNumberById.get(m.referenceId) || '';
+      } else if ((m.referenceType === 'PURCHASE_RETURN' || m.referenceType === 'RETURN') && m.referenceId) {
+        reference = returnNumberById.get(m.referenceId) || '';
+      } else if (m.referenceType === 'PRODUCTION' && m.referenceId) {
+        reference = `PRD-${m.referenceId.substring(0, 8).toUpperCase()}`;
+      } else if (m.referenceType === 'PACKAGING' && m.referenceId) {
+        reference = `PKG-${m.referenceId.substring(0, 8).toUpperCase()}`;
+      }
+      if (!reference && m.batch?.batchNumber) reference = m.batch.batchNumber;
+      if (!reference && m.referenceType) reference = m.referenceType.replace(/_/g, ' ');
+
+      // Description: the stored note, but with any raw UUID it happens to
+      // embed (older GRN notes wrote "via GRN <uuid>" directly) swapped for
+      // the same resolved reference — the note text itself is never rewritten.
+      const description = m.note && uuidPattern.test(m.note) && reference
+        ? m.note.replace(uuidPattern, reference)
+        : (m.note || '');
+
       return {
         id: m.id,
         date: m.createdAt,
@@ -1150,8 +1222,9 @@ export class InventoryService {
         totalValue: Math.abs(qty) * (m.unitCost ?? 0),
         referenceId: m.referenceId || '',
         referenceType: m.referenceType || '',
-        notes: m.note || '',
-        actor: m.createdBy || 'System'
+        reference,
+        notes: description,
+        actor
       };
     });
 
