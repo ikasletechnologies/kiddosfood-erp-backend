@@ -1,8 +1,39 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { ProcurementService } from '../procurement/procurement.service';
+import { VendorInvoiceService } from '../vendor-invoices/vendor-invoices.service';
 
 export class GRNService {
+  /**
+   * Atomic sequence number — a row-level UPDATE...increment inside a
+   * transaction serializes concurrent callers at the DB level, unlike
+   * deriving a number from Date.now()/row counts (the previous batch number
+   * used `Date.now().toString().slice(-4)`, which repeats every 10 seconds
+   * and two GRNs approved in the same window collided).
+   */
+  private static async nextSequence(tx: any, key: string): Promise<number> {
+    const seq = await tx.numberSequence.upsert({
+      where: { key },
+      create: { key, value: 1 },
+      update: { value: { increment: 1 } }
+    });
+    return seq.value;
+  }
+
+  /**
+   * On-demand unique lot/batch number for the "Auto Batch" control on the
+   * New GRN form — called before the GRN itself is even saved, so the user
+   * sees the generated value immediately instead of a blank field.
+   */
+  static async generateLotNumber(): Promise<string> {
+    return prisma.$transaction(async (tx) => {
+      const seq = await this.nextSequence(tx, 'GRN_LOT');
+      const now = new Date();
+      const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+      return `LOT-${ymd}-${String(seq).padStart(5, '0')}`;
+    });
+  }
+
   static async getAll(params: { poId?: string; status?: string } = {}) {
     return prisma.goodsReceipt.findMany({
       where: {
@@ -115,8 +146,11 @@ export class GRNService {
       // Computed once up front so every batch created below AND the vendor
       // invoice generated later carry the exact same reference — FIFO
       // consumption should trace back to "which bill this stock came from,
-      // at what price," not an arbitrary internal lot code.
-      const billNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+      // at what price," not an arbitrary internal lot code. Uses the atomic
+      // sequence (see nextSequence) instead of Date.now(), which two GRNs
+      // approved within the same 10-second window could collide on.
+      const billSeq = await this.nextSequence(tx, 'GRN_BILL');
+      const billNumber = `BILL-${grn.procurementOrder.poNumber || grn.poId.slice(0, 8)}-${String(billSeq).padStart(6, '0')}`;
 
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
@@ -176,19 +210,16 @@ export class GRNService {
         });
       }
 
-      // 4. Update Financial Ledger (Liability) & Generate Purchase Bill (Vendor Invoice)
-      // Calculate total value of goods received in this GRN
-      const grnSubtotal = grn.items.reduce((acc, it) => acc + (it.acceptedQty * it.price), 0);
-      
-      // Approximate tax based on PO's overall tax rate if possible, 
-      // or just use subtotal if the user prefers simple accounting.
-      // Manufacturing ERPs usually record the exact liability from the GRN.
-      const poTotal = grn.procurementOrder.totalAmount;
-      const poSubtotal = grn.procurementOrder.subtotal;
-      const taxFactor = poSubtotal > 0 ? poTotal / poSubtotal : 1;
-      const grnTotalWithTax = grnSubtotal * taxFactor;
+      // 4. Update Financial Ledger (Liability) & Generate Purchase Bill (Vendor Invoice).
+      // Commercials (subtotal/CGST/SGST/gross) are derived per-line from the
+      // PO's own GST rates against ACCEPTED quantities — the same shared
+      // helper the manual "Generate Bill" screen now uses too, so the two
+      // paths can no longer disagree the way they used to (this path had
+      // tax right via a flat taxFactor; the manual path hardcoded 0% and
+      // could overwrite this correct bill with a tax-free one).
+      const commercials = VendorInvoiceService.computeCommercialsFromPO(grn.procurementOrder, grn.items);
 
-      if (grnTotalWithTax > 0) {
+      if (commercials.amount > 0) {
         // Automatically generate a Purchase Bill (Vendor Invoice) only if one doesn't exist yet.
         const existingInvoice = await tx.vendorInvoice.findFirst({
           where: { grnId: grnId }
@@ -200,7 +231,13 @@ export class GRNService {
               poId: grn.poId,
               grnId: grnId,
               invoiceNumber: billNumber,
-              amount: grnTotalWithTax,
+              amount: commercials.amount,
+              subtotal: commercials.subtotal,
+              taxAmount: commercials.taxAmount,
+              cgst: commercials.cgst,
+              sgst: commercials.sgst,
+              igst: commercials.igst,
+              warehouseId: commercials.warehouseId,
               status: 'PENDING'
             }
           });

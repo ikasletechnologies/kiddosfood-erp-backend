@@ -179,18 +179,39 @@ export class ProcurementService {
         .filter(e => e.type === 'DEBIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE' || e.referenceType === 'OPENING_BALANCE'))
         .reduce((s, e) => s + (e.amount || 0), 0);
 
-      const totalOwedByUs = totalPurchased + manualCredits; 
+      const totalOwedByUs = totalPurchased + manualCredits;
       const totalPaidToThem = totalPayments + totalReturns + manualDebits;
-      
-      const balance = totalOwedByUs - totalPaidToThem; // Positive = We owe them (To Pay), Negative = They owe us (Advance)
+
+      // Single source of truth for balance/due/advance: the full, unfiltered
+      // ledger sum (same formula as getVendorBalance/getAvailableAdvance),
+      // not the referenceType-filtered totals above — those stay scoped to
+      // "Total Purchases"/"Payments Made" display, which intentionally
+      // exclude ADVANCE/ADJUSTMENT rows. Using the filtered version for
+      // balance/advance too is what let a spent advance still count as
+      // "available" forever, since the CREDIT row (or any other
+      // referenceType) that offsets it wasn't part of this same filter set.
+      const balance = entries.reduce((acc, e) => acc + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
+      const rawAdvance = balance < 0 ? -balance : 0;
+      const reservedAdvance = rawAdvance > 0
+        ? (await prisma.procurementOrder.aggregate({
+            where: { vendorId: v.id, status: { notIn: ['CLOSED', 'CANCELLED'] } },
+            _sum: { advanceApplied: true }
+          }))._sum.advanceApplied || 0
+        : 0;
 
       return {
         ...v,
         totalPurchased: totalOwedByUs,
-        totalPaid: totalPaidToThem, 
+        totalPaid: totalPaidToThem,
+        // Cash/bank payments only — excludes advance grants, returns, and
+        // manual adjustments. This is what "Payments Made" should mean:
+        // money paid against invoices, not the vendor's total cash outflow.
+        // (totalPaid above stays as the broader figure for whatever else
+        // already relies on its inclusive definition.)
+        totalPayments,
         balance: balance,
         due: balance > 0 ? balance : 0,         // We owe them
-        advance: balance < 0 ? Math.abs(balance) : 0, // They owe us
+        advance: Math.max(0, rawAdvance - reservedAdvance), // Unspent/available — they owe us, minus whatever's already earmarked to an open PO
         lastOrderDate: v.orders?.[0]?.createdAt || null
       };
     }));
@@ -349,12 +370,42 @@ export class ProcurementService {
     });
   }
 
-  static async getVendorBalance(vendorId: string): Promise<number> {
-    const entries = await prisma.vendorLedger.findMany({
+  static async getVendorBalance(vendorId: string, tx: any = prisma): Promise<number> {
+    const entries = await tx.vendorLedger.findMany({
       where: { vendorId },
       select: { type: true, amount: true }
     });
-    return entries.reduce((acc, e) => acc + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
+    return entries.reduce((acc: number, e: any) => acc + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
+  }
+
+  /**
+   * Single source of truth for "how much unspent vendor advance is actually
+   * available right now" — used by every place that offers to apply advance
+   * (PO creation, the explicit Apply Advance action, invoice approval's
+   * auto-utilization, and the Vendor Overview "Advance" figure).
+   *
+   * getVendorBalance() alone isn't enough: a negative balance means advance
+   * was paid, but if some of it has already been earmarked to a specific PO
+   * (ProcurementOrder.advanceApplied) that PO's own purchase liability
+   * hasn't been billed/recognized yet, so it hasn't yet reduced the raw
+   * ledger balance. Subtracting reservations still outstanding on other open
+   * POs prevents that same advance being offered again elsewhere.
+   */
+  static async getAvailableAdvance(vendorId: string, tx: any = prisma, excludePoId?: string): Promise<number> {
+    const balance = await this.getVendorBalance(vendorId, tx);
+    const rawAvailable = balance < 0 ? -balance : 0;
+    if (rawAvailable <= 0) return 0;
+
+    const reserved = await tx.procurementOrder.aggregate({
+      where: {
+        vendorId,
+        status: { notIn: ['CLOSED', 'CANCELLED'] },
+        ...(excludePoId ? { id: { not: excludePoId } } : {})
+      },
+      _sum: { advanceApplied: true }
+    });
+
+    return Math.max(0, rawAvailable - (reserved._sum.advanceApplied || 0));
   }
 
   static async createPurchaseOrder(data: {
@@ -410,11 +461,11 @@ export class ProcurementService {
     const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
     const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
 
-    const ledgerBalance = await this.getVendorBalance(data.vendorId);
-    // Ledger balance follows this system's own convention: negative = HQ holds advance/credit
-    // with the vendor, positive = HQ owes the vendor. Existing usable credit is therefore the
-    // negated balance, not the raw (usually-negative) value clamped at zero.
-    const existingCredit = Math.max(0, -ledgerBalance);
+    // Existing usable credit — see getAvailableAdvance for why this isn't
+    // just the raw ledger balance (it also excludes advance already
+    // reserved to other open POs, so the same credit can't be handed out
+    // twice).
+    const existingCredit = await this.getAvailableAdvance(data.vendorId);
     const providedAmount = data.advancePaid || 0;
     // const finalPaidOnPO = Math.max(autoApplied, providedAmount);
     const newMoneyPayment = Math.max(0, providedAmount - existingCredit);
@@ -441,6 +492,7 @@ export class ProcurementService {
           igst: totalIGST,
           totalAmount,
           advancePaid: providedAmount, // Real money provided
+          advanceApplied: appliedFromCredit, // Portion of the above that was pre-existing credit, not fresh cash
           paid: providedAmount,
           balance: totalAmount - providedAmount,
           expectedDeliveryDate: data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null,
@@ -467,15 +519,20 @@ export class ProcurementService {
         include: { poItems: { include: { inventoryItem: true } }, vendor: true }
       });
 
-      // NO LEDGER ENTRY ON PO CREATION (Wait for GRN)
-      // BUT Advance Payment hits Ledger and Account
+      // NO LEDGER ENTRY ON PO CREATION FOR THE PURCHASE ITSELF (wait for GRN/Bill).
+      // Fresh cash paid as advance right now DOES hit Ledger + Account — via
+      // FinanceService.createPayment alone. It already creates the Payment
+      // record, writes the VendorLedger DEBIT row, and adjusts the account
+      // balance in one place; this used to ALSO do all three manually right
+      // after, which duplicated the Payment row, duplicated the ledger row,
+      // and double-deducted the account balance for the same advance.
       if (newMoneyPayment > 0) {
         if (!data.accountId) throw new Error('Source Account ID is required for advance payment.');
 
-        // 1. Central Payment + Account Update
         await FinanceService.createPayment({
           tx,
           amount: newMoneyPayment,
+          type: 'ADVANCE',
           flow: 'OUT',
           status: 'PAID',
           sourceAccount: data.accountId,
@@ -485,67 +542,20 @@ export class ProcurementService {
           linkedDocId: po.poNumber,
           entityType: 'VENDOR',
           entityId: data.vendorId,
+          note: `Advance Payment for PO #${po.poNumber}`,
           createdBy: 'SYSTEM_PO'
         });
-
-        // 2. Vendor Ledger Entry — a payment to the vendor is a DEBIT (reduces payable /
-        // builds advance), matching the convention recordPayment() uses for every other
-        // vendor payment in this module.
-        const nextBalance = await this.getNextBalance(tx, data.vendorId, newMoneyPayment, 'DEBIT');
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: data.vendorId,
-            type: 'DEBIT',
-            amount: newMoneyPayment,
-            balanceAfterTransaction: nextBalance,
-            paymentMode: 'CASH',
-            sourceModule: 'PROCUREMENT',
-            referenceType: 'ADVANCE',
-            referenceId: po.id,
-            accountId: data.accountId,
-            note: `Advance Payment for PO #${po.poNumber}`
-          }
-        });
-
-        // Track Money Movement
-        await AccountService.adjustBalance(tx, data.accountId, newMoneyPayment, 'OUTFLOW');
-
-        // Also record as a Payment entity for audit
-        await tx.payment.create({
-          data: {
-            type: 'ADVANCE',
-            entityType: 'VENDOR',
-            entityId: data.vendorId,
-            paidAmount: newMoneyPayment,
-            accountId: data.accountId,
-            transactionRef: po.id,
-            status: 'SUCCESS'
-          }
-        });
       }
 
-      // Existing credit spent on this PO — a CREDIT entry retiring that much
-      // of the advance, mirroring the DEBIT that built it. getPurchaseOrders()
-      // already looks for CREDIT rows keyed by referenceId=po.id to compute
-      // each PO's "live paid" figure; without this write that lookup always
-      // found nothing, which is how the same ₹1,000 kept showing as available
-      // no matter how many POs had already consumed it.
-      if (appliedFromCredit > 0) {
-        const nextCreditBalance = await this.getNextBalance(tx, data.vendorId, appliedFromCredit, 'CREDIT');
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: data.vendorId,
-            type: 'CREDIT',
-            amount: appliedFromCredit,
-            balanceAfterTransaction: nextCreditBalance,
-            paymentMode: 'CASH',
-            sourceModule: 'PROCUREMENT',
-            referenceType: 'ADVANCE',
-            referenceId: po.id,
-            note: `Existing advance applied to PO #${po.poNumber}`
-          }
-        });
-      }
+      // Existing credit spent on this PO is recorded on the PO itself
+      // (advanceApplied, set above) — not as an extra offsetting VendorLedger
+      // entry. Writing one here used to zero the vendor's ledger balance out
+      // immediately, before the purchase liability it's meant to offset was
+      // even recognized (that only happens later, at Bill approval), so the
+      // balance overshot back up to the FULL gross amount once the Bill
+      // posted instead of net of the advance. getAvailableAdvance() reads
+      // ProcurementOrder.advanceApplied directly, so nothing else needs this
+      // written to the ledger to know the credit is spoken for.
 
       // TRANSACTION SAFETY: Material linking must be inside the transaction
       for (const item of data.items) {
@@ -767,10 +777,12 @@ export class ProcurementService {
       });
       if (!po) throw new Error('Purchase Order not found');
 
-      const balance = await this.getVendorBalance(po.vendorId);
-      const availableAdvance = balance < 0 ? Math.abs(balance) : 0;
+      // Excludes this PO's own (currently zero, since it hasn't applied yet)
+      // reservation — see getAvailableAdvance for why the raw ledger balance
+      // alone isn't safe to use here.
+      const availableAdvance = await this.getAvailableAdvance(po.vendorId, tx, poId);
       if (availableAdvance <= 0) {
-        throw new Error(`Vendor ${po.vendor.name} has no available advance balance (Current: ₹${balance})`);
+        throw new Error(`Vendor ${po.vendor.name} has no available advance balance.`);
       }
 
       const remainingDue = po.totalAmount - po.paid;
@@ -778,32 +790,34 @@ export class ProcurementService {
 
       const amountToApply = Math.min(remainingDue, availableAdvance);
       const newPaid = po.paid + amountToApply;
+      const newAdvanceApplied = (po.advanceApplied || 0) + amountToApply;
 
-      // Same fix as createPurchaseOrder's appliedFromCredit — record this
-      // advance as spent, or getVendorBalance() (and this same action, on a
-      // second PO) will keep seeing it as untouched.
-      const nextCreditBalance = await this.getNextBalance(tx, po.vendorId, amountToApply, 'CREDIT');
-      await tx.vendorLedger.create({
+      // Advance consumption lives on the PO (advanceApplied), not as an
+      // extra VendorLedger entry — see createPurchaseOrder's appliedFromCredit
+      // comment for why a ledger write here corrupts the running balance.
+      //
+      // updateMany + a WHERE clause pinned to the `paid` value just read
+      // (rather than a plain update-by-id) is an optimistic-concurrency
+      // guard: if a second "Apply Advance" call for this same PO — or a
+      // payment/settlement touching the same `paid` field — commits between
+      // this transaction's read above and this write, `count` comes back 0
+      // and this throws instead of silently applying advance a second time
+      // on stale numbers.
+      const result = await tx.procurementOrder.updateMany({
+        where: { id: poId, paid: po.paid },
         data: {
-          vendorId: po.vendorId,
-          type: 'CREDIT',
-          amount: amountToApply,
-          balanceAfterTransaction: nextCreditBalance,
-          paymentMode: 'CASH',
-          sourceModule: 'PROCUREMENT',
-          referenceType: 'ADVANCE',
-          referenceId: po.id,
-          note: `Advance applied to PO #${po.poNumber}`
-        }
-      });
-
-      return tx.procurementOrder.update({
-        where: { id: poId },
-        data: { 
           paid: newPaid,
+          advanceApplied: newAdvanceApplied,
           balance: po.totalAmount - newPaid,
           status: (po.totalAmount - newPaid <= 0 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
-        },
+        }
+      });
+      if (result.count === 0) {
+        throw new Error('This Purchase Order was updated by another request — please retry.');
+      }
+
+      return tx.procurementOrder.findUnique({
+        where: { id: poId },
         include: { vendor: true, poItems: { include: { inventoryItem: true } } }
       });
     });
@@ -1083,8 +1097,12 @@ export class ProcurementService {
     return type === 'CREDIT' ? currentBalance + amount : currentBalance - amount;
   }
 
-  static async recordPayment(vendorId: string, data: { amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE'; paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string }) {
-    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef } = data;
+  static async recordPayment(vendorId: string, data: {
+    amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE';
+    paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string;
+    idempotencyKey?: string; allowOverpayment?: boolean;
+  }) {
+    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef, idempotencyKey, allowOverpayment } = data;
     const modeMap: Record<string, string> = {
       CASH: 'CASH',
       UPI: 'UPI',
@@ -1099,7 +1117,56 @@ export class ProcurementService {
     const resolvedMode = modeMap[String(paymentMode || 'CASH').toUpperCase()] || 'CASH';
 
     return prisma.$transaction(async (tx) => {
-      // Centralized Payment & Account Adjustment (FinanceService will handle Ledger)
+      // Idempotency short-circuit for THIS function's own side effects (PO
+      // update, ledger sweep) — FinanceService.createPayment has the same
+      // check for the Payment/VendorLedger rows it owns, but a replay must
+      // not re-run recordPayment's own PO/settlement updates either, or a
+      // retry would apply the payment's effect on the PO twice even though
+      // no second Payment/ledger row gets created.
+      if (idempotencyKey) {
+        const existing = await tx.payment.findUnique({ where: { idempotencyKey } });
+        if (existing) return existing;
+      }
+
+      // Resolve which PO this payment should update. Paying from the Bills
+      // screen only ever passed vendorInvoiceId, never referenceId (a PO
+      // id) — so the linked PO's `paid`/`balance` never moved and stayed
+      // out of sync with what the invoice/vendor ledger showed as paid.
+      let targetPoId = referenceId;
+      if (!targetPoId && vendorInvoiceId) {
+        const inv = await tx.vendorInvoice.findUnique({ where: { id: vendorInvoiceId }, select: { poId: true } });
+        targetPoId = inv?.poId || undefined;
+      }
+
+      // Outstanding = Invoice/PO gross total - advance already applied -
+      // previously recorded valid payments. Reject anything beyond that
+      // unless the caller explicitly opted into overpayment (which should
+      // be recorded as a fresh vendor advance, not silently absorbed here).
+      if (!allowOverpayment) {
+        let outstanding: number | null = null;
+        if (vendorInvoiceId) {
+          const inv = await tx.vendorInvoice.findUnique({ where: { id: vendorInvoiceId } });
+          if (inv) {
+            const priorPaid = await tx.payment.aggregate({
+              where: { vendorInvoiceId, status: 'PAID', isCancelled: false },
+              _sum: { paidAmount: true }
+            });
+            outstanding = inv.amount - (inv.advanceApplied || 0) - (priorPaid._sum.paidAmount || 0);
+          }
+        } else if (targetPoId) {
+          const po = await tx.procurementOrder.findUnique({ where: { id: targetPoId } });
+          if (po) outstanding = po.totalAmount - (po.paid || 0);
+        }
+        if (outstanding !== null && amount > outstanding + 0.01) {
+          throw new Error(`Payment of ₹${amount} exceeds the outstanding balance of ₹${Math.max(0, outstanding).toFixed(2)}. Pass allowOverpayment to record the excess as a vendor advance instead.`);
+        }
+      }
+
+      // Centralized Payment, Account Adjustment, and VendorLedger posting —
+      // all in one place (FinanceService.createPayment). This function used
+      // to ALSO write its own VendorLedger DEBIT row for the same payment
+      // right after this call, which is exactly how one payment ended up as
+      // two identical "Payment Out" ledger rows under the same reference.
       const payment = await FinanceService.createPayment({
         tx,
         amount,
@@ -1109,23 +1176,24 @@ export class ProcurementService {
         sourceAccount: accountId,
         method: resolvedMode,
         sourceModule: 'PROCUREMENT',
-        linkedDocType: vendorInvoiceId ? 'INVOICE' : (referenceId ? 'PO' : 'DIRECT'),
-        linkedDocId: vendorInvoiceId || referenceId,
+        linkedDocType: vendorInvoiceId ? 'INVOICE' : (targetPoId ? 'PO' : 'DIRECT'),
+        linkedDocId: vendorInvoiceId || targetPoId,
         vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',
         entity: vendorId,
         createdBy: 'PROCUREMENT_MODULE',
         note: note,
-        reference: transactionRef
+        reference: transactionRef,
+        idempotencyKey
       });
 
-      // Update PO Payment status if linked
-      if (referenceId) {
-        const po = await tx.procurementOrder.findUnique({ where: { id: referenceId } });
+      // Update PO Payment status if linked (directly, or via the invoice's PO)
+      if (targetPoId) {
+        const po = await tx.procurementOrder.findUnique({ where: { id: targetPoId } });
         if (po) {
           const newPaid = (po.paid || 0) + Math.min(amount, po.totalAmount - (po.paid || 0));
           await tx.procurementOrder.update({
-            where: { id: referenceId },
+            where: { id: targetPoId },
             data: {
               paid: newPaid,
               balance: Math.max(0, Number((po.totalAmount - newPaid).toFixed(2))),
@@ -1135,30 +1203,10 @@ export class ProcurementService {
         }
       }
 
-      // Record Vendor Ledger Debit
-      const nextBalance = await this.getNextBalance(tx, vendorId, amount, 'DEBIT');
-      await tx.vendorLedger.create({
-        data: {
-          vendorId,
-          type: 'DEBIT',
-          amount,
-          balanceAfterTransaction: nextBalance,
-          paymentMode: resolvedMode as any,
-          sourceModule: 'PROCUREMENT',
-          referenceType: 'PAYMENT',
-          referenceId: payment.id,
-          invoiceId: vendorInvoiceId,
-          accountId,
-          note: note || 'Payment to Vendor'
-        }
-      });
-
-      if (vendorInvoiceId) {
-        await tx.vendorInvoice.update({
-          where: { id: vendorInvoiceId },
-          data: { status: 'PAID' }
-        });
-      }
+      // Invoice status (PAID once cash+advance cover the gross amount) is
+      // already handled inside FinanceService.createPayment, which checks
+      // the actual paid total instead of blindly marking PAID regardless of
+      // whether `amount` covered the invoice — no need to repeat it here.
 
       // Settle against any available advance
       await this.settleVendorOrders(vendorId, tx);

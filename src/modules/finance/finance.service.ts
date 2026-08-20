@@ -866,6 +866,17 @@ export class FinanceService {
     const resolvedPaymentMode = paymentModeMap[data.method] || paymentModeMap[sourceId] || 'CASH';
 
     const operation = async (tx: any) => {
+      // 0. Idempotency: a retry/double-click/API re-entry carrying the same
+      // key must return the ALREADY-created payment instead of posting a
+      // second one. Checked first so a fast in-transaction re-entry never
+      // reaches the ledger-write step below; the `idempotencyKey` column's
+      // unique constraint is the hard backstop for a true concurrent race
+      // (two requests both passing this check before either commits).
+      if (data.idempotencyKey) {
+        const existing = await tx.payment.findUnique({ where: { idempotencyKey: data.idempotencyKey } });
+        if (existing) return existing;
+      }
+
       // 1. Resolve account (Prefer ID, fallback to Type mapping)
       let account;
       if (sourceId && sourceId.length > 20) { // Likely a UUID
@@ -914,6 +925,7 @@ export class FinanceService {
           status,
           accountId:      account?.id ?? undefined,
           createdBy:      data.createdBy,
+          idempotencyKey: data.idempotencyKey || undefined,
         },
       });
 
@@ -943,6 +955,7 @@ export class FinanceService {
               referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
               referenceId: payment.id,
               invoiceId: data.vendorInvoiceId,
+              accountId: account?.id,
               paymentMode: resolvedPaymentMode as any,
               note: data.note || `Payment #${paymentNumber} recorded`
             }
@@ -952,12 +965,16 @@ export class FinanceService {
           if (data.vendorInvoiceId) {
              const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
              if (inv) {
-                // Check if fully paid (this is a simple check, better to sum all payments)
+                // Check if fully paid: cash/bank payments PLUS whatever advance
+                // was already applied to this invoice must cover the gross
+                // amount — advance settles the invoice too, it just isn't a
+                // Payment row, so leaving it out of this sum under-counted
+                // how much of the invoice was actually settled.
                 const totalPaid = await tx.payment.aggregate({
                    where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
                    _sum: { paidAmount: true }
                 });
-                const total = totalPaid._sum.paidAmount || 0;
+                const total = (totalPaid._sum.paidAmount || 0) + (inv.advanceApplied || 0);
                 if (total >= inv.amount - 0.01) {
                    await tx.vendorInvoice.update({
                       where: { id: data.vendorInvoiceId },
@@ -984,8 +1001,21 @@ export class FinanceService {
 
     if (data.tx) {
       return operation(data.tx);
-    } else {
-      return prisma.$transaction(async (tx) => operation(tx));
+    }
+
+    try {
+      return await prisma.$transaction(async (tx) => operation(tx));
+    } catch (err: any) {
+      // True concurrent race: two requests both passed the idempotency
+      // check (step 0) before either committed, and the loser hit the
+      // idempotencyKey unique constraint, aborting its transaction. Query
+      // with a fresh (non-aborted) client for the winner's row rather than
+      // surfacing this as a failure to a legitimate retry.
+      if (data.idempotencyKey && err?.code === 'P2002') {
+        const winner = await prisma.payment.findUnique({ where: { idempotencyKey: data.idempotencyKey } });
+        if (winner) return winner;
+      }
+      throw err;
     }
   }
 

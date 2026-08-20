@@ -217,7 +217,7 @@ export class ProcurementController {
       const data = await ProcurementService.recordPayment(req.params.id, req.body);
       res.json(data);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 

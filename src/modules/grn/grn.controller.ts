@@ -22,6 +22,15 @@ export class GRNController {
     }
   }
 
+  static async generateLotNumber(req: Request, res: Response) {
+    try {
+      const lotNumber = await GRNService.generateLotNumber();
+      res.json({ lotNumber });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async createFromPO(req: Request, res: Response) {
     try {
       const grn = await GRNService.createFromPO(req.params.poId, req.body);

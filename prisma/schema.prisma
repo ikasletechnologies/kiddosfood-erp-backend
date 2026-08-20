@@ -344,6 +344,14 @@ model ProcurementOrder {
   status               POStatus               @default(PENDING_APPROVAL)
   totalAmount          Float
   advancePaid          Float                  @default(0)
+  // How much of `advancePaid` came from pre-existing vendor advance/credit
+  // (as opposed to fresh cash paid at PO creation) — tracked separately so
+  // it can be displayed ("₹100 Advance Applied") and so the same advance
+  // can't be re-applied to another PO. Consumption is tracked here, not via
+  // an extra offsetting VendorLedger entry, so the vendor's running ledger
+  // balance isn't zeroed out before the purchase liability it's meant to
+  // offset actually exists.
+  advanceApplied       Float                  @default(0)
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   notes                String?
@@ -447,10 +455,27 @@ model VendorInvoice {
   amount           Float
   status           InvoiceStatus    @default(PENDING)
   createdAt        DateTime         @default(now())
+  // Tax/commercial breakdown — `amount` was historically the only figure
+  // stored (always gross-or-whatever-the-caller-sent, with no way to tell
+  // which), which is how GST silently vanished when a bill was generated
+  // without deriving these from the PO. `amount` remains the authoritative
+  // GROSS invoice total; these are the breakdown behind it.
+  subtotal         Float?
+  taxAmount        Float?
+  cgst             Float?
+  sgst             Float?
+  igst             Float?
+  // How much of this invoice's gross amount has been settled via vendor
+  // advance (as opposed to a cash/bank Payment) — kept separate so the
+  // invoice's own gross `amount` never gets silently reduced by a
+  // settlement (advance is a settlement method, not an invoice discount).
+  advanceApplied   Float            @default(0)
+  warehouseId      String?
   payments         Payment[]
   grn              GoodsReceipt?    @relation(fields: [grnId], references: [id])
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
   vendor           Vendor           @relation(fields: [vendorId], references: [id])
+  warehouse        Warehouse?       @relation(fields: [warehouseId], references: [id])
   ledgerEntries    VendorLedger[]
 }
 
@@ -787,6 +812,11 @@ model Payment {
   linkedDocId         String?
   linkedDocType       LinkedDocType?
   paymentNumber       String?               @unique
+  // Client-supplied key (one per logical "Make Payment" submission) so a
+  // retry/double-click/API re-entry with the same key returns the existing
+  // Payment instead of creating a second one. Nullable + unique: most
+  // callers won't send one, but any that do get a real DB-level guarantee.
+  idempotencyKey      String?               @unique
   reversalOfPaymentId String?
   sourceModule        PaymentSourceModule   @default(MANUAL)
   vendorInvoiceId     String?
@@ -1422,6 +1452,7 @@ model Warehouse {
   primaryForFranchises Franchise[]        @relation("PrimaryWarehouse")
   inventoryBatches     InventoryBatch[]
   productions          Production[]
+  vendorInvoices       VendorInvoice[]
 }
 
 model WarehouseBin {
@@ -1457,6 +1488,16 @@ model InventoryBatch {
   productBatch    ProductBatch?       @relation(fields: [productBatchId], references: [id])
   warehouse       Warehouse?          @relation(fields: [warehouseId], references: [id])
   stockMovements  StockMovement[]
+}
+
+// Atomic counter for generating collision-free sequential numbers (e.g. GRN
+// lot/batch numbers). A row-level UPDATE ... increment inside a transaction
+// serializes concurrent callers at the DB level — unlike deriving a number
+// from Date.now()/row counts, which two requests can race and both compute
+// the same value from.
+model NumberSequence {
+  key   String @id
+  value Int    @default(0)
 }
 
 model AuditLog {
