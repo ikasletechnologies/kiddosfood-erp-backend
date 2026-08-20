@@ -267,14 +267,15 @@ app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRAN
 app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.updateStatus);
 
 // Logistics (Stock Requests & Transfers)
-app.get('/api/logistics/requests', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.getRequests);
-app.post('/api/logistics/requests', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.createRequest);
-app.patch('/api/logistics/requests/:id/approve', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.approveRequest);
+app.get('/api/logistics/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.getRequests);
+app.post('/api/logistics/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.createRequest);
+app.patch('/api/logistics/requests/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.approveRequest);
 
-app.get('/api/logistics/transfers', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.getTransfers);
-app.get('/api/logistics/transfers/in-transit', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.getInTransit);
-app.post('/api/logistics/transfers', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.initiateTransfer);
-app.patch('/api/logistics/transfers/:id/complete', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LogisticsController.completeTransfer);
+app.get('/api/logistics/transfers', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.getTransfers);
+app.get('/api/logistics/transfers/in-transit', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.getInTransit);
+app.post('/api/logistics/transfers', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.initiateTransfer);
+app.patch('/api/logistics/transfers/:id/dispatch', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.dispatchTransfer);
+app.patch('/api/logistics/transfers/:id/complete', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.completeTransfer);
 
 // Delivery & Logistics
 app.get('/api/delivery/active', authenticate, authorizeRole(['FRANCHISE_ADMIN']), DeliveryController.getActive);

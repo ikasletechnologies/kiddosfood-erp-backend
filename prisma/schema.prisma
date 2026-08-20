@@ -470,6 +470,7 @@ model Product {
   updatedAt       DateTime             @updatedAt
   hsnCode         String?
   productType     ProductType          @default(FINISHED_GOOD)
+  shelfLifeDays   Int?
   franchiseOrders FranchiseOrderItem[]
   orderItems      OrderItem[]
   batches         ProductBatch[]

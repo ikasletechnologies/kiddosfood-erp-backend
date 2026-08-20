@@ -1,5 +1,7 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { TokenPayload } from '../../lib/jwt.util';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class LogisticsService {
   /**
@@ -54,16 +56,58 @@ export class LogisticsService {
 
   /**
    * --- INTER-FRANCHISE STOCK TRANSFERS ---
+   *
+   * Lifecycle: PENDING (created, no stock moved) -> SHIPPED (dispatched,
+   * source deducted) -> COMPLETED (received, destination credited). Stock
+   * only ever moves at dispatch/receipt, never at creation, so a transfer
+   * can be raised as a plan/request without committing real stock until
+   * someone actually sends it.
    */
   static async initiateTransfer(data: {
     fromBranchId: string,
     toBranchId: string,
     items: { inventoryItemId: string, quantity: number }[],
-    userId?: string
+    userId?: string,
+    requestingUser?: TokenPayload
   }) {
+    // A FRANCHISE_ADMIN can only raise a transfer sourced from their own
+    // branch — they can't drain another branch's stock. HQ (SUPER_ADMIN)
+    // may source from anywhere. Destination is left open either way: a
+    // branch sending stock elsewhere doesn't expose/alter anyone else's data.
+    if (data.requestingUser) {
+      const enforcedFromBranchId = IsolationUtil.enforceFranchiseMatch(data.requestingUser, data.fromBranchId);
+      if (!enforcedFromBranchId) {
+        throw new Error('Your account has no branch assigned — cannot determine a source branch for this transfer.');
+      }
+      data.fromBranchId = enforcedFromBranchId;
+    }
+
+    if (data.fromBranchId === data.toBranchId) {
+      throw new Error('Source and destination branch must be different.');
+    }
+    if (!data.items || data.items.length === 0) {
+      throw new Error('At least one item is required.');
+    }
+    for (const item of data.items) {
+      if (!(item.quantity > 0)) {
+        throw new Error('Quantity must be greater than 0 for every item.');
+      }
+    }
+
     return prisma.$transaction(async (tx) => {
-      // 1. Create Transfer Record
-      const transfer = await tx.stockTransfer.create({
+      // Soft availability check only — no stock is deducted here. Actual
+      // stock can still move between now and dispatch, so this is early
+      // user feedback, not the authoritative check (that happens at dispatch).
+      for (const item of data.items) {
+        const sourceInv = await tx.inventoryItem.findFirst({
+          where: { id: item.inventoryItemId, franchiseId: data.fromBranchId }
+        });
+        if (!sourceInv || sourceInv.currentStock < item.quantity) {
+          throw new Error(`Insufficient stock in source branch for ${sourceInv?.name ?? item.inventoryItemId}. Available: ${sourceInv?.currentStock || 0}`);
+        }
+      }
+
+      return tx.stockTransfer.create({
         data: {
           fromBranchId: data.fromBranchId,
           toBranchId: data.toBranchId,
@@ -76,18 +120,38 @@ export class LogisticsService {
             }))
           }
         },
-        include: { items: true }
+        include: { items: { include: { inventoryItem: true } }, fromBranch: true, toBranch: true }
       });
+    });
+  }
 
-      // 2. Deduct from Source Branch (TRANSFER_OUT)
-      for (const item of data.items) {
-        // Validate source stock
+  /**
+   * Dispatch: PENDING -> SHIPPED. This is where stock actually leaves the
+   * source branch (TRANSFER_OUT). Re-validates availability against live
+   * stock since it may have changed since the transfer was created.
+   */
+  static async dispatchTransfer(id: string, requestingUser: TokenPayload) {
+    const userId = requestingUser.userId;
+    return prisma.$transaction(async (tx) => {
+      const transfer = await tx.stockTransfer.findUnique({
+        where: { id },
+        include: { items: { include: { inventoryItem: true } } }
+      });
+      if (!transfer) throw new Error('Transfer not found');
+      // Only the sending branch (or HQ) may dispatch its own outgoing transfer.
+      if (requestingUser.role !== 'SUPER_ADMIN' && transfer.fromBranchId !== requestingUser.franchiseId) {
+        throw new Error('You are not authorized to dispatch a transfer that does not originate from your branch.');
+      }
+      if (transfer.status !== 'PENDING') {
+        throw new Error(`Only PENDING transfers can be dispatched (current status: ${transfer.status}).`);
+      }
+
+      for (const item of transfer.items) {
         const sourceInv = await tx.inventoryItem.findFirst({
-          where: { id: item.inventoryItemId, franchiseId: data.fromBranchId }
+          where: { id: item.inventoryItemId, franchiseId: transfer.fromBranchId }
         });
-
         if (!sourceInv || sourceInv.currentStock < item.quantity) {
-          throw new Error(`Insufficient stock in source branch for ${sourceInv?.name}. Available: ${sourceInv?.currentStock || 0}`);
+          throw new Error(`Insufficient stock in source branch for ${sourceInv?.name ?? item.inventoryItemId}. Available: ${sourceInv?.currentStock || 0}`);
         }
 
         await InventoryService.recordMovement(tx, {
@@ -96,38 +160,65 @@ export class LogisticsService {
           quantity: -item.quantity,
           referenceType: 'TRANSFER',
           referenceId: transfer.id,
-          note: `Transfer to branch ${data.toBranchId}`,
-          userId: data.userId
+          note: `Dispatched to branch ${transfer.toBranchId}`,
+          userId
         });
       }
 
-      return transfer;
+      return tx.stockTransfer.update({
+        where: { id },
+        data: { status: 'SHIPPED' },
+        include: { items: { include: { inventoryItem: true } }, fromBranch: true, toBranch: true }
+      });
     });
   }
 
-  static async completeTransfer(id: string, userId: string) {
+  /**
+   * Receive: SHIPPED -> COMPLETED. Credits the destination branch
+   * (TRANSFER_IN). Guarded to SHIPPED-only so a still-PENDING transfer
+   * (nothing dispatched yet) or an already-COMPLETED one can't be
+   * received/double-credited.
+   */
+  static async completeTransfer(id: string, requestingUser: TokenPayload) {
+    const userId = requestingUser.userId;
     return prisma.$transaction(async (tx) => {
-      // 1. Get Transfer Details
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
         include: { items: { include: { inventoryItem: true } } }
       });
+      if (!transfer) throw new Error('Transfer not found');
+      // Only the receiving branch (or HQ) may mark its own incoming transfer received.
+      if (requestingUser.role !== 'SUPER_ADMIN' && transfer.toBranchId !== requestingUser.franchiseId) {
+        throw new Error('You are not authorized to receive a transfer that is not destined for your branch.');
+      }
+      if (transfer.status !== 'SHIPPED') {
+        throw new Error(`Only SHIPPED (in-transit) transfers can be received (current status: ${transfer.status}).`);
+      }
 
-      if (!transfer || transfer.status === 'COMPLETED') throw new Error('Invalid transfer or already completed');
-
-      // 2. Add to Destination Branch (TRANSFER_IN)
       for (const item of transfer.items) {
-        // Find existing item in destination branch, or create it if not present
+        // Find existing item in destination branch (by SKU, falling back to
+        // name — a branch may already stock the same item under a
+        // differently-generated SKU), or create it if not present.
         let destInv = await tx.inventoryItem.findFirst({
-          where: { sku: item.inventoryItem.sku, franchiseId: transfer.toBranchId }
+          where: {
+            franchiseId: transfer.toBranchId,
+            OR: [
+              { sku: item.inventoryItem.sku },
+              { name: { equals: item.inventoryItem.name, mode: 'insensitive' } }
+            ]
+          }
         });
 
         if (!destInv) {
-          // If destination doesn't have this item, create it
+          // InventoryItem.sku is globally unique (not scoped per branch), so
+          // the source item's own SKU can't be reused verbatim — every other
+          // branch's copy of "the same item" is still a distinct row with
+          // its own SKU. Derive one from the source SKU + destination branch
+          // instead of colliding with it.
           destInv = await tx.inventoryItem.create({
             data: {
               name: item.inventoryItem.name,
-              sku: item.inventoryItem.sku,
+              sku: `${item.inventoryItem.sku}-${transfer.toBranchId.replace(/-/g, '').slice(0, 6).toUpperCase()}`,
               category: item.inventoryItem.category,
               unit: item.inventoryItem.unit,
               currentStock: 0,
@@ -143,14 +234,14 @@ export class LogisticsService {
           referenceType: 'TRANSFER',
           referenceId: transfer.id,
           note: `Received from branch ${transfer.fromBranchId}`,
-          userId: userId
+          userId
         });
       }
 
-      // 3. Update Status
       return tx.stockTransfer.update({
         where: { id },
-        data: { status: 'COMPLETED', approvedBy: userId }
+        data: { status: 'COMPLETED', approvedBy: userId },
+        include: { items: { include: { inventoryItem: true } }, fromBranch: true, toBranch: true }
       });
     });
   }

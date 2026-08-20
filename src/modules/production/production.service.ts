@@ -74,7 +74,23 @@ export class ProductionService {
         }
       }
 
-      // 3. Create production record (IN_PROGRESS)
+      // 3. Expiry is derived from the linked Product's configured shelf life
+      // (Production Date + shelfLifeDays) — that's the single source of truth
+      // so it stays correct as new products/shelf-life values are added, instead
+      // of every caller having to compute and pass its own expiry. A caller-supplied
+      // expiryDate or the DEFAULT_SHELF_LIFE_DAYS fallback only apply until the
+      // product's shelf life gets configured. Computed once here and stored on the
+      // Production row, so changing a product's shelf life later never rewrites the
+      // expiry of batches already produced.
+      const DEFAULT_SHELF_LIFE_DAYS = 7;
+      const shelfLifeDays = recipe.product?.shelfLifeDays;
+      const expiryDate = shelfLifeDays
+        ? new Date(Date.now() + shelfLifeDays * 24 * 60 * 60 * 1000)
+        : data.expiryDate
+        ? new Date(data.expiryDate)
+        : new Date(Date.now() + DEFAULT_SHELF_LIFE_DAYS * 24 * 60 * 60 * 1000);
+
+      // 4. Create production record (IN_PROGRESS)
       const production = await tx.production.create({
         data: {
           recipeId: data.recipeId,
@@ -87,7 +103,7 @@ export class ProductionService {
           startTime: new Date(),
           producedBy: data.userId,
           operatorId: data.operatorId || null,
-          expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
+          expiryDate,
           currentStage: 'QUEUED',
           stageUpdatedAt: new Date(),
         },
@@ -97,7 +113,7 @@ export class ProductionService {
         data: { productionId: production.id, stage: 'QUEUED' },
       });
 
-      // 4. Deduct raw materials, capturing the real FIFO lot cost of whatever
+      // 5. Deduct raw materials, capturing the real FIFO lot cost of whatever
       // was actually consumed (oldest/cheapest purchase lot first) instead of
       // letting it get discarded once the batch rows are decremented.
       let materialCost = 0;

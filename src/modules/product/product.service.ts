@@ -131,6 +131,9 @@ export class ProductService {
           emoji: data.emoji,
           isVeg: data.isVeg ?? true,
           productType,
+          shelfLifeDays: data.shelfLifeDays !== undefined && data.shelfLifeDays !== null && data.shelfLifeDays !== ''
+            ? Number(data.shelfLifeDays)
+            : null,
         },
         include: {
           recipe: true
@@ -176,6 +179,11 @@ export class ProductService {
           ...(data.emoji !== undefined && { emoji: data.emoji }),
           ...(data.isVeg !== undefined && { isVeg: data.isVeg }),
           ...(data.productType !== undefined && { productType: data.productType }),
+          ...(data.shelfLifeDays !== undefined && {
+            shelfLifeDays: data.shelfLifeDays === null || data.shelfLifeDays === ''
+              ? null
+              : Number(data.shelfLifeDays),
+          }),
         },
         include: { recipe: true }
       });
