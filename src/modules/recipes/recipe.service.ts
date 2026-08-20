@@ -19,6 +19,22 @@ export class RecipeService {
     return prisma.$transaction(async (tx) => {
       let recipeId = data.id;
 
+      // Recipe.productId is unique (one recipe per product) — check first
+      // and name the conflicting recipe, rather than letting Postgres reject
+      // the write and leaking a raw constraint-violation stack trace to the
+      // client. Excludes the recipe being edited so re-saving it with the
+      // same product it already has doesn't false-positive.
+      if (data.productId) {
+        const conflict = await tx.recipe.findFirst({
+          where: { productId: data.productId, ...(recipeId ? { id: { not: recipeId } } : {}) },
+          include: { product: true }
+        });
+        if (conflict) {
+          const productName = conflict.product?.name || 'this product';
+          throw new Error(`"${productName}" is already linked to recipe "${conflict.name}" — each product can only have one recipe. Unlink it there first, or choose a different product.`);
+        }
+      }
+
       if (recipeId) {
         await tx.recipe.update({
           where: { id: recipeId },

@@ -6,8 +6,16 @@ export class RecipeController {
     try {
       const recipe = await RecipeService.upsertRecipe(req.body);
       res.status(201).json(recipe);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      // RecipeService pre-checks the productId conflict and throws a plain
+      // Error with a specific message — this P2002 branch is only a
+      // backstop for a race (two saves for the same product landing
+      // between the pre-check and the write), so it still needs to be
+      // client-friendly rather than leaking the raw Prisma error.
+      if (error.code === 'P2002' && error.meta?.target?.includes?.('productId')) {
+        return res.status(400).json({ error: 'This product is already linked to another recipe — each product can only have one recipe.' });
+      }
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
