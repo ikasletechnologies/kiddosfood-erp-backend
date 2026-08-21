@@ -155,16 +155,10 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
-        // Snapshot stock/cost BEFORE this receipt so the weighted-average
-        // below reflects "what we had" vs "what just arrived", not the
-        // post-receipt total.
-        const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
-        const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
-
-        // 1. Create Inventory Batch (Directly APPROVED for streamlined flow).
+        // 1. Create Inventory Batch (Initially held in QC_HOLD, pending inspection).
         // Tagged with the purchase bill number, not a generic lot code — the
         // vendor's own batch/lot reference (if they gave one) still wins when present.
-        const batch = await tx.inventoryBatch.create({
+        await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
             batchNumber: item.vendorBatchNo || billNumber,
@@ -172,41 +166,17 @@ export class GRNService {
             mfgDate: item.mfgDate,
             expDate: item.expDate,
             initialQty: item.acceptedQty,
-            currentQty: item.acceptedQty, // Usable immediately
+            currentQty: item.acceptedQty, // Under QC inspection, not usable yet
             unitCost: item.price,
             warehouseId: item.warehouseId || null,
-            status: 'APPROVED'
+            status: 'QC_HOLD'
           }
         });
 
-        // 2. Record Stock Movement (Impacts InventoryItem.currentStock)
-        await InventoryService.recordMovement(tx, {
-          itemId: item.materialId!,
-          type: 'PURCHASE_IN',
-          quantity: item.acceptedQty,
-          referenceType: 'GRN',
-          referenceId: grnId,
-          note: `Auto-approved via GRN ${grnId}`,
-          warehouseId: item.warehouseId || undefined
-        });
-
-        // 3. Recompute costPrice as a moving weighted average, instead of it
-        // being a single static number that's only ever set/edited by hand.
-        const priorQty = Math.max(0, preReceiptStock);
-        const priorCost = invItemBefore?.costPrice || 0;
-        const newCostPrice = priorQty + item.acceptedQty > 0
-          ? ((priorQty * priorCost) + (item.acceptedQty * item.price)) / (priorQty + item.acceptedQty)
-          : item.price;
-
-        await tx.inventoryItem.update({
-          where: { id: item.materialId! },
-          data: { vendorId: grn.procurementOrder.vendorId, costPrice: newCostPrice }
-        });
-
-        // 3. Mark GRN Item as APPROVED
+        // 2. Mark GRN Item as PENDING QC
         await tx.goodsReceiptItem.update({
           where: { id: item.id },
-          data: { qcStatus: 'APPROVED' }
+          data: { qcStatus: 'PENDING' }
         });
       }
 
@@ -225,7 +195,7 @@ export class GRNService {
           where: { grnId: grnId }
         });
         if (!existingInvoice) {
-          await tx.vendorInvoice.create({
+          const newInvoice = await tx.vendorInvoice.create({
             data: {
               vendorId: grn.procurementOrder.vendorId,
               poId: grn.poId,
@@ -241,6 +211,14 @@ export class GRNService {
               status: 'PENDING'
             }
           });
+
+          // Recognize the liability (Vendor Ledger CREDIT + advance
+          // attribution) immediately — the Purchase Bills UI has no
+          // "Approve" action, only "Make Payment" on PENDING bills, so
+          // waiting for a manual approve() call left Total Purchases at ₹0
+          // and Make Payment/outstanding using the full gross amount
+          // instead of net-of-advance. See VendorInvoiceService.recognizeLiability.
+          await VendorInvoiceService.recognizeLiability(tx, newInvoice.id);
         }
       }
 
@@ -292,7 +270,7 @@ export class GRNService {
             module: 'GRN',
             action: 'APPROVE',
             recordId: grnId,
-            newValue: { status: 'COMPLETED', inventoryState: 'APPROVED' },
+            newValue: { status: 'COMPLETED', inventoryState: 'QC_HOLD' },
             performedBy: 'SYSTEM'
          }
       });

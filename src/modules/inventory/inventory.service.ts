@@ -242,14 +242,6 @@ export class InventoryService {
   }
 
   static async createItem(data: any) {
-    const mappedCategory = mapCategoryToDb(data.category);
-    if (mappedCategory === ItemCategory.FINISHED_GOOD) {
-      const sPrice = Number(data.customerPrice) || Number(data.basePrice) || 0;
-      if (sPrice <= 0) {
-        throw new Error("A valid selling price (Customer Retail) must be provided to launch a finished good item master.");
-      }
-    }
-
     if (data.name && data.franchiseId) {
       const existing = await prisma.inventoryItem.findFirst({
         where: {
@@ -392,15 +384,6 @@ export class InventoryService {
     const currentItem = await prisma.inventoryItem.findUnique({ where: { id } });
     const finalCategory = data.category ? mapCategoryToDb(data.category) : currentItem?.category;
     
-    if (finalCategory === ItemCategory.FINISHED_GOOD) {
-      const finalPrice = data.customerPrice !== undefined ? Number(data.customerPrice)
-        : data.basePrice !== undefined ? Number(data.basePrice)
-        : currentItem?.basePrice || 0;
-      if (finalPrice <= 0) {
-        throw new Error("A valid selling price (Customer Retail) must be provided to launch a finished good item master.");
-      }
-    }
-
     const { currentStock: _currentStock, ...safeData } = data; // strip any stock field
     if (safeData.category) {
       safeData.category = mapCategoryToDb(safeData.category);
@@ -833,6 +816,7 @@ export class InventoryService {
       where: {
         inventoryItemId: itemId,
         currentQty: { gt: 0 },
+        status: 'APPROVED',
         AND: [
           { OR: [{ expDate: null }, { expDate: { gte: new Date() } }] },
           ...(warehouseId ? [{ OR: [{ warehouseId }, { warehouseId: null }] }] : [])

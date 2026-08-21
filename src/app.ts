@@ -13,6 +13,7 @@ import { FinanceController } from './modules/finance/finance.controller';
 import { AnalyticsController } from './modules/analytics/analytics.controller';
 import { ProductionController } from './modules/production/production.controller';
 import { CartonController } from './modules/production/carton.controller';
+import { RecallController } from './modules/production/recall.controller';
 import { ProcurementController } from './modules/procurement/procurement.controller';
 import { FranchiseController } from './modules/franchise/franchise.controller';
 import { NavController } from './modules/users/nav.controller';
@@ -263,6 +264,18 @@ app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPE
 app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.inspectBatch);
 app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.packageBatch);
 app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
+// Batch Recall — eligibility/state are shared source of truth for both the
+// registry list and the inspector panel; mutation endpoints are transactional
+// and idempotent (see recall.service.ts).
+app.get('/api/production/batches/:id/recall/eligibility', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.getEligibility);
+app.get('/api/production/batches/:id/recall', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.getState);
+app.post('/api/production/batches/:id/recall/initiate', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.initiate);
+app.post('/api/production/batches/:id/recall/locate-distribution', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.locateDistribution);
+app.post('/api/production/batches/:id/recall/block-sales', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.blockSales);
+app.post('/api/production/batches/:id/recall/generate-report', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.generateReport);
+app.post('/api/production/batches/:id/recall/collect-return', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.collectReturn);
+app.post('/api/production/batches/:id/recall/complete', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.complete);
+app.post('/api/production/batches/:id/recall/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.cancel);
 app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getOne);
 app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.updateStatus);
 

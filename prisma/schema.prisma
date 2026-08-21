@@ -231,6 +231,7 @@ model WasteEntry {
   id              String        @id @default(uuid())
   inventoryItemId String
   franchiseId     String?
+  warehouseId     String?
   quantity        Float
   reason          String
   note            String?
@@ -238,6 +239,7 @@ model WasteEntry {
   createdAt       DateTime      @default(now())
   inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
   franchise       Franchise?    @relation(fields: [franchiseId], references: [id])
+  warehouse       Warehouse?    @relation(fields: [warehouseId], references: [id])
 }
 
 model StockMovement {
@@ -623,6 +625,65 @@ model ProductBatch {
   packagings       ProductPackaging[]
   cartons          Carton[]
   inventoryBatches InventoryBatch[]
+  recall           BatchRecall?
+}
+
+enum RecallStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum RecallStep {
+  INITIATED
+  DISTRIBUTION_LOCATED
+  SALES_BLOCKED
+  REPORT_GENERATED
+  RETURN_COLLECTED
+  COMPLETED
+}
+
+// One row per ProductBatch, ever — productBatchId is unique so the DB itself
+// rejects a second concurrent "initiate" for the same batch (see
+// recall.service.ts's create-then-fallback-to-update-if-CANCELLED pattern).
+// This is the single source of truth for whether a batch is under recall and
+// what step that recall has reached; the frontend must not derive this from
+// its own timers.
+model BatchRecall {
+  id                String            @id @default(uuid())
+  productBatchId    String            @unique
+  status            RecallStatus      @default(IN_PROGRESS)
+  step              RecallStep        @default(INITIATED)
+  reason            String
+  reasonNotes       String?
+  // Real, computed figures — never hardcoded. distributedQty is populated by
+  // locateDistribution() from actual InventoryBatch/StockMovement records;
+  // returnedQty accumulates from collectReturn() and is bounded by it.
+  distributedQty    Float             @default(0)
+  returnedQty       Float             @default(0)
+  affectedLocations Json?
+  reportData        Json?
+  initiatedBy       String?
+  initiatedAt       DateTime          @default(now())
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+  updatedAt         DateTime          @updatedAt
+  productBatch      ProductBatch      @relation(fields: [productBatchId], references: [id])
+  events            BatchRecallEvent[]
+}
+
+// Persisted audit trail — the frontend's "Live Recall Audit Log" reads this,
+// it does not generate its own messages.
+model BatchRecallEvent {
+  id          String      @id @default(uuid())
+  recallId    String
+  event       String
+  status      String // SUCCESS, FAILED, INFO
+  actor       String?
+  affectedQty Float?
+  details     Json?
+  createdAt   DateTime    @default(now())
+  recall      BatchRecall @relation(fields: [recallId], references: [id])
 }
 
 model Carton {
@@ -1453,6 +1514,7 @@ model Warehouse {
   inventoryBatches     InventoryBatch[]
   productions          Production[]
   vendorInvoices       VendorInvoice[]
+  wasteEntries         WasteEntry[]
 }
 
 model WarehouseBin {
@@ -1645,6 +1707,7 @@ enum StockMovementType {
   TRANSFER_OUT
   ADJUSTMENT
   RETURN_OUT
+  RECALL_RETURN_IN
 }
 
 enum GRNStatus {

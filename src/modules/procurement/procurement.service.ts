@@ -388,10 +388,19 @@ export class ProcurementService {
    * was paid, but if some of it has already been earmarked to a specific PO
    * (ProcurementOrder.advanceApplied) that PO's own purchase liability
    * hasn't been billed/recognized yet, so it hasn't yet reduced the raw
-   * ledger balance. Subtracting reservations still outstanding on other open
-   * POs prevents that same advance being offered again elsewhere.
+   * ledger balance. Subtracting reservations across ALL open POs — including
+   * the PO the caller is about to apply advance to — prevents that same
+   * advance being offered again, to another PO OR back to this same one.
+   *
+   * No excludePoId: an earlier version excluded the target PO from the
+   * reservation sum, on the assumption a PO calling this always had
+   * advanceApplied still at 0. That's false for the common case of a PO
+   * that already got advance auto-applied at creation (createPurchaseOrder)
+   * — excluding it made that PO's own already-claimed advance look
+   * unclaimed again, letting "Apply Advance" grant the same ₹ a second time
+   * on top of what the PO already had.
    */
-  static async getAvailableAdvance(vendorId: string, tx: any = prisma, excludePoId?: string): Promise<number> {
+  static async getAvailableAdvance(vendorId: string, tx: any = prisma): Promise<number> {
     const balance = await this.getVendorBalance(vendorId, tx);
     const rawAvailable = balance < 0 ? -balance : 0;
     if (rawAvailable <= 0) return 0;
@@ -399,8 +408,7 @@ export class ProcurementService {
     const reserved = await tx.procurementOrder.aggregate({
       where: {
         vendorId,
-        status: { notIn: ['CLOSED', 'CANCELLED'] },
-        ...(excludePoId ? { id: { not: excludePoId } } : {})
+        status: { notIn: ['CLOSED', 'CANCELLED'] }
       },
       _sum: { advanceApplied: true }
     });
@@ -777,10 +785,10 @@ export class ProcurementService {
       });
       if (!po) throw new Error('Purchase Order not found');
 
-      // Excludes this PO's own (currently zero, since it hasn't applied yet)
-      // reservation — see getAvailableAdvance for why the raw ledger balance
-      // alone isn't safe to use here.
-      const availableAdvance = await this.getAvailableAdvance(po.vendorId, tx, poId);
+      // Includes this PO's own already-applied reservation in what counts as
+      // "spent" — see getAvailableAdvance for why excluding it let the same
+      // advance be applied to this PO twice.
+      const availableAdvance = await this.getAvailableAdvance(po.vendorId, tx);
       if (availableAdvance <= 0) {
         throw new Error(`Vendor ${po.vendor.name} has no available advance balance.`);
       }
@@ -934,17 +942,16 @@ export class ProcurementService {
 
       for (const item of po.poItems) {
         if (!item.inventoryItemId) continue;
-        await InventoryService.recordMovement(tx, {
-          itemId: item.inventoryItemId,
-          type: 'PURCHASE_IN',
-          quantity: item.quantity,
-          referenceType: 'PROCUREMENT_ORDER',
-          referenceId: po.id,
-          note: `GRN for PO ${po.poNumber || po.id.substring(0, 8)}`
-        });
-        await tx.inventoryItem.update({
-          where: { id: item.inventoryItemId },
-          data: { vendorId: po.vendorId }
+        const billNumber = `BILL-${po.poNumber || po.id.substring(0, 8)}-REC`;
+        await tx.inventoryBatch.create({
+          data: {
+            inventoryItemId: item.inventoryItemId,
+            batchNumber: billNumber,
+            initialQty: item.quantity,
+            currentQty: item.quantity,
+            unitCost: item.price,
+            status: 'QC_HOLD'
+          }
         });
       }
 
@@ -959,7 +966,8 @@ export class ProcurementService {
               receivedQty: item.quantity,
               acceptedQty: item.quantity,
               rejectedQty: 0,
-              price: item.price
+              price: item.price,
+              qcStatus: 'PENDING'
             }))
           }
         }

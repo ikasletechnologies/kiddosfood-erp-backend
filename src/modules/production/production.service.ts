@@ -487,6 +487,9 @@ export class ProductionService {
       // output ever became usable stock, so that's the real packaging ceiling
       // (not the raw batch.quantity, which includes anything QC rejected).
       const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
+      if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
+        throw new Error('This batch is already fully packaged.');
+      }
       if (totalWeightNeeded > remainingInBatch + 0.001) {
         throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
@@ -653,6 +656,10 @@ export class ProductionService {
             stageLogs: { orderBy: { enteredAt: 'asc' } },
           },
         },
+        // So the Batch Registry (and any other list consuming this
+        // endpoint) can show IN_PROGRESS/COMPLETED/CANCELLED recall status
+        // instead of only ever showing APPROVED/PENDING QC status.
+        recall: { select: { status: true, step: true } },
       },
       orderBy: { createdAt: 'desc' },
     });

@@ -12,7 +12,14 @@ export class RecipeController {
       // backstop for a race (two saves for the same product landing
       // between the pre-check and the write), so it still needs to be
       // client-friendly rather than leaking the raw Prisma error.
-      if (error.code === 'P2002' && error.meta?.target?.includes?.('productId')) {
+      const isProductIdConflict = 
+        (error.code === 'P2002' && (
+          error.meta?.target?.includes?.('productId') || 
+          error.meta?.target?.some?.((t: string) => t.includes('productId'))
+        )) ||
+        (error.message && error.message.includes('Unique constraint') && error.message.includes('productId'));
+
+      if (isProductIdConflict) {
         return res.status(400).json({ error: 'This product is already linked to another recipe — each product can only have one recipe.' });
       }
       res.status(400).json({ error: (error as Error).message });

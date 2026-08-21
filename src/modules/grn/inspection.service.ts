@@ -31,7 +31,7 @@ export class InspectionService {
     return prisma.$transaction(async (tx) => {
       const item = await tx.goodsReceiptItem.findUnique({
         where: { id: data.grnItemId },
-        include: { grn: true }
+        include: { grn: { include: { procurementOrder: true } } }
       });
 
       if (!item) throw new Error('GRN Item not found');
@@ -83,31 +83,75 @@ export class InspectionService {
         if (data.actionTaken === 'APPROVE') newState = 'APPROVED';
         else if (data.actionTaken === 'REJECT_RETURN') newState = 'RETURNED';
         else if (data.actionTaken === 'REJECT_SCRAP') newState = 'REJECTED';
-        else if (data.actionTaken === 'REWORK') newState = 'QC_HOLD'; // Still in hold for rework
+        else if (data.actionTaken === 'REWORK') newState = 'QC_HOLD';
 
-        await tx.inventoryBatch.update({
-          where: { id: batch.id },
-          data: { 
-            status: newState,
-            currentQty: data.approvedQty // Only approved qty is usable
+        if (data.actionTaken === 'APPROVE') {
+          // Update the main batch to approved status with approved quantity
+          await tx.inventoryBatch.update({
+            where: { id: batch.id },
+            data: { 
+              status: 'APPROVED',
+              currentQty: data.approvedQty
+            }
+          });
+
+          // If there is a rejected portion, split it into a separate rejected batch
+          if (data.rejectedQty > 0) {
+            await tx.inventoryBatch.create({
+              data: {
+                inventoryItemId: item.materialId!,
+                batchNumber: (item.vendorBatchNo || batch.batchNumber) + '-REJ',
+                lotNumber: batch.lotNumber,
+                mfgDate: batch.mfgDate,
+                expDate: batch.expDate,
+                initialQty: data.rejectedQty,
+                currentQty: data.rejectedQty,
+                unitCost: batch.unitCost,
+                warehouseId: batch.warehouseId,
+                status: 'REJECTED'
+              }
+            });
           }
-        });
 
-        // Update main inventory only if approved
-        if (data.actionTaken === 'APPROVE' && data.approvedQty > 0) {
-          await InventoryService.recordMovement(tx, {
-            itemId: item.materialId!,
-            type: 'PURCHASE_IN',
-            quantity: data.approvedQty,
-            referenceType: 'QC_INSPECTION',
-            referenceId: record.id,
-            note: `QC Approved: ${data.approvedQty} ${item.materialId}`
+          // Update main inventory and record movement only if approvedQty > 0
+          if (data.approvedQty > 0) {
+            const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
+            const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
+            const priorQty = Math.max(0, preReceiptStock);
+            const priorCost = invItemBefore?.costPrice || 0;
+            const newCostPrice = priorQty + data.approvedQty > 0
+              ? ((priorQty * priorCost) + (data.approvedQty * item.price)) / (priorQty + data.approvedQty)
+              : item.price;
+
+            await tx.inventoryItem.update({
+              where: { id: item.materialId! },
+              data: { 
+                vendorId: item.grn.procurementOrder.vendorId, 
+                costPrice: newCostPrice 
+              }
+            });
+
+            await InventoryService.recordMovement(tx, {
+              itemId: item.materialId!,
+              type: 'PURCHASE_IN',
+              quantity: data.approvedQty,
+              referenceType: 'QC_INSPECTION',
+              referenceId: record.id,
+              note: `QC Approved: ${data.approvedQty} ${item.materialId}`
+            });
+          }
+        } else {
+          // Full rejection or rework
+          await tx.inventoryBatch.update({
+            where: { id: batch.id },
+            data: { 
+              status: newState,
+              currentQty: data.rejectedQty || item.receivedQty
+            }
           });
         }
 
-        // Scrapped material never entered usable inventory — log it as waste for
-        // cost/traceability reporting (previously discarded with no trace at all).
-        // REJECT_RETURN is excluded: that's going back to the vendor, not waste.
+        // Scrapped material log as waste
         const scrapQty = data.scrapQty || (data.actionTaken === 'REJECT_SCRAP' ? data.rejectedQty : 0);
         if (data.actionTaken === 'REJECT_SCRAP' && scrapQty > 0) {
           const material = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });

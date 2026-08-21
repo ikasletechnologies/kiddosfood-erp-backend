@@ -8,11 +8,13 @@ export class WasteController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const warehouseId = req.query.warehouseId as string | undefined;
 
       const entries = await WasteService.getAll(
         req.query.dateFrom as string,
         req.query.dateTo as string,
-        franchiseId
+        franchiseId,
+        warehouseId
       );
       res.json(entries);
     } catch (error) {
@@ -34,7 +36,8 @@ export class WasteController {
     try {
       const user = (req as any).user;
       const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      const entry = await WasteService.create({ ...req.body, franchiseId });
+      const warehouseId = req.body.warehouseId as string | undefined;
+      const entry = await WasteService.create({ ...req.body, franchiseId, warehouseId });
       res.status(201).json(entry);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
@@ -46,7 +49,8 @@ export class WasteController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const summary = await WasteService.getSummary(franchiseId);
+      const warehouseId = req.query.warehouseId as string | undefined;
+      const summary = await WasteService.getSummary(franchiseId, warehouseId);
       res.json(summary);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

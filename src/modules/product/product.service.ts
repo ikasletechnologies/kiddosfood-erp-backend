@@ -20,7 +20,6 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
 
   const existing = await tx.inventoryItem.findFirst({
     where: {
-      franchiseId: hq.id,
       OR: [
         ...(product.sku ? [{ sku: product.sku }] : []),
         { name: { equals: product.name, mode: 'insensitive' } },
@@ -35,6 +34,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
         name: product.name,
         basePrice: product.basePrice || 0,
         customerPrice: product.basePrice || 0,
+        franchiseId: existing.franchiseId || hq.id,
       },
     });
   } else {
@@ -91,16 +91,18 @@ export class ProductService {
         const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
                    inventory.find(i => i.name.trim().toLowerCase() === pName);
         
+        if (!inv) return null;
+
         return {
           ...p,
-          currentStock: inv ? inv.currentStock : 0,
-          inventoryFranchiseId: inv ? inv.franchiseId : (franchiseId || null),
-          inventoryBasePrice: inv ? inv.basePrice : null,
-          inventoryCostPrice: inv ? inv.costPrice : null,
-          baseUnit: inv ? inv.baseUnit : null,
-          conversions: inv ? inv.conversions : []
+          currentStock: inv.currentStock,
+          inventoryFranchiseId: inv.franchiseId || (franchiseId || null),
+          inventoryBasePrice: inv.basePrice,
+          inventoryCostPrice: inv.costPrice,
+          baseUnit: inv.baseUnit,
+          conversions: inv.conversions
         };
-      });
+      }).filter(Boolean) as any[];
     }
 
     return products;
@@ -111,13 +113,6 @@ export class ProductService {
    */
   static async create(data: any) {
     const productType: ProductType = data.productType ?? ProductType.FINISHED_GOOD;
-
-    // A sellable finished good must have a real price — otherwise it silently enters the
-    // catalog as "PRICE PENDING" and can be requested/ordered for ₹0 (see franchise-orders).
-    if (productType === ProductType.FINISHED_GOOD && !(Number(data.basePrice) > 0)) {
-      throw new Error('A valid selling price is required to launch a finished good product.');
-    }
-
     return prisma.$transaction(async (tx) => {
       const product = await tx.product.create({
         data: {
@@ -160,10 +155,6 @@ export class ProductService {
     const current = await prisma.product.findUniqueOrThrow({ where: { id } });
     const productType: ProductType = data.productType ?? current.productType;
     const basePrice = data.basePrice !== undefined ? Number(data.basePrice) : current.basePrice;
-
-    if (productType === ProductType.FINISHED_GOOD && !(basePrice > 0)) {
-      throw new Error('A valid selling price is required for a finished good product.');
-    }
 
     return prisma.$transaction(async (tx) => {
       const product = await tx.product.update({

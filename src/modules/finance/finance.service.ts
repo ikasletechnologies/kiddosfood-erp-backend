@@ -1698,6 +1698,25 @@ export class FinanceService {
     };
   }
 
+  // Atomic row-level UPDATE...increment (same NumberSequence pattern as
+  // GRNService.nextSequence) — a COUNT-based sequence let two payments
+  // committed in the same window both read the same count and land on the
+  // identical paymentNumber (this is how "VPAY-20260820-0001" ended up
+  // posted twice for two distinct Payment rows). The idempotencyKey check
+  // upstream in createPayment stops a genuine retry from creating a second
+  // row at all; this stops two DIFFERENT concurrent payments from racing
+  // each other onto the same number (which, now that paymentNumber is
+  // DB-unique, would otherwise fail the second payment outright instead of
+  // just mislabeling it).
+  private static async nextPaymentSequence(tx: any, key: string): Promise<number> {
+    const seq = await tx.numberSequence.upsert({
+      where: { key },
+      create: { key, value: 1 },
+      update: { value: { increment: 1 } }
+    });
+    return seq.value;
+  }
+
   private static async generatePaymentNumber(tx: any, isVendorPayment?: boolean): Promise<string> {
     const now = new Date();
     const year = now.getFullYear();
@@ -1706,21 +1725,13 @@ export class FinanceService {
       const monthStr = (now.getMonth() + 1).toString().padStart(2, '0');
       const dateStr = now.getDate().toString().padStart(2, '0');
       const dateKey = `${yearStr}${monthStr}${dateStr}`;
-      
-      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const count = await tx.payment.count({
-        where: {
-          entityType: 'VENDOR',
-          createdAt: { gte: todayStart }
-        }
-      });
-      return `VPAY-${dateKey}-${(count + 1).toString().padStart(4, '0')}`;
+
+      const seq = await this.nextPaymentSequence(tx, `VPAY_${dateKey}`);
+      return `VPAY-${dateKey}-${seq.toString().padStart(4, '0')}`;
     }
 
-    const count = await tx.payment.count({
-      where: { createdAt: { gte: new Date(year, 0, 1) } }
-    });
-    return `PAY-${year}-${(count + 1).toString().padStart(4, '0')}`;
+    const seq = await this.nextPaymentSequence(tx, `PAY_${year}`);
+    return `PAY-${year}-${seq.toString().padStart(4, '0')}`;
   }
 
   static async getTrialBalanceReport(filters: {
