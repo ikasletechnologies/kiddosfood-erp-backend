@@ -54,7 +54,8 @@ export class AccountService {
       
       let lastTransaction: any = null;
       if (lastPayment && (!lastExpense || lastPayment.createdAt > lastExpense.createdAt)) {
-        lastTransaction = { type: 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: 'Payment Received' };
+        const isOutflow = lastPayment.entityType === 'VENDOR';
+        lastTransaction = { type: isOutflow ? 'OUTFLOW' : 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: isOutflow ? 'Payment Made' : 'Payment Received' };
       } else if (lastExpense) {
         lastTransaction = { type: 'OUTFLOW', amount: lastExpense.amount, date: lastExpense.createdAt, note: lastExpense.description || 'Business Expense' };
       }
