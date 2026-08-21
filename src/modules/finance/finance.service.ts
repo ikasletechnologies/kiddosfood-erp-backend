@@ -1164,6 +1164,14 @@ export class FinanceService {
     createdBy?: string;
     invoiceNumber?: string;
   }) {
+    // Order.franchiseId is a required FK — without this check, a caller with
+    // no franchise context (e.g. SUPER_ADMIN with no branch selected) hit a
+    // raw Prisma "Argument `franchise` is missing" error instead of a clear,
+    // actionable message.
+    if (!data.franchiseId) {
+      throw new Error('A branch/franchise must be selected to create this invoice.');
+    }
+
     return prisma.$transaction(async (tx) => {
       let subTotal = 0;
       let totalDiscount = data.discountAmount || 0;
@@ -1206,10 +1214,13 @@ export class FinanceService {
 
       const totalAmount = subTotal + totalTax - totalDiscount;
       const year = new Date().getFullYear();
-      const orderCount = await tx.order.count({
-        where: { createdAt: { gte: new Date(year, 0, 1) } }
-      });
-      const invoiceNum = data.invoiceNumber || `INV-${year}-${(orderCount + 1).toString().padStart(4, '0')}`;
+      // Atomic sequence (same NumberSequence pattern as payment/GRN numbers)
+      // instead of COUNT()-based generation, which two invoices saved in the
+      // same window could both read before either commits and land on the
+      // identical number — Order.invoiceNum is DB-unique, so that used to
+      // fail the second save outright rather than silently duplicate it.
+      const seq = await this.nextPaymentSequence(tx, `INV_${year}`);
+      const invoiceNum = data.invoiceNumber || `INV-${year}-${seq.toString().padStart(4, '0')}`;
 
       const received = data.receivedAmount || 0;
       let paymentStatus = 'UNPAID';
