@@ -17,6 +17,18 @@ export class RecipeService {
     items: { inventoryItemId: string, quantityRequired: number, unit: string }[]
   }) {
     return prisma.$transaction(async (tx) => {
+      // Validate items before saving to prevent DB constraint errors
+      if (data.items && data.items.length > 0) {
+        for (const item of data.items) {
+          if (!item.inventoryItemId) {
+            throw new Error("Cannot save recipe: One or more ingredients are missing a selected material.");
+          }
+          if (!item.quantityRequired || Number(item.quantityRequired) <= 0) {
+            throw new Error("Cannot save recipe: One or more ingredients have an invalid quantity.");
+          }
+        }
+      }
+
       let recipeId = data.id;
 
       // Recipe.productId is unique (one recipe per product) — check first
