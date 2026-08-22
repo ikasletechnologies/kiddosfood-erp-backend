@@ -934,5 +934,119 @@ export class FinanceController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getSalePurchaseByItemReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getSalePurchaseByItemData(franchiseId, startDate as string, endDate as string);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getStockSummaryByItemReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const report = await FinanceService.getStockSummaryByItemData(franchiseId);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getProductionReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getProductionReportData(franchiseId, startDate as string, endDate as string);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getInventoryLedgerReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { itemId, startDate, endDate } = req.query;
+      const report = await FinanceService.getInventoryLedgerReportData(franchiseId, itemId as string, startDate as string, endDate as string);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getExpenseCategoryReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getExpenseCategoryReportData(franchiseId, startDate as string, endDate as string);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getExpenseItemReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate, category } = req.query;
+      const report = await FinanceService.getExpenseItemReportData(franchiseId, startDate as string, endDate as string, category as string);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getSaleOrdersReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate, status } = req.query;
+      const report = await FinanceService.getSaleOrdersReportData({ franchiseId, startDate: startDate as string, endDate: endDate as string, status: status as string });
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getSaleOrderItemsReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, endDate } = req.query;
+      const report = await FinanceService.getSaleOrderItemsReportData({ franchiseId, startDate: startDate as string, endDate: endDate as string });
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getFranchiseReport(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const report = await FinanceService.getFranchiseReportData(franchiseId);
+      res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }
-//

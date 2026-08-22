@@ -369,6 +369,7 @@ app.get('/api/reports/trial-balance', authenticate, authorizeRole(['FRANCHISE_AD
 app.get('/api/reports/balance-sheet', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getBalanceSheet);
 app.get('/api/reports/account-summary', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getAccountTransactionSummary);
 app.get('/api/reports/bill-wise-profit', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getBillWiseProfit);
+app.get('/api/reports/cash-flow', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getCashFlow);
 app.get('/api/reports/party-statement', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPartyStatement);
 app.get('/api/reports/party-profit-loss', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPartyProfitLoss);
 app.get('/api/reports/party-by-item', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPartyReportByItem);
@@ -376,6 +377,11 @@ app.get('/api/reports/sale-purchase-by-party', authenticate, authorizeRole(['FRA
 app.get('/api/reports/sale-purchase-by-party-group', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByPartyGroup);
 app.get('/api/reports/all-parties', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getAllPartiesReport);
 
+// Root Level Category Reports
+app.get('/api/reports/production', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getProductionReport);
+app.get('/api/reports/inventory', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInventoryValue);
+app.get('/api/reports/inventory-ledger', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInventoryLedgerReport);
+app.get('/api/reports/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getFranchiseReport);
 
 // Item/Stock Reports
 app.get('/api/reports/item-by-party', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getItemByPartyReport);
@@ -385,12 +391,23 @@ app.get('/api/reports/low-stock-summary', authenticate, authorizeRole(['FRANCHIS
 app.get('/api/reports/stock-summary', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getStockSummaryReport);
 app.get('/api/reports/item-discount', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getItemDiscountReport);
 app.get('/api/reports/sale-purchase-by-category', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByCategoryReport);
+app.get('/api/reports/sale-purchase-by-item', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByItemReport);
 app.get('/api/reports/stock-by-category', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getStockByCategoryReport);
+app.get('/api/reports/stock-summary-by-item', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getStockSummaryByItemReport);
 app.get('/api/reports/stock-detail', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getStockDetailReport);
 app.get('/api/reports/item-detail', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getItemDetailReport);
 app.get('/api/reports/bank-statement', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getBankStatement);
 app.get('/api/reports/discount-report', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getDiscountReport);
 
+// Expense Reports
+app.get('/api/reports/expense-category', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getExpenseCategoryReport);
+app.get('/api/reports/expense-item', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getExpenseItemReport);
+
+// Sale Order Reports
+app.get('/api/reports/sale-orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSaleOrdersReport);
+app.get('/api/reports/sale-order-items', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSaleOrderItemsReport);
+
+// Loans
 app.get('/api/reports/loans', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getLoans);
 app.post('/api/reports/loans', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.addLoan);
 app.get('/api/reports/loan-statement', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getLoanStatement);

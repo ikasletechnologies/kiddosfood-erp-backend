@@ -3616,5 +3616,271 @@ export class FinanceService {
 
     return parties.sort((a, b) => a.name.localeCompare(b.name));
   }
+
+  static async getSalePurchaseByItemData(franchiseId: string, startDate?: string, endDate?: string) {
+    const dateFilter: any = {};
+    if (startDate || endDate) {
+      dateFilter.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const [orders, purchases] = await Promise.all([
+      prisma.order.findMany({
+        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        include: { orderItems: { include: { product: true } } }
+      }),
+      prisma.procurementOrder.findMany({
+        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        include: { poItems: { include: { inventoryItem: true } } }
+      })
+    ]);
+
+    const itemMap: Record<string, { itemName: string; category: string; saleQty: number; saleAmount: number; purchaseQty: number; purchaseAmount: number }> = {};
+
+    orders.forEach(o => {
+      o.orderItems.forEach(item => {
+        const name = item.product?.name || 'Unknown Item';
+        const category = item.product?.category || 'General';
+        if (!itemMap[name]) itemMap[name] = { itemName: name, category, saleQty: 0, saleAmount: 0, purchaseQty: 0, purchaseAmount: 0 };
+        itemMap[name].saleQty += item.quantity || 0;
+        itemMap[name].saleAmount += item.totalAmount || 0;
+      });
+    });
+
+    purchases.forEach(p => {
+      p.poItems.forEach(item => {
+        const name = item.inventoryItem?.name || 'Unknown Item';
+        const category = item.inventoryItem?.category || 'Raw Material';
+        if (!itemMap[name]) itemMap[name] = { itemName: name, category, saleQty: 0, saleAmount: 0, purchaseQty: 0, purchaseAmount: 0 };
+        itemMap[name].purchaseQty += item.quantity || 0;
+        itemMap[name].purchaseAmount += item.total || 0;
+      });
+    });
+
+    return Object.values(itemMap).map(r => ({
+      ...r,
+      saleQty: Number(r.saleQty.toFixed(2)),
+      saleAmount: Number(r.saleAmount.toFixed(2)),
+      purchaseQty: Number(r.purchaseQty.toFixed(2)),
+      purchaseAmount: Number(r.purchaseAmount.toFixed(2)),
+      grossMargin: Number((r.saleAmount - r.purchaseAmount).toFixed(2))
+    }));
+  }
+
+  static async getStockSummaryByItemData(franchiseId: string) {
+    const items = await prisma.inventoryItem.findMany({
+      where: { franchiseId, isActive: true },
+      orderBy: { name: 'asc' }
+    });
+
+    return items.map(item => ({
+      id: item.id,
+      name: item.name,
+      sku: item.sku,
+      category: item.category,
+      unit: item.unit,
+      currentStock: item.currentStock || 0,
+      minStockLevel: item.minimumStock || 0,
+      costPrice: item.costPrice || 0,
+      sellingPrice: item.customerPrice || item.basePrice || 0,
+      stockValue: Number(((item.currentStock || 0) * (item.costPrice || 0)).toFixed(2)),
+      status: (item.currentStock || 0) <= (item.minimumStock || 0) ? 'LOW_STOCK' : 'ADEQUATE'
+    }));
+  }
+
+  static async getProductionReportData(franchiseId?: string, startDate?: string, endDate?: string) {
+    const where: any = {};
+    if (franchiseId) where.franchiseId = franchiseId;
+    if (startDate || endDate) {
+      where.producedAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const productions = await prisma.production.findMany({
+      where,
+      include: {
+        recipe: { include: { product: true } },
+        operator: { include: { user: { select: { id: true, fullName: true, email: true } } } }
+      },
+      orderBy: { producedAt: 'desc' }
+    });
+
+    const totalBatches = productions.length;
+    const completedBatches = productions.filter(p => p.status === 'COMPLETED').length;
+    const inProgressBatches = productions.filter(p => p.status === 'IN_PROGRESS' || p.status === 'PENDING').length;
+    const totalYieldQty = productions.reduce((s, p) => s + (p.actualYield || p.quantity || 0), 0);
+
+    return {
+      summary: {
+        totalBatches,
+        completedBatches,
+        inProgressBatches,
+        totalYieldQty: Number(totalYieldQty.toFixed(2))
+      },
+      productions
+    };
+  }
+
+  static async getInventoryLedgerReportData(franchiseId?: string, itemId?: string, startDate?: string, endDate?: string) {
+    const where: any = {};
+    if (franchiseId) {
+      where.item = { franchiseId };
+    }
+    if (itemId) {
+      where.itemId = itemId;
+    }
+    if (startDate || endDate) {
+      where.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {})
+      };
+    }
+
+    const movements = await prisma.stockMovement.findMany({
+      where,
+      include: {
+        item: { select: { id: true, name: true, sku: true, unit: true, category: true } },
+        warehouse: { select: { id: true, name: true } }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 200
+    });
+
+    return movements.map(m => ({
+      id: m.id,
+      date: m.createdAt,
+      itemName: m.item?.name || 'Unknown',
+      sku: m.item?.sku,
+      category: m.item?.category,
+      movementType: m.movementType,
+      quantity: m.quantity,
+      baseQty: m.baseQty,
+      unit: m.item?.unit,
+      referenceType: m.referenceType,
+      referenceId: m.referenceId,
+      note: m.note,
+      warehouseName: m.warehouse?.name || 'Central',
+      performedBy: m.createdBy || 'System'
+    }));
+  }
+
+  static async getExpenseCategoryReportData(franchiseId?: string, startDate?: string, endDate?: string) {
+    const res = await FinanceService.getExpensesReportData(franchiseId, startDate, endDate);
+    return res.categoryBreakdown;
+  }
+
+  static async getExpenseItemReportData(franchiseId?: string, startDate?: string, endDate?: string, category?: string) {
+    const res = await FinanceService.getExpensesReportData(franchiseId, startDate, endDate, category);
+    return res.expenses;
+  }
+
+  static async getSaleOrdersReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string; status?: string }) {
+    const where: any = {};
+    if (filters.franchiseId) where.franchiseId = filters.franchiseId;
+    if (filters.status) where.status = filters.status;
+    if (filters.startDate || filters.endDate) {
+      where.createdAt = {
+        ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
+        ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+      };
+    }
+
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        customer: true,
+        orderItems: { include: { product: true } },
+        payments: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const totalRevenue = orders.reduce((s, o) => s + (o.totalAmount || 0), 0);
+    const totalPaid = orders.reduce((s, o) => s + (o.paymentStatus === 'PAID' ? (o.totalAmount || 0) : o.payments.reduce((ps, p) => ps + p.paidAmount, 0)), 0);
+
+    return {
+      summary: {
+        totalOrders: orders.length,
+        totalRevenue: Number(totalRevenue.toFixed(2)),
+        totalPaid: Number(totalPaid.toFixed(2)),
+        totalPending: Number((totalRevenue - totalPaid).toFixed(2))
+      },
+      orders
+    };
+  }
+
+  static async getSaleOrderItemsReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string }) {
+    const where: any = {};
+    if (filters.franchiseId) where.order = { franchiseId: filters.franchiseId };
+    if (filters.startDate || filters.endDate) {
+      where.order = {
+        ...(where.order || {}),
+        createdAt: {
+          ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
+          ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+        }
+      };
+    }
+
+    const items = await prisma.orderItem.findMany({
+      where,
+      include: {
+        product: true,
+        order: { select: { id: true, invoiceNum: true, createdAt: true, status: true, customer: { select: { name: true } } } }
+      }
+    });
+
+    return items.map(item => ({
+      id: item.id,
+      orderId: item.orderId,
+      orderNumber: item.order?.invoiceNum,
+      orderDate: item.order?.createdAt,
+      orderStatus: item.order?.status,
+      customerName: item.order?.customer?.name || 'Walk-in',
+      productName: item.product?.name || 'Item',
+      productSku: item.product?.sku,
+      quantity: item.quantity,
+      unitPrice: item.price,
+      totalAmount: item.totalAmount || (item.quantity * item.price),
+      totalCost: item.totalCost || 0
+    }));
+  }
+
+  static async getFranchiseReportData(franchiseId?: string) {
+    const franchises = await prisma.franchise.findMany({
+      where: franchiseId ? { id: franchiseId } : undefined,
+      include: {
+        orders: { where: { status: 'COMPLETED' } },
+        expenses: { where: { isCancelled: false } },
+        users: { select: { id: true } }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    return franchises.map(f => {
+      const totalSales = f.orders.reduce((s, o) => s + (o.totalAmount || 0), 0);
+      const totalExpenses = f.expenses.reduce((s, e) => s + (e.amount || 0), 0);
+
+      return {
+        id: f.id,
+        name: f.name,
+        location: f.location,
+        ownerName: f.ownerName,
+        contactNum: f.contactNum,
+        status: f.status,
+        totalSales: Number(totalSales.toFixed(2)),
+        totalExpenses: Number(totalExpenses.toFixed(2)),
+        creditLimit: f.creditLimit || 0,
+        outstandingAmount: f.outstandingAmount || 0,
+        walletBalance: f.walletBalance || 0,
+        ordersCount: f.orders.length,
+        usersCount: f.users.length
+      };
+    });
+  }
 }
 
