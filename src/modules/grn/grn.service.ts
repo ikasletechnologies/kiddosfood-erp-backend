@@ -235,7 +235,8 @@ export class GRNService {
               sgst: commercials.sgst,
               igst: commercials.igst,
               warehouseId: commercials.warehouseId,
-              status: 'PENDING'
+              status: 'PENDING',
+              billDate: new Date()
             }
           });
 

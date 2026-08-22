@@ -101,6 +101,7 @@ export class VendorInvoiceService {
     invoiceNumber?: string;
     amount: number;
     items?: any[];
+    billDate?: string;
   }) {
     return prisma.$transaction(async (tx) => {
       let actualPoId = data.poId;
@@ -172,6 +173,7 @@ export class VendorInvoiceService {
               sgst: commercials?.sgst,
               igst: commercials?.igst,
               warehouseId: commercials?.warehouseId,
+              billDate: data.billDate ? new Date(data.billDate) : undefined,
             }
           });
           invoiceId = targetInvoice.id;
@@ -192,7 +194,8 @@ export class VendorInvoiceService {
             sgst: commercials?.sgst,
             igst: commercials?.igst,
             warehouseId: commercials?.warehouseId,
-            status: 'PENDING'
+            status: 'PENDING',
+            billDate: data.billDate ? new Date(data.billDate) : new Date()
           }
         });
         invoiceId = created.id;

@@ -487,6 +487,7 @@ model VendorInvoice {
   amount           Float
   status           InvoiceStatus    @default(PENDING)
   createdAt        DateTime         @default(now())
+  billDate         DateTime?
   // Tax/commercial breakdown — `amount` was historically the only figure
   // stored (always gross-or-whatever-the-caller-sent, with no way to tell
   // which), which is how GST silently vanished when a bill was generated
