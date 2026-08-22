@@ -939,7 +939,8 @@ export class ProcurementService {
       include: { 
         vendor: true, 
         poItems: { include: { inventoryItem: true } }, 
-        goodsReceipts: { include: { items: true } } 
+        goodsReceipts: { include: { items: true } },
+        warehouse: true
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -979,7 +980,12 @@ export class ProcurementService {
   static async getPurchaseOrderById(id: string) {
     return prisma.procurementOrder.findUnique({
       where: { id },
-      include: { vendor: true, poItems: { include: { inventoryItem: true } }, goodsReceipts: true }
+      include: { 
+        vendor: true, 
+        poItems: { include: { inventoryItem: true } }, 
+        goodsReceipts: { include: { items: true } },
+        warehouse: true
+      }
     });
   }
 

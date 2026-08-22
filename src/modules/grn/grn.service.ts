@@ -155,28 +155,55 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
-        // 1. Create Inventory Batch (Initially held in QC_HOLD, pending inspection).
-        // Tagged with the purchase bill number, not a generic lot code — the
-        // vendor's own batch/lot reference (if they gave one) still wins when present.
+        const batchRef = item.lotNumber || item.vendorBatchNo || billNumber;
+
+        // 1. Create Inventory Batch (APPROVED status directly to update stock)
         await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
-            batchNumber: item.vendorBatchNo || billNumber,
+            batchNumber: batchRef,
             lotNumber: item.lotNumber,
             mfgDate: item.mfgDate,
             expDate: item.expDate,
             initialQty: item.acceptedQty,
-            currentQty: item.acceptedQty, // Under QC inspection, not usable yet
+            currentQty: item.acceptedQty,
             unitCost: item.price,
             warehouseId: item.warehouseId || null,
-            status: 'QC_HOLD'
+            status: 'APPROVED'
           }
         });
 
-        // 2. Mark GRN Item as PENDING QC
+        // 2. Mark GRN Item as APPROVED
         await tx.goodsReceiptItem.update({
           where: { id: item.id },
-          data: { qcStatus: 'PENDING' }
+          data: { qcStatus: 'APPROVED' }
+        });
+
+        // 3. Record stock movement and cost price update immediately
+        const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
+        const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
+        const priorQty = Math.max(0, preReceiptStock);
+        const priorCost = invItemBefore?.costPrice || 0;
+        const newCostPrice = priorQty + item.acceptedQty > 0
+          ? ((priorQty * priorCost) + (item.acceptedQty * item.price)) / (priorQty + item.acceptedQty)
+          : item.price;
+
+        await tx.inventoryItem.update({
+          where: { id: item.materialId! },
+          data: { 
+            vendorId: grn.procurementOrder.vendorId, 
+            costPrice: newCostPrice 
+          }
+        });
+
+        await InventoryService.recordMovement(tx, {
+          itemId: item.materialId!,
+          type: 'PURCHASE_IN',
+          quantity: item.acceptedQty,
+          referenceType: 'GOODS_RECEIPT',
+          referenceId: grnId,
+          warehouseId: item.warehouseId || undefined,
+          note: `GRN Approved & Synced: ${item.acceptedQty} ${item.materialId}`
         });
       }
 

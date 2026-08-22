@@ -38,6 +38,11 @@ export class SettingsService {
    */
   static async updateCompanyProfile(data: any) {
     const value = JSON.stringify(data);
-    return this.setSetting('COMPANY_PROFILE', value, 'GENERAL', 'Enterprise Company Identity Data');
+    const setting = await this.setSetting('COMPANY_PROFILE', value, 'GENERAL', 'Enterprise Company Identity Data');
+    try {
+      return JSON.parse(setting.value);
+    } catch {
+      return data;
+    }
   }
 }
