@@ -24,7 +24,8 @@ export class UserController {
 
   static async create(req: Request, res: Response) {
     try {
-      const user = await UserService.create(req.body);
+      const actingUserId = (req as any).user?.userId;
+      const user = await UserService.create(req.body, actingUserId);
       res.status(201).json(user);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
@@ -33,7 +34,8 @@ export class UserController {
 
   static async update(req: Request, res: Response) {
     try {
-      const user = await UserService.update(req.params.id, req.body);
+      const actingUserId = (req as any).user?.userId;
+      const user = await UserService.update(req.params.id, req.body, actingUserId);
       res.json(user);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
@@ -110,7 +112,8 @@ export class UserController {
 
   static async delete(req: Request, res: Response) {
     try {
-      await UserService.delete(req.params.id);
+      const actingUserId = (req as any).user?.userId;
+      await UserService.delete(req.params.id, actingUserId);
       res.json({ message: 'User deleted successfully' });
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

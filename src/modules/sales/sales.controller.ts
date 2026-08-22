@@ -115,10 +115,14 @@ export class SalesController {
 
   static async getReturnOrders(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const franchiseId = user.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string | undefined)
+        : user.franchiseId;
       const returns = await SalesService.getReturnOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        franchiseId: req.query.franchiseId as string,
+        franchiseId,
         source: req.query.source as any,
         search: req.query.search as string
       });

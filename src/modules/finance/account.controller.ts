@@ -16,6 +16,18 @@ export class AccountController {
     }
   }
 
+  static async getById(req: Request, res: Response) {
+    try {
+      const account = await AccountService.getAccountById(req.params.id);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      res.json(account);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;

@@ -42,7 +42,9 @@ export class AccountService {
       where: franchiseId ? { franchiseId } : { franchiseId: null },
       orderBy: { name: 'asc' },
       include: {
-        payments: { orderBy: { createdAt: 'desc' }, take: 1 },
+        // Only posted, non-cancelled payments count as "activity" — same
+        // convention as the Day Book / All Transactions reports.
+        payments: { where: { status: 'PAID', isCancelled: false }, orderBy: { createdAt: 'desc' }, take: 1 },
         expenses: { orderBy: { createdAt: 'desc' }, take: 1 }
       }
     });
@@ -51,10 +53,19 @@ export class AccountService {
     return accounts.map(acc => {
       const lastPayment = acc.payments[0];
       const lastExpense = acc.expenses[0];
-      
+
       let lastTransaction: any = null;
       if (lastPayment && (!lastExpense || lastPayment.createdAt > lastExpense.createdAt)) {
-        lastTransaction = { type: 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: 'Payment Received' };
+        // Same outflow classification as Cash Flow / Day Book — a Payment
+        // row covers BOTH money in and money out, so it can't be labeled
+        // "Payment Received" unconditionally.
+        const isOutflow = lastPayment.entityType === 'VENDOR' || lastPayment.sourceModule === 'EXPENSE' || lastPayment.type === 'INTERNAL_TRANSFER';
+        const note = !isOutflow
+          ? 'Payment Received'
+          : lastPayment.sourceModule === 'EXPENSE'
+            ? 'Expense Paid'
+            : 'Payment Made';
+        lastTransaction = { type: isOutflow ? 'OUTFLOW' : 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note };
       } else if (lastExpense) {
         lastTransaction = { type: 'OUTFLOW', amount: lastExpense.amount, date: lastExpense.createdAt, note: lastExpense.description || 'Business Expense' };
       }
@@ -63,17 +74,28 @@ export class AccountService {
     });
   }
 
+  // Above this, an opening balance is almost certainly a typo (extra zeros,
+  // a pasted value) rather than a real business figure — nothing in this
+  // codebase validated `balance` before, which is how one account ended up
+  // with a ~2e16 opening balance that then propagated into every summary card.
+  static readonly MAX_ACCOUNT_BALANCE = 1_000_000_000_000; // ₹1 trillion
+
   static async createAccount(data: { name: string, type: 'CASH' | 'BANK' | 'UPI', balance?: number, franchiseId?: string }) {
     // 1. Prevent duplicate accounts
     const existing = await prisma.account.findFirst({
-      where: { 
+      where: {
         name: { equals: data.name, mode: 'insensitive' },
-        franchiseId: data.franchiseId || null 
+        franchiseId: data.franchiseId || null
       }
     });
 
     if (existing) {
       throw new Error(`An account named "${data.name}" already exists.`);
+    }
+
+    const balance = data.balance || 0;
+    if (!Number.isFinite(balance) || Math.abs(balance) > this.MAX_ACCOUNT_BALANCE) {
+      throw new Error(`Opening balance ₹${balance.toLocaleString('en-IN')} is out of range. Please check the value (max ₹${this.MAX_ACCOUNT_BALANCE.toLocaleString('en-IN')}).`);
     }
 
     // 2. Generate ERP account code
@@ -84,7 +106,7 @@ export class AccountService {
       data: {
         name: data.name,
         type: data.type as any,
-        balance: data.balance || 0,
+        balance,
         accountCode,
         status: 'ACTIVE',
         franchiseId: data.franchiseId || null

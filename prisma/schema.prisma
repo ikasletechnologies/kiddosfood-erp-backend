@@ -18,10 +18,71 @@ model User {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   role          UserRole       @default(FRANCHISE_ADMIN)
+  customRoleId  String?
   activityLogs  ActivityLog[]
   employee      Employee?
   refreshTokens RefreshToken[]
   franchise     Franchise?     @relation(fields: [franchiseId], references: [id])
+  customRole    Role?          @relation(fields: [customRoleId], references: [id])
+}
+
+model Role {
+  id          String           @id @default(uuid())
+  name        String           @unique
+  description String?
+  isSystem    Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  permissions RolePermission[]
+  users       User[]
+}
+
+model Permission {
+  id     String           @id @default(uuid())
+  key    String           @unique
+  module String
+  action String
+  label  String
+  roles  RolePermission[]
+}
+
+model RolePermission {
+  id           String     @id @default(uuid())
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+}
+
+model WorkflowRequest {
+  id            String            @id @default(uuid())
+  displayId     String            @unique
+  category      WorkflowCategory
+  title         String
+  amount        Float?
+  currentStage  String
+  initiatedBy   String
+  franchiseId   String?
+  dateInitiated DateTime          @default(now())
+  details       Json              @default("{}")
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  history       WorkflowHistory[]
+  franchise     Franchise?        @relation(fields: [franchiseId], references: [id])
+}
+
+model WorkflowHistory {
+  id         String          @id @default(uuid())
+  requestId  String
+  stage      String
+  timestamp  DateTime        @default(now())
+  userId     String?
+  userLabel  String
+  notes      String?
+  isOverride Boolean         @default(false)
+  request    WorkflowRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
 }
 
 model Customer {
@@ -127,6 +188,7 @@ model Franchise {
   outgoingTransfers  StockTransfer[]    @relation("OutgoingTransfers")
   incomingTransfers  StockTransfer[]    @relation("IncomingTransfers")
   users              User[]
+  workflowRequests   WorkflowRequest[]
   cheques            Cheque[]
   accounts           Account[]
   procurementOrders  ProcurementOrder[]
@@ -1391,7 +1453,7 @@ model PurchaseReturnItem {
 
 model ActivityLog {
   id                String     @id @default(uuid())
-  userId            String
+  userId            String?
   targetFranchiseId String?
   action            String
   entityType        String?
@@ -1399,7 +1461,7 @@ model ActivityLog {
   details           Json?
   createdAt         DateTime   @default(now())
   franchise         Franchise? @relation(fields: [targetFranchiseId], references: [id])
-  user              User       @relation(fields: [userId], references: [id])
+  user              User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
 }
 
 model FranchiseRequest {
@@ -1603,6 +1665,12 @@ model SystemSetting {
 enum UserRole {
   SUPER_ADMIN
   FRANCHISE_ADMIN
+}
+
+enum WorkflowCategory {
+  PURCHASE
+  PRODUCTION
+  EXPENSE
 }
 
 enum PartnerType {

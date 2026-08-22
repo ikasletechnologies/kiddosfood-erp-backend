@@ -11,6 +11,8 @@ export interface TokenPayload {
   role: string;
   franchiseId?: string | null;
   branchId?: string | null;
+  customRoleId?: string | null;
+  customRoleName?: string | null;
   permissions?: string[];
 }
 

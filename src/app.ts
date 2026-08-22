@@ -44,6 +44,9 @@ import { PurchaseRequestController } from './modules/purchase-requests/purchase-
 import DealerRoutes from './modules/dealers';
 import BusinessPartnerRoutes from './modules/business-partners';
 import { DraftsController } from './modules/drafts/drafts.controller';
+import { RolesController } from './modules/roles/roles.controller';
+import { PermissionsController } from './modules/permissions/permissions.controller';
+import { WorkflowApprovalsController } from './modules/workflow-approvals/workflow-approvals.controller';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -195,6 +198,20 @@ app.post('/api/users', authenticate, authorizeRole(['SUPER_ADMIN']), UserControl
 app.patch('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.update);
 app.delete('/api/users/:id', authenticate, authorizeRole(['SUPER_ADMIN']), UserController.delete);
 
+// Roles & Permissions (RBAC)
+app.get('/api/roles', authenticate, authorizeRole(['SUPER_ADMIN']), RolesController.getAll);
+app.get('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RolesController.getOne);
+app.post('/api/roles', authenticate, authorizeRole(['SUPER_ADMIN']), RolesController.create);
+app.patch('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RolesController.update);
+app.delete('/api/roles/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RolesController.delete);
+app.get('/api/permissions', authenticate, authorizeRole(['SUPER_ADMIN']), PermissionsController.getAll);
+
+// Approval Workflows (Purchase / Production / Expense gatekeeper flows)
+app.get('/api/workflow-approvals', authenticate, WorkflowApprovalsController.getAll);
+app.get('/api/workflow-approvals/:id', authenticate, WorkflowApprovalsController.getOne);
+app.post('/api/workflow-approvals', authenticate, authorizeRole(['SUPER_ADMIN']), WorkflowApprovalsController.create);
+app.post('/api/workflow-approvals/:id/approve', authenticate, WorkflowApprovalsController.approve);
+
 // Other Business Modules
 // Inventory & Stock Management
 app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getInventory);
@@ -334,6 +351,7 @@ app.get('/api/accounting/ledger-summary', authenticate, authorizeRole(['FRANCHIS
 
 // Accounts management
 app.get('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.getAll);
+app.get('/api/accounts/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.getById);
 app.post('/api/accounts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.create);
 app.delete('/api/accounts/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), AccountController.delete);
 

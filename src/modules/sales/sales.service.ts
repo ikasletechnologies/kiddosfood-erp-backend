@@ -20,6 +20,18 @@ async function generateReturnNumber() {
   return `SR${(count + 1).toString().padStart(10, '0')}`;
 }
 
+// A quotation/order always stores customerId + a denormalized customerName
+// snapshot, but callers that select a real party only ever send customerId —
+// without this, customerName is saved as null and every later screen that
+// reads it (list, convert modal, the converted Sales Order) shows "—" even
+// though the party is correctly linked via customerId.
+async function resolveCustomerName(customerId?: string, customerName?: string): Promise<string | undefined> {
+  if (customerName) return customerName;
+  if (!customerId) return undefined;
+  const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: { name: true } });
+  return customer?.name;
+}
+
 function calculateTotals<T extends { quantity: number; rate: number; taxPercent?: number }>(items: T[]) {
   let subTotal = 0;
   let taxAmount = 0;
@@ -101,12 +113,13 @@ export class SalesService {
   }) {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const customerName = await resolveCustomerName(data.customerId, data.customerName);
 
     return prisma.quotation.create({
       data: {
         quotationNumber: data.quotationNumber || await generateQuotationNumber(),
         customerId: data.customerId,
-        customerName: data.customerName,
+        customerName,
         customerPhone: data.customerPhone,
         customerEmail: data.customerEmail,
         validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
@@ -152,7 +165,7 @@ export class SalesService {
   }) {
     const updateData: any = {
       customerId: data.customerId,
-      customerName: data.customerName,
+      customerName: await resolveCustomerName(data.customerId, data.customerName),
       customerPhone: data.customerPhone,
       customerEmail: data.customerEmail,
       status: data.status as any,
@@ -230,7 +243,7 @@ export class SalesService {
   ) {
     const quotation = await prisma.quotation.findUnique({
       where: { id: quotationId },
-      include: { items: true }
+      include: { items: true, customer: true }
     });
     if (!quotation) throw new Error('Quotation not found');
 
@@ -239,7 +252,7 @@ export class SalesService {
         orderNumber: await generateSalesOrderNumber(),
         quotationId,
         customerId: quotation.customerId,
-        customerName: quotation.customerName,
+        customerName: quotation.customerName || quotation.customer?.name,
         subTotal: quotation.subTotal,
         taxAmount: quotation.taxAmount,
         discountAmount: quotation.discountAmount,

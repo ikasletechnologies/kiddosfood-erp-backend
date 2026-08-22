@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
+import { ItemCategory } from '@prisma/client';
 
 export class FinanceService {
   /**
@@ -69,44 +70,14 @@ export class FinanceService {
   }
 
   /**
-   * Comprehensive Financial Reports
+   * Comprehensive Financial Reports (Reports → Profit & Loss)
+   * Delegates to getProfitAndLoss so both this and the `detailed=true`
+   * endpoint variant return the same fully-populated shape (revenue, cogs,
+   * purchase, tax, grossProfit, expenses, netProfit) instead of the two
+   * diverging, partially-empty objects this used to compute separately.
    */
   static async getFinancialReport(filters: { franchiseId?: string; startDate?: Date; endDate?: Date }) {
-    const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
-    };
-
-    // 1. Total Sales (from Invoices linked to Orders in specific branch)
-    const sales = await prisma.invoice.aggregate({
-      where: {
-        status: 'PAID',
-        ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
-        order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined
-      },
-      _sum: { finalAmount: true }
-    });
-
-    // 2. Total Expenses
-    const expenses = await prisma.expense.aggregate({
-      where: {
-        ...(filters.startDate || filters.endDate ? { date: dateQuery } : {}),
-        franchiseId: filters.franchiseId
-      },
-      _sum: { amount: true }
-    });
-
-    const totalSales = sales._sum.finalAmount || 0;
-    const totalExpenses = expenses._sum.amount || 0;
-
-    return {
-      revenue: totalSales,
-      expenses: totalExpenses,
-      netProfit: totalSales - totalExpenses,
-      generatedAt: new Date()
-    };
+    return this.getProfitAndLoss(filters);
   }
 
   /**
@@ -138,10 +109,12 @@ export class FinanceService {
 
     let totalRevenue = 0;
     let totalCOGS = 0;
+    let totalOutputTax = 0;
 
     for (const inv of sales) {
       if (!inv.order) continue;
       totalRevenue += inv.finalAmount;
+      totalOutputTax += inv.taxAmount || 0;
       for (const item of inv.order.orderItems) {
         // `totalCost` is captured at sale time (see pos.service.ts) from the
         // actual FIFO lot(s)/production batch this line drew from — the real
@@ -173,11 +146,29 @@ export class FinanceService {
       }
     }
 
-    // 2. Expenses
+    // 2. Purchases — posted (non-cancelled) procurement, plus the input tax
+    // booked against those POs. Same aggregate pattern as getTrialBalance/
+    // getBalanceSheetReport, so all three reports agree on what "Purchase" means.
+    const purchaseAggregate = await prisma.procurementOrder.aggregate({
+      where: {
+        franchiseId: filters.franchiseId,
+        status: { not: 'CANCELLED' },
+        createdAt: {
+          ...(filters.startDate ? { gte: filters.startDate } : {}),
+          ...(filters.endDate ? { lte: filters.endDate } : {})
+        }
+      },
+      _sum: { totalAmount: true, cgst: true, sgst: true, igst: true }
+    });
+    const totalPurchases = purchaseAggregate._sum.totalAmount || 0;
+    const totalInputTax = (purchaseAggregate._sum.cgst || 0) + (purchaseAggregate._sum.sgst || 0) + (purchaseAggregate._sum.igst || 0);
+
+    // 3. Expenses
     const expenses = await prisma.expense.aggregate({
       where: {
         ...(filters.startDate || filters.endDate ? { date: dateQuery } : {}),
-        franchiseId: filters.franchiseId
+        franchiseId: filters.franchiseId,
+        isCancelled: false
       },
       _sum: { amount: true }
     });
@@ -188,6 +179,10 @@ export class FinanceService {
     return {
       revenue: totalRevenue,
       cogs: totalCOGS,
+      purchase: totalPurchases,
+      taxPayable: totalOutputTax,
+      taxReceivable: totalInputTax,
+      tax: totalOutputTax,
       grossProfit: grossProfit,
       expenses: totalExpenses,
       netProfit: grossProfit - totalExpenses,
@@ -1442,12 +1437,17 @@ export class FinanceService {
     endDate?: Date;
     vendorId?: string;
     status?: string;
+    search?: string;
     page?: number;
     limit?: number;
   }) {
     const page = Math.max(1, Number(filters.page) || 1);
-    const limit = Math.max(1, Math.min(100, Number(filters.limit) || 50));
-    const skip = (page - 1) * limit;
+    // A search hits the full matching set regardless of page size, so it
+    // isn't limited to whatever page happened to load first.
+    const limit = filters.search
+      ? 100
+      : Math.max(1, Math.min(100, Number(filters.limit) || 50));
+    const skip = filters.search ? 0 : (page - 1) * limit;
 
     const dateQuery = {
       ...(filters.startDate || filters.endDate ? {
@@ -1460,7 +1460,13 @@ export class FinanceService {
       ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
       ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
       ...(filters.vendorId ? { vendorId: filters.vendorId } : {}),
-      ...(filters.status ? { status: filters.status as any } : {})
+      ...(filters.status ? { status: filters.status as any } : {}),
+      ...(filters.search ? {
+        OR: [
+          { poNumber: { contains: filters.search, mode: 'insensitive' } },
+          { vendor: { name: { contains: filters.search, mode: 'insensitive' } } }
+        ]
+      } : {})
     };
 
     const [totalCount, pos] = await Promise.all([
@@ -1515,6 +1521,35 @@ export class FinanceService {
     };
   }
 
+  /**
+   * Payment has no franchiseId column of its own — it's derived via the
+   * (optional, to-one) account/order relations. A plain nested-relation OR
+   * filter silently drops any Payment whose accountId AND orderId are both
+   * null (most vendor/expense/manual payments, since createPayment doesn't
+   * always resolve an account tied to the caller's franchise), which is why
+   * Day Book / All Transactions were coming back empty even with real posted
+   * payments in the DB. When franchiseId is unscoped (SUPER_ADMIN), skip the
+   * filter entirely instead of building a no-op relation-existence check.
+   */
+  private static paymentFranchiseWhere(franchiseId?: string): any {
+    if (!franchiseId) return {};
+    return {
+      OR: [
+        { account: { franchiseId } },
+        { order: { franchiseId } },
+        { AND: [{ accountId: null }, { orderId: null }] }
+      ]
+    };
+  }
+
+  private static readonly PAYMENT_OUTFLOW_FILTER = {
+    OR: [
+      { entityType: 'VENDOR' },
+      { sourceModule: 'EXPENSE' },
+      { type: 'INTERNAL_TRANSFER' }
+    ]
+  };
+
   static async getDayBookReport(filters: {
     franchiseId?: string;
     startDate?: Date;
@@ -1524,14 +1559,14 @@ export class FinanceService {
     page?: number;
     limit?: number;
   }) {
+    const franchiseWhere = this.paymentFranchiseWhere(filters.franchiseId);
+
     let openingBalance = 0;
     if (filters.startDate) {
       const preInflows = await prisma.payment.aggregate({
         where: {
-          OR: [
-            { account: { franchiseId: filters.franchiseId } },
-            { order: { franchiseId: filters.franchiseId } }
-          ],
+          ...franchiseWhere,
+          NOT: this.PAYMENT_OUTFLOW_FILTER,
           createdAt: { lt: filters.startDate },
           status: 'PAID',
           isCancelled: false
@@ -1541,21 +1576,7 @@ export class FinanceService {
 
       const preOutflows = await prisma.payment.aggregate({
         where: {
-          AND: [
-            {
-              OR: [
-                { account: { franchiseId: filters.franchiseId } },
-                { order: { franchiseId: filters.franchiseId } }
-              ]
-            },
-            {
-              OR: [
-                { entityType: 'VENDOR' },
-                { sourceModule: 'EXPENSE' },
-                { type: 'INTERNAL_TRANSFER' }
-              ]
-            }
-          ],
+          AND: [franchiseWhere, this.PAYMENT_OUTFLOW_FILTER],
           createdAt: { lt: filters.startDate },
           status: 'PAID',
           isCancelled: false
@@ -1580,16 +1601,15 @@ export class FinanceService {
     };
 
     const whereClause: any = {
-      OR: [
-        { account: { franchiseId: filters.franchiseId } },
-        { order: { franchiseId: filters.franchiseId } }
-      ],
+      ...franchiseWhere,
+      status: 'PAID',
+      isCancelled: false,
       ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
       ...(filters.paymentMode ? { paymentMode: filters.paymentMode as any } : {}),
       ...(filters.voucherType ? { sourceModule: filters.voucherType as any } : {})
     };
 
-    const [totalCount, payments] = await Promise.all([
+    const [totalCount, payments, rangeInAgg, rangeOutAgg] = await Promise.all([
       prisma.payment.count({ where: whereClause }),
       prisma.payment.findMany({
         where: whereClause,
@@ -1602,7 +1622,9 @@ export class FinanceService {
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit
-      })
+      }),
+      prisma.payment.aggregate({ where: { ...whereClause, NOT: this.PAYMENT_OUTFLOW_FILTER }, _sum: { paidAmount: true } }),
+      prisma.payment.aggregate({ where: { AND: [whereClause, this.PAYMENT_OUTFLOW_FILTER] }, _sum: { paidAmount: true } })
     ]);
 
     const data = payments.map(p => {
@@ -1622,13 +1644,18 @@ export class FinanceService {
       };
     });
 
-    const rangeInflows = data.filter(e => e.type === 'DEBIT' && !e.isCancelled).reduce((s, e) => s + e.amount, 0);
-    const rangeOutflows = data.filter(e => e.type === 'CREDIT' && !e.isCancelled).reduce((s, e) => s + e.amount, 0);
+    // Sourced from full-range aggregates (not the paginated `data` slice above)
+    // so the totals/closing balance stay correct once a period has more rows
+    // than one page.
+    const rangeInflows = rangeInAgg._sum.paidAmount || 0;
+    const rangeOutflows = rangeOutAgg._sum.paidAmount || 0;
 
     return {
       data,
       openingBalance,
       closingBalance: openingBalance + rangeInflows - rangeOutflows,
+      totalDebit: rangeInflows,
+      totalCredit: rangeOutflows,
       pagination: {
         page,
         limit,
@@ -1659,12 +1686,10 @@ export class FinanceService {
     };
 
     const whereClause: any = {
-      OR: [
-        { account: { franchiseId: filters.franchiseId } },
-        { order: { franchiseId: filters.franchiseId } }
-      ],
+      ...this.paymentFranchiseWhere(filters.franchiseId),
+      isCancelled: false,
       ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
-      ...(filters.status ? { status: filters.status } : {})
+      ...(filters.status ? { status: filters.status } : { status: 'PAID' })
     };
 
     if (filters.type) {
@@ -1672,14 +1697,16 @@ export class FinanceService {
       whereClause.entityType = isDebit ? { not: 'VENDOR' } : 'VENDOR';
     }
 
-    const [totalCount, payments] = await Promise.all([
+    const [totalCount, payments, inAgg, outAgg] = await Promise.all([
       prisma.payment.count({ where: whereClause }),
       prisma.payment.findMany({
         where: whereClause,
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit
-      })
+      }),
+      prisma.payment.aggregate({ where: { ...whereClause, NOT: this.PAYMENT_OUTFLOW_FILTER }, _sum: { paidAmount: true } }),
+      prisma.payment.aggregate({ where: { AND: [whereClause, this.PAYMENT_OUTFLOW_FILTER] }, _sum: { paidAmount: true } })
     ]);
 
     const data = payments.map(p => {
@@ -1700,6 +1727,8 @@ export class FinanceService {
 
     return {
       data,
+      totalDebit: inAgg._sum.paidAmount || 0,
+      totalCredit: outAgg._sum.paidAmount || 0,
       pagination: {
         page,
         limit,
@@ -2688,9 +2717,26 @@ export class FinanceService {
 
   // ─── Item / Stock Reports ───────────────────────────────────────────────────
 
-  static async getStockSummaryData(franchiseId: string) {
+  static async getStockSummaryData(
+    franchiseId: string,
+    filters?: { category?: string; startDate?: Date; endDate?: Date }
+  ) {
+    const { category, startDate, endDate } = filters || {};
+    const inclusiveEndDate = endDate ? new Date(endDate) : undefined;
+    if (inclusiveEndDate) inclusiveEndDate.setHours(23, 59, 59, 999);
+
     const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
+      where: {
+        franchiseId,
+        isActive: true,
+        ...(category && category !== 'ALL' ? { category: category as ItemCategory } : {}),
+        ...(startDate || inclusiveEndDate ? {
+          createdAt: {
+            ...(startDate ? { gte: startDate } : {}),
+            ...(inclusiveEndDate ? { lte: inclusiveEndDate } : {})
+          }
+        } : {})
+      },
       orderBy: { name: 'asc' }
     });
 

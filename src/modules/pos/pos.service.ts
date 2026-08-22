@@ -119,23 +119,33 @@ export class POSService {
 
     SocketService.io.emit('order-updated', order);
 
-    // Phase 5: Trigger Accounting (Invoice & Payment) after update succeeds
+    // Phase 5: Trigger Accounting (Invoice & Payment) after update succeeds.
+    // Ledger and invoice creation are posted independently — a walk-in order
+    // has no customerId, so CustomerLedger (which requires one) is skipped
+    // for it, but the Invoice (the record P&L/reports actually read) must
+    // still get created regardless of whether that ledger entry was posted.
     if (status === 'COMPLETED') {
+        if (order.customerId) {
+            try {
+                await prisma.customerLedger.create({
+                  data: {
+                    customerId: order.customerId,
+                    type: 'DEBIT',
+                    amount: order.totalAmount,
+                    paymentMode: 'CASH', // Placeholder until payment
+                    referenceType: 'SALE',
+                    referenceId: order.id,
+                    note: `POS Sale — Invoice #${order.invoiceNum}`
+                  }
+                });
+            } catch (ledgerErr) {
+                console.error('[Accounting] Failed to create customer ledger entry', ledgerErr);
+            }
+        }
         try {
-            await prisma.customerLedger.create({
-              data: {
-                customerId: order.customerId!,
-                type: 'DEBIT',
-                amount: order.totalAmount,
-                paymentMode: 'CASH', // Placeholder until payment
-                referenceType: 'SALE',
-                referenceId: order.id,
-                note: `POS Sale — Invoice #${order.invoiceNum}`
-              }
-            });
             await FinanceService.createInvoiceFromOrder(orderId);
-        } catch (accErr) {
-            console.error('[Accounting] Failed to create invoice/ledger', accErr);
+        } catch (invErr) {
+            console.error('[Accounting] Failed to create invoice', invErr);
         }
     }
 

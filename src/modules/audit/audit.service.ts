@@ -32,11 +32,12 @@ export class AuditService {
   /**
    * Fetch logs for Super Admin review
    */
-  static async getLogs(filters: { 
-    franchiseId?: string; 
-    userId?: string; 
-    action?: string; 
-    startDate?: Date; 
+  static async getLogs(filters: {
+    franchiseId?: string;
+    userId?: string;
+    action?: string;
+    entityType?: string;
+    startDate?: Date;
     endDate?: Date;
     take?: number;
     skip?: number;
@@ -46,6 +47,7 @@ export class AuditService {
         targetFranchiseId: filters.franchiseId,
         userId: filters.userId,
         action: filters.action,
+        entityType: filters.entityType,
         createdAt: {
           gte: filters.startDate,
           lte: filters.endDate

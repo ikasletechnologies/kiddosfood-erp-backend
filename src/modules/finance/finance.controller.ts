@@ -98,7 +98,7 @@ export class FinanceController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
 
-      const { startDate, endDate, vendorId, status, page, limit } = req.query;
+      const { startDate, endDate, vendorId, status, search, page, limit } = req.query;
 
       const report = await FinanceService.getPurchasesReportDetails({
         franchiseId: franchiseId as string,
@@ -106,6 +106,7 @@ export class FinanceController {
         endDate: endDate ? new Date(endDate as string) : undefined,
         vendorId: vendorId as string,
         status: status as string,
+        search: search as string,
         page: page ? Number(page) : undefined,
         limit: limit ? Number(limit) : undefined
       });
@@ -655,8 +656,11 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const category = (req.query.category as string) || undefined;
+      const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
+      const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
 
-      const report = await FinanceService.getStockSummaryData(franchiseId);
+      const report = await FinanceService.getStockSummaryData(franchiseId, { category, startDate, endDate });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
