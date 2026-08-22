@@ -921,6 +921,7 @@ export class FinanceService {
           accountId:      account?.id ?? undefined,
           createdBy:      data.createdBy,
           idempotencyKey: data.idempotencyKey || undefined,
+          createdAt:      data.createdAt ? new Date(data.createdAt) : undefined,
         },
       });
 
@@ -952,7 +953,8 @@ export class FinanceService {
               invoiceId: data.vendorInvoiceId,
               accountId: account?.id,
               paymentMode: resolvedPaymentMode as any,
-              note: data.note || `Payment #${paymentNumber} recorded`
+              note: data.note || `Payment #${paymentNumber} recorded`,
+              createdAt: data.createdAt ? new Date(data.createdAt) : undefined
             }
           });
 

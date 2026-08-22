@@ -218,7 +218,7 @@ export class ProcurementService {
   }
 
   static async getVendorById(id: string) {
-    return prisma.vendor.findUnique({
+    const vendor = await prisma.vendor.findUnique({
       where: { id },
       include: { 
         orders: { 
@@ -227,14 +227,117 @@ export class ProcurementService {
             goodsReceipts: { include: { items: { include: { inventoryItem: true } } } },
             invoices: true
           }, 
-          orderBy: { createdAt: 'desc' }, 
-          take: 20
+          orderBy: { createdAt: 'desc' }
         },
-        suppliedMaterials: { include: { material: true } },
         invoices: true,
+        ledgerEntries: true,
         _count: { select: { orders: true } } 
       }
     });
+
+    if (!vendor) return null;
+
+    const entries = vendor.ledgerEntries || [];
+    
+    // Auto-repair: If openingBalance exists but no ledger entry exists, inject it!
+    const hasOpeningBalanceEntry = entries.some(e => e.referenceType === 'OPENING_BALANCE');
+    if (!hasOpeningBalanceEntry && vendor.openingBalance !== 0) {
+      const type = vendor.openingBalance > 0 ? 'CREDIT' : 'DEBIT';
+      const amount = Math.abs(vendor.openingBalance);
+      const obNumber = await prisma.vendorLedger.count({
+        where: { referenceType: 'OPENING_BALANCE' }
+      }).then(c => `OB-${String(c + 1).padStart(4, '0')}`);
+      
+      const newEntry = await prisma.vendorLedger.create({
+        data: {
+          vendorId: vendor.id,
+          type,
+          amount,
+          balanceAfterTransaction: vendor.openingBalance,
+          referenceType: 'OPENING_BALANCE',
+          referenceId: obNumber,
+          paymentMode: 'CASH',
+          note: 'Vendor Opening Balance',
+          createdAt: vendor.asOfDate ? new Date(vendor.asOfDate) : vendor.createdAt
+        }
+      });
+      entries.push(newEntry);
+    }
+
+    const totalPayments = entries
+      .filter(e => e.type === 'DEBIT' && e.referenceType === 'PAYMENT')
+      .reduce((s, e) => s + (e.amount || 0), 0);
+
+    const totalReturns = entries
+      .filter(e => e.type === 'DEBIT' && e.referenceType === 'RETURN')
+      .reduce((s, e) => s + (e.amount || 0), 0);
+
+    const totalPurchased = entries
+      .filter(e => e.type === 'CREDIT' && e.referenceType === 'PURCHASE')
+      .reduce((s, e) => s + (e.amount || 0), 0);
+    
+    const manualCredits = entries
+      .filter(e => e.type === 'CREDIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'OPENING_BALANCE'))
+      .reduce((s, e) => s + (e.amount || 0), 0);
+    
+    const manualDebits = entries
+      .filter(e => e.type === 'DEBIT' && (e.referenceType === 'ADJUSTMENT' || e.referenceType === 'ADVANCE' || e.referenceType === 'OPENING_BALANCE'))
+      .reduce((s, e) => s + (e.amount || 0), 0);
+
+    const totalOwedByUs = totalPurchased + manualCredits;
+    const totalPaidToThem = totalPayments + totalReturns + manualDebits;
+
+    const balance = entries.reduce((acc, e) => acc + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
+    const rawAdvance = balance < 0 ? -balance : 0;
+    const reservedAdvance = rawAdvance > 0
+      ? (await prisma.procurementOrder.aggregate({
+          where: { vendorId: id, status: { notIn: ['CLOSED', 'CANCELLED'] } },
+          _sum: { advanceApplied: true }
+        }))._sum.advanceApplied || 0
+      : 0;
+
+    const materialMap = new Map<string, { material: any; price: number; lastUpdated: Date }>();
+    const sortedOrders = [...vendor.orders].reverse();
+    for (const order of sortedOrders) {
+      for (const item of order.poItems) {
+        if (item.inventoryItem) {
+          materialMap.set(item.inventoryItemId, {
+            material: item.inventoryItem,
+            price: item.price,
+            lastUpdated: order.createdAt
+          });
+        }
+      }
+      for (const grn of order.goodsReceipts || []) {
+        for (const item of grn.items || []) {
+          if (item.inventoryItem) {
+            materialMap.set(item.inventoryItemId, {
+              material: item.inventoryItem,
+              price: item.price || materialMap.get(item.inventoryItemId)?.price || 0,
+              lastUpdated: grn.createdAt || order.createdAt
+            });
+          }
+        }
+      }
+    }
+
+    const suppliedMaterials = Array.from(materialMap.entries()).map(([mId, data]) => ({
+      id: mId,
+      price: data.price,
+      lastUpdated: data.lastUpdated,
+      material: data.material
+    }));
+
+    return {
+      ...vendor,
+      totalPurchased: totalOwedByUs,
+      totalPaid: totalPaidToThem,
+      totalPayments,
+      balance: balance,
+      due: balance > 0 ? balance : 0,
+      advance: Math.max(0, rawAdvance - reservedAdvance),
+      suppliedMaterials
+    };
   }
 
   static async getVendorFinancials(vendorId: string) {
@@ -1108,9 +1211,9 @@ export class ProcurementService {
   static async recordPayment(vendorId: string, data: {
     amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE';
     paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string;
-    idempotencyKey?: string; allowOverpayment?: boolean;
+    idempotencyKey?: string; allowOverpayment?: boolean; date?: string;
   }) {
-    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef, idempotencyKey, allowOverpayment } = data;
+    const { amount, note, accountId, type = 'PAYMENT', paymentMode, referenceId, vendorInvoiceId, transactionRef, idempotencyKey, allowOverpayment, date } = data;
     const modeMap: Record<string, string> = {
       CASH: 'CASH',
       UPI: 'UPI',
@@ -1192,7 +1295,8 @@ export class ProcurementService {
         createdBy: 'PROCUREMENT_MODULE',
         note: note,
         reference: transactionRef,
-        idempotencyKey
+        idempotencyKey,
+        createdAt: date
       });
 
       // Update PO Payment status if linked (directly, or via the invoice's PO)
