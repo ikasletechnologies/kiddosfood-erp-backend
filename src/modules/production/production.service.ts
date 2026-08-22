@@ -2,6 +2,13 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { ProductionStatus } from '@prisma/client';
 
+// Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
+// as identity (pcs, unit). Anything outside this set — a stray label like
+// "units" left over from before a bulk item's unit tracked the recipe's real
+// yieldUnit — can't be safely converted and must trigger the self-heal below,
+// not fall through to an unconverted 1:1 comparison.
+const RECOGNIZED_PACK_UNITS = ['kg', 'g', 'l', 'ml', 'pcs', 'unit'];
+
 export class ProductionService {
   static async startProduction(data: {
     recipeId: string;
@@ -380,7 +387,7 @@ export class ProductionService {
               franchiseId,
             },
           });
-        } else if (targetItem.unit === 'unit' && finishedGoodUnit !== 'unit') {
+        } else if (!RECOGNIZED_PACK_UNITS.includes(targetItem.unit.toLowerCase()) && RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
           targetItem = await tx.inventoryItem.update({
             where: { id: targetItem.id },
             data: { unit: finishedGoodUnit },
@@ -470,9 +477,9 @@ export class ProductionService {
       // conversion below, not just at creation time in inspectBatch, so a
       // batch that was already QC-approved before that fix shipped needs
       // correcting here too.
-      if (bulkItem.unit === 'unit') {
+      if (!RECOGNIZED_PACK_UNITS.includes(bulkItem.unit.toLowerCase())) {
         const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
-        if (finishedGoodUnit !== 'unit') {
+        if (RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
           bulkItem = await tx.inventoryItem.update({
             where: { id: bulkItem.id },
             data: { unit: finishedGoodUnit },
@@ -484,7 +491,8 @@ export class ProductionService {
       const totalWeightNeeded = data.quantityPackets * unitMultiplier;
 
       if (bulkItem.currentStock < totalWeightNeeded) {
-        throw new Error(`Insufficient bulk stock. Needed: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}`);
+        const shortage = totalWeightNeeded - bulkItem.currentStock;
+        throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
       }
 
       // Cap against this batch's own QC-approved quantity — only approved
@@ -510,10 +518,35 @@ export class ProductionService {
 
       const baseSku = bulkItem.sku.replace(/-BULK$/i, '');
       const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
-      
+
+      // The base product's own name/SKU often already carries the master
+      // pack size (e.g. product "Idly Batter 1 Kg", sku "...-1-KG-1KG") —
+      // naively appending the retail pack size on top produced stacked,
+      // conflicting sizes like "Idly Batter 1 Kg (250g)" / "...-1-KG-1KG-250G".
+      // Strip any trailing weight/volume/count token first so the retail
+      // variant reads as its own size, not the master's size plus the pack's.
+      const cleanBaseName = baseName.replace(/\s+\d+(\.\d+)?\s*(kg|g|l|ml|pcs|units?)\.?$/i, '').trim() || baseName;
+      const stripTrailingSizeSegments = (sku: string): string => {
+        const segments = sku.split('-');
+        const isSizeSegment = (seg: string) =>
+          /^\d+(\.\d+)?$/.test(seg) ||
+          /^(KG|G|L|ML|PCS|UNITS?)$/i.test(seg) ||
+          /^\d+(\.\d+)?(KG|G|L|ML|PCS|UNITS?)$/i.test(seg);
+        while (segments.length > 1 && isSizeSegment(segments[segments.length - 1])) {
+          segments.pop();
+        }
+        return segments.join('-');
+      };
+      const cleanBaseSku = stripTrailingSizeSegments(baseSku) || baseSku;
+
+      const packetSizeMatch = data.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
+      const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : data.packetSize;
       const cleanPacketSize = data.packetSize.toUpperCase().replace(/\s+/g, '');
-      const retailSku = baseSku.includes(cleanPacketSize) ? baseSku : `${baseSku}-${cleanPacketSize}`;
-      const retailName = baseName.includes(data.packetSize) ? baseName : `${baseName} (${data.packetSize})`;
+
+      const retailSku = cleanBaseSku.includes(cleanPacketSize) ? cleanBaseSku : `${cleanBaseSku}-${cleanPacketSize}`;
+      const retailName = cleanBaseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
+        ? cleanBaseName
+        : `${cleanBaseName} ${formattedPacketSize}`;
       
       let retailItem = await tx.inventoryItem.findFirst({
         where: {
@@ -603,7 +636,11 @@ export class ProductionService {
     if (bUnit === 'l' && unit === 'ml') return val / 1000;
     if (bUnit === 'ml' && unit === 'l') return val * 1000;
 
-    return val;
+    // No known conversion between the packet's unit and the bulk item's
+    // unit — returning val here would silently compare incompatible
+    // quantities (e.g. grams against a bulk stock tracked in a stray
+    // "units" label), producing a wrong-but-plausible shortage or surplus.
+    throw new Error(`Cannot convert packet size "${size}" to bulk stock unit "${bulkUnit}" — the product's recipe yield unit must be KG, G, L, or ML.`);
   }
 
 
