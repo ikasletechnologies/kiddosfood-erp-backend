@@ -1,52 +1,5 @@
 import prisma from '../src/lib/prisma';
 import bcrypt from 'bcryptjs';
-import { PERMISSION_CATALOG, Permissions } from '../src/rbac/permissions';
-
-const SYSTEM_ROLES: { name: string; description: string; permissions: string[] }[] = [
-  {
-    name: 'Purchase Manager',
-    description: 'Approves purchase requests and dispatches purchase orders.',
-    permissions: [
-      Permissions.PURCHASE_VIEW,
-      Permissions.PURCHASE_MANAGER_APPROVE,
-      Permissions.PURCHASE_ORDER_DISPATCH,
-      Permissions.PURCHASE_EXPORT,
-      Permissions.PURCHASE_PRINT,
-    ],
-  },
-  {
-    name: 'Factory Manager',
-    description: 'Approves production plans, GRN receipts, and department expense claims.',
-    permissions: [
-      Permissions.PURCHASE_GRN_APPROVE,
-      Permissions.PRODUCTION_VIEW,
-      Permissions.PRODUCTION_FACTORY_APPROVE,
-      Permissions.PRODUCTION_EXECUTION,
-      Permissions.PRODUCTION_EXPORT,
-      Permissions.EXPENSE_DEPT_APPROVE,
-    ],
-  },
-  {
-    name: 'QC Auditor',
-    description: 'Performs batch quality inspections and release verification.',
-    permissions: [
-      Permissions.PRODUCTION_VIEW,
-      Permissions.PRODUCTION_QC_VERIFY,
-    ],
-  },
-  {
-    name: 'Accounts Reviewer',
-    description: 'Verifies GRN invoices, logs expense approvals, and releases payments.',
-    permissions: [
-      Permissions.PURCHASE_ACCOUNTS_VERIFY,
-      Permissions.PURCHASE_PAYMENT_RELEASE,
-      Permissions.EXPENSE_VIEW,
-      Permissions.EXPENSE_ACCOUNTS_APPROVE,
-      Permissions.EXPENSE_PAYMENT_RELEASE,
-      Permissions.FINANCE_REPORTS,
-    ],
-  },
-];
 
 const SAMPLE_WORKFLOW_REQUESTS: {
   displayId: string;
@@ -186,32 +139,6 @@ async function main() {
       is_active: true,
     },
   });
-
-  // Permission catalog
-  for (const p of PERMISSION_CATALOG) {
-    await prisma.permission.upsert({
-      where: { key: p.key },
-      update: { module: p.module, action: p.action, label: p.label },
-      create: p,
-    });
-  }
-  console.log(`✅ Seeded ${PERMISSION_CATALOG.length} permissions.`);
-
-  // System roles (Purchase Manager, Factory Manager, QC Auditor, Accounts Reviewer)
-  for (const r of SYSTEM_ROLES) {
-    const role = await prisma.role.upsert({
-      where: { name: r.name },
-      update: { description: r.description, isSystem: true },
-      create: { name: r.name, description: r.description, isSystem: true },
-    });
-    const permissionRows = await prisma.permission.findMany({ where: { key: { in: r.permissions } } });
-    await prisma.rolePermission.deleteMany({ where: { roleId: role.id } });
-    await prisma.rolePermission.createMany({
-      data: permissionRows.map((p) => ({ roleId: role.id, permissionId: p.id })),
-      skipDuplicates: true,
-    });
-  }
-  console.log(`✅ Seeded ${SYSTEM_ROLES.length} system roles.`);
 
   // Sample workflow-approval requests (mirrors the previous frontend-only mock data)
   for (const wf of SAMPLE_WORKFLOW_REQUESTS) {

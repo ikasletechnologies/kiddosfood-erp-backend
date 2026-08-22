@@ -22,8 +22,7 @@ export class AuthService {
           { email: identifier },
           { phone: identifier }
         ]
-      },
-      include: { customRole: { include: { permissions: { include: { permission: true } } } } }
+      }
     });
 
     if (!user) throw new AppError('Invalid credentials', 401);
@@ -34,16 +33,12 @@ export class AuthService {
     if (!isMatch) throw new AppError('Invalid credentials', 401);
 
     // 3. Prepare payload
-    const permissions = user.customRole ? user.customRole.permissions.map(rp => rp.permission.key) : [];
     const payload: TokenPayload = {
       userId: user.id,
       email: user.email || undefined,
       role: user.role,
       franchiseId: user.franchiseId,
       branchId: user.branchId,
-      customRoleId: user.customRoleId,
-      customRoleName: user.customRole?.name || null,
-      permissions
     };
 
     // 4. Generate Tokens
@@ -68,8 +63,6 @@ export class AuthService {
         email: user.email,
         role: user.role,
         franchiseId: user.franchiseId,
-        customRole: user.customRole ? { id: user.customRole.id, name: user.customRole.name, permissions } : null,
-        permissions
       }
     };
   }
@@ -82,7 +75,7 @@ export class AuthService {
     // 2. Check DB
     const storedToken = await prisma.refreshToken.findUnique({
       where: { token: refreshToken },
-      include: { user: { include: { customRole: { include: { permissions: { include: { permission: true } } } } } } }
+      include: { user: true }
     });
 
     if (!storedToken) throw new AppError('Refresh token not found', 401);
@@ -109,9 +102,6 @@ export class AuthService {
       role: user.role,
       franchiseId: user.franchiseId,
       branchId: user.branchId,
-      customRoleId: user.customRoleId,
-      customRoleName: user.customRole?.name || null,
-      permissions: user.customRole ? user.customRole.permissions.map(rp => rp.permission.key) : []
     };
 
     const newAccessToken = JwtUtil.generateAccessToken(newPayload);

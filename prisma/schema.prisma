@@ -18,42 +18,10 @@ model User {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   role          UserRole       @default(FRANCHISE_ADMIN)
-  customRoleId  String?
   activityLogs  ActivityLog[]
   employee      Employee?
   refreshTokens RefreshToken[]
   franchise     Franchise?     @relation(fields: [franchiseId], references: [id])
-  customRole    Role?          @relation(fields: [customRoleId], references: [id])
-}
-
-model Role {
-  id          String           @id @default(uuid())
-  name        String           @unique
-  description String?
-  isSystem    Boolean          @default(false)
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  permissions RolePermission[]
-  users       User[]
-}
-
-model Permission {
-  id     String           @id @default(uuid())
-  key    String           @unique
-  module String
-  action String
-  label  String
-  roles  RolePermission[]
-}
-
-model RolePermission {
-  id           String     @id @default(uuid())
-  roleId       String
-  permissionId String
-  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
-  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
-
-  @@unique([roleId, permissionId])
 }
 
 model WorkflowRequest {

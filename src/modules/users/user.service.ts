@@ -4,14 +4,12 @@ import { AppError } from '../../middleware/error.middleware';
 import { AuditService } from '../audit/audit.service';
 import { UserRole } from '@prisma/client';
 
-const CUSTOM_ROLE_INCLUDE = { customRole: { include: { permissions: { include: { permission: true } } } } };
-
 export class UserService {
   static async getAll(skip = 0, take = 20) {
     return prisma.user.findMany({
       skip,
       take,
-      include: { franchise: true, ...CUSTOM_ROLE_INCLUDE },
+      include: { franchise: true },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -19,7 +17,7 @@ export class UserService {
   static async getById(id: string) {
     return prisma.user.findUnique({
       where: { id },
-      include: { franchise: true, ...CUSTOM_ROLE_INCLUDE }
+      include: { franchise: true }
     });
   }
 
@@ -37,7 +35,6 @@ export class UserService {
     role?: UserRole;
     franchiseId?: string;
     branchId?: string;
-    customRoleId?: string;
   }, actingUserId?: string) {
     try {
       // 1. Check if user exists
@@ -56,14 +53,6 @@ export class UserService {
         ? data.branchId
         : null;
 
-      const customRoleId = (data.customRoleId && data.customRoleId.trim() !== '' && data.customRoleId !== 'undefined' && data.customRoleId !== 'null')
-        ? data.customRoleId
-        : null;
-      if (customRoleId) {
-        const role = await prisma.role.findUnique({ where: { id: customRoleId } });
-        if (!role) throw new AppError('Assigned role not found', 400);
-      }
-
       // 4. Create
       const created = await prisma.user.create({
         data: {
@@ -74,10 +63,9 @@ export class UserService {
           role: data.role || UserRole.FRANCHISE_ADMIN,
           franchiseId: franchiseId,
           branchId: branchId,
-          customRoleId,
           is_active: true
         },
-        include: { franchise: true, ...CUSTOM_ROLE_INCLUDE }
+        include: { franchise: true }
       });
 
       if (actingUserId) {
@@ -87,7 +75,7 @@ export class UserService {
           entityType: 'User',
           entityId: created.id,
           targetFranchiseId: franchiseId || undefined,
-          details: { fullName: created.fullName, email: created.email, role: created.role, customRoleId },
+          details: { fullName: created.fullName, email: created.email, role: created.role },
         });
       }
 
@@ -108,7 +96,7 @@ export class UserService {
 
   static async update(id: string, data: any, actingUserId?: string) {
     try {
-      const existingUser = await prisma.user.findUnique({ where: { id }, include: CUSTOM_ROLE_INCLUDE });
+      const existingUser = await prisma.user.findUnique({ where: { id } });
       if (!existingUser) throw new AppError('User not found', 404);
 
       const updateData = { ...data };
@@ -117,13 +105,6 @@ export class UserService {
       }
       if (updateData.branchId === '' || updateData.branchId === 'null' || updateData.branchId === 'undefined') {
         updateData.branchId = null;
-      }
-      if (updateData.customRoleId === '' || updateData.customRoleId === 'null' || updateData.customRoleId === 'undefined') {
-        updateData.customRoleId = null;
-      }
-      if (updateData.customRoleId) {
-        const role = await prisma.role.findUnique({ where: { id: updateData.customRoleId } });
-        if (!role) throw new AppError('Assigned role not found', 400);
       }
 
       if (updateData.email) {
@@ -142,13 +123,12 @@ export class UserService {
       const updated = await prisma.user.update({
         where: { id },
         data: updateData,
-        include: { franchise: true, ...CUSTOM_ROLE_INCLUDE }
+        include: { franchise: true }
       });
 
       if (actingUserId) {
         const roleChanged = 'role' in updateData && updateData.role !== existingUser.role;
-        const customRoleChanged = 'customRoleId' in updateData && updateData.customRoleId !== existingUser.customRoleId;
-        if (roleChanged || customRoleChanged) {
+        if (roleChanged) {
           await AuditService.log({
             userId: actingUserId,
             action: 'USER_ROLE_CHANGED',
@@ -156,8 +136,8 @@ export class UserService {
             entityId: id,
             targetFranchiseId: updated.franchiseId || undefined,
             details: {
-              from: { role: existingUser.role, customRole: existingUser.customRole?.name || null },
-              to: { role: updated.role, customRole: updated.customRole?.name || null },
+              from: { role: existingUser.role },
+              to: { role: updated.role },
             },
           });
         } else {

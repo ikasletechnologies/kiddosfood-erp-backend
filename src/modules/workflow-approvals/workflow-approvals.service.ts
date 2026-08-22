@@ -1,34 +1,48 @@
 import prisma from '../../lib/prisma';
 import { AppError } from '../../middleware/error.middleware';
 import { AuditService } from '../audit/audit.service';
-import { PermissionUtil } from '../../utils/permission.util';
 import { STAGE_CONFIG, getStageIndex } from './stage-config';
 
 type Category = keyof typeof STAGE_CONFIG;
 
 export class WorkflowApprovalsService {
-  static async getAll(category?: Category) {
+  // A Super Admin sees every request; a Franchise Admin only ever sees
+  // (and can act on) requests belonging to their own franchise.
+  static async getAll(category?: Category, franchiseId?: string | null) {
     return prisma.workflowRequest.findMany({
-      where: category ? { category } : undefined,
+      where: {
+        ...(category ? { category } : {}),
+        ...(franchiseId ? { franchiseId } : {}),
+      },
       include: { history: { orderBy: { timestamp: 'asc' } } },
       orderBy: { dateInitiated: 'desc' },
     });
   }
 
-  static async getOne(id: string) {
-    return prisma.workflowRequest.findUnique({
+  static async getOne(id: string, franchiseId?: string | null) {
+    const request = await prisma.workflowRequest.findUnique({
       where: { id },
       include: { history: { orderBy: { timestamp: 'asc' } } },
     });
+    if (request && franchiseId && request.franchiseId && request.franchiseId !== franchiseId) {
+      throw new AppError('Forbidden: this request belongs to a different franchise', 403);
+    }
+    return request;
   }
 
   static async create(
     data: { category: Category; title: string; amount?: number; details?: any; franchiseId?: string },
-    actingUser: { userId: string; fullName?: string }
+    actingUser: { userId: string; fullName?: string; role: string; franchiseId?: string | null }
   ) {
     const stages = STAGE_CONFIG[data.category];
     if (!stages) throw new AppError('Invalid workflow category', 400);
     if (!data.title?.trim()) throw new AppError('Title is required', 400);
+
+    // A Franchise Admin's requests are always stamped with their own
+    // franchise — the client can't claim to initiate on behalf of another one.
+    const franchiseId = actingUser.role === 'SUPER_ADMIN'
+      ? (data.franchiseId || null)
+      : (actingUser.franchiseId || null);
 
     const count = await prisma.workflowRequest.count({ where: { category: data.category } });
     const prefix = data.category === 'PURCHASE' ? 'PUR' : data.category === 'PRODUCTION' ? 'PROD' : 'EXP';
@@ -42,7 +56,7 @@ export class WorkflowApprovalsService {
         amount: data.amount,
         currentStage: stages[0].key,
         initiatedBy: actingUser.fullName || actingUser.userId,
-        franchiseId: data.franchiseId || null,
+        franchiseId,
         details: data.details || {},
         history: {
           create: {
@@ -70,7 +84,7 @@ export class WorkflowApprovalsService {
 
   static async approve(
     id: string,
-    actingUser: { userId: string; role: string; fullName?: string },
+    actingUser: { userId: string; role: string; fullName?: string; franchiseId?: string | null },
     notes?: string
   ) {
     const request = await prisma.workflowRequest.findUnique({ where: { id } });
@@ -85,18 +99,17 @@ export class WorkflowApprovalsService {
     const currentStageDef = stages[curIdx];
     const nextStageDef = stages[curIdx + 1];
 
-    const effective = await PermissionUtil.getEffectivePermissions(actingUser.userId);
-    const hasPermission = effective.permissions.includes(currentStageDef.requiredPermission);
     const isSuperAdmin = actingUser.role === 'SUPER_ADMIN';
 
-    if (!isSuperAdmin && !hasPermission) {
-      throw new AppError(
-        `Forbidden: this stage requires the '${currentStageDef.requiredPermission}' permission, which your assigned role does not have.`,
-        403
-      );
+    // Every stage is approvable by any Franchise Admin — the only rule is
+    // they must own the request's franchise. A Super Admin can act on any
+    // franchise (that's recorded as an override below, purely for the audit
+    // trail — it isn't a permission check).
+    if (!isSuperAdmin && request.franchiseId && request.franchiseId !== actingUser.franchiseId) {
+      throw new AppError('Forbidden: this request belongs to a different franchise', 403);
     }
 
-    const isOverride = isSuperAdmin && !hasPermission;
+    const isOverride = isSuperAdmin && !!request.franchiseId && request.franchiseId !== actingUser.franchiseId;
 
     const [updated] = await prisma.$transaction([
       prisma.workflowRequest.update({
