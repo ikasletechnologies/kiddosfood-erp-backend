@@ -56,16 +56,7 @@ export class AccountService {
 
       let lastTransaction: any = null;
       if (lastPayment && (!lastExpense || lastPayment.createdAt > lastExpense.createdAt)) {
-        // Same outflow classification as Cash Flow / Day Book — a Payment
-        // row covers BOTH money in and money out, so it can't be labeled
-        // "Payment Received" unconditionally.
-        const isOutflow = lastPayment.entityType === 'VENDOR' || lastPayment.sourceModule === 'EXPENSE' || lastPayment.type === 'INTERNAL_TRANSFER';
-        const note = !isOutflow
-          ? 'Payment Received'
-          : lastPayment.sourceModule === 'EXPENSE'
-            ? 'Expense Paid'
-            : 'Payment Made';
-        lastTransaction = { type: isOutflow ? 'OUTFLOW' : 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note };
+        lastTransaction = { type: 'INFLOW', amount: lastPayment.paidAmount, date: lastPayment.createdAt, note: 'Payment Received' };
       } else if (lastExpense) {
         lastTransaction = { type: 'OUTFLOW', amount: lastExpense.amount, date: lastExpense.createdAt, note: lastExpense.description || 'Business Expense' };
       }
