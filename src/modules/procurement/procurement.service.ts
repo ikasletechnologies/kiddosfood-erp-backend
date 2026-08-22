@@ -301,7 +301,7 @@ export class ProcurementService {
     for (const order of sortedOrders) {
       for (const item of order.poItems) {
         if (item.inventoryItem) {
-          materialMap.set(item.inventoryItemId, {
+          materialMap.set(item.inventoryItem.id, {
             material: item.inventoryItem,
             price: item.price,
             lastUpdated: order.createdAt
@@ -311,9 +311,9 @@ export class ProcurementService {
       for (const grn of order.goodsReceipts || []) {
         for (const item of grn.items || []) {
           if (item.inventoryItem) {
-            materialMap.set(item.inventoryItemId, {
+            materialMap.set(item.inventoryItem.id, {
               material: item.inventoryItem,
-              price: item.price || materialMap.get(item.inventoryItemId)?.price || 0,
+              price: item.price || materialMap.get(item.inventoryItem.id)?.price || 0,
               lastUpdated: grn.createdAt || order.createdAt
             });
           }
