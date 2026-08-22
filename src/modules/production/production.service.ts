@@ -355,12 +355,15 @@ export class ProductionService {
         // apart from grams/kilograms, producing wildly wrong stock math).
         const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
 
+        const bulkSku = batch.product.sku ? (batch.product.sku.endsWith('-BULK') ? batch.product.sku : `${batch.product.sku}-BULK`) : `PRD-${batch.productId.substring(0, 5).toUpperCase()}-BULK`;
+        const bulkName = batch.product.name.endsWith(' - Bulk') ? batch.product.name : `${batch.product.name} - Bulk`;
+
         let targetItem = await tx.inventoryItem.findFirst({
           where: {
             franchiseId,
             OR: [
-              { sku: batch.product.sku ?? undefined },
-              { name: batch.product.name },
+              { sku: bulkSku },
+              { name: bulkName },
             ],
           },
         });
@@ -368,9 +371,9 @@ export class ProductionService {
         if (!targetItem) {
           targetItem = await tx.inventoryItem.create({
             data: {
-              name: batch.product.name,
-              sku: batch.product?.sku || `PRD-${batch.productId.substring(0, 5).toUpperCase()}`,
-              category: 'FINISHED_GOOD',
+              name: bulkName,
+              sku: bulkSku,
+              category: 'SEMI_FINISHED',
               currentStock: 0,
               unit: finishedGoodUnit,
               minimumStock: 5,
@@ -378,8 +381,6 @@ export class ProductionService {
             },
           });
         } else if (targetItem.unit === 'unit' && finishedGoodUnit !== 'unit') {
-          // Self-heal an item created before this fix — the quantity stored
-          // was always correct, only the unit label was wrong.
           targetItem = await tx.inventoryItem.update({
             where: { id: targetItem.id },
             data: { unit: finishedGoodUnit },
@@ -449,12 +450,15 @@ export class ProductionService {
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
 
+      const bulkSku = batch.product.sku ? (batch.product.sku.endsWith('-BULK') ? batch.product.sku : `${batch.product.sku}-BULK`) : `PRD-${batch.productId.substring(0, 5).toUpperCase()}-BULK`;
+      const bulkName = batch.product.name.endsWith(' - Bulk') ? batch.product.name : `${batch.product.name} - Bulk`;
+
       let bulkItem = await tx.inventoryItem.findFirst({
         where: {
           franchiseId,
           OR: [
-            { sku: batch.product.sku ?? undefined },
-            { name: batch.product.name },
+            { sku: bulkSku },
+            { name: bulkName },
           ],
         },
       });
@@ -504,8 +508,12 @@ export class ProductionService {
         userId: data.userId,
       });
 
-      const retailSku = `${bulkItem.sku}-${data.packetSize.toUpperCase().replace(/\s+/g, '')}`;
-      const retailName = `${bulkItem.name} (${data.packetSize})`;
+      const baseSku = bulkItem.sku.replace(/-BULK$/i, '');
+      const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
+      
+      const cleanPacketSize = data.packetSize.toUpperCase().replace(/\s+/g, '');
+      const retailSku = baseSku.includes(cleanPacketSize) ? baseSku : `${baseSku}-${cleanPacketSize}`;
+      const retailName = baseName.includes(data.packetSize) ? baseName : `${baseName} (${data.packetSize})`;
       
       let retailItem = await tx.inventoryItem.findFirst({
         where: {
@@ -649,6 +657,7 @@ export class ProductionService {
       include: {
         product: true,
         franchise: true,
+        packagings: true,
         production: {
           include: {
             recipe: true,
@@ -666,8 +675,15 @@ export class ProductionService {
 
     return batches.map(b => {
       const effectiveExpiry = b.expiryDate || b.production?.expiryDate;
+      const packedQuantity = b.packagedQty || 0;
+      const bulkQuantity = Math.max(0, (b.approvedQty || 0) - (b.packagedQty || 0));
+      const availableQuantity = b.packagings?.reduce((sum, p) => sum + (p.quantityPackets || 0), 0) || 0;
+
       return {
         ...b,
+        packedQuantity,
+        bulkQuantity,
+        availableQuantity,
         expiryStatus: !effectiveExpiry
           ? 'VALID' // Fallback (should be filtered out by DB query)
           : effectiveExpiry < now
