@@ -4,6 +4,7 @@ import SocketService from '../../lib/socket';
 import { FinanceService } from '../finance/finance.service';
 import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
+import { FranchiseService } from '../franchise/franchise.service';
 
 export class POSService {
 
@@ -11,11 +12,22 @@ export class POSService {
 
   // Step 1: Create empty order shell
   static async createOrder(data: { franchiseId?: string, customerId?: string, orderType?: string }) {
-    let fid = data.franchiseId || 'hq-001';
-    
-    // Safety check: verify franchise exists, else pick the first one
-    const exists = await prisma.franchise.findUnique({ where: { id: fid } });
-    if (!exists) {
+    let fid: string | undefined = data.franchiseId;
+
+    // Safety check: verify an explicitly-passed franchise actually exists.
+    if (fid) {
+      const exists = await prisma.franchise.findUnique({ where: { id: fid } });
+      if (!exists) fid = undefined;
+    }
+
+    // No (valid) franchise given — default to HQ, not a literal id that may
+    // not correspond to any real franchise in this database.
+    if (!fid) {
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      fid = hq?.id;
+    }
+
+    if (!fid) {
       const first = await prisma.franchise.findFirst();
       if (!first) throw new Error('No franchises found in the system. Please create one first.');
       fid = first.id;
@@ -351,19 +363,10 @@ export class POSService {
 
     let fid = data.franchiseId;
     if (!fid) {
-      const hq = await prisma.franchise.findFirst({ 
-        where: { 
-          OR: [
-            { name: { contains: 'HQ', mode: 'insensitive' } },
-            { name: { contains: 'Head', mode: 'insensitive' } },
-            { name: { contains: 'Main', mode: 'insensitive' } },
-            { name: { contains: 'Home', mode: 'insensitive' } }
-          ],
-          status: 'ACTIVE' 
-        } 
-      });
-      const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
-      fid = hq?.id || first?.id || 'hq-001';
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      const first = hq ? null : await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
+      fid = hq?.id || first?.id;
+      if (!fid) throw new Error('No franchises found in the system. Please create one first.');
     }
 
     const result = await prisma.$transaction(async (tx) => {

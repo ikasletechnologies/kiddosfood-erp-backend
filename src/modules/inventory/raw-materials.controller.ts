@@ -2,6 +2,7 @@ import { IsolationUtil as DataIsolator } from '../../utils/isolation.util';
 import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import prisma from '../../lib/prisma';
+import { FranchiseService } from '../franchise/franchise.service';
 
 
 /**
@@ -19,26 +20,23 @@ export class RawMaterialsController {
       if (exists) return requestedId;
     }
 
-    // 2. Try seeded defaults
-    const defaults = ['hq-001', 'branch-001'];
-    for (const id of defaults) {
-      const exists = await prisma.franchise.findUnique({ where: { id } });
-      if (exists) return id;
-    }
+    // 2. Default to HQ
+    const hq = await FranchiseService.getHqFranchiseOrNull();
+    if (hq) return hq.id;
 
     // 3. Fallback to first available
     const first = await prisma.franchise.findFirst();
     if (first) return first.id;
 
-    // 4. ABSOLUTE FALLBACK: Create a default franchise so the app doesn't break
-    console.log('⚠️ No franchises found. Creating a default "Main Branch"...');
+    // 4. ABSOLUTE FALLBACK: no franchises exist at all — create the one-and-only HQ.
+    console.log('⚠️ No franchises found. Creating a default HQ franchise...');
     const root = await prisma.franchise.create({
       data: {
-        id: 'hq-001',
         name: 'Main Headquarters',
         location: 'Default Location',
         ownerName: 'Super Admin',
-        contactNum: '0000000000'
+        contactNum: '0000000000',
+        isHQ: true,
       }
     });
     return root.id;

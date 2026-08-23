@@ -140,12 +140,13 @@ export class InventoryService {
     };
   }
 
-  static async getInventory(franchiseId: string, includeInactive = false, excludeCategories?: ItemCategory[]) {
+  static async getInventory(franchiseId: string, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory) {
     const items = await prisma.inventoryItem.findMany({
       where: {
         franchiseId,
         ...(includeInactive ? {} : { isActive: true }),
-        ...(excludeCategories && excludeCategories.length > 0 ? { category: { notIn: excludeCategories } } : {})
+        ...(excludeCategories && excludeCategories.length > 0 ? { category: { notIn: excludeCategories } } : {}),
+        ...(category ? { category } : {})
       },
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
@@ -265,13 +266,17 @@ export class InventoryService {
         ? data.franchiseId.trim()
         : null;
 
-      let nameUpper = "";
+      // No franchiseId given at all — historically treated as an HQ-scoped
+      // item (falls through to the isHQ pricing branch below).
       let isHQ = true;
 
       if (targetFranchiseId) {
         let franchise = await tx.franchise.findUnique({ where: { id: targetFranchiseId } });
         if (!franchise) {
           console.log(`⚠️ Franchise '${targetFranchiseId}' not found in DB. Auto-creating default franchise record...`);
+          // Never auto-created as HQ (schema default isHQ=false) — HQ status
+          // is only ever granted by explicitly setting Franchise.isHQ, never
+          // inferred here just because the caller happened to pass 'hq-001'.
           franchise = await tx.franchise.create({
             data: {
               id: targetFranchiseId,
@@ -284,12 +289,7 @@ export class InventoryService {
           });
         }
         data.franchiseId = franchise.id;
-        nameUpper = franchise.name.toUpperCase();
-        isHQ = nameUpper.includes('HQ') || 
-                     nameUpper.includes('HEAD') ||
-                     nameUpper.includes('MAIN') ||
-                     nameUpper.includes('CORPORATE') ||
-                     nameUpper.includes('CENTRAL');
+        isHQ = franchise.isHQ;
       } else {
         data.franchiseId = null;
       }
@@ -393,12 +393,7 @@ export class InventoryService {
     let isHQ = false;
     if (franchiseId) {
       const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId } });
-      const nameUpper = franchise?.name.toUpperCase() || "";
-      isHQ = nameUpper.includes('HQ') || 
-             nameUpper.includes('HEAD') ||
-             nameUpper.includes('MAIN') ||
-             nameUpper.includes('CORPORATE') ||
-             nameUpper.includes('CENTRAL');
+      isHQ = franchise?.isHQ || false;
     }
 
     if (isHQ && (data.franchisePrice !== undefined || data.basePrice !== undefined)) {
@@ -553,8 +548,7 @@ export class InventoryService {
 
       if (item && (item.category === 'FINISHED_GOOD' || item.category === 'SEMI_FINISHED')) {
         const franchise = item.franchiseId ? await tx.franchise.findUnique({ where: { id: item.franchiseId } }) : null;
-        const nameUpper = franchise?.name.toUpperCase() || "";
-        const isHQ = nameUpper.includes('HQ') || nameUpper.includes('HEAD') || nameUpper.includes('CORPORATE');
+        const isHQ = franchise?.isHQ || false;
 
         if (isHQ) {
           const syncedProduct = await tx.product.findUnique({ where: { sku: item.sku || "" } });
@@ -603,7 +597,7 @@ export class InventoryService {
   }
 
   // Internal: stock-out via production / waste — not exposed as free-form UI edit
-  static async stockOut(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string }, externalTx?: any) {
+  static async stockOut(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string; strictFIFO?: boolean }, externalTx?: any) {
     const run = (tx: any) =>
       this.recordMovement(tx, {
         itemId: data.itemId,
@@ -613,6 +607,7 @@ export class InventoryService {
         userId: data.userId,
         referenceType: data.referenceType,
         referenceId: data.referenceId,
+        strictFIFO: data.strictFIFO,
       });
     return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
@@ -716,6 +711,7 @@ export class InventoryService {
       // depletion or receiveAtCost branches below derive their own values.
       batchId?: string;
       unitCost?: number;
+      strictFIFO?: boolean;
     }
   ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
     const stockChange = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
@@ -741,6 +737,11 @@ export class InventoryService {
 
     if (stockChange < 0) {
       fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+      
+      if (data.strictFIFO && fifo.consumedFromBatches < Math.abs(stockChange)) {
+        throw new Error('Insufficient approved stock available for dispatch. Stock may be blocked or recalled.');
+      }
+
       // Only unambiguous when everything came from a single lot — a
       // movement that spans multiple batches has no single Batch ID to
       // report, so it's left null rather than picking one arbitrarily.

@@ -12,6 +12,13 @@ export class LogisticsService {
     items: { inventoryItemId: string; quantity: number }[];
     initiatedBy: string;
   }) {
+    // Validate that all items being transferred are FINISHED_GOOD
+    const itemIds = data.items.map(item => item.inventoryItemId);
+    const dbItems = await prisma.inventoryItem.findMany({ where: { id: { in: itemIds } } });
+    if (dbItems.some(i => i.category !== 'FINISHED_GOOD')) {
+      throw new Error("Only finished goods can be transferred to branches.");
+    }
+
     return prisma.stockTransfer.create({
       data: {
         fromBranchId: data.fromBranchId,
@@ -43,6 +50,10 @@ export class LogisticsService {
     if (status === 'SHIPPED' && transfer.status !== 'SHIPPED') {
       await prisma.$transaction(async (tx) => {
         for (const item of transfer.items) {
+          if (item.inventoryItem.category !== 'FINISHED_GOOD') {
+            throw new Error("Only finished goods can be transferred to branches.");
+          }
+
           // We need to find the equivalent item in the Source Branch if IDs aren't global
           // Assuming inventoryItemId represents a specific item instance in a branch
           await InventoryService.stockOut({
@@ -50,7 +61,8 @@ export class LogisticsService {
             quantity: item.quantity,
             type: StockMovementType.TRANSFER_OUT,
             note: `Transfer to Branch ${transfer.toBranchId}`,
-            userId
+            userId,
+            strictFIFO: true
           }, tx);
         }
         await tx.stockTransfer.update({

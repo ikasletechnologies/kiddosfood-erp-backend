@@ -2,6 +2,20 @@ import { Request, Response } from 'express';
 import { POSService } from './pos.service';
 import prisma from '../../lib/prisma';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { FranchiseService } from '../franchise/franchise.service';
+
+// Resolves a request's franchise context to HQ when the caller didn't supply
+// one (e.g. a Super Admin with no franchise filter selected). Replaces the
+// old `|| 'hq-001'` literal, which silently referenced a franchise id that
+// may not exist in this database at all.
+async function resolveFranchiseIdOrHq(franchiseId?: string | null): Promise<string> {
+  if (franchiseId) return franchiseId;
+  const hq = await FranchiseService.getHqFranchiseOrNull();
+  if (hq) return hq.id;
+  const first = await prisma.franchise.findFirst();
+  if (!first) throw new Error('No franchises found in the system. Please create one first.');
+  return first.id;
+}
 
 export class POSController {
   /**
@@ -45,7 +59,7 @@ export class POSController {
       );
 
       const order = await POSService.checkout({
-        franchiseId: franchiseId || 'hq-001',
+        franchiseId: await resolveFranchiseIdOrHq(franchiseId),
         customerId,
         accountId: req.body.accountId,
         items: resolvedItems,
@@ -98,7 +112,7 @@ export class POSController {
     try {
       const user = (req as any).user;
       const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
-      const settlement = await POSService.getTodaySettlement(franchiseId || 'hq-001');
+      const settlement = await POSService.getTodaySettlement(await resolveFranchiseIdOrHq(franchiseId));
       res.json(settlement);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -109,7 +123,7 @@ export class POSController {
     try {
       const user = (req as any).user;
       const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
-      const settlement = await POSService.getLatestSettlement(franchiseId || 'hq-001');
+      const settlement = await POSService.getLatestSettlement(await resolveFranchiseIdOrHq(franchiseId));
       res.json(settlement);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -120,7 +134,7 @@ export class POSController {
     try {
       const user = (req as any).user;
       const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      const settlement = await POSService.closeDay(franchiseId || 'hq-001', req.body, user?.email || user?.userId);
+      const settlement = await POSService.closeDay(await resolveFranchiseIdOrHq(franchiseId), req.body, user?.email || user?.userId);
       res.status(201).json(settlement);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

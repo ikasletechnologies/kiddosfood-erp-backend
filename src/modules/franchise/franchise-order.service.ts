@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { FranchiseService } from './franchise.service';
 import SocketService from '../../lib/socket';
 
 function generateOrderNumber(): string {
@@ -10,12 +11,12 @@ function generateOrderNumber(): string {
   return `FO-${ts}-${rnd}`;
 }
 
+// Kept as a thin wrapper (rather than inlining FranchiseService calls at
+// every call site) so both existing callers below — one treats "no HQ" as a
+// soft no-op, the other throws a specific user-facing message — keep working
+// unchanged while sharing one detection mechanism (Franchise.isHQ).
 async function getHqFranchise(tx: any) {
-  return tx.franchise.findFirst({
-    where: {
-      OR: [{ id: 'hq-001' }, { name: { contains: 'HQ', mode: 'insensitive' } }, { name: { contains: 'Head', mode: 'insensitive' } }]
-    }
-  });
+  return FranchiseService.getHqFranchiseOrNull(tx);
 }
 
 async function findHqStockItem(tx: any, hqId: string, product: { sku: string | null; name: string }) {
@@ -512,9 +513,7 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
   // Synchronize with Master InventoryItem at HQ
   const product = await tx.product.findUnique({ where: { id: productId } });
   if (product) {
-    const hq = await tx.franchise.findFirst({
-      where: { OR: [{ id: 'hq-001' }, { name: { contains: 'HQ', mode: 'insensitive' } }] }
-    });
+    const hq = await FranchiseService.getHqFranchiseOrNull(tx);
 
     if (hq) {
       const invItem = await tx.inventoryItem.findFirst({

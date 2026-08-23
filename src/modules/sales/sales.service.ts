@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { FranchiseService } from '../franchise/franchise.service';
 
 // Number generators are DB-count-based (not in-memory counters) so they can't
 // collide against their @unique DB columns after a server restart.
@@ -566,6 +567,9 @@ export class SalesService {
   // ─── Delivery Challans ───────────────────────────────────────────────────────
 
   static async getDeliveryChallans(filters: { customerId?: string; status?: string; search?: string }) {
+    // One-time safe migration: legacy rows stored status 'OPEN' before the IN_TRANSIT rename
+    await prisma.deliveryChallan.updateMany({ where: { status: 'OPEN' }, data: { status: 'IN_TRANSIT' } });
+
     const where: any = {};
     if (filters.customerId) where.customerId = filters.customerId;
     if (filters.status) where.status = filters.status;
@@ -618,7 +622,7 @@ export class SalesService {
         customerId: data.customerId || null,
         salesOrderId: data.salesOrderId || null,
         franchiseId: data.franchiseId || null,
-        sourceFranchiseId: data.sourceFranchiseId || 'hq-001',
+        sourceFranchiseId: data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null,
         status: data.status || 'DRAFT',
         challanDate: data.challanDate ? new Date(data.challanDate) : new Date(),
         dueDate: data.dueDate ? new Date(data.dueDate) : null,
@@ -647,7 +651,7 @@ export class SalesService {
       include: { customer: true, items: true }
     });
 
-    if (newChallan.status === 'OPEN') {
+    if (newChallan.status === 'IN_TRANSIT') {
       await SalesService.dispatchChallanStock(newChallan, userId);
     }
 
@@ -658,19 +662,23 @@ export class SalesService {
     const currentChallan = await prisma.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
     if (!currentChallan) throw new Error('Delivery challan not found');
 
+    // Legacy rows/clients may still send/hold 'OPEN' — treat it as IN_TRANSIT
+    const currentStatus = currentChallan.status === 'OPEN' ? 'IN_TRANSIT' : currentChallan.status;
+    if (data.status === 'OPEN') data.status = 'IN_TRANSIT';
+
     // Block moving away from CLOSED once delivered
-    if (currentChallan.status === 'CLOSED' && data.status && data.status !== 'CLOSED') {
+    if (currentStatus === 'CLOSED' && data.status && data.status !== 'CLOSED') {
       throw new Error('Cannot change status of a closed delivery challan');
     }
 
     const updated = await prisma.deliveryChallan.update({ where: { id }, data, include: { items: true } });
 
     // Handle Stock Transitions
-    if (currentChallan.status === 'DRAFT' && updated.status === 'OPEN') {
+    if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT') {
       await SalesService.dispatchChallanStock(updated, userId);
-    } else if (currentChallan.status === 'OPEN' && updated.status === 'CLOSED') {
+    } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED') {
       await SalesService.receiveChallanStock(updated, userId);
-    } else if (currentChallan.status === 'OPEN' && updated.status === 'CANCELLED') {
+    } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED') {
       await SalesService.reverseChallanStock(updated, userId);
     }
 
@@ -680,7 +688,8 @@ export class SalesService {
   // --- Helper Stock Movement methods for DC ---
   
   private static async dispatchChallanStock(challan: any, userId: string) {
-    const sourceId = challan.sourceFranchiseId || 'hq-001';
+    const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
+    if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to dispatch from
     for (const item of challan.items) {
       if (!item.productId) continue;
       
@@ -742,7 +751,8 @@ export class SalesService {
   }
 
   private static async reverseChallanStock(challan: any, userId: string) {
-    const sourceId = challan.sourceFranchiseId || 'hq-001';
+    const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
+    if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to reverse against
     for (const item of challan.items) {
       if (!item.productId) continue;
       

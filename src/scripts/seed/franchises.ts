@@ -9,6 +9,7 @@ export async function seedFranchises() {
       location: 'Central Plaza, Tech Hub',
       ownerName: 'System Owner',
       contactNum: '1112223333',
+      isHQ: true,
     },
     {
       id: 'distribution-branch',

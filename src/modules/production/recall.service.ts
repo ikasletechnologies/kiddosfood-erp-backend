@@ -142,8 +142,12 @@ export class RecallService {
     }
 
     return prisma.$transaction(async (tx) => {
-      const batch = await tx.productBatch.findUnique({ where: { id: productBatchId } });
+      const batch = await tx.productBatch.findUnique({
+        where: { id: productBatchId },
+        include: { production: { include: { recipe: true } } },
+      });
       if (!batch) throw new Error('Batch not found.');
+      const unit = batch.production?.recipe?.yieldUnit || 'KG';
 
       const existingRecall = await tx.batchRecall.findUnique({ where: { productBatchId } });
       const reasons = this.evaluateEligibility(batch, existingRecall);
@@ -228,6 +232,15 @@ export class RecallService {
       }
       const blockedQty = blockable.reduce((s, b) => s + b.currentQty, 0);
 
+      // Explicit about what this figure is (and isn't): only the stock still
+      // sitting in warehouse right now. Anything already dispatched before the
+      // recall started isn't in currentQty any more — that portion shows up
+      // separately as "distributed" once locateDistribution runs, and the two
+      // numbers are deliberately not meant to be summed with this one.
+      const message = blockedQty > 0
+        ? `${blockedQty} ${unit} of remaining warehouse stock quarantined (blocked from sale/dispatch). Any quantity already dispatched before this recall is tracked separately as distributed.`
+        : 'No warehouse stock remained for this batch — nothing available to quarantine.';
+
       await tx.batchRecallEvent.create({
         data: {
           recallId: recall.id,
@@ -235,7 +248,7 @@ export class RecallService {
           status: 'SUCCESS',
           actor: data.userId || 'system',
           affectedQty: blockedQty,
-          details: { reason: data.reason, reasonNotes: data.reasonNotes || null, blockedInventoryBatchIds: blockable.map((b) => b.id) },
+          details: { reason: data.reason, reasonNotes: data.reasonNotes || null, blockedInventoryBatchIds: blockable.map((b) => b.id), message },
         },
       });
 
@@ -247,6 +260,12 @@ export class RecallService {
     return prisma.$transaction(async (tx) => {
       const recall = await tx.batchRecall.findUnique({ where: { productBatchId } });
       if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
+
+      const batch = await tx.productBatch.findUnique({
+        where: { id: productBatchId },
+        include: { production: { include: { recipe: true } } },
+      });
+      const unit = batch?.production?.recipe?.yieldUnit || 'KG';
 
       const inventoryBatches = await tx.inventoryBatch.findMany({
         where: { productBatchId },
@@ -316,9 +335,12 @@ export class RecallService {
         data: { step: 'DISTRIBUTION_LOCATED', distributedQty, affectedLocations: affectedLocations as any },
       });
 
+      // Explicit that this is stock which left BEFORE the recall — distinct
+      // from, and not additive with, the warehouse-quarantine figure recorded
+      // at RECALL_INITIATED.
       const message = affectedLocations.length
-        ? `Distribution located: ${affectedLocations.length} affected location(s), ${distributedQty} unit(s) traced.`
-        : 'No distribution records found for this batch.';
+        ? `${distributedQty} ${unit} already dispatched before this recall, traced to ${affectedLocations.length} location(s).`
+        : 'No stock had left the warehouse for this batch before the recall — nothing to trace.';
 
       await tx.batchRecallEvent.create({
         data: {
@@ -341,6 +363,12 @@ export class RecallService {
       if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
       if (recall.step === 'INITIATED') throw new Error('Locate distribution before blocking sales.');
 
+      const batch = await tx.productBatch.findUnique({
+        where: { id: productBatchId },
+        include: { production: { include: { recipe: true } } },
+      });
+      const unit = batch?.production?.recipe?.yieldUnit || 'KG';
+
       const inventoryBatches = await tx.inventoryBatch.findMany({ where: { productBatchId } });
       const toBlock = inventoryBatches.filter((b) => b.status === 'APPROVED');
       if (toBlock.length) {
@@ -351,11 +379,19 @@ export class RecallService {
       }
       const blockedNow = inventoryBatches.filter((b) => b.status === 'BLOCKED' || toBlock.includes(b));
       const blockedQty = blockedNow.reduce((s, b) => s + b.currentQty, 0);
+      // toBlock.length > 0 means this step actually flipped fresh APPROVED lots
+      // to BLOCKED (e.g. stock that only became available after Initiate ran).
+      // The far more common case is toBlock being empty — Initiate already
+      // blocked everything sellable, so this step is a re-confirmation
+      // checkpoint on the SAME quantity, not an additional block.
+      const newlyBlocked = toBlock.length > 0;
 
       await tx.batchRecall.update({ where: { productBatchId }, data: { step: 'SALES_BLOCKED' } });
 
       const message = blockedQty > 0
-        ? `Sale/dispatch blocked for this batch — ${blockedQty} unit(s) across ${blockedNow.length} lot(s) quarantined.`
+        ? newlyBlocked
+          ? `${blockedQty} ${unit} newly blocked from sale across ${blockedNow.length} lot(s).`
+          : `${blockedQty} ${unit} at warehouse confirmed blocked from sale (already quarantined at recall initiation — not an additional quantity).`
         : 'No sellable stock remained for this batch — nothing left to block.';
 
       await tx.batchRecallEvent.create({

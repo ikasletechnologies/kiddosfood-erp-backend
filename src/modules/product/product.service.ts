@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
+import { FranchiseService } from '../franchise/franchise.service';
 
 // Keep the Product catalog and the HQ Finished-Goods inventory ledger in sync no matter
 // which screen created the record (standalone Product form vs. Inventory Item Master).
@@ -7,15 +8,7 @@ import { ItemCategory, ProductType } from '@prisma/client';
 async function syncInventoryItemForProduct(tx: any, product: { id: string; name: string; sku: string | null; basePrice: number; productType: ProductType }) {
   if (product.productType !== ProductType.FINISHED_GOOD) return;
 
-  const hq = await tx.franchise.findFirst({
-    where: {
-      OR: [
-        { id: 'hq-001' },
-        { name: { contains: 'HQ', mode: 'insensitive' } },
-        { name: { contains: 'Head', mode: 'insensitive' } },
-      ],
-    },
-  });
+  const hq = await FranchiseService.getHqFranchiseOrNull(tx);
   if (!hq) return; // No HQ configured yet — nothing to sync against.
 
   const existing = await tx.inventoryItem.findFirst({

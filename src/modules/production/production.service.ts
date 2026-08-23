@@ -9,6 +9,31 @@ import { ProductionStatus } from '@prisma/client';
 // not fall through to an unconverted 1:1 comparison.
 const RECOGNIZED_PACK_UNITS = ['kg', 'g', 'l', 'ml', 'pcs', 'unit'];
 
+// Derives the bulk SEMI_FINISHED item's name/SKU. A ProductBatch's Product
+// link is optional (bulk-manufacturing recipes like FRUITMIX have none —
+// only POS made-to-order recipes need one, see pos.controller.ts), so when
+// there's no Product this falls back to the recipe's own identity instead of
+// creating one. recipe.recipeCode is the canonical base SKU; recipe.name is
+// the display-name fallback.
+function resolveBulkIdentity(
+  product: { id: string; sku: string | null; name: string } | null | undefined,
+  recipe: { recipeCode: string | null; name: string } | null | undefined,
+): { bulkSku: string; bulkName: string } {
+  if (product) {
+    const bulkSku = product.sku
+      ? (product.sku.endsWith('-BULK') ? product.sku : `${product.sku}-BULK`)
+      : `PRD-${product.id.substring(0, 5).toUpperCase()}-BULK`;
+    const bulkName = product.name.endsWith(' - Bulk') ? product.name : `${product.name} - Bulk`;
+    return { bulkSku, bulkName };
+  }
+
+  const baseCode = recipe?.recipeCode || recipe?.name || 'RECIPE';
+  const bulkSku = baseCode.toUpperCase().endsWith('-BULK') ? baseCode.toUpperCase() : `${baseCode.toUpperCase()}-BULK`;
+  const baseName = recipe?.name || baseCode;
+  const bulkName = baseName.endsWith(' - Bulk') ? baseName : `${baseName} - Bulk`;
+  return { bulkSku, bulkName };
+}
+
 export class ProductionService {
   static async startProduction(data: {
     recipeId: string;
@@ -249,9 +274,14 @@ export class ProductionService {
       }
 
       const recipe = production.recipe;
-      if (!recipe || !recipe.productId) {
-        throw new Error('Recipe or associated product not found');
+      if (!recipe) {
+        throw new Error('Recipe not found');
       }
+      // recipe.productId is optional — a recipe only needs a linked Product
+      // for the POS made-to-order sale path (see pos.controller.ts). Bulk
+      // manufacturing recipes go Production -> QC -> Bulk -> Packaging
+      // without ever needing a Product, so ProductBatch.productId is
+      // likewise optional and simply mirrors whatever the recipe has.
       const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
 
       // The batch's real unit cost: whatever raw materials this specific run
@@ -267,7 +297,7 @@ export class ProductionService {
       const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
       await tx.productBatch.create({
         data: {
-          productId: recipe.productId,
+          productId: recipe.productId ?? null,
           productionId: production.id,
           quantity: totalYield,
           expiryDate: production.expiryDate,
@@ -362,8 +392,7 @@ export class ProductionService {
         // apart from grams/kilograms, producing wildly wrong stock math).
         const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
 
-        const bulkSku = batch.product.sku ? (batch.product.sku.endsWith('-BULK') ? batch.product.sku : `${batch.product.sku}-BULK`) : `PRD-${batch.productId.substring(0, 5).toUpperCase()}-BULK`;
-        const bulkName = batch.product.name.endsWith(' - Bulk') ? batch.product.name : `${batch.product.name} - Bulk`;
+        const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
 
         let targetItem = await tx.inventoryItem.findFirst({
           where: {
@@ -452,13 +481,26 @@ export class ProductionService {
         include: { product: true, production: { include: { recipe: true } } },
       });
       if (!batch) throw new Error('Product batch not found');
-      if (batch.qcStatus !== 'APPROVED') throw new Error('Batch must be QC APPROVED before packaging');
+
+      // Allow both APPROVED and PARTIALLY_APPROVED — both have legitimate
+      // approved bulk stock equal to batch.approvedQty.
+      if (batch.qcStatus !== 'APPROVED' && batch.qcStatus !== 'PARTIALLY_APPROVED') {
+        throw new Error('Batch must be QC approved (or partially approved) before packaging.');
+      }
+
+      // Recall check — must be inside the transaction so the check and the
+      // subsequent stock deduction are atomic. If a recall is initiated between
+      // the pre-flight check and the actual deduction, the transaction will
+      // re-read the recall row and reject here before any movement is written.
+      const recall = await tx.batchRecall.findUnique({ where: { productBatchId: data.batchId } });
+      if (recall?.status === 'IN_PROGRESS') {
+        throw new Error('Packaging blocked — batch is under recall.');
+      }
 
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
 
-      const bulkSku = batch.product.sku ? (batch.product.sku.endsWith('-BULK') ? batch.product.sku : `${batch.product.sku}-BULK`) : `PRD-${batch.productId.substring(0, 5).toUpperCase()}-BULK`;
-      const bulkName = batch.product.name.endsWith(' - Bulk') ? batch.product.name : `${batch.product.name} - Bulk`;
+      const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
 
       let bulkItem = await tx.inventoryItem.findFirst({
         where: {
@@ -525,7 +567,10 @@ export class ProductionService {
       // conflicting sizes like "Idly Batter 1 Kg (250g)" / "...-1-KG-1KG-250G".
       // Strip any trailing weight/volume/count token first so the retail
       // variant reads as its own size, not the master's size plus the pack's.
-      const cleanBaseName = baseName.replace(/\s+\d+(\.\d+)?\s*(kg|g|l|ml|pcs|units?)\.?$/i, '').trim() || baseName;
+      // This only applies to a linked Product's own name/SKU — a recipe-code
+      // fallback base (e.g. "RCP-0001") has no embedded master pack size, and
+      // its trailing digits are part of the code's identity, not a size to
+      // strip (stripping them collapsed "RCP-0001" down to "RCP").
       const stripTrailingSizeSegments = (sku: string): string => {
         const segments = sku.split('-');
         const isSizeSegment = (seg: string) =>
@@ -537,7 +582,12 @@ export class ProductionService {
         }
         return segments.join('-');
       };
-      const cleanBaseSku = stripTrailingSizeSegments(baseSku) || baseSku;
+      const cleanBaseName = batch.product
+        ? (baseName.replace(/\s+\d+(\.\d+)?\s*(kg|g|l|ml|pcs|units?)\.?$/i, '').trim() || baseName)
+        : baseName;
+      const cleanBaseSku = batch.product
+        ? (stripTrailingSizeSegments(baseSku) || baseSku)
+        : baseSku;
 
       const packetSizeMatch = data.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
       const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : data.packetSize;
@@ -754,7 +804,13 @@ export class ProductionService {
   static async getAllProductBatches(franchiseId?: string) {
     return prisma.productBatch.findMany({
       where: franchiseId ? { franchiseId } : {},
-      include: { product: true, franchise: true, production: { include: { recipe: true } }, packagings: true },
+      include: {
+        product: true,
+        franchise: true,
+        production: { include: { recipe: true } },
+        packagings: true,
+        recall: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
   }

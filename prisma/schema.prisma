@@ -133,6 +133,12 @@ model Franchise {
   ownerName          String
   contactNum         String
   status             String             @default("ACTIVE")
+  // Explicit source of truth for "is this franchise HQ" — replaces the
+  // ~11 independent id==='hq-001'/name-contains-'HQ' heuristics that used
+  // to be scattered across the codebase and could disagree with each other.
+  // Exactly one franchise should have this set; FranchiseService.getHqFranchise()
+  // enforces that invariant at read time.
+  isHQ               Boolean            @default(false)
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
   dashboardPassword  String?
@@ -630,7 +636,7 @@ enum PackagingStatus {
 
 model ProductBatch {
   id               String             @id @default(uuid())
-  productId        String
+  productId        String?
   productionId     String?
   quantity         Float
   expiryDate       DateTime?
@@ -651,7 +657,7 @@ model ProductBatch {
   unitCost         Float?
   totalCost        Float?
   franchise        Franchise?         @relation(fields: [franchiseId], references: [id])
-  product          Product            @relation(fields: [productId], references: [id])
+  product          Product?           @relation(fields: [productId], references: [id])
   production       Production?        @relation(fields: [productionId], references: [id])
   packagings       ProductPackaging[]
   cartons          Carton[]

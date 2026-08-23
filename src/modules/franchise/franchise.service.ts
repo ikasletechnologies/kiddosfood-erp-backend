@@ -63,6 +63,7 @@ export class FranchiseService {
         outstandingAmount: true,
         creditLimit: true,
         walletBalance: true,
+        isHQ: true,
         createdAt: true,
         updatedAt: true,
         _count: {
@@ -70,6 +71,32 @@ export class FranchiseService {
         }
       }
     });
+  }
+
+  // The single source of truth for "which franchise is HQ" — replaces the
+  // id==='hq-001'/name-contains-'HQ' heuristics that used to be duplicated
+  // (and disagreed with each other) across product/pos/inventory/franchise-order
+  // services. `tx` lets callers use it inside an existing transaction.
+  static async getHqFranchise(tx: any = prisma) {
+    const rows = await tx.franchise.findMany({ where: { isHQ: true } });
+    if (rows.length > 1) {
+      throw new Error(`Multiple franchises are marked isHQ (${rows.map((f: any) => f.id).join(', ')}) — exactly one HQ franchise is required.`);
+    }
+    if (rows.length === 0) {
+      throw new Error('No franchise is marked as HQ (Franchise.isHQ). Set isHQ=true on exactly one franchise.');
+    }
+    return rows[0];
+  }
+
+  // Same invariant (never silently pick one of several), but returns null
+  // instead of throwing when there simply isn't an HQ configured yet — for
+  // call sites that historically treated "no HQ yet" as a soft no-op.
+  static async getHqFranchiseOrNull(tx: any = prisma) {
+    const rows = await tx.franchise.findMany({ where: { isHQ: true } });
+    if (rows.length > 1) {
+      throw new Error(`Multiple franchises are marked isHQ (${rows.map((f: any) => f.id).join(', ')}) — exactly one HQ franchise is required.`);
+    }
+    return rows[0] || null;
   }
 
   static async getById(id: string) {

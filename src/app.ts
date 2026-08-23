@@ -16,6 +16,7 @@ import { CartonController } from './modules/production/carton.controller';
 import { RecallController } from './modules/production/recall.controller';
 import { ProcurementController } from './modules/procurement/procurement.controller';
 import { FranchiseController } from './modules/franchise/franchise.controller';
+import { FranchiseService } from './modules/franchise/franchise.service';
 import { NavController } from './modules/users/nav.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 import { AuditController } from './modules/audit/audit.controller';
@@ -132,19 +133,25 @@ app.get('/', (_req: Request, res: Response) => {
 app.get('/health', async (req: Request, res: Response) => {
   if (req.query.seed === 'true') {
     try {
-      // 1. Ensure HQ exists
-      await prisma.franchise.upsert({
-        where: { id: 'hq-001' },
-        update: {},
-        create: {
-          id: 'hq-001',
-          name: 'Kiddos Food Headquarters',
-          location: 'Mumbai',
-          ownerName: 'Super Admin',
-          contactNum: '9999999999',
-          status: 'ACTIVE'
-        }
-      });
+      // 1. Ensure HQ exists — but never if a real HQ (Franchise.isHQ=true)
+      // already exists under some other id, since that would silently
+      // create a second HQ franchise alongside it.
+      const existingHq = await FranchiseService.getHqFranchiseOrNull();
+      if (!existingHq) {
+        await prisma.franchise.upsert({
+          where: { id: 'hq-001' },
+          update: { isHQ: true },
+          create: {
+            id: 'hq-001',
+            name: 'Kiddos Food Headquarters',
+            location: 'Mumbai',
+            ownerName: 'Super Admin',
+            contactNum: '9999999999',
+            status: 'ACTIVE',
+            isHQ: true
+          }
+        });
+      }
 
       // 2. Ensure basic warehouse exists
       await prisma.warehouse.upsert({

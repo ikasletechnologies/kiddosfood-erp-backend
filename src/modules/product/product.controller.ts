@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { ProductService } from './product.service';
 import prisma from '../../lib/prisma';
+import { FranchiseService } from '../franchise/franchise.service';
 
 export class ProductController {
   static async getAll(req: Request, res: Response) {
@@ -16,18 +17,12 @@ export class ProductController {
 
       // If HQ stock is requested, or if no context is available for a Super Admin
       if (stockSource === 'HQ' || (!franchiseId && user?.role === 'SUPER_ADMIN')) {
-        const hq = await prisma.franchise.findFirst({ 
-          where: { 
-            OR: [
-              { id: 'hq-001' },
-              { name: { contains: 'HQ', mode: 'insensitive' } },
-              { name: { contains: 'Head', mode: 'insensitive' } },
-              { name: { contains: 'Main', mode: 'insensitive' } }
-            ],
-            status: 'ACTIVE' 
-          } 
-        });
-        const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
+        const hq = await FranchiseService.getHqFranchiseOrNull();
+        // Falling back to "any active franchise" here is a last-resort default
+        // so the page still renders something — it is not a claim that the
+        // fallback franchise is HQ (that determination now only ever comes
+        // from Franchise.isHQ via getHqFranchiseOrNull above).
+        const first = hq ? null : await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
         franchiseId = hq?.id || first?.id || "";
       }
       

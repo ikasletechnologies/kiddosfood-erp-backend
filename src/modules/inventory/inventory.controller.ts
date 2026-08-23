@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 import prisma from '../../lib/prisma';
+import { FranchiseService } from '../franchise/franchise.service';
 
 function normalizeWarehouseName(s: string) {
   return s.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -14,15 +15,20 @@ export class InventoryController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
 
-      // For SUPER_ADMIN without franchiseId, fetch the first available franchise to avoid empty screen
+      const category = req.query.category as string | undefined;
+
+      // For SUPER_ADMIN without franchiseId, default to HQ (falling back to
+      // any franchise) to avoid an empty screen.
       if (!franchiseId) {
-        const franchises = await prisma.franchise.findMany({ take: 1 });
-        const defaultId = franchises[0]?.id || 'hq-001';
-        const items = await InventoryService.getInventory(defaultId);
+        const hq = await FranchiseService.getHqFranchiseOrNull();
+        const first = hq ? null : await prisma.franchise.findFirst();
+        const defaultId = hq?.id || first?.id;
+        if (!defaultId) return res.json([]);
+        const items = await InventoryService.getInventory(defaultId, false, undefined, category as any);
         return res.json(items);
       }
 
-      const items = await InventoryService.getInventory(franchiseId);
+      const items = await InventoryService.getInventory(franchiseId, false, undefined, category as any);
       res.json(items);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -291,8 +297,9 @@ export class InventoryController {
       const { itemId, category } = req.query;
 
       if (!franchiseId) {
-        const franchises = await prisma.franchise.findMany({ take: 1 });
-        franchiseId = franchises[0]?.id || 'hq-001';
+        const hq = await FranchiseService.getHqFranchiseOrNull();
+        const first = hq ? null : await prisma.franchise.findFirst();
+        franchiseId = hq?.id || first?.id;
       }
 
       const ledger = await InventoryService.getInventoryLedger(
