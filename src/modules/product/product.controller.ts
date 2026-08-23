@@ -8,7 +8,32 @@ export class ProductController {
     try {
       const user = (req as any).user;
       let franchiseId = req.query.franchiseId as string;
-      const stockSource = req.query.stockSource as string;
+      let stockSource = req.query.stockSource as string;
+
+      // GLOBAL is a SUPER_ADMIN-only directive — checked here, server-side,
+      // never trusted from the client. A FRANCHISE_ADMIN passing it must be
+      // treated exactly as if they hadn't passed it at all, so it falls
+      // through to their own-franchise resolution below untouched (rather
+      // than merely skipping the GLOBAL branch while still perturbing the
+      // "no stockSource" checks further down, which would leave franchiseId
+      // unset and unintentionally return the unfiltered global catalog).
+      if (stockSource === 'GLOBAL' && user?.role !== 'SUPER_ADMIN') {
+        stockSource = '';
+      }
+
+      // Super Admin can explicitly ask for the full global finished-goods
+      // catalog — every product regardless of which franchise (if any)
+      // stocks it — instead of being silently narrowed to one franchise's
+      // inventory. ProductService.getAll() with no franchiseId already
+      // returns the unfiltered catalog (no per-franchise stock
+      // enrichment/dropping) — callers that need per-franchise stock keep
+      // computing it themselves from /api/raw-materials, same as
+      // FinishedGoodsStockClient does today.
+      if (stockSource === 'GLOBAL') {
+        const category = req.query.category as string;
+        const products = await ProductService.getAll(category ? { category } : {});
+        return res.json(products);
+      }
 
       // If user is logged in and no specific franchise/source is requested, use their own
       if (!franchiseId && !stockSource && user?.franchiseId) {

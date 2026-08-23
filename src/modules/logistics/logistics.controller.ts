@@ -34,7 +34,13 @@ export class LogisticsController {
 
   static async getRequests(req: Request, res: Response) {
     try {
-      const franchiseId = req.query.franchiseId as string;
+      const user = (req as any).user;
+      // Same pattern as getTransfers/getInTransit below: a Franchise Admin is
+      // always scoped to their own branch regardless of what franchiseId (if
+      // any) the request asked for; only SUPER_ADMIN's query param is honored.
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string | undefined)
+        : IsolationUtil.getFranchiseFilter(user).franchiseId;
       const result = await LogisticsService.getRequests(franchiseId);
       res.json(result);
     } catch (error: any) {

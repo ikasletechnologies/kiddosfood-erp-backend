@@ -2,7 +2,6 @@ import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 import prisma from '../../lib/prisma';
-import { FranchiseService } from '../franchise/franchise.service';
 
 function normalizeWarehouseName(s: string) {
   return s.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -17,17 +16,11 @@ export class InventoryController {
 
       const category = req.query.category as string | undefined;
 
-      // For SUPER_ADMIN without franchiseId, default to HQ (falling back to
-      // any franchise) to avoid an empty screen.
-      if (!franchiseId) {
-        const hq = await FranchiseService.getHqFranchiseOrNull();
-        const first = hq ? null : await prisma.franchise.findFirst();
-        const defaultId = hq?.id || first?.id;
-        if (!defaultId) return res.json([]);
-        const items = await InventoryService.getInventory(defaultId, false, undefined, category as any);
-        return res.json(items);
-      }
-
+      // SUPER_ADMIN with no franchiseId means "global": every franchise's
+      // stock, HQ and branches alike. Do NOT default to a single franchise
+      // here — that would silently convert a global request into a
+      // single-branch one. FRANCHISE_ADMIN always has franchiseId forced by
+      // IsolationUtil above, so this only ever runs unscoped for SUPER_ADMIN.
       const items = await InventoryService.getInventory(franchiseId, false, undefined, category as any);
       res.json(items);
     } catch (error: any) {
@@ -293,14 +286,12 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      // No franchise = no filter (see everything) for SUPER_ADMIN — same rule
+      // as getInventory/getRawMaterialStockSummary above. Previously this
+      // substituted HQ (or any franchise) instead, silently hiding every
+      // other branch's movements from a "global" ledger request.
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
       const { itemId, category } = req.query;
-
-      if (!franchiseId) {
-        const hq = await FranchiseService.getHqFranchiseOrNull();
-        const first = hq ? null : await prisma.franchise.findFirst();
-        franchiseId = hq?.id || first?.id;
-      }
 
       const ledger = await InventoryService.getInventoryLedger(
         franchiseId,

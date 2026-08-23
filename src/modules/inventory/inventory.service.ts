@@ -140,7 +140,10 @@ export class InventoryService {
     };
   }
 
-  static async getInventory(franchiseId: string, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory) {
+  // franchiseId is optional: Prisma drops an `undefined` where-key entirely,
+  // so omitting it here correctly means "every franchise" (SUPER_ADMIN's
+  // global view), not "no results" — do not substitute a default franchise.
+  static async getInventory(franchiseId: string | undefined, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory) {
     const items = await prisma.inventoryItem.findMany({
       where: {
         franchiseId,
@@ -1076,7 +1079,7 @@ export class InventoryService {
   // RAW_MATERIAL only, which meant finished-goods stock movements (e.g. QC
   // acceptance into inventory) never showed up here. `category` is now an
   // optional narrowing filter, not a fixed scope.
-  static async getInventoryLedger(franchiseId: string, itemId?: string, category?: ItemCategory) {
+  static async getInventoryLedger(franchiseId: string | undefined, itemId?: string, category?: ItemCategory) {
     const movements = await prisma.stockMovement.findMany({
       where: {
         item: {
