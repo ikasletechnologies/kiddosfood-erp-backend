@@ -152,13 +152,44 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
+  // SUPER_ADMIN: every active warehouse, globally, each tagged with the
+  // franchise it's primary for (if any) — Warehouse has no franchiseId
+  // column, so this is derived via the reverse "primary warehouse of"
+  // relation, not assumed from the warehouse's name/code.
+  // FRANCHISE_ADMIN: only their own franchise's primary warehouse (or an
+  // empty list if none is set) — resolved from the authenticated user via
+  // IsolationUtil, never from a client-supplied franchiseId.
   static async getWarehouses(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+
+      if (franchiseFilter.franchiseId) {
+        const franchise = await prisma.franchise.findUnique({
+          where: { id: franchiseFilter.franchiseId },
+          select: { name: true, primaryWarehouse: { select: { id: true, name: true, code: true, status: true } } },
+        });
+        if (!franchise?.primaryWarehouse || franchise.primaryWarehouse.status !== 'ACTIVE') {
+          return res.json([]);
+        }
+        return res.json([{
+          ...franchise.primaryWarehouse,
+          franchiseId: franchiseFilter.franchiseId,
+          franchiseName: franchise.name,
+        }]);
+      }
+
       const warehouses = await prisma.warehouse.findMany({
         where: { status: 'ACTIVE' },
+        include: { primaryForFranchises: { select: { id: true, name: true } } },
         orderBy: { name: 'asc' }
       });
-      res.json(warehouses);
+      const result = warehouses.map((w: any) => {
+        const { primaryForFranchises, ...rest } = w;
+        const owner = primaryForFranchises?.[0];
+        return { ...rest, franchiseId: owner?.id ?? null, franchiseName: owner?.name ?? null };
+      });
+      res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

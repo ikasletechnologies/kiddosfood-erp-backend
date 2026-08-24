@@ -23,6 +23,21 @@ export class WarehouseService {
   }
 
   /**
+   * Get one warehouse and its bins directly by id — for SUPER_ADMIN picking
+   * an arbitrary warehouse from the global list (not necessarily anyone's
+   * "primary"). getPrimaryWarehouse() can't serve this: it only resolves
+   * via a franchise's primaryWarehouseId.
+   */
+  static async getWarehouseById(warehouseId: string) {
+    const warehouse = await prisma.warehouse.findUnique({
+      where: { id: warehouseId },
+      include: { bins: true },
+    });
+    if (!warehouse) throw new Error('Warehouse not found');
+    return warehouse;
+  }
+
+  /**
    * Gets physical stock strictly broken down by Item, Batch, and Bin.
    */
   static async getWarehouseStock(warehouseId: string) {

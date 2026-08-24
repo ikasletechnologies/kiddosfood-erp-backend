@@ -9,6 +9,7 @@ router.use(authenticate);
 // Main warehouse routes
 router.get('/primary', WarehouseController.getPrimaryWarehouse);
 router.get('/:warehouseId/stock', WarehouseController.getWarehouseStock);
+router.get('/:warehouseId', WarehouseController.getWarehouseById);
 
 // Bin management
 router.post('/:warehouseId/bins', WarehouseController.createBin);
