@@ -106,21 +106,38 @@ export class ProductionService {
         }
       }
 
-      // 3. Expiry is derived from the linked Product's configured shelf life
-      // (Production Date + shelfLifeDays) — that's the single source of truth
-      // so it stays correct as new products/shelf-life values are added, instead
-      // of every caller having to compute and pass its own expiry. A caller-supplied
-      // expiryDate or the DEFAULT_SHELF_LIFE_DAYS fallback only apply until the
-      // product's shelf life gets configured. Computed once here and stored on the
-      // Production row, so changing a product's shelf life later never rewrites the
-      // expiry of batches already produced.
+      // 3. Expiry is derived from the linked Product's configured shelf life,
+      // the earliest expiry date of the consumed GRN raw material ingredients, or fallback.
       const DEFAULT_SHELF_LIFE_DAYS = 7;
       const shelfLifeDays = recipe.product?.shelfLifeDays;
-      const expiryDate = shelfLifeDays
-        ? new Date(Date.now() + shelfLifeDays * 24 * 60 * 60 * 1000)
-        : data.expiryDate
-        ? new Date(data.expiryDate)
-        : new Date(Date.now() + DEFAULT_SHELF_LIFE_DAYS * 24 * 60 * 60 * 1000);
+
+      // Look up the earliest GRN ingredient batch expiry date for recipe items
+      const ingredientItemIds = recipe.recipeItems.map(ri => ri.inventoryItemId);
+      const ingredientBatches = await tx.inventoryBatch.findMany({
+        where: {
+          inventoryItemId: { in: ingredientItemIds },
+          currentQty: { gt: 0 },
+          expDate: { not: null },
+          status: 'APPROVED',
+        },
+        orderBy: { expDate: 'asc' },
+        take: 1,
+      });
+      const earliestIngredientExpiry = ingredientBatches[0]?.expDate;
+
+      let expiryDate: Date;
+      if (data.expiryDate) {
+        expiryDate = new Date(data.expiryDate);
+      } else if (shelfLifeDays) {
+        const productExpiry = new Date(Date.now() + shelfLifeDays * 24 * 60 * 60 * 1000);
+        expiryDate = earliestIngredientExpiry && earliestIngredientExpiry < productExpiry
+          ? earliestIngredientExpiry
+          : productExpiry;
+      } else if (earliestIngredientExpiry) {
+        expiryDate = earliestIngredientExpiry;
+      } else {
+        expiryDate = new Date(Date.now() + DEFAULT_SHELF_LIFE_DAYS * 24 * 60 * 60 * 1000);
+      }
 
       // 4. Create production record (IN_PROGRESS)
       const production = await tx.production.create({
@@ -760,7 +777,7 @@ export class ProductionService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return batches.map(b => {
+    const mappedProductBatches = batches.map(b => {
       const effectiveExpiry = b.expiryDate || b.production?.expiryDate;
       const packedQuantity = b.packagedQty || 0;
       const bulkQuantity = Math.max(0, (b.approvedQty || 0) - (b.packagedQty || 0));
@@ -768,6 +785,7 @@ export class ProductionService {
 
       return {
         ...b,
+        product: b.product || (b.production?.recipe ? { name: b.production.recipe.name, sku: b.production.recipe.recipeCode } : null),
         packedQuantity,
         bulkQuantity,
         availableQuantity,
@@ -780,6 +798,61 @@ export class ProductionService {
           : 'VALID',
       };
     });
+
+    // Also include GRN raw material / inventory batches that carry expiry dates
+    const inventoryBatches = await prisma.inventoryBatch.findMany({
+      where: {
+        expDate: { not: null },
+        ...(franchiseId ? { inventoryItem: { franchiseId } } : {}),
+        ...(productId ? { inventoryItemId: productId } : {}),
+      },
+      include: {
+        inventoryItem: {
+          include: { franchise: true },
+        },
+        warehouse: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const mappedInventoryBatches = inventoryBatches.map(ib => {
+      const effectiveExpiry = ib.expDate;
+      return {
+        id: ib.id,
+        batchCode: ib.lotNumber || ib.batchNumber || `GRN-${ib.id.substring(0, 8).toUpperCase()}`,
+        productId: ib.inventoryItemId,
+        product: {
+          id: ib.inventoryItem?.id,
+          name: ib.inventoryItem?.name || 'Raw Material',
+          sku: ib.inventoryItem?.sku,
+        },
+        franchise: ib.inventoryItem?.franchise || (ib.warehouse ? { name: ib.warehouse.name } : null),
+        franchiseId: ib.inventoryItem?.franchiseId,
+        quantity: ib.initialQty,
+        approvedQty: ib.initialQty,
+        bulkQuantity: ib.currentQty,
+        packagedQty: 0,
+        packedQuantity: 0,
+        availableQuantity: ib.currentQty,
+        mfgDate: ib.mfgDate || ib.createdAt,
+        createdAt: ib.createdAt,
+        expiryDate: ib.expDate,
+        qcStatus: ib.status,
+        unit: ib.inventoryItem?.unit || 'KG',
+        batchType: 'GRN_RAW_MATERIAL',
+        expiryStatus: !effectiveExpiry
+          ? 'VALID'
+          : effectiveExpiry < now
+          ? 'EXPIRED'
+          : effectiveExpiry < soonThreshold
+          ? 'EXPIRING_SOON'
+          : 'VALID',
+      } as any;
+    });
+
+    return [...mappedProductBatches, ...mappedInventoryBatches].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
   }
 
   static async getPendingQCBatches(franchiseId?: string) {
