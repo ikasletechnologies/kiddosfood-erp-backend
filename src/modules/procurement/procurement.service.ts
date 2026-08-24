@@ -12,6 +12,7 @@ export class ProcurementService {
     contact: string; 
     email?: string; 
     address?: string; 
+    billingAddress?: string;
     state?: string;
     district?: string;
     city?: string;
@@ -19,6 +20,7 @@ export class ProcurementService {
     shippingAddress?: string;
     gstType?: string;
     openingBalance?: number;
+    openingBalanceType?: string;
     asOfDate?: string;
     creditLimit?: number;
     remark?: string;
@@ -42,8 +44,9 @@ export class ProcurementService {
       throw new Error("Please enter a valid email address.");
     }
 
+    const resolvedAddress = data.address || (data as any).billingAddress;
     // 4. Address Validation (Mandatory)
-    if (!data.address || data.address.trim().length === 0) {
+    if (!resolvedAddress || resolvedAddress.trim().length === 0) {
       throw new Error("Registered Office Address is required.");
     }
 
@@ -68,17 +71,17 @@ export class ProcurementService {
             vendorCode,
             name: data.name,
             contact: data.contact,
-            email: data.email,
-            address: data.address,
+            email: data.email || null,
+            address: resolvedAddress,
             state: data.state,
             district: data.district,
             city: data.city,
             pincode: data.pincode,
             shippingAddress: data.shippingAddress,
             gstType: data.gstType,
-            openingBalance: data.openingBalance || 0,
+            openingBalance: Number(data.openingBalance) || 0,
             asOfDate: data.asOfDate ? new Date(data.asOfDate) : null,
-            creditLimit: data.creditLimit,
+            creditLimit: data.creditLimit !== undefined && data.creditLimit !== null ? Number(data.creditLimit) : null,
             remark: data.remark,
             gstNumber: data.gstNumber,
             category: data.category,
@@ -121,7 +124,12 @@ export class ProcurementService {
         _count: { select: { orders: true } },
         suppliedMaterials: { include: { material: true } },
         ledgerEntries: { select: { type: true, amount: true, referenceType: true } },
-        orders: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 }
+        orders: { 
+          include: { 
+            poItems: { include: { inventoryItem: true } }
+          }, 
+          orderBy: { createdAt: 'desc' } 
+        }
       },
       orderBy: { name: 'asc' }
     });
@@ -182,14 +190,7 @@ export class ProcurementService {
       const totalOwedByUs = totalPurchased + manualCredits;
       const totalPaidToThem = totalPayments + totalReturns + manualDebits;
 
-      // Single source of truth for balance/due/advance: the full, unfiltered
-      // ledger sum (same formula as getVendorBalance/getAvailableAdvance),
-      // not the referenceType-filtered totals above — those stay scoped to
-      // "Total Purchases"/"Payments Made" display, which intentionally
-      // exclude ADVANCE/ADJUSTMENT rows. Using the filtered version for
-      // balance/advance too is what let a spent advance still count as
-      // "available" forever, since the CREDIT row (or any other
-      // referenceType) that offsets it wasn't part of this same filter set.
+      // Single source of truth for balance/due/advance
       const balance = entries.reduce((acc, e) => acc + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
       const rawAdvance = balance < 0 ? -balance : 0;
       const reservedAdvance = rawAdvance > 0
@@ -199,19 +200,65 @@ export class ProcurementService {
           }))._sum.advanceApplied || 0
         : 0;
 
+      const materialMap = new Map<string, { material: any; price: number; quantity: number; totalQuantity: number; totalAmount: number; lastUpdated: Date }>();
+      if (v.suppliedMaterials) {
+        for (const sm of v.suppliedMaterials) {
+          if (sm.material) {
+            const qty = Number(sm.quantity) || 0;
+            const p = Number(sm.price) || Number(sm.material.costPrice) || Number(sm.material.basePrice) || 0;
+            materialMap.set(sm.materialId, {
+              material: sm.material,
+              price: p,
+              quantity: qty,
+              totalQuantity: qty,
+              totalAmount: qty * p,
+              lastUpdated: sm.lastUpdated || v.createdAt
+            });
+          }
+        }
+      }
+
+      const sortedOrders = [...(v.orders || [])].reverse();
+      for (const order of sortedOrders) {
+        for (const item of order.poItems || []) {
+          if (item.inventoryItem) {
+            const prev = materialMap.get(item.inventoryItem.id);
+            const itemQty = Number(item.quantity) || 0;
+            const itemPrice = Number(item.price) || 0;
+            const itemTotal = Number(item.total) || (itemQty * itemPrice);
+
+            materialMap.set(item.inventoryItem.id, {
+              material: item.inventoryItem,
+              price: itemPrice,
+              quantity: itemQty,
+              totalQuantity: (prev?.totalQuantity || 0) + itemQty,
+              totalAmount: (prev?.totalAmount || 0) + itemTotal,
+              lastUpdated: order.createdAt
+            });
+          }
+        }
+      }
+
+      const suppliedMaterials = Array.from(materialMap.entries()).map(([mId, data]) => ({
+        id: mId,
+        materialId: mId,
+        price: data.price,
+        quantity: data.quantity,
+        totalQuantity: data.totalQuantity,
+        totalAmount: data.totalAmount,
+        lastUpdated: data.lastUpdated,
+        material: data.material
+      }));
+
       return {
         ...v,
         totalPurchased: totalOwedByUs,
         totalPaid: totalPaidToThem,
-        // Cash/bank payments only — excludes advance grants, returns, and
-        // manual adjustments. This is what "Payments Made" should mean:
-        // money paid against invoices, not the vendor's total cash outflow.
-        // (totalPaid above stays as the broader figure for whatever else
-        // already relies on its inclusive definition.)
         totalPayments,
         balance: balance,
-        due: balance > 0 ? balance : 0,         // We owe them
-        advance: Math.max(0, rawAdvance - reservedAdvance), // Unspent/available — they owe us, minus whatever's already earmarked to an open PO
+        due: balance > 0 ? balance : 0,
+        advance: Math.max(0, rawAdvance - reservedAdvance),
+        suppliedMaterials,
         lastOrderDate: v.orders?.[0]?.createdAt || null
       };
     }));
@@ -231,6 +278,7 @@ export class ProcurementService {
         },
         invoices: true,
         ledgerEntries: true,
+        suppliedMaterials: { include: { material: true } },
         _count: { select: { orders: true } } 
       }
     });
@@ -296,14 +344,40 @@ export class ProcurementService {
         }))._sum.advanceApplied || 0
       : 0;
 
-    const materialMap = new Map<string, { material: any; price: number; lastUpdated: Date }>();
+    const materialMap = new Map<string, { material: any; price: number; quantity: number; totalQuantity: number; totalAmount: number; lastUpdated: Date }>();
+    
+    if (vendor.suppliedMaterials) {
+      for (const sm of vendor.suppliedMaterials) {
+        if (sm.material) {
+          const qty = Number(sm.quantity) || 0;
+          const p = Number(sm.price) || Number(sm.material.costPrice) || Number(sm.material.basePrice) || 0;
+          materialMap.set(sm.materialId, {
+            material: sm.material,
+            price: p,
+            quantity: qty,
+            totalQuantity: qty,
+            totalAmount: qty * p,
+            lastUpdated: sm.lastUpdated || vendor.createdAt
+          });
+        }
+      }
+    }
+
     const sortedOrders = [...vendor.orders].reverse();
     for (const order of sortedOrders) {
       for (const item of order.poItems) {
         if (item.inventoryItem) {
+          const prev = materialMap.get(item.inventoryItem.id);
+          const itemQty = Number(item.quantity) || 0;
+          const itemPrice = Number(item.price) || 0;
+          const itemTotal = Number(item.total) || (itemQty * itemPrice);
+
           materialMap.set(item.inventoryItem.id, {
             material: item.inventoryItem,
-            price: item.price,
+            price: itemPrice,
+            quantity: itemQty,
+            totalQuantity: (prev?.totalQuantity || 0) + itemQty,
+            totalAmount: (prev?.totalAmount || 0) + itemTotal,
             lastUpdated: order.createdAt
           });
         }
@@ -311,11 +385,11 @@ export class ProcurementService {
       for (const grn of order.goodsReceipts || []) {
         for (const item of grn.items || []) {
           if (item.inventoryItem) {
-            materialMap.set(item.inventoryItem.id, {
-              material: item.inventoryItem,
-              price: item.price || materialMap.get(item.inventoryItem.id)?.price || 0,
-              lastUpdated: grn.createdAt || order.createdAt
-            });
+            const prev = materialMap.get(item.inventoryItem.id);
+            if (prev) {
+              prev.lastUpdated = grn.createdAt || order.createdAt;
+              if (item.price) prev.price = Number(item.price);
+            }
           }
         }
       }
@@ -323,7 +397,11 @@ export class ProcurementService {
 
     const suppliedMaterials = Array.from(materialMap.entries()).map(([mId, data]) => ({
       id: mId,
+      materialId: mId,
       price: data.price,
+      quantity: data.quantity,
+      totalQuantity: data.totalQuantity,
+      totalAmount: data.totalAmount,
       lastUpdated: data.lastUpdated,
       material: data.material
     }));
@@ -358,6 +436,7 @@ export class ProcurementService {
     contact?: string; 
     email?: string; 
     address?: string; 
+    billingAddress?: string;
     state?: string;
     district?: string;
     city?: string;
@@ -365,16 +444,18 @@ export class ProcurementService {
     shippingAddress?: string;
     gstType?: string;
     openingBalance?: number;
-    asOfDate?: string;
-    creditLimit?: number;
-    remark?: string;
-    rating?: number;
-    gstNumber?: string;
-    category?: string;
+    openingBalanceType?: string;
+    asOfDate?: string | Date | null;
+    creditLimit?: number | null;
+    remark?: string | null;
+    rating?: number | null;
+    gstNumber?: string | null;
+    category?: string | null;
     paymentTerms?: any;
     status?: any;
     paymentReminderEnabled?: boolean;
     paymentReminderDays?: number;
+    vendorCode?: string | null;
   }) {
     if (data.name !== undefined && !/^[A-Za-z0-9\s&.,\-()]+$/.test(data.name)) {
       throw new Error("Vendor Name must only contain alphanumeric characters, spaces, and the following symbols: & . , - ( )");
@@ -385,15 +466,38 @@ export class ProcurementService {
     if (data.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) {
       throw new Error("Please enter a valid email address.");
     }
-    if (data.address !== undefined && data.address.trim().length === 0) {
+    const resolvedAddress = data.address !== undefined ? data.address : (data as any).billingAddress;
+    if (resolvedAddress !== undefined && resolvedAddress.trim().length === 0) {
       throw new Error("Registered Office Address cannot be empty.");
     }
     
-    const updateData: any = { ...data };
-    if (data.asOfDate) updateData.asOfDate = new Date(data.asOfDate);
-    
-    // Remove properties that are not part of the Prisma schema
-    delete updateData.openingBalanceType;
+    const updateData: any = {};
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.contact !== undefined) updateData.contact = data.contact;
+    if (data.email !== undefined) updateData.email = data.email || null;
+    if (resolvedAddress !== undefined) updateData.address = resolvedAddress;
+    if (data.state !== undefined) updateData.state = data.state;
+    if (data.district !== undefined) updateData.district = data.district;
+    if (data.city !== undefined) updateData.city = data.city;
+    if (data.pincode !== undefined) updateData.pincode = data.pincode;
+    if (data.shippingAddress !== undefined) updateData.shippingAddress = data.shippingAddress;
+    if (data.gstType !== undefined) updateData.gstType = data.gstType;
+    if (data.openingBalance !== undefined) updateData.openingBalance = Number(data.openingBalance) || 0;
+    if (data.asOfDate !== undefined) {
+      updateData.asOfDate = data.asOfDate ? new Date(data.asOfDate) : null;
+    }
+    if (data.creditLimit !== undefined) updateData.creditLimit = data.creditLimit !== null && data.creditLimit !== undefined ? Number(data.creditLimit) : null;
+    if (data.remark !== undefined) updateData.remark = data.remark;
+    if (data.rating !== undefined) updateData.rating = data.rating !== null && data.rating !== undefined ? Number(data.rating) : null;
+    if (data.gstNumber !== undefined) updateData.gstNumber = data.gstNumber;
+    if (data.category !== undefined) updateData.category = data.category;
+    if (data.paymentTerms !== undefined) updateData.paymentTerms = data.paymentTerms;
+    if (data.status !== undefined) updateData.status = data.status;
+    if (data.paymentReminderEnabled !== undefined) updateData.paymentReminderEnabled = Boolean(data.paymentReminderEnabled);
+    if (data.paymentReminderDays !== undefined) updateData.paymentReminderDays = Number(data.paymentReminderDays);
+    if ((data as any).vendorCode !== undefined) updateData.vendorCode = (data as any).vendorCode;
+    if ((data as any).manualPurchaseAdj !== undefined) updateData.manualPurchaseAdj = Number((data as any).manualPurchaseAdj);
+    if ((data as any).manualAdvanceAdj !== undefined) updateData.manualAdvanceAdj = Number((data as any).manualAdvanceAdj);
     
     return prisma.$transaction(async (tx) => {
       const vendor = await tx.vendor.update({ where: { id }, data: updateData });
