@@ -353,7 +353,7 @@ export class FranchiseOrderService {
               let sku = product.sku
                 ? `${product.sku}-${order.franchiseId.substring(0, 6).toUpperCase()}`
                 : `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-              if (await tx.inventoryItem.findUnique({ where: { sku } })) {
+              if (await tx.inventoryItem.findFirst({ where: { sku } })) {
                 sku = `${sku}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
               }
 

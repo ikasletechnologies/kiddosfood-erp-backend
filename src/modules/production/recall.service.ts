@@ -110,7 +110,10 @@ export class RecallService {
       batch: {
         id: quantities.batch.id,
         batchCode: quantities.batch.batchCode,
-        productName: quantities.batch.product?.name,
+        // product is legitimately null for a recipe with no linked Product
+        // (see approveProduction) — the recipe name is still the batch's
+        // real, canonical product reference.
+        productName: quantities.batch.product?.name || quantities.batch.production?.recipe?.name,
         qcStatus: quantities.batch.qcStatus,
         unit: quantities.unit,
         producedQty: quantities.producedQty,
@@ -421,7 +424,7 @@ export class RecallService {
       const report = {
         recallId: recall.id,
         batchCode: quantities.batch.batchCode,
-        productName: quantities.batch.product?.name,
+        productName: quantities.batch.product?.name || quantities.batch.production?.recipe?.name,
         productionDate: quantities.batch.production?.startTime || quantities.batch.mfgDate || quantities.batch.createdAt,
         qcStatus: quantities.batch.qcStatus,
         unit: quantities.unit,

@@ -210,15 +210,16 @@ export class LogisticsService {
         });
 
         if (!destInv) {
-          // InventoryItem.sku is globally unique (not scoped per branch), so
-          // the source item's own SKU can't be reused verbatim — every other
-          // branch's copy of "the same item" is still a distinct row with
-          // its own SKU. Derive one from the source SKU + destination branch
-          // instead of colliding with it.
+          // InventoryItem.sku is unique per franchise (not globally), so the
+          // destination branch's row for this product keeps the exact same
+          // SKU as the source — same master item, just a location-level
+          // balance for a different branch. Never derive/suffix a new SKU
+          // here: that would fork the product identity and make Stock Hub
+          // show the same item twice under different SKUs.
           destInv = await tx.inventoryItem.create({
             data: {
               name: item.inventoryItem.name,
-              sku: `${item.inventoryItem.sku}-${transfer.toBranchId.replace(/-/g, '').slice(0, 6).toUpperCase()}`,
+              sku: item.inventoryItem.sku,
               category: item.inventoryItem.category,
               unit: item.inventoryItem.unit,
               currentStock: 0,

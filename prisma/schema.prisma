@@ -260,7 +260,11 @@ model InventoryItem {
   baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
   wasteEntries         WasteEntry[]
 
-  @@unique([sku])
+  // Scoped per franchise, not globally: the same master item (identical SKU)
+  // legitimately has one row per location it's stocked at (HQ + each
+  // branch/franchise) — see StockTransfer completion, which credits the
+  // destination branch's row for this SKU rather than inventing a new one.
+  @@unique([sku, franchiseId])
 }
 
 model WasteEntry {

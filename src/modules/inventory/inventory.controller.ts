@@ -155,6 +155,7 @@ export class InventoryController {
   static async getWarehouses(req: Request, res: Response) {
     try {
       const warehouses = await prisma.warehouse.findMany({
+        where: { status: 'ACTIVE' },
         orderBy: { name: 'asc' }
       });
       res.json(warehouses);

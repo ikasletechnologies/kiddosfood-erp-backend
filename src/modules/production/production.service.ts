@@ -932,6 +932,13 @@ export class ProductionService {
 
       return {
         ...b,
+        // ProductBatch.product is legitimately null for bulk-manufacturing
+        // recipes with no linked Product (see approveProduction) — the
+        // recipe itself is still the batch's real, canonical product
+        // reference. Every consumer of this endpoint (Batch Registry,
+        // Expiry Tracking, Batch Recall) should resolve the same name
+        // instead of independently guessing at a fallback.
+        product: b.product || (b.production?.recipe ? { id: b.production.recipe.id, name: b.production.recipe.name, sku: b.production.recipe.recipeCode ?? null } : null),
         packedQuantity,
         bulkQuantity,
         availableQuantity,

@@ -113,7 +113,7 @@ export class WarehouseService {
       // 2. We use an ADJUSTMENT movement to move it out of null bin and into new bin.
       const basePayload = {
         itemId: data.itemId,
-        type: 'ADJUSTMENT' as any,
+        movementType: 'ADJUSTMENT' as any,
         referenceType: 'BIN_ASSIGNMENT',
         note: `Assigned to bin ${bin.code}`,
         createdBy: data.userId,

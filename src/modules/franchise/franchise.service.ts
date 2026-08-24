@@ -64,6 +64,7 @@ export class FranchiseService {
         creditLimit: true,
         walletBalance: true,
         isHQ: true,
+        primaryWarehouseId: true,
         createdAt: true,
         updatedAt: true,
         _count: {

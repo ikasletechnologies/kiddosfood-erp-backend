@@ -67,7 +67,7 @@ export async function seedMasterData() {
   
   // Inventory Item (Batter)
   const material = await prisma.inventoryItem.upsert({
-    where: { sku: 'BATTER-001' },
+    where: { sku_franchiseId: { sku: 'BATTER-001', franchiseId: 'root-franchise' } },
     update: {},
     create: {
       name: 'Test Batter',
@@ -80,7 +80,7 @@ export async function seedMasterData() {
   });
 
   await prisma.inventoryItem.upsert({
-    where: { sku: 'BATTER-002' },
+    where: { sku_franchiseId: { sku: 'BATTER-002', franchiseId: 'distribution-branch' } },
     update: {},
     create: {
       name: 'Test Batter 2',
