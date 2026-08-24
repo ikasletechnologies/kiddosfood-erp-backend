@@ -174,7 +174,7 @@ export class InventoryController {
 
   static async createWarehouse(req: Request, res: Response) {
     try {
-      const { name, location, type } = req.body;
+      const { name, location, type, code, status, franchiseId } = req.body;
       if (!name || !name.trim()) {
         return res.status(400).json({ error: 'Warehouse name is required' });
       }
@@ -192,9 +192,25 @@ export class InventoryController {
         return res.status(400).json({ error: `A warehouse named "${clash.name}" already exists. Use that one instead of creating a near-duplicate.` });
       }
 
+      if (franchiseId) {
+        const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId }});
+        if (!franchise) return res.status(404).json({ error: 'Franchise not found.' });
+        if (franchise.primaryWarehouseId) {
+          return res.status(400).json({ error: 'This franchise already has a primary warehouse configured.' });
+        }
+      }
+
       const warehouse = await prisma.warehouse.create({
-        data: { name: name.trim(), nameKey, location, type }
+        data: { name: name.trim(), nameKey, location, type, code, status }
       });
+      
+      if (franchiseId) {
+        await prisma.franchise.update({
+          where: { id: franchiseId },
+          data: { primaryWarehouseId: warehouse.id }
+        });
+      }
+
       res.status(201).json(warehouse);
     } catch (error: any) {
       if (error.code === 'P2002') {

@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { WasteService } from '../waste/waste.service';
 import { ProductionStatus } from '@prisma/client';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
@@ -469,7 +470,99 @@ export class ProductionService {
     });
   }
 
-  static async packageBatch(data: {
+  // Derives the retail FINISHED_GOOD item's name/SKU from the bulk item plus
+  // pack size. Shared by confirmPackaging (the only place that still needs
+  // it — see the module-level two-phase-packaging note above startPackaging).
+  private static deriveRetailIdentity(
+    bulkItem: { sku: string; name: string },
+    packetSize: string,
+    hasLinkedProduct: boolean,
+  ): { retailSku: string; retailName: string } {
+    const baseSku = bulkItem.sku.replace(/-BULK$/i, '');
+    const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
+
+    // The base product's own name/SKU often already carries the master
+    // pack size (e.g. product "Idly Batter 1 Kg", sku "...-1-KG-1KG") —
+    // naively appending the retail pack size on top produced stacked,
+    // conflicting sizes like "Idly Batter 1 Kg (250g)" / "...-1-KG-1KG-250G".
+    // Strip any trailing weight/volume/count token first so the retail
+    // variant reads as its own size, not the master's size plus the pack's.
+    // This only applies to a linked Product's own name/SKU — a recipe-code
+    // fallback base (e.g. "RCP-0001") has no embedded master pack size, and
+    // its trailing digits are part of the code's identity, not a size to
+    // strip (stripping them collapsed "RCP-0001" down to "RCP").
+    const stripTrailingSizeSegments = (sku: string): string => {
+      const segments = sku.split('-');
+      const isSizeSegment = (seg: string) =>
+        /^\d+(\.\d+)?$/.test(seg) ||
+        /^(KG|G|L|ML|PCS|UNITS?)$/i.test(seg) ||
+        /^\d+(\.\d+)?(KG|G|L|ML|PCS|UNITS?)$/i.test(seg);
+      while (segments.length > 1 && isSizeSegment(segments[segments.length - 1])) {
+        segments.pop();
+      }
+      return segments.join('-');
+    };
+    const cleanBaseName = hasLinkedProduct
+      ? (baseName.replace(/\s+\d+(\.\d+)?\s*(kg|g|l|ml|pcs|units?)\.?$/i, '').trim() || baseName)
+      : baseName;
+    const cleanBaseSku = hasLinkedProduct
+      ? (stripTrailingSizeSegments(baseSku) || baseSku)
+      : baseSku;
+
+    const packetSizeMatch = packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
+    const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : packetSize;
+    const cleanPacketSize = packetSize.toUpperCase().replace(/\s+/g, '');
+
+    const retailSku = cleanBaseSku.includes(cleanPacketSize) ? cleanBaseSku : `${cleanBaseSku}-${cleanPacketSize}`;
+    const retailName = cleanBaseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
+      ? cleanBaseName
+      : `${cleanBaseName} ${formattedPacketSize}`;
+
+    return { retailSku, retailName };
+  }
+
+  // Re-run at both startPackaging and confirmPackaging: looks up the bulk
+  // item for a batch and self-heals a stale generic 'unit' label so the
+  // g/kg conversion below stays correct. Throws if there's no bulk item at
+  // all — a batch can't be packaged (started or confirmed) without one.
+  private static async resolveBulkItem(tx: any, batch: any, franchiseId: string) {
+    const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
+
+    let bulkItem = await tx.inventoryItem.findFirst({
+      where: { franchiseId, OR: [{ sku: bulkSku }, { name: bulkName }] },
+    });
+    if (!bulkItem) throw new Error('Bulk inventory item not found');
+
+    // Self-heal a bulk item still carrying the old generic 'unit' label
+    // (from before finished-goods items recorded their real yield unit) —
+    // this is the actual point where a wrong unit breaks the g/kg
+    // conversion below, not just at creation time in inspectBatch, so a
+    // batch that was already QC-approved before that fix shipped needs
+    // correcting here too.
+    if (!RECOGNIZED_PACK_UNITS.includes(bulkItem.unit.toLowerCase())) {
+      const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
+      if (RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
+        bulkItem = await tx.inventoryItem.update({
+          where: { id: bulkItem.id },
+          data: { unit: finishedGoodUnit },
+        });
+      }
+    }
+
+    return bulkItem;
+  }
+
+  // ── Two-phase packaging ───────────────────────────────────────────────
+  // Phase 1 (this method): create an AWAITING_CONFIRMATION ticket only.
+  // Nothing here touches InventoryItem/StockMovement/ProductBatch.packagedQty
+  // — bulk deduction and Finished Goods creation only happen once the
+  // operator has physically packed + labeled the run and reports the real
+  // good/damaged/spoiled split via confirmPackaging (phase 2, below). This
+  // replaces the old one-shot packageBatch, which deducted bulk and created
+  // sellable Finished Goods stock the instant this button was clicked —
+  // before a single physical label had been printed or a single packet
+  // inspected.
+  static async startPackaging(data: {
     batchId: string;
     packetSize: string;
     quantityPackets: number;
@@ -488,10 +581,6 @@ export class ProductionService {
         throw new Error('Batch must be QC approved (or partially approved) before packaging.');
       }
 
-      // Recall check — must be inside the transaction so the check and the
-      // subsequent stock deduction are atomic. If a recall is initiated between
-      // the pre-flight check and the actual deduction, the transaction will
-      // re-read the recall row and reject here before any movement is written.
       const recall = await tx.batchRecall.findUnique({ where: { productBatchId: data.batchId } });
       if (recall?.status === 'IN_PROGRESS') {
         throw new Error('Packaging blocked — batch is under recall.');
@@ -500,38 +589,14 @@ export class ProductionService {
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
 
-      const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
-
-      let bulkItem = await tx.inventoryItem.findFirst({
-        where: {
-          franchiseId,
-          OR: [
-            { sku: bulkSku },
-            { name: bulkName },
-          ],
-        },
-      });
-      if (!bulkItem) throw new Error('Bulk inventory item not found');
-
-      // Self-heal a bulk item still carrying the old generic 'unit' label
-      // (from before finished-goods items recorded their real yield unit) —
-      // this is the actual point where a wrong unit breaks the g/kg
-      // conversion below, not just at creation time in inspectBatch, so a
-      // batch that was already QC-approved before that fix shipped needs
-      // correcting here too.
-      if (!RECOGNIZED_PACK_UNITS.includes(bulkItem.unit.toLowerCase())) {
-        const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
-        if (RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
-          bulkItem = await tx.inventoryItem.update({
-            where: { id: bulkItem.id },
-            data: { unit: finishedGoodUnit },
-          });
-        }
-      }
+      const bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
 
       const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
       const totalWeightNeeded = data.quantityPackets * unitMultiplier;
 
+      // Pre-flight only — nothing is reserved or deducted here, so this is
+      // re-checked (authoritatively) again at confirmPackaging, since other
+      // packaging runs may consume this same bulk stock in the meantime.
       if (bulkItem.currentStock < totalWeightNeeded) {
         const shortage = totalWeightNeeded - bulkItem.currentStock;
         throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
@@ -548,63 +613,141 @@ export class ProductionService {
         throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
 
+      const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
+      const packaging = await tx.productPackaging.create({
+        data: {
+          batchId: batch.id,
+          packetSize: data.packetSize,
+          quantityPackets: data.quantityPackets,
+          totalWeight: totalWeightNeeded,
+          barcode,
+          printedLabels: false,
+          status: 'AWAITING_CONFIRMATION',
+        },
+      });
+
+      return { packaging };
+    });
+  }
+
+  static async savePackagingVerification(data: {
+    packagingId: string;
+    stickersPrinted: number;
+    physicalChecked: boolean;
+    goodQty: number;
+    damagedQty: number;
+    spoiledQty: number;
+  }) {
+    const packaging = await prisma.productPackaging.findUnique({
+      where: { id: data.packagingId },
+    });
+    if (!packaging) throw new Error('Packaging run not found');
+    if (packaging.status !== 'AWAITING_CONFIRMATION') {
+      throw new Error(`This packaging run is already ${packaging.status.toLowerCase().replace('_', ' ')} and cannot be verified again.`);
+    }
+
+    return prisma.productPackaging.update({
+      where: { id: data.packagingId },
+      data: {
+        stickersPrinted: data.stickersPrinted,
+        physicalChecked: data.physicalChecked,
+        goodQty: data.goodQty,
+        damagedQty: data.damagedQty,
+        spoiledQty: data.spoiledQty
+      }
+    });
+  }
+
+  // Phase 2: the operator reports the real outcome of the physical
+  // packaging run (good / damaged / spoiled, summing to exactly the planned
+  // quantityPackets from startPackaging — not checked sticker-by-sticker).
+  // Only now does bulk get deducted and Finished Goods get created; damaged
+  // and spoiled quantities never touch Finished Goods at all, mirroring how
+  // a QC-rejected batch quantity never touches inventory either (see the
+  // rejection-qty WasteEntry a few lines up in inspectBatch).
+  static async confirmPackaging(data: {
+    packagingId: string;
+    goodQty: number;
+    damagedQty: number;
+    spoiledQty: number;
+    userId?: string;
+  }) {
+    return prisma.$transaction(async tx => {
+      const packaging = await tx.productPackaging.findUnique({
+        where: { id: data.packagingId },
+        include: {
+          batch: {
+            include: { product: true, production: { include: { recipe: true } }, recall: true },
+          },
+        },
+      });
+      if (!packaging) throw new Error('Packaging run not found');
+      // The ticket-status guard is what makes "confirm twice" and "bulk
+      // deducted twice" impossible — a second confirm attempt fails right
+      // here, before anything is touched.
+      if (packaging.status !== 'AWAITING_CONFIRMATION') {
+        throw new Error(`This packaging run is already ${packaging.status.toLowerCase().replace('_', ' ')} and cannot be confirmed again.`);
+      }
+
+      const batch = packaging.batch;
+
+      // Re-check recall — a recall could have been initiated in the gap
+      // between Start Packaging and Confirm, a gap that didn't exist under
+      // the old one-shot flow.
+      if (batch.recall?.status === 'IN_PROGRESS') {
+        throw new Error('Cannot confirm — batch is under recall.');
+      }
+
+      const good = Number(data.goodQty) || 0;
+      const damaged = Number(data.damagedQty) || 0;
+      const spoiled = Number(data.spoiledQty) || 0;
+      if (good < 0 || damaged < 0 || spoiled < 0) {
+        throw new Error('Quantities cannot be negative.');
+      }
+      if (good + damaged + spoiled !== packaging.quantityPackets) {
+        throw new Error(`Good + Damaged + Spoiled (${good + damaged + spoiled}) must equal the planned packaging quantity (${packaging.quantityPackets}).`);
+      }
+
+      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+      if (!franchiseId) throw new Error('Franchise ID not found for batch');
+
+      const bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
+
+      const unitMultiplier = this.parseWeight(packaging.packetSize, bulkItem.unit);
+      const totalWeightNeeded = packaging.quantityPackets * unitMultiplier;
+
+      // Authoritative re-check — time has passed since Start, and other
+      // packaging runs may have consumed this same bulk stock meanwhile.
+      if (bulkItem.currentStock < totalWeightNeeded) {
+        const shortage = totalWeightNeeded - bulkItem.currentStock;
+        throw new Error(`Insufficient bulk stock to confirm. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
+      }
+      const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
+      if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
+        throw new Error('This batch is already fully packaged.');
+      }
+      if (totalWeightNeeded > remainingInBatch + 0.001) {
+        throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
+      }
+
+      // Bulk is deducted for the FULL planned quantity — all of it was
+      // physically taken out of the bulk container regardless of whether it
+      // turned out good, damaged, or spoiled.
       await InventoryService.recordMovement(tx, {
         itemId: bulkItem.id,
         type: 'PRODUCTION_OUT',
         quantity: -totalWeightNeeded,
         referenceType: 'PACKAGING',
         referenceId: batch.id,
-        note: `Packaging conversion: Deducted bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
+        note: `Packaging confirmed: Deducted bulk stock for ${packaging.quantityPackets} x ${packaging.packetSize} packs (${good} good, ${damaged} damaged, ${spoiled} spoiled)`,
         userId: data.userId,
       });
 
-      const baseSku = bulkItem.sku.replace(/-BULK$/i, '');
-      const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
+      const { retailSku, retailName } = this.deriveRetailIdentity(bulkItem, packaging.packetSize, !!batch.product);
 
-      // The base product's own name/SKU often already carries the master
-      // pack size (e.g. product "Idly Batter 1 Kg", sku "...-1-KG-1KG") —
-      // naively appending the retail pack size on top produced stacked,
-      // conflicting sizes like "Idly Batter 1 Kg (250g)" / "...-1-KG-1KG-250G".
-      // Strip any trailing weight/volume/count token first so the retail
-      // variant reads as its own size, not the master's size plus the pack's.
-      // This only applies to a linked Product's own name/SKU — a recipe-code
-      // fallback base (e.g. "RCP-0001") has no embedded master pack size, and
-      // its trailing digits are part of the code's identity, not a size to
-      // strip (stripping them collapsed "RCP-0001" down to "RCP").
-      const stripTrailingSizeSegments = (sku: string): string => {
-        const segments = sku.split('-');
-        const isSizeSegment = (seg: string) =>
-          /^\d+(\.\d+)?$/.test(seg) ||
-          /^(KG|G|L|ML|PCS|UNITS?)$/i.test(seg) ||
-          /^\d+(\.\d+)?(KG|G|L|ML|PCS|UNITS?)$/i.test(seg);
-        while (segments.length > 1 && isSizeSegment(segments[segments.length - 1])) {
-          segments.pop();
-        }
-        return segments.join('-');
-      };
-      const cleanBaseName = batch.product
-        ? (baseName.replace(/\s+\d+(\.\d+)?\s*(kg|g|l|ml|pcs|units?)\.?$/i, '').trim() || baseName)
-        : baseName;
-      const cleanBaseSku = batch.product
-        ? (stripTrailingSizeSegments(baseSku) || baseSku)
-        : baseSku;
-
-      const packetSizeMatch = data.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
-      const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : data.packetSize;
-      const cleanPacketSize = data.packetSize.toUpperCase().replace(/\s+/g, '');
-
-      const retailSku = cleanBaseSku.includes(cleanPacketSize) ? cleanBaseSku : `${cleanBaseSku}-${cleanPacketSize}`;
-      const retailName = cleanBaseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
-        ? cleanBaseName
-        : `${cleanBaseName} ${formattedPacketSize}`;
-      
       let retailItem = await tx.inventoryItem.findFirst({
-        where: {
-          franchiseId,
-          sku: retailSku,
-        },
+        where: { franchiseId, sku: retailSku },
       });
-
       if (!retailItem) {
         retailItem = await tx.inventoryItem.create({
           data: {
@@ -621,32 +764,46 @@ export class ProductionService {
         });
       }
 
-      await InventoryService.recordMovement(tx, {
-        itemId: retailItem.id,
-        type: 'PRODUCTION_IN',
-        quantity: data.quantityPackets,
-        referenceType: 'PACKAGING',
-        referenceId: batch.id,
-        note: `Packaging conversion: Created retail stock from batch ${batch.batchCode}`,
-        userId: data.userId,
-      });
+      // Only the GOOD quantity ever becomes sellable Finished Goods.
+      if (good > 0) {
+        await InventoryService.recordMovement(tx, {
+          itemId: retailItem.id,
+          type: 'PRODUCTION_IN',
+          quantity: good,
+          referenceType: 'PACKAGING',
+          referenceId: batch.id,
+          note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode}`,
+          userId: data.userId,
+        });
+      }
 
-      const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
-      const packaging = await tx.productPackaging.create({
-        data: {
-          batchId: batch.id,
-          packetSize: data.packetSize,
-          quantityPackets: data.quantityPackets,
-          totalWeight: totalWeightNeeded,
-          barcode,
-          printedLabels: true,
-        },
-      });
+      const wasteEntries: any[] = [];
+      if (damaged > 0) {
+        wasteEntries.push(await WasteService.createFromProductionReject(tx, {
+          inventoryItemId: retailItem.id,
+          franchiseId,
+          quantity: damaged,
+          reason: 'DAMAGED',
+          note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
+          productPackagingId: packaging.id,
+          unitCost: retailItem.costPrice || undefined,
+        }));
+      }
+      if (spoiled > 0) {
+        wasteEntries.push(await WasteService.createFromProductionReject(tx, {
+          inventoryItemId: retailItem.id,
+          franchiseId,
+          quantity: spoiled,
+          reason: 'SPOILAGE',
+          note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
+          productPackagingId: packaging.id,
+          unitCost: retailItem.costPrice || undefined,
+        }));
+      }
 
-      // A batch can be packaged across multiple runs — only mark it fully
-      // PACKAGED once the cumulative packaged weight covers the batch quantity,
-      // otherwise it's PARTIALLY_PACKED (previously this was hardcoded to
-      // PACKAGED on every single packaging run, even a partial one).
+      // A batch can be packaged across multiple confirmed runs — only mark
+      // it fully PACKAGED once the cumulative confirmed weight covers the
+      // batch quantity, otherwise it's PARTIALLY_PACKED.
       const newPackagedQty = (batch.packagedQty || 0) + totalWeightNeeded;
       const newPackagingStatus = newPackagedQty >= (batch.approvedQty || 0) - 0.001 ? 'PACKAGED' : 'PARTIALLY_PACKED';
 
@@ -658,11 +815,18 @@ export class ProductionService {
         },
       });
 
-      return {
-        packaging,
-        retailItem,
-        bulkItem,
-      };
+      const confirmedPackaging = await tx.productPackaging.update({
+        where: { id: packaging.id },
+        data: {
+          status: 'CONFIRMED',
+          goodQty: good,
+          damagedQty: damaged,
+          spoiledQty: spoiled,
+          confirmedAt: new Date(),
+        },
+      });
+
+      return { packaging: confirmedPackaging, retailItem, bulkItem, wasteEntries };
     });
   }
 

@@ -91,6 +91,43 @@ export class WasteService {
     });
   }
 
+  // For output that never became sellable inventory in the first place —
+  // e.g. damaged/spoiled packets identified during Confirm Packaging — not
+  // the manual "Log Spoilage" flow above (create()). That method requires
+  // the item to already have available warehouse stock (`available` check)
+  // because it's removing real, already-received inventory; these units
+  // were never received at all, so there's no InventoryItem.currentStock to
+  // check against or decrement, and no StockMovement to write (mirrors how
+  // a QC-rejected batch quantity already never touches inventory either).
+  // Must run inside the caller's transaction so it's atomic with the bulk
+  // deduction / Finished Goods credit it accompanies.
+  static async createFromProductionReject(
+    tx: any,
+    data: {
+      inventoryItemId: string;
+      franchiseId?: string;
+      warehouseId?: string;
+      quantity: number;
+      reason: string;
+      note?: string;
+      productPackagingId: string;
+      unitCost?: number;
+    }
+  ) {
+    return tx.wasteEntry.create({
+      data: {
+        inventoryItemId: data.inventoryItemId,
+        franchiseId: data.franchiseId,
+        warehouseId: data.warehouseId,
+        quantity: data.quantity,
+        reason: data.reason,
+        note: data.note,
+        costAtTime: data.unitCost !== undefined ? data.quantity * data.unitCost : undefined,
+        productPackagingId: data.productPackagingId,
+      },
+    });
+  }
+
   static async getSummary(franchiseId?: string, warehouseId?: string) {
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());

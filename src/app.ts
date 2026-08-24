@@ -46,6 +46,7 @@ import DealerRoutes from './modules/dealers';
 import BusinessPartnerRoutes from './modules/business-partners';
 import { DraftsController } from './modules/drafts/drafts.controller';
 import { WorkflowApprovalsController } from './modules/workflow-approvals/workflow-approvals.controller';
+import WarehouseRoutes from './modules/warehouse/warehouse.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -289,7 +290,9 @@ app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', '
 app.get('/api/production/batches-all', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getAllBatches);
 app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPendingQC);
 app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.inspectBatch);
-app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.packageBatch);
+app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.startPackaging);
+app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.confirmPackaging);
+app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.savePackagingVerification);
 app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
 // Batch Recall — eligibility/state are shared source of truth for both the
 // registry list and the inspector panel; mutation endpoints are transactional
@@ -564,6 +567,9 @@ app.post('/api/waste', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteCo
 
 // Stock Alerts
 app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']), InventoryController.getAlerts);
+
+// Warehouse
+app.use('/api/warehouse', WarehouseRoutes);
 
 // CRM — Pipelines
 app.get('/api/crm/pipelines', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CRMController.getPipelines);

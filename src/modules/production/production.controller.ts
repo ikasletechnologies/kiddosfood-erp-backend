@@ -116,14 +116,55 @@ export class ProductionController {
     }
   }
 
-  static async packageBatch(req: Request, res: Response) {
+  // Phase 1 of two-phase packaging — creates an AWAITING_CONFIRMATION
+  // ticket only. Bulk stock and Finished Goods are untouched until
+  // confirmPackaging below.
+  static async startPackaging(req: Request, res: Response) {
     try {
       const { packetSize, quantityPackets } = req.body;
       const user = (req as any).user;
-      const result = await ProductionService.packageBatch({
+      const result = await ProductionService.startPackaging({
         batchId: req.params.id,
         packetSize,
         quantityPackets: Number(quantityPackets),
+        userId: user?.userId
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  // Phase 2 — the operator reports the real good/damaged/spoiled split for
+  // the completed physical packaging run; only now does bulk get deducted
+  static async savePackagingVerification(req: Request, res: Response) {
+    try {
+      const { stickersPrinted, physicalChecked, goodQty, damagedQty, spoiledQty } = req.body;
+      const result = await ProductionService.savePackagingVerification({
+        packagingId: req.params.id,
+        stickersPrinted: Number(stickersPrinted),
+        physicalChecked: Boolean(physicalChecked),
+        goodQty: Number(goodQty),
+        damagedQty: Number(damagedQty),
+        spoiledQty: Number(spoiledQty)
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  // Phase 2 of packaging: physical verification is complete, bulk gets deducted
+  // and Finished Goods get created.
+  static async confirmPackaging(req: Request, res: Response) {
+    try {
+      const { goodQty, damagedQty, spoiledQty } = req.body;
+      const user = (req as any).user;
+      const result = await ProductionService.confirmPackaging({
+        packagingId: req.params.id,
+        goodQty: Number(goodQty),
+        damagedQty: Number(damagedQty),
+        spoiledQty: Number(spoiledQty),
         userId: user?.userId
       });
       res.json(result);

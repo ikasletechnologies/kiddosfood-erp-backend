@@ -264,18 +264,23 @@ model InventoryItem {
 }
 
 model WasteEntry {
-  id              String        @id @default(uuid())
-  inventoryItemId String
-  franchiseId     String?
-  warehouseId     String?
-  quantity        Float
-  reason          String
-  note            String?
-  costAtTime      Float?
-  createdAt       DateTime      @default(now())
-  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
-  franchise       Franchise?    @relation(fields: [franchiseId], references: [id])
-  warehouse       Warehouse?    @relation(fields: [warehouseId], references: [id])
+  id                 String            @id @default(uuid())
+  inventoryItemId    String
+  franchiseId        String?
+  warehouseId        String?
+  quantity           Float
+  reason             String
+  note               String?
+  costAtTime         Float?
+  // Links a DAMAGED/SPOILED entry back to the packaging run that produced
+  // it (Confirm Packaging) — null for wastage logged manually via the
+  // standalone Wastage Control "Log Spoilage" flow.
+  productPackagingId String?
+  createdAt          DateTime          @default(now())
+  inventoryItem      InventoryItem     @relation(fields: [inventoryItemId], references: [id])
+  franchise          Franchise?        @relation(fields: [franchiseId], references: [id])
+  warehouse          Warehouse?        @relation(fields: [warehouseId], references: [id])
+  productPackaging   ProductPackaging? @relation(fields: [productPackagingId], references: [id])
 }
 
 model StockMovement {
@@ -310,39 +315,39 @@ model StockMovement {
 }
 
 model Vendor {
-  id                String             @id @default(uuid())
-  name              String
-  contact           String
-  email             String?
-  address           String?
-  state             String?
-  district          String?
-  city              String?
-  pincode           String?
-  shippingAddress   String?
-  gstType           String?
-  openingBalance    Float              @default(0)
-  asOfDate          DateTime?
-  creditLimit       Float?
-  remark            String?
-  manualPurchaseAdj Float              @default(0)
-  manualAdvanceAdj  Float              @default(0)
-  rating            Float?             @default(5.0)
-  createdAt         DateTime           @default(now())
-  category          String?
-  gstNumber         String?
-  paymentTerms      PaymentTerms       @default(IMMEDIATE)
-  status            VendorStatus       @default(ACTIVE)
-  vendorCode        String?            @unique
-  paymentReminderEnabled Boolean       @default(false)
-  paymentReminderDays    Int           @default(1)
-  items             InventoryItem[]
-  orders            ProcurementOrder[]
-  purchaseReturns   PurchaseReturn[]
-  invoices          VendorInvoice[]
-  ledgerEntries     VendorLedger[]
-  suppliedMaterials VendorMaterial[]
-  vendorQuotations  VendorQuotation[]
+  id                     String             @id @default(uuid())
+  name                   String
+  contact                String
+  email                  String?
+  address                String?
+  state                  String?
+  district               String?
+  city                   String?
+  pincode                String?
+  shippingAddress        String?
+  gstType                String?
+  openingBalance         Float              @default(0)
+  asOfDate               DateTime?
+  creditLimit            Float?
+  remark                 String?
+  manualPurchaseAdj      Float              @default(0)
+  manualAdvanceAdj       Float              @default(0)
+  rating                 Float?             @default(5.0)
+  createdAt              DateTime           @default(now())
+  category               String?
+  gstNumber              String?
+  paymentTerms           PaymentTerms       @default(IMMEDIATE)
+  status                 VendorStatus       @default(ACTIVE)
+  vendorCode             String?            @unique
+  paymentReminderEnabled Boolean            @default(false)
+  paymentReminderDays    Int                @default(1)
+  items                  InventoryItem[]
+  orders                 ProcurementOrder[]
+  purchaseReturns        PurchaseReturn[]
+  invoices               VendorInvoice[]
+  ledgerEntries          VendorLedger[]
+  suppliedMaterials      VendorMaterial[]
+  vendorQuotations       VendorQuotation[]
 }
 
 model VendorLedger {
@@ -687,25 +692,25 @@ enum RecallStep {
 // what step that recall has reached; the frontend must not derive this from
 // its own timers.
 model BatchRecall {
-  id                String            @id @default(uuid())
-  productBatchId    String            @unique
-  status            RecallStatus      @default(IN_PROGRESS)
-  step              RecallStep        @default(INITIATED)
+  id                String             @id @default(uuid())
+  productBatchId    String             @unique
+  status            RecallStatus       @default(IN_PROGRESS)
+  step              RecallStep         @default(INITIATED)
   reason            String
   reasonNotes       String?
   // Real, computed figures — never hardcoded. distributedQty is populated by
   // locateDistribution() from actual InventoryBatch/StockMovement records;
   // returnedQty accumulates from collectReturn() and is bounded by it.
-  distributedQty    Float             @default(0)
-  returnedQty       Float             @default(0)
+  distributedQty    Float              @default(0)
+  returnedQty       Float              @default(0)
   affectedLocations Json?
   reportData        Json?
   initiatedBy       String?
-  initiatedAt       DateTime          @default(now())
+  initiatedAt       DateTime           @default(now())
   completedAt       DateTime?
   cancelledAt       DateTime?
-  updatedAt         DateTime          @updatedAt
-  productBatch      ProductBatch      @relation(fields: [productBatchId], references: [id])
+  updatedAt         DateTime           @updatedAt
+  productBatch      ProductBatch       @relation(fields: [productBatchId], references: [id])
   events            BatchRecallEvent[]
 }
 
@@ -740,40 +745,61 @@ model Carton {
 }
 
 model ProductPackaging {
-  id              String       @id @default(uuid())
+  id              String             @id @default(uuid())
   batchId         String
   packetSize      String // e.g. "100g", "500g", "1KG"
   quantityPackets Int
   totalWeight     Float // quantityPackets * size
-  barcode         String       @unique
-  printedLabels   Boolean      @default(false)
-  createdAt       DateTime     @default(now())
-  batch           ProductBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  barcode         String             @unique
+  printedLabels   Boolean            @default(false)
+  // Two-phase packaging: a ticket starts as AWAITING_CONFIRMATION with no
+  // inventory touched. Bulk deduction and Finished Goods creation only
+  // happen at Confirm (see ProductionService.confirmPackaging). Historical
+  // rows (created before this field existed, under the old one-shot flow)
+  // default to CONFIRMED via the schema default itself — their Finished
+  // Goods stock already exists, so they're retroactively "done". Every new
+  // ticket passes status explicitly at creation, overriding this default.
+  status          PackagingRunStatus @default(CONFIRMED)
+  stickersPrinted Int?
+  physicalChecked Boolean?
+  goodQty         Int?
+  damagedQty      Int?
+  spoiledQty      Int?
+  confirmedAt     DateTime?
+  createdAt       DateTime           @default(now())
+  batch           ProductBatch       @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  wasteEntries    WasteEntry[]
+}
+
+enum PackagingRunStatus {
+  AWAITING_CONFIRMATION
+  CONFIRMED
+  CANCELLED
 }
 
 model FranchiseOrder {
-  id                   String               @id @default(uuid())
-  orderNumber          String               @unique
+  id                   String                     @id @default(uuid())
+  orderNumber          String                     @unique
   franchiseId          String
-  status               FranchiseOrderStatus @default(PENDING)
-  orderType            FranchiseOrderType   @default(STOCK)
+  status               FranchiseOrderStatus       @default(PENDING)
+  orderType            FranchiseOrderType         @default(STOCK)
   fulfillmentPath      FranchiseOrderFulfillment?
   materialsReady       Boolean?
   materialsShortfall   Json?
   totalAmount          Float
-  paymentType          PaymentType          @default(CREDIT)
-  paymentStatus        String               @default("UNPAID")
+  paymentType          PaymentType                @default(CREDIT)
+  paymentStatus        String                     @default("UNPAID")
   notes                String?
   expectedDispatchDate DateTime?
   actualDispatchDate   DateTime?
   delayStatus          String?
-  createdAt            DateTime             @default(now())
-  updatedAt            DateTime             @updatedAt
-  deliveryCharges      Float                @default(0)
-  priority             String               @default("NORMAL")
-  subtotal             Float                @default(0)
-  taxAmount            Float                @default(0)
-  franchise            Franchise            @relation(fields: [franchiseId], references: [id])
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt
+  deliveryCharges      Float                      @default(0)
+  priority             String                     @default("NORMAL")
+  subtotal             Float                      @default(0)
+  taxAmount            Float                      @default(0)
+  franchise            Franchise                  @relation(fields: [franchiseId], references: [id])
   items                FranchiseOrderItem[]
   returnOrders         ReturnOrder[]
 }
@@ -1539,6 +1565,8 @@ model Warehouse {
   // (Hopes)" — an app-level pre-check alone can't close the race window
   // between two concurrent create requests; this can.
   nameKey              String             @unique
+  code                 String?
+  status               String             @default("ACTIVE")
   location             String?
   type                 String?
   createdAt            DateTime           @default(now())
