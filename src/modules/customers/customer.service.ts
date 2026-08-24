@@ -42,6 +42,7 @@ export class CustomerService {
     email?: string;
     franchiseId?: string;
     address?: string;
+    billingAddress?: string;
     state?: string;
     district?: string;
     city?: string;
@@ -54,10 +55,14 @@ export class CustomerService {
     asOfDate?: string | Date;
     creditLimit?: number | null;
   }) {
+    const { billingAddress, ...customerData } = data as any;
+    if (billingAddress && !customerData.address) {
+      customerData.address = billingAddress;
+    }
     return prisma.customer.create({
       data: {
-        ...data,
-        asOfDate: data.asOfDate ? new Date(data.asOfDate) : undefined,
+        ...customerData,
+        asOfDate: customerData.asOfDate ? new Date(customerData.asOfDate) : undefined,
       }
     });
   }
@@ -67,6 +72,7 @@ export class CustomerService {
     phone?: string;
     email?: string;
     address?: string;
+    billingAddress?: string;
     state?: string;
     district?: string;
     city?: string;
@@ -79,11 +85,15 @@ export class CustomerService {
     asOfDate?: string | Date | null;
     creditLimit?: number | null;
   }) {
+    const { billingAddress, ...customerData } = data as any;
+    if (billingAddress && !customerData.address) {
+      customerData.address = billingAddress;
+    }
     return prisma.customer.update({
       where: { id },
       data: {
-        ...data,
-        asOfDate: data.asOfDate === null ? null : (data.asOfDate ? new Date(data.asOfDate) : undefined),
+        ...customerData,
+        asOfDate: customerData.asOfDate === null ? null : (customerData.asOfDate ? new Date(customerData.asOfDate) : undefined),
       }
     });
   }
