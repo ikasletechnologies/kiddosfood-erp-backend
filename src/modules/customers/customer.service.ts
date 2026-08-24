@@ -24,9 +24,9 @@ export class CustomerService {
     });
   }
 
-  static async getById(id: string) {
-    return prisma.customer.findUnique({
-      where: { id },
+  static async getById(id: string, franchiseId?: string) {
+    return prisma.customer.findFirst({
+      where: { id, ...(franchiseId && { franchiseId }) },
       include: {
         orders: {
           include: { orderItems: { include: { product: true } }, payments: true },
@@ -84,7 +84,12 @@ export class CustomerService {
     openingBalanceType?: string;
     asOfDate?: string | Date | null;
     creditLimit?: number | null;
-  }) {
+  }, franchiseId?: string) {
+    if (franchiseId) {
+      const owned = await prisma.customer.findFirst({ where: { id, franchiseId } });
+      if (!owned) throw new Error('Customer not found');
+    }
+
     const { billingAddress, ...customerData } = data as any;
     if (billingAddress && !customerData.address) {
       customerData.address = billingAddress;
@@ -98,7 +103,11 @@ export class CustomerService {
     });
   }
 
-  static async delete(id: string) {
+  static async delete(id: string, franchiseId?: string) {
+    if (franchiseId) {
+      const owned = await prisma.customer.findFirst({ where: { id, franchiseId } });
+      if (!owned) throw new Error('Customer not found');
+    }
     return prisma.customer.delete({ where: { id } });
   }
 

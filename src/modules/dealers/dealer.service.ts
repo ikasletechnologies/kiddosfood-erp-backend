@@ -15,7 +15,11 @@ export class DealerService {
     });
   }
 
-  static async delete(id: string) {
+  static async delete(id: string, franchiseId?: string) {
+    if (franchiseId) {
+      const owned = await prisma.dealer.findFirst({ where: { id, franchiseId } });
+      if (!owned) throw new Error('Dealer not found');
+    }
     return prisma.dealer.delete({ where: { id } });
   }
 }

@@ -1,12 +1,20 @@
 import { Request, Response } from 'express';
 import { CustomerService } from './customer.service';
 import { CRMService } from '../crm/crm.service';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class CustomerController {
   static async getAll(req: Request, res: Response) {
     try {
-      const { search, franchiseId } = req.query;
-      const customers = await CustomerService.getAll(search as string, franchiseId as string);
+      const { search } = req.query;
+      const user = (req as any).user;
+      // SUPER_ADMIN may pick any scope (HQ or a specific franchise) via the query
+      // param; everyone else is always forced to their own franchise.
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string | undefined)
+        : ownFranchiseId;
+      const customers = await CustomerService.getAll(search as string, franchiseId);
       res.json(customers);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -15,7 +23,9 @@ export class CustomerController {
 
   static async getOne(req: Request, res: Response) {
     try {
-      const customer = await CustomerService.getById(req.params.id);
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const customer = await CustomerService.getById(req.params.id, ownFranchiseId);
       if (!customer) return res.status(404).json({ error: 'Customer not found' });
       res.json(customer);
     } catch (error: any) {
@@ -25,6 +35,7 @@ export class CustomerController {
 
   static async create(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const data: any = {
         name: req.body.name,
         phone: req.body.phone || undefined,
@@ -43,11 +54,9 @@ export class CustomerController {
         creditLimit: req.body.creditLimit !== undefined ? (req.body.creditLimit === null ? null : Number(req.body.creditLimit)) : undefined,
       };
 
-      if ((req as any).user?.role === 'FRANCHISE_ADMIN' || (req as any).user?.role?.name === 'FRANCHISE_ADMIN') {
-        data.franchiseId = (req as any).user.franchiseId;
-      } else if (req.body.franchiseId) {
-        data.franchiseId = req.body.franchiseId;
-      }
+      // SUPER_ADMIN may target any franchise (including HQ) via req.body.franchiseId;
+      // FRANCHISE_ADMIN is always forced to their own franchise, ignoring the body.
+      data.franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
 
       const customer = await CustomerService.create(data);
       res.status(201).json(customer);
@@ -58,6 +67,8 @@ export class CustomerController {
 
   static async update(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
       const data: any = {};
       if (req.body.name !== undefined) data.name = req.body.name;
       if (req.body.phone !== undefined) data.phone = req.body.phone || null;
@@ -75,19 +86,23 @@ export class CustomerController {
       if (req.body.asOfDate !== undefined) data.asOfDate = req.body.asOfDate || null;
       if (req.body.creditLimit !== undefined) data.creditLimit = req.body.creditLimit === null ? null : Number(req.body.creditLimit);
 
-      const customer = await CustomerService.update(req.params.id, data);
+      const customer = await CustomerService.update(req.params.id, data, ownFranchiseId);
       res.json(customer);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.message === 'Customer not found' ? 404 : 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
   static async delete(req: Request, res: Response) {
     try {
-      await CustomerService.delete(req.params.id);
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      await CustomerService.delete(req.params.id, ownFranchiseId);
       res.json({ success: true });
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const status = error.message === 'Customer not found' ? 404 : 500;
+      res.status(status).json({ error: error.message });
     }
   }
 
