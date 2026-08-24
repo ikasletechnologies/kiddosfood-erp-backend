@@ -275,7 +275,7 @@ export class ProductionService {
     });
   }
 
-  static async approveProduction(id: string, userId?: string, actualYield?: number, remarks?: string) {
+  static async approveProduction(id: string, userId?: string, actualYield?: number, remarks?: string, expiryDate?: string) {
     return prisma.$transaction(async tx => {
       const production = await tx.production.findUnique({
         where: { id },
@@ -313,12 +313,16 @@ export class ProductionService {
       // touch stock — finished-good stock is credited exactly once, at QC
       // acceptance (inspectBatch, guarded against re-inspection), never here.
       const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
+      // The operator completing this run can confirm/correct the expiry
+      // date at handoff time (same as GRN's expiry capture for raw
+      // material lots) — it overrides the estimate computed at
+      // startProduction, since actual cook/QC timing can shift it.
       await tx.productBatch.create({
         data: {
           productId: recipe.productId ?? null,
           productionId: production.id,
           quantity: totalYield,
-          expiryDate: production.expiryDate,
+          expiryDate: expiryDate ? new Date(expiryDate) : production.expiryDate,
           batchCode,
           franchiseId: production.franchiseId,
           qcStatus: "PENDING",
@@ -474,6 +478,7 @@ export class ProductionService {
             data: {
               inventoryItemId: targetItem.id,
               franchiseId,
+              warehouseId: batch.production?.warehouseId || undefined,
               quantity: rejection,
               reason: 'QC_FAIL',
               note: data.qcRemarks || `QC rejected from batch ${batch.batchCode}`,
@@ -781,7 +786,14 @@ export class ProductionService {
         });
       }
 
-      // Only the GOOD quantity ever becomes sellable Finished Goods.
+      // Only the GOOD quantity ever becomes sellable Finished Goods. Credited
+      // as a real lot (receiveAtCost + productBatchId), not just a plain
+      // currentStock bump — that's what makes this batch's FG output
+      // traceable afterward: subsequent sales/transfers/waste already deplete
+      // InventoryBatch lots FIFO for any item that has them (see
+      // depleteBatchesFIFO), so "Available FG" for this batch can be read
+      // back later as this lot's remaining currentQty instead of a frozen
+      // historical produced-count.
       if (good > 0) {
         await InventoryService.recordMovement(tx, {
           itemId: retailItem.id,
@@ -791,6 +803,14 @@ export class ProductionService {
           referenceId: batch.id,
           note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode}`,
           userId: data.userId,
+          warehouseId: batch.production?.warehouseId || undefined,
+          receiveAtCost: {
+            unitCost: retailItem.costPrice || 0,
+            batchNumber: batch.batchCode || undefined,
+            mfgDate: batch.mfgDate,
+            expDate: batch.expiryDate,
+            productBatchId: batch.id,
+          },
         });
       }
 
@@ -799,6 +819,7 @@ export class ProductionService {
         wasteEntries.push(await WasteService.createFromProductionReject(tx, {
           inventoryItemId: retailItem.id,
           franchiseId,
+          warehouseId: batch.production?.warehouseId || undefined,
           quantity: damaged,
           reason: 'DAMAGED',
           note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
@@ -810,6 +831,7 @@ export class ProductionService {
         wasteEntries.push(await WasteService.createFromProductionReject(tx, {
           inventoryItemId: retailItem.id,
           franchiseId,
+          warehouseId: batch.production?.warehouseId || undefined,
           quantity: spoiled,
           reason: 'SPOILAGE',
           note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
@@ -933,6 +955,11 @@ export class ProductionService {
             stageLogs: { orderBy: { enteredAt: 'asc' } },
           },
         },
+        // Real remaining stock for "Available FG" (see below) — only lots on
+        // the FINISHED_GOOD retail item count; the bulk SEMI_FINISHED lot
+        // created at QC approval is also linked to this same productBatchId
+        // and must not be counted here.
+        inventoryBatches: { include: { inventoryItem: true } },
         // So the Batch Registry (and any other list consuming this
         // endpoint) can show IN_PROGRESS/COMPLETED/CANCELLED recall status
         // instead of only ever showing APPROVED/PENDING QC status.
@@ -945,7 +972,21 @@ export class ProductionService {
       const effectiveExpiry = b.expiryDate || b.production?.expiryDate;
       const packedQuantity = b.packagedQty || 0;
       const bulkQuantity = Math.max(0, (b.approvedQty || 0) - (b.packagedQty || 0));
-      const availableQuantity = b.packagings?.reduce((sum, p) => sum + (p.quantityPackets || 0), 0) || 0;
+      // "Available FG" — stock from this batch still actually sitting in
+      // inventory right now, not just historical good-output. confirmPackaging
+      // credits the good quantity as a real lot (productBatchId-linked
+      // InventoryBatch), which every subsequent sale/transfer/waste already
+      // depletes FIFO — so this lot's remaining currentQty naturally falls as
+      // that stock moves out. Falls back to the historical good-produced
+      // count only for batches packaged before that lot-tracking existed
+      // (no FINISHED_GOOD lot on record at all), so old batches don't
+      // suddenly show 0.
+      const fgLots = (b.inventoryBatches || []).filter(ib => ib.inventoryItem?.category === 'FINISHED_GOOD');
+      const availableQuantity = fgLots.length > 0
+        ? fgLots.reduce((sum, ib) => sum + (ib.currentQty || 0), 0)
+        : (b.packagings
+            ?.filter(p => p.status === 'CONFIRMED')
+            .reduce((sum, p) => sum + (p.goodQty ?? p.quantityPackets ?? 0), 0) || 0);
 
       return {
         ...b,
@@ -969,11 +1010,20 @@ export class ProductionService {
       };
     });
 
-    // Also include GRN raw material / inventory batches that carry expiry dates
+    // Also include GRN raw material / inventory batches that carry expiry
+    // dates — genuine RAW_MATERIAL lots only. SEMI_FINISHED (QC-approved
+    // bulk, awaiting Packaging) and FINISHED_GOOD (Confirm Packaging output)
+    // InventoryBatch lots are real inventory records in their own right, but
+    // they already belong to a ProductBatch row above — appending them here
+    // too would show the same production batch twice under two different
+    // formulas (see ProductionService.getProductBatches investigation).
     const inventoryBatches = await prisma.inventoryBatch.findMany({
       where: {
         expDate: { not: null },
-        ...(franchiseId ? { inventoryItem: { franchiseId } } : {}),
+        inventoryItem: {
+          category: 'RAW_MATERIAL',
+          ...(franchiseId ? { franchiseId } : {}),
+        },
         ...(productId ? { inventoryItemId: productId } : {}),
       },
       include: {
@@ -1037,15 +1087,28 @@ export class ProductionService {
   }
 
   static async getPackagings(franchiseId?: string) {
-    return prisma.productPackaging.findMany({
+    const packagings = await prisma.productPackaging.findMany({
       where: franchiseId ? { batch: { franchiseId } } : {},
-      include: { batch: { include: { product: true } } },
+      include: { batch: { include: { product: true, production: { include: { recipe: true } } } } },
       orderBy: { createdAt: 'desc' },
     });
+
+    // Same canonical product/recipe fallback as getProductBatches/
+    // getAllProductBatches — batch.product is legitimately null for a
+    // recipe with no linked Product, and Confirm Packaging (Awaiting
+    // Confirmation + History) consumes this same list, so it was showing a
+    // blank product name for any such batch.
+    return packagings.map(p => ({
+      ...p,
+      batch: {
+        ...p.batch,
+        product: p.batch.product || (p.batch.production?.recipe ? { id: p.batch.production.recipe.id, name: p.batch.production.recipe.name, sku: p.batch.production.recipe.recipeCode ?? null } : null),
+      },
+    }));
   }
 
   static async getAllProductBatches(franchiseId?: string) {
-    return prisma.productBatch.findMany({
+    const batches = await prisma.productBatch.findMany({
       where: franchiseId ? { franchiseId } : {},
       include: {
         product: true,
@@ -1056,5 +1119,16 @@ export class ProductionService {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    // Same canonical product/recipe fallback as getProductBatches (Batch
+    // Registry, Expiry Tracking, Batch Recall) — ProductBatch.product is
+    // legitimately null for a recipe with no linked Product, and the recipe
+    // itself is still the batch's real product identity. Packaging Queue
+    // consumes this same list, so it was showing a blank product name for
+    // any such batch instead of falling back like every other consumer does.
+    return batches.map(b => ({
+      ...b,
+      product: b.product || (b.production?.recipe ? { id: b.production.recipe.id, name: b.production.recipe.name, sku: b.production.recipe.recipeCode ?? null } : null),
+    }));
   }
 }

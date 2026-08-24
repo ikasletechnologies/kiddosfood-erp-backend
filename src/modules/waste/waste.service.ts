@@ -25,7 +25,30 @@ export class WasteService {
   static async getById(id: string) {
     return prisma.wasteEntry.findUnique({
       where: { id },
-      include: { 
+      include: {
+        inventoryItem: { select: { name: true, sku: true, unit: true } },
+        warehouse: { select: { name: true } }
+      }
+    });
+  }
+
+  // Metadata-only correction (reason/note) — quantity is deliberately not
+  // editable here. create() already recorded a real WASTE_OUT StockMovement
+  // and decremented InventoryItem.currentStock at the original quantity;
+  // changing it after the fact would need to reverse and re-apply that
+  // stock effect, not just update this row. Fixing a mislabeled reason or a
+  // typo'd note carries no such risk.
+  static async update(id: string, data: { reason?: string; note?: string }) {
+    const existing = await prisma.wasteEntry.findUnique({ where: { id } });
+    if (!existing) throw new Error('Waste entry not found');
+
+    return prisma.wasteEntry.update({
+      where: { id },
+      data: {
+        ...(data.reason !== undefined ? { reason: data.reason } : {}),
+        ...(data.note !== undefined ? { note: data.note } : {}),
+      },
+      include: {
         inventoryItem: { select: { name: true, sku: true, unit: true } },
         warehouse: { select: { name: true } }
       }

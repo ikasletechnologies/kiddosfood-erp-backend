@@ -564,6 +564,7 @@ app.get('/api/waste', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteCon
 app.get('/api/waste/summary', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.getSummary);
 app.get('/api/waste/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.getOne);
 app.post('/api/waste', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.create);
+app.patch('/api/waste/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.update);
 
 // Stock Alerts
 app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']), InventoryController.getAlerts);

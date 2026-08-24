@@ -44,6 +44,16 @@ export class WasteController {
     }
   }
 
+  static async update(req: Request, res: Response) {
+    try {
+      const { reason, note } = req.body;
+      const entry = await WasteService.update(req.params.id, { reason, note });
+      res.json(entry);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
   static async getSummary(req: Request, res: Response) {
     try {
       const user = (req as any).user;
