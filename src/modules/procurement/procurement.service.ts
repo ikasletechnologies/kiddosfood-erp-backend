@@ -634,6 +634,10 @@ export class ProcurementService {
     vendorNotes?: string;
     deliveryInstructions?: string;
     status?: string;
+    warehouseId?: string;
+    purchaseType?: string;
+    discountAmount?: number;
+    freightCost?: number;
     items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
@@ -674,7 +678,9 @@ export class ProcurementService {
     const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
     const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
     const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
-    const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
+    const discountAmount = Number(data.discountAmount) || 0;
+    const freightCost = Number(data.freightCost) || 0;
+    const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost;
 
     // Existing usable credit — see getAvailableAdvance for why this isn't
     // just the raw ledger balance (it also excludes advance already
@@ -701,10 +707,14 @@ export class ProcurementService {
           poNumber,
           vendorId: data.vendorId,
           franchiseId: data.franchiseId || null,
+          warehouseId: data.warehouseId || null,
+          purchaseType: (data.purchaseType as any) || 'RAW_MATERIAL',
           subtotal: totalSubtotal,
           cgst: totalCGST,
           sgst: totalSGST,
           igst: totalIGST,
+          discountAmount,
+          freightCost,
           totalAmount,
           advancePaid: providedAmount, // Real money provided
           advanceApplied: appliedFromCredit, // Portion of the above that was pre-existing credit, not fresh cash
@@ -807,6 +817,10 @@ export class ProcurementService {
     internalNotes?: string;
     vendorNotes?: string;
     deliveryInstructions?: string;
+    warehouseId?: string;
+    purchaseType?: string;
+    discountAmount?: number;
+    freightCost?: number;
     items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
@@ -828,6 +842,10 @@ export class ProcurementService {
       const updateData: any = {};
       if (data.vendorId) updateData.vendorId = data.vendorId;
       if (data.franchiseId !== undefined) updateData.franchiseId = data.franchiseId || null;
+      if (data.warehouseId !== undefined) updateData.warehouseId = data.warehouseId || null;
+      if (data.purchaseType !== undefined) updateData.purchaseType = data.purchaseType;
+      if (data.discountAmount !== undefined) updateData.discountAmount = Number(data.discountAmount) || 0;
+      if (data.freightCost !== undefined) updateData.freightCost = Number(data.freightCost) || 0;
       if (data.expectedDeliveryDate !== undefined) {
         updateData.expectedDeliveryDate = data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null;
       }
@@ -867,7 +885,9 @@ export class ProcurementService {
         const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
         const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
         const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
-        const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST;
+        const discount = data.discountAmount !== undefined ? (Number(data.discountAmount) || 0) : (po.discountAmount || 0);
+        const freight = data.freightCost !== undefined ? (Number(data.freightCost) || 0) : (po.freightCost || 0);
+        const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight;
 
         await tx.procurementOrderItem.deleteMany({ where: { poId } });
 
