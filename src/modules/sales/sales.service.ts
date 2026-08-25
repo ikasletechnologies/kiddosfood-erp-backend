@@ -566,6 +566,20 @@ export class SalesService {
 
   // ─── Delivery Challans ───────────────────────────────────────────────────────
 
+  // A challan has exactly one destination — Customer, Dealer, or Franchise —
+  // never more than one. Dealer is architecturally equivalent to Customer for
+  // stock accounting (external party, no receiving ledger of its own) but is
+  // a distinct master, so it gets its own column rather than overloading
+  // customerId. Doesn't require exactly one (a DRAFT may have none yet,
+  // matching existing Customer/Franchise behavior — the frontend enforces
+  // "required" only once the challan actually goes IN_TRANSIT).
+  private static assertSingleDestination(customerId?: string | null, dealerId?: string | null, franchiseId?: string | null) {
+    const provided = [customerId, dealerId, franchiseId].filter(Boolean);
+    if (provided.length > 1) {
+      throw new Error('A delivery challan can only have one destination: Customer, Dealer, or Franchise.');
+    }
+  }
+
   static async getDeliveryChallans(filters: { customerId?: string; status?: string; search?: string }) {
     // One-time safe migration: legacy rows stored status 'OPEN' before the IN_TRANSIT rename
     await prisma.deliveryChallan.updateMany({ where: { status: 'OPEN' }, data: { status: 'IN_TRANSIT' } });
@@ -581,7 +595,7 @@ export class SalesService {
     }
     return prisma.deliveryChallan.findMany({
       where,
-      include: { customer: true, items: true },
+      include: { customer: true, dealer: true, items: true },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -589,12 +603,13 @@ export class SalesService {
   static async getDeliveryChallanById(id: string) {
     return prisma.deliveryChallan.findUnique({
       where: { id },
-      include: { customer: true, items: true }
+      include: { customer: true, dealer: true, items: true }
     });
   }
 
   static async createDeliveryChallan(data: {
     customerId?: string;
+    dealerId?: string;
     salesOrderId?: string;
     franchiseId?: string;
     sourceFranchiseId?: string;
@@ -608,10 +623,16 @@ export class SalesService {
     termsConditions?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number; batchNumber?: string }>;
   }, userId: string = 'system') {
+    SalesService.assertSingleDestination(data.customerId, data.dealerId, data.franchiseId);
+    if (data.dealerId) {
+      const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
+      if (!dealer) throw new Error('Selected dealer not found.');
+    }
+
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(
       data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 }))
     );
-    
+
     // Generate sequential challan number from DB count
     const count = await prisma.deliveryChallan.count();
     const challanNumber = `DC-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`;
@@ -620,6 +641,7 @@ export class SalesService {
       data: {
         challanNumber,
         customerId: data.customerId || null,
+        dealerId: data.dealerId || null,
         salesOrderId: data.salesOrderId || null,
         franchiseId: data.franchiseId || null,
         sourceFranchiseId: data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null,
@@ -648,7 +670,7 @@ export class SalesService {
           }))
         }
       },
-      include: { customer: true, items: true }
+      include: { customer: true, dealer: true, items: true }
     });
 
     if (newChallan.status === 'IN_TRANSIT') {
@@ -658,7 +680,7 @@ export class SalesService {
     return newChallan;
   }
 
-  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string }, userId: string = 'system') {
+  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string; customerId?: string | null; dealerId?: string | null; franchiseId?: string | null }, userId: string = 'system') {
     const currentChallan = await prisma.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
     if (!currentChallan) throw new Error('Delivery challan not found');
 
@@ -671,7 +693,19 @@ export class SalesService {
       throw new Error('Cannot change status of a closed delivery challan');
     }
 
-    const updated = await prisma.deliveryChallan.update({ where: { id }, data, include: { items: true } });
+    if ('customerId' in data || 'dealerId' in data || 'franchiseId' in data) {
+      SalesService.assertSingleDestination(
+        'customerId' in data ? data.customerId : currentChallan.customerId,
+        'dealerId' in data ? data.dealerId : currentChallan.dealerId,
+        'franchiseId' in data ? data.franchiseId : currentChallan.franchiseId
+      );
+      if (data.dealerId) {
+        const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
+        if (!dealer) throw new Error('Selected dealer not found.');
+      }
+    }
+
+    const updated = await prisma.deliveryChallan.update({ where: { id }, data, include: { customer: true, dealer: true, items: true } });
 
     // Handle Stock Transitions
     if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT') {

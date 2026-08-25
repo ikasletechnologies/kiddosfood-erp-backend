@@ -648,6 +648,19 @@ export class ProductionService {
         },
       });
 
+      // Reserve the required bulk stock immediately against this run.
+      // This ensures it cannot be consumed by other concurrent packaging runs
+      // and acts as the transactional deduction.
+      await InventoryService.recordMovement(tx, {
+        itemId: bulkItem.id,
+        type: 'PRODUCTION_OUT',
+        quantity: -totalWeightNeeded,
+        referenceType: 'PACKAGING',
+        referenceId: batch.id,
+        note: `Packaging started: Reserved bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
+        userId: data.userId,
+      });
+
       return { packaging };
     });
   }
@@ -738,12 +751,11 @@ export class ProductionService {
       const unitMultiplier = this.parseWeight(packaging.packetSize, bulkItem.unit);
       const totalWeightNeeded = packaging.quantityPackets * unitMultiplier;
 
-      // Authoritative re-check — time has passed since Start, and other
-      // packaging runs may have consumed this same bulk stock meanwhile.
-      if (bulkItem.currentStock < totalWeightNeeded) {
-        const shortage = totalWeightNeeded - bulkItem.currentStock;
-        throw new Error(`Insufficient bulk stock to confirm. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
-      }
+      // The authoritative check and bulk deduction have already occurred in
+      // startPackaging (which acts as a reservation). We do not re-check
+      // bulkItem.currentStock here to avoid double-deducting or failing when
+      // the reservation is the only reason stock is "short".
+
       const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
       if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
         throw new Error('This batch is already fully packaged.');
@@ -751,19 +763,6 @@ export class ProductionService {
       if (totalWeightNeeded > remainingInBatch + 0.001) {
         throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
-
-      // Bulk is deducted for the FULL planned quantity — all of it was
-      // physically taken out of the bulk container regardless of whether it
-      // turned out good, damaged, or spoiled.
-      await InventoryService.recordMovement(tx, {
-        itemId: bulkItem.id,
-        type: 'PRODUCTION_OUT',
-        quantity: -totalWeightNeeded,
-        referenceType: 'PACKAGING',
-        referenceId: batch.id,
-        note: `Packaging confirmed: Deducted bulk stock for ${packaging.quantityPackets} x ${packaging.packetSize} packs (${good} good, ${damaged} damaged, ${spoiled} spoiled)`,
-        userId: data.userId,
-      });
 
       const { retailSku, retailName } = this.deriveRetailIdentity(bulkItem, packaging.packetSize, !!batch.product);
 

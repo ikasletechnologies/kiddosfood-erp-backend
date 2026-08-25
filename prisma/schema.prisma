@@ -85,16 +85,17 @@ model Customer {
 }
 
 model Dealer {
-  id          String    @id @default(uuid())
-  name        String
-  phone       String?   @unique
-  email       String?   @unique
-  address     String?
-  status      String    @default("ACTIVE")
-  franchiseId String
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  franchise   Franchise @relation(fields: [franchiseId], references: [id])
+  id               String            @id @default(uuid())
+  name             String
+  phone            String?           @unique
+  email            String?           @unique
+  address          String?
+  status           String            @default("ACTIVE")
+  franchiseId      String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  franchise        Franchise         @relation(fields: [franchiseId], references: [id])
+  deliveryChallans DeliveryChallan[]
 }
 
 model BusinessPartner {
@@ -1395,6 +1396,11 @@ model DeliveryChallan {
   id                String                @id @default(uuid())
   challanNumber     String                @unique
   customerId        String?
+  // External B2B reseller destination — architecturally distinct from
+  // Customer (separate master, own scoping) even though stock accounting
+  // treats it identically: dispatch deducts source stock, no destination
+  // receipt (see SalesService.dispatchChallanStock/receiveChallanStock).
+  dealerId          String?
   salesOrderId      String?
   franchiseId       String?
   sourceFranchiseId String?
@@ -1412,6 +1418,7 @@ model DeliveryChallan {
   createdAt         DateTime              @default(now())
   updatedAt         DateTime              @updatedAt
   customer          Customer?             @relation(fields: [customerId], references: [id])
+  dealer            Dealer?               @relation(fields: [dealerId], references: [id])
   items             DeliveryChallanItem[]
 }
 
