@@ -560,10 +560,10 @@ app.post('/api/loyalty/add-points', authenticate, authorizeRole(['FRANCHISE_ADMI
 app.post('/api/loyalty/redeem', authenticate, authorizeRole(['FRANCHISE_ADMIN']), LoyaltyController.redeem);
 
 // Waste & Loss
-app.get('/api/waste', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.getAll);
-app.get('/api/waste/summary', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.getSummary);
-app.get('/api/waste/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.getOne);
-app.post('/api/waste', authenticate, authorizeRole(['FRANCHISE_ADMIN']), WasteController.create);
+app.get('/api/waste', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.getAll);
+app.get('/api/waste/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.getSummary);
+app.get('/api/waste/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.getOne);
+app.post('/api/waste', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.create);
 
 // Stock Alerts
 app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']), InventoryController.getAlerts);
