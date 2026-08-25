@@ -1064,7 +1064,8 @@ export class ProcurementService {
         vendor: true, 
         poItems: { include: { inventoryItem: true } }, 
         goodsReceipts: { include: { items: true } },
-        warehouse: true
+        warehouse: true,
+        franchise: true
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -1108,7 +1109,8 @@ export class ProcurementService {
         vendor: true, 
         poItems: { include: { inventoryItem: true } }, 
         goodsReceipts: { include: { items: true } },
-        warehouse: true
+        warehouse: true,
+        franchise: true
       }
     });
   }

@@ -1374,6 +1374,7 @@ model SalesOrder {
   proformaInvoiceId String?        @unique
   customerId      String?
   customerName    String?
+  customerPhone   String?
   status          SalesOrderStatus @default(DRAFT)
   subTotal        Float
   taxAmount       Float

@@ -274,6 +274,7 @@ export class SalesService {
           quotationId: quotation.id,
           customerId: quotation.customerId,
           customerName: quotation.customerName,
+          customerPhone: quotation.customerPhone,
           status: 'DRAFT',
           subTotal: quotation.subTotal,
           taxAmount: quotation.taxAmount,
@@ -523,6 +524,7 @@ export class SalesService {
   static async createSalesOrder(data: {
     customerId?: string;
     customerName?: string;
+    customerPhone?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     deliveryDate?: string;
@@ -538,6 +540,7 @@ export class SalesService {
         orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
         customerId: data.customerId,
         customerName: data.customerName,
+        customerPhone: data.customerPhone,
         subTotal,
         taxAmount,
         discountAmount: discount,
