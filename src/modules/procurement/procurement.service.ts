@@ -639,7 +639,7 @@ export class ProcurementService {
     discountAmount?: number;
     freightCost?: number;
     paymentTerms?: string;
-    items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
+    items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     const poItemsData = await Promise.all(data.items.map(async (item) => {
@@ -653,6 +653,20 @@ export class ProcurementService {
       if (inventoryItem?.category === 'FINISHED_GOOD') {
         throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
       }
+
+      // Unit Validation: Ensure the transaction unit is compatible with the item's base unit.
+      // E.g. Reject KG -> ML. We don't save the unit or convert the quantity for PO financials,
+      // we only use the engine to enforce dimension safety.
+      if (item.unit && inventoryItem?.unit) {
+         try {
+            const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+            // This will throw if dimensions don't match (e.g. WEIGHT vs VOLUME)
+            convertMeasurement(item.quantity, item.unit.toUpperCase(), inventoryItem.unit.toUpperCase());
+         } catch (e: any) {
+            throw new Error(`Unit mismatch for "${inventoryItem.name}": ${e.message}`);
+         }
+      }
+
       // Prefer whatever GST% the line item actually shows on the PO (the
       // user can override it there); fall back to the item master's own
       // rate, then 5% as a last resort. `??` matters here — `|| 5` would
@@ -667,6 +681,9 @@ export class ProcurementService {
         ...item,
         itemName: inventoryItem?.name || "Unknown Material",
         gstRate,
+        quantity: item.quantity,
+        price: item.price,
+        unit: item.unit || 'UNIT',
         subtotal,
         cgst,
         sgst,
@@ -735,6 +752,7 @@ export class ProcurementService {
               gstRate: item.gstRate,
               quantity: item.quantity,
               price: item.price,
+              unit: item.unit,
               subtotal: item.subtotal,
               cgst: item.cgst,
               sgst: item.sgst,
@@ -824,7 +842,7 @@ export class ProcurementService {
     discountAmount?: number;
     freightCost?: number;
     paymentTerms?: string;
-    items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
+    items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     return prisma.$transaction(async (tx) => {
@@ -866,6 +884,16 @@ export class ProcurementService {
           if (inventoryItem?.category === 'FINISHED_GOOD') {
             throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
           }
+
+          if (item.unit && inventoryItem?.unit) {
+             try {
+                const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+                convertMeasurement(item.quantity, item.unit.toUpperCase(), inventoryItem.unit.toUpperCase());
+             } catch (e: any) {
+                throw new Error(`Unit mismatch for "${inventoryItem.name}": ${e.message}`);
+             }
+          }
+
           // Same `??` fix as createPurchaseOrder — a real 0%-GST item must
           // not get silently bumped to 5% by a falsy-zero fallback.
           const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
@@ -877,6 +905,7 @@ export class ProcurementService {
             gstRate,
             quantity: item.quantity,
             price: item.price,
+            unit: item.unit || 'UNIT',
             subtotal,
             cgst: gstAmount / 2,
             sgst: gstAmount / 2,
@@ -1206,6 +1235,7 @@ export class ProcurementService {
               acceptedQty: item.quantity,
               rejectedQty: 0,
               price: item.price,
+              unit: item.unit,
               qcStatus: 'PENDING'
             }))
           }

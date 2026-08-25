@@ -30,22 +30,7 @@ function mapCategoryToDb(category?: string): ItemCategory {
   return ItemCategory.RAW_MATERIAL;
 }
 
-export function getStockInPhysicalUnit(stock: number, sku: string, category?: string): number {
-  if (!sku || category !== 'FINISHED_GOOD') return stock;
-  const parts = sku.split('-');
-  const sizePart = parts.length >= 2 ? parts[parts.length - 1] : "";
-  const match = sizePart.match(/^(\d+(?:\.\d+)?)\s*([A-Z]+)$/i);
-  if (!match) return stock;
 
-  const weightVal = parseFloat(match[1]);
-  const weightUnit = match[2].toUpperCase();
-
-  const totalVal = stock * weightVal;
-  if (weightUnit === "G" || weightUnit === "ML") {
-    return totalVal / 1000;
-  }
-  return totalVal;
-}
 
 
 export class InventoryService {
@@ -227,8 +212,7 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) > 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
       const outbound = Math.abs(todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) < 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0));
 
-      const physicalStock = getStockInPhysicalUnit(computedStock, item.sku, item.category);
-      const status = physicalStock <= item.minimumStock ? 'LOW' : 'SAFE';
+      const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
 
       const incomingStock = pendingMap.get(item.id) || 0;
 
@@ -602,12 +586,13 @@ export class InventoryService {
   }
 
   // Internal: stock-in via GRN / procurement — not exposed as free-form UI edit
-  static async stockIn(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string }, externalTx?: any) {
+  static async stockIn(data: { itemId: string; quantity: number; unit?: string; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string }, externalTx?: any) {
     const run = (tx: any) =>
       this.recordMovement(tx, {
         itemId: data.itemId,
         type: data.type ?? 'PURCHASE_IN',
         quantity: data.quantity,
+        transactionUnit: data.unit,
         note: data.note,
         userId: data.userId,
         referenceType: data.referenceType,
@@ -617,12 +602,13 @@ export class InventoryService {
   }
 
   // Internal: stock-out via production / waste — not exposed as free-form UI edit
-  static async stockOut(data: { itemId: string; quantity: number; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string; strictFIFO?: boolean }, externalTx?: any) {
+  static async stockOut(data: { itemId: string; quantity: number; unit?: string; type?: any; note?: string; userId?: string; referenceType?: string; referenceId?: string; strictFIFO?: boolean }, externalTx?: any) {
     const run = (tx: any) =>
       this.recordMovement(tx, {
         itemId: data.itemId,
         type: data.type ?? 'PRODUCTION_OUT',
         quantity: -data.quantity,
+        transactionUnit: data.unit,
         note: data.note,
         userId: data.userId,
         referenceType: data.referenceType,
@@ -633,7 +619,7 @@ export class InventoryService {
   }
 
   // SUPER_ADMIN only: physical count adjustment
-  static async adjustStock(data: { itemId: string; newQuantity: number; note?: string; userId?: string }) {
+  static async adjustStock(data: { itemId: string; newQuantity: number; unit?: string; note?: string; userId?: string }) {
     return prisma.$transaction(async tx => {
       const computedStock = await this.computeStock(data.itemId, tx);
       const difference = data.newQuantity - computedStock;
@@ -643,6 +629,7 @@ export class InventoryService {
         itemId: data.itemId,
         type: StockMovementType.ADJUSTMENT,
         quantity: difference,
+        transactionUnit: data.unit,
         referenceType: 'ADJUSTMENT',
         note: data.note || 'Physical count adjustment',
         userId: data.userId,
@@ -706,7 +693,7 @@ export class InventoryService {
       type: string;
       quantity: number;
       baseQty?: number;
-      unitId?: string;
+      transactionUnit?: string;
       referenceType?: string;
       referenceId?: string;
       note?: string;
@@ -734,7 +721,24 @@ export class InventoryService {
       strictFIFO?: boolean;
     }
   ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
-    const stockChange = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
+    const itemBefore = await tx.inventoryItem.findUnique({ where: { id: data.itemId } });
+    if (!itemBefore) throw new Error(`Inventory item ${data.itemId} not found`);
+
+    let finalBaseQty = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
+    
+    // Normalize transaction quantity to canonical stock units if units differ
+    if (data.transactionUnit && itemBefore.unit && data.transactionUnit.toUpperCase() !== itemBefore.unit.toUpperCase() && data.transactionUnit !== 'UNIT') {
+      try {
+        const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+        finalBaseQty = convertMeasurement(data.quantity, data.transactionUnit.toUpperCase(), itemBefore.unit.toUpperCase()).toNumber();
+      } catch (err: any) {
+        throw new Error(`Unit conversion failed for "${itemBefore.name}": ${err.message}`);
+      }
+    }
+    
+    // Ensure baseQty is correctly saved in the DB so computeStock works accurately
+    const stockChange = finalBaseQty;
+    data.baseQty = finalBaseQty;
 
     const updatedItem = await tx.inventoryItem.update({
       where: { id: data.itemId },
@@ -810,7 +814,7 @@ export class InventoryService {
         movementType: data.type as any,
         quantity: data.quantity,
         baseQty: data.baseQty,
-        unitId: data.unitId,
+        transactionUnit: data.transactionUnit,
         referenceType: data.referenceType,
         referenceId: data.referenceId,
         note: data.note,
@@ -926,8 +930,8 @@ export class InventoryService {
   static async getAlerts(franchiseId: string) {
     const items = await this.getInventory(franchiseId);
     return items.filter(item => {
-      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
-      return physicalStock <= item.minimumStock;
+      // currentStock is always in the canonical unit (Phase 4) — compare directly
+      return item.currentStock <= item.minimumStock;
     });
   }
 

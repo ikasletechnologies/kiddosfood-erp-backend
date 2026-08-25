@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { convertUnit } from '../../lib/conversion';
+import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 export class RecipeService {
   /**
@@ -158,9 +158,22 @@ export class RecipeService {
       // costPrice/basePrice are per item.inventoryItem.unit (e.g. per KG),
       // while quantityRequired is expressed in the recipe's own item.unit
       // (e.g. g) — convert before pricing, or a 500 g line prices out as if
-      // it were 500 KG.
+      // it were 500 KG. Uses the canonical shared engine to guarantee
+      // identical factors to production.service.ts.
       const unitCost = item.inventoryItem.costPrice || item.inventoryItem.basePrice || 0;
-      const qtyInStockUnit = convertUnit(item.quantityRequired, item.unit, item.inventoryItem.unit);
+      let qtyInStockUnit: number;
+      try {
+        qtyInStockUnit = convertMeasurement(
+          item.quantityRequired,
+          item.unit.toUpperCase() as ValidUnit,
+          item.inventoryItem.unit.toUpperCase() as ValidUnit
+        ).toNumber();
+      } catch {
+        // Units are from different dimensions or unrecognized — fall back to
+        // raw quantity to avoid crashing the cost report, but the data is
+        // misconfigured and should be fixed in the recipe definition.
+        qtyInStockUnit = item.quantityRequired;
+      }
       const lineCost = qtyInStockUnit * unitCost;
       totalCost += lineCost;
       breakdown.push({

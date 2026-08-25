@@ -53,10 +53,11 @@ export class InventoryController {
 
   static async stockIn(req: Request, res: Response) {
     try {
-      const { itemId, quantity, type, note } = req.body;
+      const { itemId, quantity, unit, type, note } = req.body;
       const result = await InventoryService.stockIn({
         itemId,
         quantity,
+        unit,
         type,
         note,
         userId: (req as any).user?.userId
@@ -69,10 +70,11 @@ export class InventoryController {
 
   static async stockOut(req: Request, res: Response) {
     try {
-      const { itemId, quantity, type, note } = req.body;
+      const { itemId, quantity, unit, type, note } = req.body;
       const result = await InventoryService.stockOut({
         itemId,
         quantity,
+        unit,
         type,
         note,
         userId: (req as any).user?.userId
@@ -85,10 +87,11 @@ export class InventoryController {
 
   static async adjustment(req: Request, res: Response) {
     try {
-      const { itemId, newQuantity, note } = req.body;
+      const { itemId, newQuantity, unit, note } = req.body;
       const result = await InventoryService.adjustStock({
         itemId,
         newQuantity,
+        unit,
         note,
         userId: (req as any).user?.userId
       });

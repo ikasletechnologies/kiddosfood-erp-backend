@@ -1,6 +1,5 @@
 import prisma from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
-import { getStockInPhysicalUnit } from '../inventory/inventory.service';
 
 export class DashboardInventoryService {
   static async getInventoryStats(franchiseId?: string) {
@@ -65,15 +64,16 @@ export class DashboardInventoryService {
       };
     });
 
-    // Compute low stock raw items in-memory using physicalStock compared to minimumStock
+    // Compute low stock raw items in-memory using canonical stock vs minimumStock.
+    // Phase 4 established that InventoryItem.currentStock is always in the item's
+    // configured canonical unit — no SKU-parsing hack needed.
     const lowStockRawItems = inventoryItems.filter(item => {
-      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
-      return physicalStock <= item.minimumStock;
+      return item.currentStock <= item.minimumStock;
     });
 
     // Build Low Stock raw materials list
     const lowStockAlerts = lowStockRawItems.map(item => {
-      const physicalStock = getStockInPhysicalUnit(item.currentStock, item.sku, item.category);
+      const physicalStock = item.currentStock; // already canonical
       let status = 'GREEN';
       if (physicalStock <= 0) {
         status = 'RED';

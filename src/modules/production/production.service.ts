@@ -2,7 +2,7 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { WasteService } from '../waste/waste.service';
 import { ProductionStatus } from '@prisma/client';
-import { convertUnit } from '../../lib/conversion';
+import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -117,17 +117,34 @@ export class ProductionService {
       // stock reads as "8" against a 500 g requirement and looks short by
       // 3 orders of magnitude.
       for (const item of recipe.recipeItems) {
-        const amountNeeded = convertUnit(item.quantityRequired * scalar, item.unit, item.inventoryItem.unit);
+        // Validate and convert recipe quantity into the inventory canonical unit.
+        // convertMeasurement throws "Incompatible units" if recipe and inventory
+        // units are from different dimensions (e.g. G vs ML), which is the
+        // correct behavior — we never want a silent 1:1 fallback here.
+        let amountNeededInCanonical: number;
+        try {
+          amountNeededInCanonical = convertMeasurement(
+            item.quantityRequired * scalar,
+            item.unit.toUpperCase() as ValidUnit,
+            item.inventoryItem.unit.toUpperCase() as ValidUnit
+          ).toNumber();
+        } catch (e: any) {
+          throw new Error(
+            `Unit mismatch for ingredient "${item.inventoryItem.name}": ` +
+            `recipe requires ${item.unit} but inventory tracks ${item.inventoryItem.unit}. ` +
+            `${e.message}`
+          );
+        }
         if (data.warehouseId) {
           const available = await InventoryService.computeWarehouseStock(item.inventoryItemId, data.warehouseId, tx);
-          if (available < amountNeeded) {
-            throw new Error(`Insufficient stock for "${item.inventoryItem.name}" in the selected warehouse (need ${amountNeeded.toFixed(3)} ${item.inventoryItem.unit}, have ${available.toFixed(3)} ${item.inventoryItem.unit})`);
+          if (available < amountNeededInCanonical) {
+            throw new Error(`Insufficient stock for "${item.inventoryItem.name}" in the selected warehouse (need ${amountNeededInCanonical.toFixed(3)} ${item.inventoryItem.unit}, have ${available.toFixed(3)} ${item.inventoryItem.unit})`);
           }
         } else {
           const inv = await tx.inventoryItem.findFirst({
             where: { id: item.inventoryItemId, franchiseId },
           });
-          if (!inv || inv.currentStock < amountNeeded) {
+          if (!inv || inv.currentStock < amountNeededInCanonical) {
             throw new Error(`Insufficient stock for "${inv?.name ?? 'ingredient'}"`);
           }
         }
@@ -197,21 +214,30 @@ export class ProductionService {
       // letting it get discarded once the batch rows are decremented.
       let materialCost = 0;
       for (const item of recipe.recipeItems) {
-        // Converted into the inventory item's own unit (see the identical
-        // conversion in the availability check above) — recordMovement
-        // deducts this value straight from currentStock, which is tracked
-        // in item.inventoryItem.unit, not the recipe's unit.
-        const amountNeeded = convertUnit(item.quantityRequired * scalar, item.unit, item.inventoryItem.unit);
+        // Pass the recipe unit and raw quantity to recordMovement. The engine
+        // normalizes to the inventory canonical unit (item.inventoryItem.unit)
+        // internally, storing transactionUnit on the ledger row for audit
+        // traceability. We do NOT pre-convert here — the single source of
+        // truth for conversion is @businessgroupikasle/erp-units inside recordMovement.
+        const rawQty = item.quantityRequired * scalar; // in item.unit (e.g. 500 g)
+        // Also compute the canonical amount for cost calculations below
+        const amountNeededInCanonical = convertMeasurement(
+          rawQty,
+          item.unit.toUpperCase() as ValidUnit,
+          item.inventoryItem.unit.toUpperCase() as ValidUnit
+        ).toNumber();
         const { fifo } = await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PRODUCTION_OUT',
-          quantity: -amountNeeded,
+          quantity: -rawQty,
+          transactionUnit: item.unit,
           referenceType: 'PRODUCTION',
           referenceId: production.id,
           note: `Production started: ${recipe.name}`,
           userId: data.userId,
           warehouseId: data.warehouseId,
         });
+        const amountNeeded = amountNeededInCanonical; // alias for cost section below
 
         // Fall back to the item's moving-average costPrice for any portion
         // that had no tracked batch to draw from (e.g. opening stock), so a
@@ -507,10 +533,13 @@ export class ProductionService {
           // InventoryBatch for the finished good, so a later sale draws from
           // (and gets costed at) this batch's actual cost — not a generic
           // average — exactly like raw materials already do off GRN batches.
+          // transactionUnit records the yield's business unit (e.g. "KG") on
+          // the ledger; recordMovement normalizes to targetItem.unit internally.
           await InventoryService.recordMovement(tx, {
             itemId: targetItem.id,
             type: 'PRODUCTION_IN',
             quantity: approvedQty,
+            transactionUnit: finishedGoodUnit,
             referenceType: 'PRODUCTION',
             referenceId: batch.productionId || batch.id,
             note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
@@ -956,21 +985,20 @@ export class ProductionService {
       throw new Error(`Invalid packet size "${size}" — expected a number with a unit, e.g. "250 g" or "1 Kg".`);
     }
     const val = parseFloat(match[1]);
-    const unit = match[3].toLowerCase();
-    const bUnit = bulkUnit.toLowerCase();
+    const packetUnit = match[3].toUpperCase();
+    const targetUnit = bulkUnit.toUpperCase();
 
-    if (unit === bUnit) return val;
+    if (packetUnit === targetUnit) return val;
 
-    if (bUnit === 'kg' && unit === 'g') return val / 1000;
-    if (bUnit === 'g' && unit === 'kg') return val * 1000;
-    if (bUnit === 'l' && unit === 'ml') return val / 1000;
-    if (bUnit === 'ml' && unit === 'l') return val * 1000;
-
-    // No known conversion between the packet's unit and the bulk item's
-    // unit — returning val here would silently compare incompatible
-    // quantities (e.g. grams against a bulk stock tracked in a stray
-    // "units" label), producing a wrong-but-plausible shortage or surplus.
-    throw new Error(`Cannot convert packet size "${size}" to bulk stock unit "${bulkUnit}" — the product's recipe yield unit must be KG, G, L, or ML.`);
+    // Delegate cross-unit conversion to the shared engine — this is the single
+    // source of truth for g↔kg and ml↔l conversions. The engine throws
+    // "Incompatible units" for cross-dimension pairs (e.g. g vs ml), which is
+    // the correct behavior: packaging units must match the bulk stock dimension.
+    try {
+      return convertMeasurement(val, packetUnit as ValidUnit, targetUnit as ValidUnit).toNumber();
+    } catch {
+      throw new Error(`Cannot convert packet size "${size}" to bulk stock unit "${bulkUnit}" — the product's recipe yield unit must be KG, G, L, or ML.`);
+    }
   }
 
 

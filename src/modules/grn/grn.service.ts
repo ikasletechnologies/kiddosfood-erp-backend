@@ -112,6 +112,7 @@ export class GRNService {
               acceptedQty: accepted,
               rejectedQty: rejected,
               price: price,
+              unit: poItem?.unit || 'UNIT',
               qcStatus: (item.qcStatus as any) || 'PENDING',
               vendorBatchNo: item.vendorBatchNo,
               mfgDate: item.mfgDate ? new Date(item.mfgDate) : null,
@@ -157,7 +158,29 @@ export class GRNService {
 
         const batchRef = item.lotNumber || item.vendorBatchNo || billNumber;
 
-        // 1. Create Inventory Batch (APPROVED status directly to update stock)
+        // 2. Mark GRN Item as APPROVED
+        await tx.goodsReceiptItem.update({
+          where: { id: item.id },
+          data: { qcStatus: 'APPROVED' }
+        });
+
+        // Convert accepted quantity to inventory base unit for stock updates
+        const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
+        if (!invItemBefore) throw new Error(`Inventory item ${item.materialId} not found`);
+
+        let canonicalQty = item.acceptedQty;
+        console.log(`[GRN DBG] item.unit: ${item.unit}, inv.unit: ${invItemBefore.unit}, qty: ${canonicalQty}`);
+        if (item.unit && invItemBefore.unit && item.unit !== 'UNIT') {
+          try {
+            const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+            canonicalQty = convertMeasurement(item.acceptedQty, item.unit.toUpperCase(), invItemBefore.unit.toUpperCase()).toNumber();
+            console.log(`[GRN DBG] canonicalQty after calc: ${canonicalQty}`);
+          } catch (err: any) {
+             throw new Error(`Unit conversion failed for "${invItemBefore.name}": ${err.message}`);
+          }
+        }
+
+        // 1. Create Inventory Batch (APPROVED status directly to update stock) using canonicalQty
         await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
@@ -165,28 +188,21 @@ export class GRNService {
             lotNumber: item.lotNumber,
             mfgDate: item.mfgDate,
             expDate: item.expDate,
-            initialQty: item.acceptedQty,
-            currentQty: item.acceptedQty,
+            initialQty: canonicalQty,
+            currentQty: canonicalQty,
             unitCost: item.price,
             warehouseId: item.warehouseId || null,
             status: 'APPROVED'
           }
         });
 
-        // 2. Mark GRN Item as APPROVED
-        await tx.goodsReceiptItem.update({
-          where: { id: item.id },
-          data: { qcStatus: 'APPROVED' }
-        });
-
         // 3. Record stock movement and cost price update immediately
         const preReceiptStock = await InventoryService.computeStock(item.materialId!, tx);
-        const invItemBefore = await tx.inventoryItem.findUnique({ where: { id: item.materialId! } });
         const priorQty = Math.max(0, preReceiptStock);
         const priorCost = invItemBefore?.costPrice || 0;
-        const newCostPrice = priorQty + item.acceptedQty > 0
-          ? ((priorQty * priorCost) + (item.acceptedQty * item.price)) / (priorQty + item.acceptedQty)
-          : item.price;
+        const newCostPrice = priorQty + canonicalQty > 0
+          ? ((priorQty * priorCost) + (item.acceptedQty * item.price)) / (priorQty + canonicalQty)
+          : item.price; // Note: PO value remains (acceptedQty * price), but per-canonical-unit cost applies
 
         await tx.inventoryItem.update({
           where: { id: item.materialId! },
@@ -199,11 +215,11 @@ export class GRNService {
         await InventoryService.recordMovement(tx, {
           itemId: item.materialId!,
           type: 'PURCHASE_IN',
-          quantity: item.acceptedQty,
+          quantity: canonicalQty,
           referenceType: 'GOODS_RECEIPT',
           referenceId: grnId,
           warehouseId: item.warehouseId || undefined,
-          note: `GRN Approved & Synced: ${item.acceptedQty} ${item.materialId}`
+          note: `GRN Approved & Synced: ${item.acceptedQty} ${item.unit} -> ${canonicalQty} ${invItemBefore.unit}`
         });
       }
 

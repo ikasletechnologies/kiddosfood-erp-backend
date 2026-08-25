@@ -297,9 +297,10 @@ model StockMovement {
   id            String            @id @default(uuid())
   itemId        String
   movementType  StockMovementType
-  quantity      Float
-  baseQty       Float?
-  unitId        String?
+  quantity       Float
+  baseQty        Float?
+  transactionUnit String?
+  unitId         String?
   referenceType String?
   referenceId   String?
   note          String?
@@ -457,6 +458,7 @@ model ProcurementOrderItem {
   inventoryItemId  String?
   quantity         Float
   price            Float
+  unit             String           @default("UNIT")
   cgst             Float            @default(0)
   gstRate          Float            @default(5)
   hsnCode          String?
@@ -492,6 +494,7 @@ model GoodsReceiptItem {
   acceptedQty    Float
   rejectedQty    Float
   price          Float
+  unit           String            @default("UNIT")
   binId          String?
   expDate        DateTime?
   lotNumber      String?

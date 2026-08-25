@@ -254,7 +254,7 @@ export class POSService {
                   type: 'SALES_OUT',
                   quantity: -orderItem.quantity, // original selected quantity
                   baseQty: -requiredBaseQty,     // converted base quantity
-                  unitId: unitId,
+                  transactionUnit: unitId,
                   referenceType: 'ORDER',
                   referenceId: order.id,
                   note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
@@ -489,7 +489,7 @@ export class POSService {
                 type: 'SALES_OUT',
                 quantity: -item.quantity,
                 baseQty: -requiredBaseQty,
-                unitId: unitId,
+                transactionUnit: unitId,
                 referenceType: 'ORDER',
                 referenceId: order.id,
                 note: `Direct stock reduction: ${item.quantity}x ${product.name}`
