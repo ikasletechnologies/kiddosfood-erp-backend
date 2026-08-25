@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { convertUnit } from '../../lib/conversion';
 
 export class RecipeService {
   /**
@@ -154,8 +155,13 @@ export class RecipeService {
     let totalCost = 0;
 
     for (const item of recipe.recipeItems) {
+      // costPrice/basePrice are per item.inventoryItem.unit (e.g. per KG),
+      // while quantityRequired is expressed in the recipe's own item.unit
+      // (e.g. g) — convert before pricing, or a 500 g line prices out as if
+      // it were 500 KG.
       const unitCost = item.inventoryItem.costPrice || item.inventoryItem.basePrice || 0;
-      const lineCost = item.quantityRequired * unitCost;
+      const qtyInStockUnit = convertUnit(item.quantityRequired, item.unit, item.inventoryItem.unit);
+      const lineCost = qtyInStockUnit * unitCost;
       totalCost += lineCost;
       breakdown.push({
         name: item.inventoryItem.name,

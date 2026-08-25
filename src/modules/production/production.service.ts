@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { WasteService } from '../waste/waste.service';
 import { ProductionStatus } from '@prisma/client';
+import { convertUnit } from '../../lib/conversion';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -105,12 +106,22 @@ export class ProductionService {
       // Production Planning show on screen), not the item's franchise-wide
       // total. franchiseId is only a fallback for callers that predate
       // warehouse selection.
+      //
+      // RecipeItem.quantityRequired is expressed in the recipe's own unit
+      // (item.unit, e.g. "g") while InventoryItem.currentStock/movements are
+      // tracked in that item's own unit (item.inventoryItem.unit, e.g.
+      // "KG") — two independent free-text fields with no guarantee they
+      // match. Every amount compared against or deducted from stock must be
+      // converted into the inventory item's unit first, via the same
+      // centralized convertUnit() used below at deduction time, or an 8 KG
+      // stock reads as "8" against a 500 g requirement and looks short by
+      // 3 orders of magnitude.
       for (const item of recipe.recipeItems) {
-        const amountNeeded = item.quantityRequired * scalar;
+        const amountNeeded = convertUnit(item.quantityRequired * scalar, item.unit, item.inventoryItem.unit);
         if (data.warehouseId) {
           const available = await InventoryService.computeWarehouseStock(item.inventoryItemId, data.warehouseId, tx);
           if (available < amountNeeded) {
-            throw new Error(`Insufficient stock for "${item.inventoryItem.name}" in the selected warehouse`);
+            throw new Error(`Insufficient stock for "${item.inventoryItem.name}" in the selected warehouse (need ${amountNeeded.toFixed(3)} ${item.inventoryItem.unit}, have ${available.toFixed(3)} ${item.inventoryItem.unit})`);
           }
         } else {
           const inv = await tx.inventoryItem.findFirst({
@@ -186,7 +197,11 @@ export class ProductionService {
       // letting it get discarded once the batch rows are decremented.
       let materialCost = 0;
       for (const item of recipe.recipeItems) {
-        const amountNeeded = item.quantityRequired * scalar;
+        // Converted into the inventory item's own unit (see the identical
+        // conversion in the availability check above) — recordMovement
+        // deducts this value straight from currentStock, which is tracked
+        // in item.inventoryItem.unit, not the recipe's unit.
+        const amountNeeded = convertUnit(item.quantityRequired * scalar, item.unit, item.inventoryItem.unit);
         const { fifo } = await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PRODUCTION_OUT',
