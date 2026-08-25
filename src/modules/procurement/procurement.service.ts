@@ -638,6 +638,7 @@ export class ProcurementService {
     purchaseType?: string;
     discountAmount?: number;
     freightCost?: number;
+    paymentTerms?: string;
     items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
@@ -725,6 +726,7 @@ export class ProcurementService {
           internalNotes: data.internalNotes,
           vendorNotes: data.vendorNotes,
           deliveryInstructions: data.deliveryInstructions,
+          paymentTerms: data.paymentTerms || 'IMMEDIATE',
           status: (data.status as any) || 'PENDING_APPROVAL',
           poItems: {
             create: poItemsData.map((item) => ({
@@ -821,6 +823,7 @@ export class ProcurementService {
     purchaseType?: string;
     discountAmount?: number;
     freightCost?: number;
+    paymentTerms?: string;
     items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
@@ -853,6 +856,7 @@ export class ProcurementService {
       if (data.internalNotes !== undefined) updateData.internalNotes = data.internalNotes;
       if (data.vendorNotes !== undefined) updateData.vendorNotes = data.vendorNotes;
       if (data.deliveryInstructions !== undefined) updateData.deliveryInstructions = data.deliveryInstructions;
+      if (data.paymentTerms !== undefined) updateData.paymentTerms = data.paymentTerms;
 
       if (data.items && data.items.length > 0) {
         const poItemsData = await Promise.all(data.items.map(async (item) => {

@@ -104,6 +104,8 @@ export class SalesService {
   }
 
   static async createQuotation(data: {
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId?: string;
     customerId?: string;
     customerName?: string;
     customerPhone?: string;
@@ -119,12 +121,19 @@ export class SalesService {
   }) {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
-    const customerName = await resolveCustomerName(data.customerId, data.customerName);
+    const partyType = data.partyType || 'CUSTOMER';
+    // The `customer` relation/customerId only ever means a real Customer
+    // record — a Dealer or Franchise party has no such row, so customerId
+    // must stay null for those (partyId carries the id for every type).
+    const customerId = partyType === 'CUSTOMER' ? data.customerId : undefined;
+    const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId, data.customerName) : (data.customerName || undefined);
 
     return prisma.$transaction(async (tx) => tx.quotation.create({
       data: {
         quotationNumber: data.quotationNumber || await nextDocumentNumber(tx, 'QT', 'QT'),
-        customerId: data.customerId,
+        partyType: partyType as any,
+        partyId: data.partyId,
+        customerId,
         customerName,
         customerPhone: data.customerPhone,
         customerEmail: data.customerEmail,
@@ -155,6 +164,8 @@ export class SalesService {
   }
 
   static async updateQuotation(id: string, data: {
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId?: string;
     customerId?: string;
     customerName?: string;
     customerPhone?: string;
@@ -169,9 +180,16 @@ export class SalesService {
     trackingNumber?: string;
     courierName?: string;
   }) {
+    const partyType = data.partyType;
+    // Same CUSTOMER-only rule as createQuotation — but only override
+    // customerId here when the caller actually sent a partyType (a plain
+    // field-only PATCH, e.g. tracking info, must not clobber it to null).
+    const customerId = partyType ? (partyType === 'CUSTOMER' ? data.customerId : undefined) : data.customerId;
     const updateData: any = {
-      customerId: data.customerId,
-      customerName: await resolveCustomerName(data.customerId, data.customerName),
+      partyType: partyType as any,
+      partyId: data.partyId,
+      customerId,
+      customerName: partyType === 'DEALER' || partyType === 'FRANCHISE' ? (data.customerName || undefined) : await resolveCustomerName(customerId, data.customerName),
       customerPhone: data.customerPhone,
       customerEmail: data.customerEmail,
       status: data.status as any,
@@ -272,6 +290,8 @@ export class SalesService {
         data: {
           orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
           quotationId: quotation.id,
+          partyType: quotation.partyType,
+          partyId: quotation.partyId,
           customerId: quotation.customerId,
           customerName: quotation.customerName,
           customerPhone: quotation.customerPhone,

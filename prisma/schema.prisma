@@ -431,6 +431,7 @@ model ProcurementOrder {
   deliveryInstructions String?
   internalNotes        String?
   vendorNotes          String?
+  paymentTerms         String?
   approvedAt           DateTime?
   approvedBy           String?
   warehouseId          String?
@@ -1327,6 +1328,12 @@ model Payslip {
 model Quotation {
   id               String          @id @default(uuid())
   quotationNumber  String          @unique
+  // Generic party selection (Customer / Dealer / Franchise). customerId +
+  // the `customer` relation below stay populated only when partyType is
+  // CUSTOMER (preserves the existing relation/include); partyId is the
+  // universal id regardless of type.
+  partyType        PartyType       @default(CUSTOMER)
+  partyId          String?
   customerId       String?
   customerName     String?
   customerPhone    String?
@@ -1372,6 +1379,10 @@ model SalesOrder {
   // duplicate-prevention guard for "Create Proforma Invoice" (see
   // SalesService.convertSalesOrderToProforma), not just an app-level check.
   proformaInvoiceId String?        @unique
+  // Copied forward from the source Estimate at conversion time — see
+  // Quotation.partyType/partyId above for the same generic-party pattern.
+  partyType       PartyType        @default(CUSTOMER)
+  partyId         String?
   customerId      String?
   customerName    String?
   customerPhone   String?
@@ -2048,6 +2059,15 @@ enum QuotationStatus {
   REJECTED
   EXPIRED
   CONVERTED
+}
+
+// Which master table `partyId` on Quotation/SalesOrder points to — a
+// generic FK-by-convention (like convertedOrderId elsewhere in this
+// schema) since it must reference one of three different tables.
+enum PartyType {
+  CUSTOMER
+  DEALER
+  FRANCHISE
 }
 
 enum SalesOrderStatus {
