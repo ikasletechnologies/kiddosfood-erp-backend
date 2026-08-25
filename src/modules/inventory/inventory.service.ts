@@ -143,7 +143,7 @@ export class InventoryService {
   // franchiseId is optional: Prisma drops an `undefined` where-key entirely,
   // so omitting it here correctly means "every franchise" (SUPER_ADMIN's
   // global view), not "no results" — do not substitute a default franchise.
-  static async getInventory(franchiseId: string | undefined, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory) {
+  static async getInventory(franchiseId: string | undefined, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory, asOfDate?: string) {
     const items = await prisma.inventoryItem.findMany({
       where: {
         franchiseId,
@@ -158,6 +158,16 @@ export class InventoryService {
       orderBy: { name: 'asc' },
     });
 
+    const asOfBoundary = asOfDate
+      ? (/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)
+          ? new Date(`${asOfDate}T23:59:59.999+05:30`)
+          : (() => {
+              const d = new Date(asOfDate);
+              d.setHours(23, 59, 59, 999);
+              return d;
+            })())
+      : undefined;
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -165,9 +175,12 @@ export class InventoryService {
       where: { item: { franchiseId }, createdAt: { gte: today } },
     });
 
-    // Recompute stock from all movements for accuracy
+    // Recompute stock from movements for accuracy (scoped to asOfBoundary when provided)
     const allMovements = await prisma.stockMovement.findMany({
-      where: { item: { franchiseId } },
+      where: {
+        item: { franchiseId },
+        ...(asOfBoundary ? { createdAt: { lte: asOfBoundary } } : {})
+      },
       select: { itemId: true, quantity: true, baseQty: true },
     });
     const stockMap = new Map<string, number>();
@@ -202,9 +215,13 @@ export class InventoryService {
 
     return items.map(item => {
       // Use recomputed stock from ledger (movements) as source of truth
-      // Fallback to item.currentStock ONLY if no movements exist for this item
+      // When asOfDate is provided, any item with no movements prior to boundary has 0 stock
       const hasMovements = stockMap.has(item.id);
-      const computedStock = hasMovements ? (stockMap.get(item.id) ?? 0) : item.currentStock;
+      const computedStock = hasMovements
+        ? (stockMap.get(item.id) ?? 0)
+        : asOfBoundary
+        ? 0
+        : item.currentStock;
 
       const todayMoves = movementsToday.filter(m => m.itemId === item.id);
       const inbound = todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) > 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0);

@@ -15,13 +15,14 @@ export class InventoryController {
       const franchiseId = franchiseFilter.franchiseId ?? (req.query.franchiseId as string | undefined);
 
       const category = req.query.category as string | undefined;
+      const asOfDate = (req.query.asOfDate || req.query.endDate || req.query.dateTo) as string | undefined;
 
       // SUPER_ADMIN with no franchiseId means "global": every franchise's
       // stock, HQ and branches alike. Do NOT default to a single franchise
       // here — that would silently convert a global request into a
       // single-branch one. FRANCHISE_ADMIN always has franchiseId forced by
       // IsolationUtil above, so this only ever runs unscoped for SUPER_ADMIN.
-      const items = await InventoryService.getInventory(franchiseId, false, undefined, category as any);
+      const items = await InventoryService.getInventory(franchiseId, false, undefined, category as any, asOfDate);
       res.json(items);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -132,6 +133,26 @@ export class InventoryController {
       if (itemId) filters.itemId = itemId;
       if (type) filters.movementType = type;
       if (franchiseId) filters.item = { franchiseId };
+
+      const startDate = (req.query.startDate || req.query.dateFrom) as string | undefined;
+      const endDate = (req.query.endDate || req.query.dateTo || req.query.asOfDate) as string | undefined;
+
+      if (startDate || endDate) {
+        const dateFilter: any = {};
+        if (startDate) {
+          const startBoundary = /^\d{4}-\d{2}-\d{2}$/.test(startDate)
+            ? new Date(`${startDate}T00:00:00.000+05:30`)
+            : new Date(startDate);
+          dateFilter.gte = startBoundary;
+        }
+        if (endDate) {
+          const endBoundary = /^\d{4}-\d{2}-\d{2}$/.test(endDate)
+            ? new Date(`${endDate}T23:59:59.999+05:30`)
+            : new Date(endDate);
+          dateFilter.lte = endBoundary;
+        }
+        filters.createdAt = dateFilter;
+      }
 
       const movements = await InventoryService.getMovements(filters);
       res.json(movements);
