@@ -139,11 +139,8 @@ app.get('/health', async (req: Request, res: Response) => {
       // create a second HQ franchise alongside it.
       const existingHq = await FranchiseService.getHqFranchiseOrNull();
       if (!existingHq) {
-        await prisma.franchise.upsert({
-          where: { id: 'hq-001' },
-          update: { isHQ: true },
-          create: {
-            id: 'hq-001',
+        await prisma.franchise.create({
+          data: {
             name: 'Kiddos Food Headquarters',
             location: 'Mumbai',
             ownerName: 'Super Admin',
@@ -155,17 +152,17 @@ app.get('/health', async (req: Request, res: Response) => {
       }
 
       // 2. Ensure basic warehouse exists
-      await prisma.warehouse.upsert({
-        where: { id: 'w-central' },
-        update: {},
-        create: {
-          id: 'w-central',
-          name: 'Central Warehouse',
-          nameKey: 'centralwarehouse',
-          location: 'Mumbai',
-          type: 'MAIN'
-        }
-      });
+      const existingWarehouse = await prisma.warehouse.findFirst({ where: { type: 'MAIN' } });
+      if (!existingWarehouse) {
+        await prisma.warehouse.create({
+          data: {
+            name: 'Central Warehouse',
+            nameKey: 'centralwarehouse',
+            location: 'Mumbai',
+            type: 'MAIN'
+          }
+        });
+      }
 
       return res.json({ status: 'ok', message: 'SEED_SUCCESS' });
     } catch (e: any) {
