@@ -55,13 +55,15 @@ export class SalesController {
     }
   }
 
+  // Estimate -> Sales Order (not a Tax Invoice — see SalesService's chain
+  // comment for why this used to skip straight there).
   static async convertQuotation(req: Request, res: Response) {
     try {
       const createdBy = (req as any).user?.userId;
-      const salesOrder = await SalesService.convertQuotationToOrder(req.params.id, createdBy, req.body);
+      const salesOrder = await SalesService.convertQuotationToSalesOrder(req.params.id, createdBy, req.body);
       res.status(201).json(salesOrder);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
@@ -108,6 +110,53 @@ export class SalesController {
       res.json(order);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  // Sales Order -> Proforma Invoice.
+  static async convertSalesOrder(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const proforma = await SalesService.convertSalesOrderToProforma(req.params.id, createdBy);
+      res.status(201).json(proforma);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  // ─── Proforma Invoices ───────────────────────────────────────────────────────
+
+  static async getProformaInvoices(req: Request, res: Response) {
+    try {
+      const proformas = await SalesService.getProformaInvoices({
+        status: req.query.status as string,
+        customerId: req.query.customerId as string,
+        search: req.query.search as string
+      });
+      res.json(proformas);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getProformaInvoice(req: Request, res: Response) {
+    try {
+      const proforma = await SalesService.getProformaInvoiceById(req.params.id);
+      if (!proforma) return res.status(404).json({ error: 'Proforma Invoice not found' });
+      res.json(proforma);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  // Proforma Invoice -> Tax Invoice.
+  static async convertProformaInvoice(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const invoiceOrder = await SalesService.convertProformaToInvoice(req.params.id, createdBy);
+      res.status(201).json(invoiceOrder);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 

@@ -36,6 +36,21 @@ function resolveBulkIdentity(
 }
 
 export class ProductionService {
+  /**
+   * Allocate the one business-facing batch identity for a production run.
+   * The NumberSequence upsert is atomic within the surrounding transaction,
+   * so retries/concurrent starts cannot reuse a code.
+   */
+  private static async nextProductionBatchCode(tx: any): Promise<string> {
+    const year = new Date().getFullYear();
+    const seq = await tx.numberSequence.upsert({
+      where: { key: `PRODUCTION_BATCH_${year}` },
+      create: { key: `PRODUCTION_BATCH_${year}`, value: 1 },
+      update: { value: { increment: 1 } },
+    });
+    return `PRD-${year}-${String(seq.value).padStart(4, '0')}`;
+  }
+
   static async startProduction(data: {
     recipeId: string;
     quantity: number;
@@ -140,9 +155,12 @@ export class ProductionService {
         expiryDate = new Date(Date.now() + DEFAULT_SHELF_LIFE_DAYS * 24 * 60 * 60 * 1000);
       }
 
-      // 4. Create production record (IN_PROGRESS)
+      // 4. Create production record (IN_PROGRESS). This code is the single
+      // business identity for the run and every downstream batch reference.
+      const productionBatchCode = await this.nextProductionBatchCode(tx);
       const production = await tx.production.create({
         data: {
+          productionBatchCode,
           recipeId: data.recipeId,
           quantity: data.quantity,
           franchiseId,
@@ -277,6 +295,19 @@ export class ProductionService {
 
   static async approveProduction(id: string, userId?: string, actualYield?: number, remarks?: string, expiryDate?: string) {
     return prisma.$transaction(async tx => {
+      // Row-lock the production row first. Without this, two concurrent
+      // Complete Production calls for the same run (a double-click, a
+      // retried request) can both read status IN_PROGRESS and
+      // productionBatchCode null before either commits, both pass the
+      // guard below, and both allocate a batch code + create a
+      // ProductBatch — leaving two batches for one run, with the
+      // Production row's productionBatchCode ending up as whichever
+      // commit won last (see the ProductBatch.productionId @unique
+      // constraint, which now also backstops this at the DB level). The
+      // lock forces the second call to wait, then see the first call's
+      // committed COMPLETED status and reject via the guard below —
+      // mirroring the same pattern already used in confirmPackaging.
+      await tx.$queryRaw`SELECT id FROM "Production" WHERE id = ${id} FOR UPDATE`;
       const production = await tx.production.findUnique({
         where: { id },
         include: { recipe: { include: { product: true, recipeItems: true } } },
@@ -309,21 +340,31 @@ export class ProductionService {
       const totalCost = production.totalCost ?? production.materialCost ?? 0;
       const unitCost = totalYield > 0 ? totalCost / totalYield : 0;
 
+      // A legacy in-progress run may predate productionBatchCode. Allocate it
+      // once here, then persist it on Production before creating ProductBatch.
+      const productionBatchCode = production.productionBatchCode
+        || await this.nextProductionBatchCode(tx);
+      if (!production.productionBatchCode) {
+        await tx.production.update({
+          where: { id: production.id },
+          data: { productionBatchCode },
+        });
+      }
+
       // Create ProductBatch with PENDING QC status. Deliberately does NOT
       // touch stock — finished-good stock is credited exactly once, at QC
       // acceptance (inspectBatch, guarded against re-inspection), never here.
-      const batchCode = `BATCH-${production.id.substring(0, 8).toUpperCase()}`;
       // The operator completing this run can confirm/correct the expiry
       // date at handoff time (same as GRN's expiry capture for raw
       // material lots) — it overrides the estimate computed at
       // startProduction, since actual cook/QC timing can shift it.
-      await tx.productBatch.create({
+      const batch = await tx.productBatch.create({
         data: {
           productId: recipe.productId ?? null,
           productionId: production.id,
           quantity: totalYield,
           expiryDate: expiryDate ? new Date(expiryDate) : production.expiryDate,
-          batchCode,
+          batchCode: productionBatchCode,
           franchiseId: production.franchiseId,
           qcStatus: "PENDING",
           approvedQty: 0,
@@ -337,7 +378,7 @@ export class ProductionService {
       // Finalize status and record actual yield. endTime previously only
       // ever got set by stopProduction (a pause) — a run that finished
       // normally had no recorded completion time at all.
-      return tx.production.update({
+      const completedProduction = await tx.production.update({
         where: { id },
         data: {
           status: 'COMPLETED',
@@ -346,6 +387,7 @@ export class ProductionService {
           ...(remarks ? { remarks } : {}),
         },
       });
+      return { production: completedProduction, batch };
     });
   }
 
@@ -611,14 +653,26 @@ export class ProductionService {
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
 
-      const bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
+      let bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
+
+      // Row-lock the bulk item so two concurrent Start Packaging calls for
+      // this batch (a double-click, two tabs, two operators) can't both read
+      // the same currentStock, both pass the check below, and both reserve
+      // against stock that only really covers one of them. Re-read after the
+      // lock is acquired — resolveBulkItem's read above may now be stale.
+      await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${bulkItem.id} FOR UPDATE`;
+      bulkItem = await tx.inventoryItem.findUniqueOrThrow({ where: { id: bulkItem.id } });
 
       const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
       const totalWeightNeeded = data.quantityPackets * unitMultiplier;
 
-      // Pre-flight only — nothing is reserved or deducted here, so this is
-      // re-checked (authoritatively) again at confirmPackaging, since other
-      // packaging runs may consume this same bulk stock in the meantime.
+      // This check and the reservation deduction below are the single
+      // authoritative point where bulk availability is enforced — the lock
+      // above makes it safe against concurrent Start Packaging calls, and
+      // confirmPackaging deliberately does not re-check (see the comment
+      // there): re-checking against currentStock post-reservation would
+      // compare against a pool that already has this run's own reservation
+      // subtracted from it, failing every confirm with a phantom shortage.
       if (bulkItem.currentStock < totalWeightNeeded) {
         const shortage = totalWeightNeeded - bulkItem.currentStock;
         throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
@@ -708,6 +762,15 @@ export class ProductionService {
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
+      // Row-lock the packaging ticket first. Without this, two concurrent
+      // Confirm calls for the same ticket (a double-click, a retried
+      // request) can both read status AWAITING_CONFIRMATION before either
+      // commits its status update, both pass the guard below, and both
+      // create Finished Goods stock + waste entries — the exact
+      // double-deduction/duplicate-entry the status guard is meant to
+      // prevent. The lock forces the second call to wait, then see the
+      // first call's committed CONFIRMED status.
+      await tx.$queryRaw`SELECT id FROM "ProductPackaging" WHERE id = ${data.packagingId} FOR UPDATE`;
       const packaging = await tx.productPackaging.findUnique({
         where: { id: data.packagingId },
         include: {

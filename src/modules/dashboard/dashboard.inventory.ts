@@ -7,18 +7,25 @@ export class DashboardInventoryService {
     const itemWhere: Prisma.InventoryItemWhereInput = franchiseId ? { franchiseId } : {};
     const batchWhere: Prisma.ProductBatchWhereInput = franchiseId ? { franchiseId } : {};
 
-    const [inventoryItems, productBatches] = await Promise.all([
-      prisma.inventoryItem.findMany({
-        where: itemWhere,
-        include: { franchise: true }
-      }),
+    const [inventoryItems, productBatches, lowStockBatchCount] = await Promise.all([
+      // franchise relation was fetched but never read below — dropped to
+      // avoid the join.
+      prisma.inventoryItem.findMany({ where: itemWhere }),
+      // Only the soonest-expiring 50 are ever shown (sliced to 10 below) —
+      // previously this pulled every batch with an expiry date ever
+      // created, unbounded and growing forever. lowStockCount below needs
+      // the true count across ALL batches, not just this page, so that's a
+      // separate DB-side count() rather than derived from this bounded list.
       prisma.productBatch.findMany({
         where: {
           ...batchWhere,
           expiryDate: { not: null }
         },
-        include: { product: true }
-      })
+        include: { product: true },
+        orderBy: { expiryDate: 'asc' },
+        take: 50
+      }),
+      prisma.productBatch.count({ where: { ...batchWhere, expiryDate: { not: null }, quantity: { lte: 10 } } })
     ]);
 
     // Calculate inventory valuation
@@ -93,7 +100,7 @@ export class DashboardInventoryService {
     return {
       inventoryValue,
       inventoryItemCount: inventoryItems.length,
-      lowStockCount: lowStockRawItems.length + productBatches.filter(b => b.quantity <= 10).length,
+      lowStockCount: lowStockRawItems.length + lowStockBatchCount,
       inventoryAlerts: inventoryAlerts.slice(0, 10), // Limit dashboard view
       lowStockAlerts: lowStockAlerts.slice(0, 10)
     };

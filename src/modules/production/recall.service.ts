@@ -19,6 +19,18 @@ const VALID_REASONS = [
 // same transition), and REJECTED batches had approvedQty forced to 0.
 const QC_ELIGIBLE_STATUSES = ['APPROVED', 'PARTIALLY_APPROVED'];
 
+// StockMovement.referenceType values that represent stock genuinely leaving
+// the warehouse to an external party (a customer, a franchise outlet,
+// another warehouse) — the only kind of outbound movement a recall can
+// meaningfully ask someone to "return." A batch's currentQty can also drop
+// for reasons that have nothing to do with distribution — WASTE (damage/
+// spoilage write-off, destroyed, not returnable), ADJUSTMENT/BIN_ASSIGNMENT
+// (internal moves that usually net to zero), PACKAGING (bulk -> packaged
+// conversion within the same warehouse) — none of those should ever count
+// toward "distributed," be listed as an affected location, or be eligible
+// for "Collect Returned Stock."
+const GENUINE_DISTRIBUTION_REFERENCE_TYPES = ['ORDER', 'FRANCHISE_ORDER', 'SALE', 'DELIVERY_CHALLAN', 'TRANSFER'];
+
 export class RecallService {
   // Single shared eligibility check — both the eligibility endpoint and
   // initiateRecall() (inside its own transaction, to close the check/act
@@ -78,10 +90,34 @@ export class RecallService {
       || 'KG';
 
     const availableQty = inventoryBatches.reduce((s, b) => s + b.currentQty, 0);
-    // "Left the lot" — consumed by any outbound movement (sale, dispatch,
-    // transfer, waste). Distribution-specific breakdown comes from
-    // locateDistribution(); this is the top-line total.
-    const distributedQty = inventoryBatches.reduce((s, b) => s + Math.max(0, b.initialQty - b.currentQty), 0);
+    // "Left the lot to somewhere a recall can act on" — genuine outbound
+    // distribution only (sale, dispatch, franchise transfer), never waste/
+    // spoilage or internal bin/adjustment churn. Previously this summed
+    // initialQty - currentQty for ANY reason the quantity dropped, which
+    // counted waste write-offs as "distributed" and made them eligible for
+    // Collect Returned Stock — collecting a "return" on destroyed stock then
+    // added that quantity back into currentQty with no physical stock behind
+    // it. Computed straight from the real movement rows so it always agrees
+    // with locateDistribution()'s breakdown below.
+    const inventoryBatchIds = inventoryBatches.map((b) => b.id);
+    const outboundMovements = inventoryBatchIds.length
+      ? await prisma.stockMovement.findMany({
+          where: { batchId: { in: inventoryBatchIds }, quantity: { lt: 0 }, referenceType: { in: GENUINE_DISTRIBUTION_REFERENCE_TYPES } },
+        })
+      : [];
+    const distributedQty = outboundMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+
+    // Destroyed/written-off warehouse stock (damage, spoilage) — tracked
+    // separately from distributedQty precisely so it's never treated as
+    // something a recall can ask to be "returned." Reconciles as:
+    // approvedQty - wastedQty - distributedQty (+ returnedQty already
+    // credited back) = availableQty.
+    const wasteMovements = inventoryBatchIds.length
+      ? await prisma.stockMovement.findMany({
+          where: { batchId: { in: inventoryBatchIds }, quantity: { lt: 0 }, referenceType: 'WASTE' },
+        })
+      : [];
+    const wastedQty = wasteMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
 
     return {
       batch,
@@ -93,6 +129,7 @@ export class RecallService {
       cartonedQty: batch.cartonedQty || 0,
       availableQty,
       distributedQty,
+      wastedQty,
       inventoryBatches,
     };
   }
@@ -123,6 +160,7 @@ export class RecallService {
         cartonedQty: quantities.cartonedQty,
         availableQty: quantities.availableQty,
         distributedQty: quantities.distributedQty,
+        wastedQty: quantities.wastedQty,
       },
       recall,
     };
@@ -275,21 +313,31 @@ export class RecallService {
         include: { warehouse: true },
       });
       const inventoryBatchIds = inventoryBatches.map((b) => b.id);
-      const distributedQty = inventoryBatches.reduce((s, b) => s + Math.max(0, b.initialQty - b.currentQty), 0);
       const availableWarehouseQty = inventoryBatches.reduce((s, b) => s + b.currentQty, 0);
 
       // Only outbound movements that trace back to this batch's own
-      // InventoryBatch lot(s) — real StockMovement rows, never fabricated.
+      // InventoryBatch lot(s) — real StockMovement rows, never fabricated —
+      // AND that represent genuine outbound distribution (sale, dispatch,
+      // franchise transfer), never waste/spoilage write-offs or internal
+      // bin/adjustment churn. Previously this pulled every negative
+      // movement regardless of cause, which listed waste write-offs as an
+      // "affected location" alongside real destinations and let a pure
+      // internal bin reassignment (which nets to zero) show up as 50 KG
+      // "distributed" to a phantom location.
       // Note: recordMovement() only stamps a batchId when a movement drew
       // from exactly one lot (see inventory.service.ts), so a sale that
       // spanned multiple lots of this same batch is not individually
-      // attributable here even though it is included in distributedQty above.
+      // attributable here even though it is included in distributedQty below.
       const movements = inventoryBatchIds.length
         ? await tx.stockMovement.findMany({
-            where: { batchId: { in: inventoryBatchIds }, quantity: { lt: 0 } },
+            where: { batchId: { in: inventoryBatchIds }, quantity: { lt: 0 }, referenceType: { in: GENUINE_DISTRIBUTION_REFERENCE_TYPES } },
             include: { warehouse: true },
           })
         : [];
+      // Recomputed from the same filtered movements that build
+      // affectedLocations below, so the two can never disagree — this now
+      // matches getBatchQuantities()'s definition of "distributed" exactly.
+      const distributedQty = movements.reduce((s, m) => s + Math.abs(m.quantity), 0);
 
       const orderIds = Array.from(new Set(movements.filter((m) => m.referenceType === 'ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
       const franchiseOrderIds = Array.from(new Set(movements.filter((m) => m.referenceType === 'FRANCHISE_ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
@@ -431,6 +479,7 @@ export class RecallService {
         producedQty: quantities.producedQty,
         approvedQty: quantities.approvedQty,
         rejectedQty: quantities.rejectedQty,
+        wastedQty: quantities.wastedQty,
         distributedQty: recall.distributedQty,
         currentWarehouseQty: quantities.availableQty,
         affectedLocations: recall.affectedLocations,

@@ -42,3 +42,28 @@ verify_operations.ts
 verify_pos.js
 verify_pos.ts
 verify_users.js
+
+# One-off debug/check/fix scripts dropped in the repo root during
+# investigation — use the OS scratchpad dir instead so these never need
+# cleaning up again. Anchored to root only so a legitimately-named file
+# inside src/ is never accidentally hidden.
+/scratch/
+/check_*.ts
+/check_*.js
+/fix_*.ts
+/fix_*.js
+/verify_*.ts
+/verify_*.js
+/debug_*.ts
+/debug_*.js
+/find_*.ts
+/find_*.js
+/temp_*.ts
+/scratch_*.ts
+/scratch_*.js
+/audit.ts
+/investigate.ts
+/db-check.ts
+/lint_output.txt
+/lint_report.json
+/migration_log.txt

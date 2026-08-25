@@ -82,6 +82,9 @@ model Customer {
   returnOrders       ReturnOrder[]
   salesOrders        SalesOrder[]
   deliveryChallans   DeliveryChallan[]
+  proformaInvoices   ProformaInvoice[]
+
+  @@index([franchiseId])
 }
 
 model Dealer {
@@ -96,6 +99,8 @@ model Dealer {
   updatedAt        DateTime          @updatedAt
   franchise        Franchise         @relation(fields: [franchiseId], references: [id])
   deliveryChallans DeliveryChallan[]
+
+  @@index([franchiseId])
 }
 
 model BusinessPartner {
@@ -317,6 +322,8 @@ model StockMovement {
   warehouse     Warehouse?        @relation(fields: [warehouseId], references: [id])
   unit          Unit?             @relation(fields: [unitId], references: [id])
   batch         InventoryBatch?   @relation(fields: [batchId], references: [id])
+
+  @@index([movementType, createdAt])
 }
 
 model Vendor {
@@ -372,6 +379,8 @@ model VendorLedger {
   account                 Account?                  @relation(fields: [accountId], references: [id])
   invoice                 VendorInvoice?            @relation(fields: [invoiceId], references: [id])
   vendor                  Vendor                    @relation(fields: [vendorId], references: [id])
+
+  @@index([vendorId])
 }
 
 model VendorMaterial {
@@ -436,6 +445,9 @@ model ProcurementOrder {
   poItems              ProcurementOrderItem[]
   purchaseReturns      PurchaseReturn[]
   invoices             VendorInvoice[]
+
+  @@index([franchiseId, createdAt])
+  @@index([createdAt])
 }
 
 model ProcurementOrderItem {
@@ -587,6 +599,9 @@ model RecipeItem {
 
 model Production {
   id             String               @id @default(uuid())
+  // Canonical, business-facing identity. Generated once when the production
+  // run is created and copied verbatim to ProductBatch on completion.
+  productionBatchCode String?         @unique
   productionType String
   recipeId       String
   quantity       Float
@@ -620,6 +635,8 @@ model Production {
   warehouse      Warehouse?           @relation(fields: [warehouseId], references: [id])
   items          ProductionItem[]
   stageLogs      ProductionStageLog[]
+
+  @@index([franchiseId, status, producedAt])
 }
 
 model ProductionStageLog {
@@ -647,7 +664,7 @@ enum PackagingStatus {
 model ProductBatch {
   id               String             @id @default(uuid())
   productId        String?
-  productionId     String?
+  productionId     String?             @unique
   quantity         Float
   expiryDate       DateTime?
   batchCode        String?
@@ -673,6 +690,8 @@ model ProductBatch {
   cartons          Carton[]
   inventoryBatches InventoryBatch[]
   recall           BatchRecall?
+
+  @@index([franchiseId, expiryDate])
 }
 
 enum RecallStatus {
@@ -807,6 +826,11 @@ model FranchiseOrder {
   franchise            Franchise                  @relation(fields: [franchiseId], references: [id])
   items                FranchiseOrderItem[]
   returnOrders         ReturnOrder[]
+
+  @@index([franchiseId, createdAt])
+  @@index([createdAt])
+  @@index([franchiseId, status])
+  @@index([status])
 }
 
 model FranchiseOrderItem {
@@ -894,6 +918,13 @@ model Order {
   paymentType        String        @default("CASH")
   stateOfSupply      String?
   inventory_deducted Boolean       @default(false)
+  sourceQuotationId  String?
+  // Full chain traceability when this Tax Invoice was created via
+  // Proforma → Convert (see SalesService.convertProformaToInvoice), not the
+  // legacy direct Estimate → Tax Invoice path. Nullable: a standalone
+  // invoice (created from /sales/invoices directly, or the legacy direct
+  // Quotation convert) has neither.
+  sourceProformaInvoiceId String?
   createdAt          DateTime      @default(now())
   delivery           Delivery?
   invoice            Invoice?
@@ -902,6 +933,15 @@ model Order {
   orderItems         OrderItem[]
   payments           Payment[]
   returns            ReturnOrder[]
+
+  // Dashboard/reporting hot paths: revenue-by-range (with and without a
+  // franchise filter), pending-dispatch status lookups, and per-customer
+  // outstanding-balance queries.
+  @@index([franchiseId, createdAt])
+  @@index([createdAt])
+  @@index([franchiseId, status])
+  @@index([customerId, paymentStatus])
+  @@index([franchiseId, paymentStatus])
 }
 
 model OrderItem {
@@ -953,6 +993,9 @@ model Payment {
   invoice             Invoice?              @relation(fields: [invoiceId], references: [id])
   order               Order?                @relation(fields: [orderId], references: [id])
   vendorInvoice       VendorInvoice?        @relation(fields: [vendorInvoiceId], references: [id])
+
+  @@index([orderId])
+  @@index([status, createdAt])
 }
 
 model Invoice {
@@ -1012,6 +1055,9 @@ model Expense {
   account         Account?          @relation(fields: [accountId], references: [id])
   franchise       Franchise?        @relation(fields: [franchiseId], references: [id])
   purchaseOrder   ProcurementOrder? @relation(fields: [purchaseOrderId], references: [id])
+
+  @@index([franchiseId, date])
+  @@index([date])
 }
 
 model Delivery {
@@ -1295,6 +1341,7 @@ model Quotation {
   notes            String?
   createdBy        String?
   convertedOrderId String?
+  convertedInvoiceId String?
   trackingNumber   String?
   courierName      String?
   createdAt        DateTime        @default(now())
@@ -1321,9 +1368,13 @@ model SalesOrder {
   id              String           @id @default(uuid())
   orderNumber     String           @unique
   quotationId     String?
+  // One Proforma Invoice per Sales Order — the @unique is the DB-level
+  // duplicate-prevention guard for "Create Proforma Invoice" (see
+  // SalesService.convertSalesOrderToProforma), not just an app-level check.
+  proformaInvoiceId String?        @unique
   customerId      String?
   customerName    String?
-  status          SalesOrderStatus @default(PENDING)
+  status          SalesOrderStatus @default(DRAFT)
   subTotal        Float
   taxAmount       Float
   discountAmount  Float            @default(0)
@@ -1356,6 +1407,49 @@ model SalesOrderItem {
   salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id])
 }
 
+// A formal pre-invoice used for advance/payment requests or commercial
+// confirmation — genuinely distinct from Quotation (which is just an
+// estimate) even though the fields largely mirror it. Sits between
+// SalesOrder and the Tax Invoice (Order+Invoice) in the document chain:
+// Quotation -> SalesOrder -> ProformaInvoice -> Order/Invoice -> Payment.
+model ProformaInvoice {
+  id                 String                @id @default(uuid())
+  proformaNumber     String                @unique
+  sourceSalesOrderId String?               @unique
+  customerId         String?
+  customerName       String?
+  customerPhone      String?
+  status             ProformaInvoiceStatus @default(DRAFT)
+  subTotal           Float
+  taxAmount          Float
+  discountAmount     Float                 @default(0)
+  totalAmount        Float
+  paymentTerms       String?
+  notes              String?
+  createdBy          String?
+  // Duplicate-prevention for "Convert to Tax Invoice", same pattern as
+  // SalesOrder.proformaInvoiceId above.
+  convertedInvoiceId String?               @unique
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  customer           Customer?             @relation(fields: [customerId], references: [id])
+  items              ProformaInvoiceItem[]
+}
+
+model ProformaInvoiceItem {
+  id                String          @id @default(uuid())
+  proformaInvoiceId String
+  productId         String?
+  productName       String
+  quantity          Float
+  unit              String?
+  rate              Float
+  taxPercent        Float           @default(0)
+  taxAmount         Float           @default(0)
+  totalAmount       Float
+  proformaInvoice   ProformaInvoice @relation(fields: [proformaInvoiceId], references: [id])
+}
+
 model ReturnOrder {
   id               String          @id @default(uuid())
   returnNumber     String          @unique
@@ -1378,6 +1472,9 @@ model ReturnOrder {
   franchiseOrder   FranchiseOrder? @relation(fields: [franchiseOrderId], references: [id])
   salesOrder       SalesOrder?     @relation(fields: [salesOrderId], references: [id])
   posOrder         Order?          @relation(fields: [posOrderId], references: [id])
+
+  @@index([franchiseId, createdAt])
+  @@index([createdAt])
 }
 
 model ReturnItem {
@@ -1953,11 +2050,19 @@ enum QuotationStatus {
 }
 
 enum SalesOrderStatus {
+  DRAFT
   PENDING
   CONFIRMED
   PROCESSING
   SHIPPED
   DELIVERED
+  CANCELLED
+}
+
+enum ProformaInvoiceStatus {
+  DRAFT
+  SENT
+  CONVERTED
   CANCELLED
 }
 

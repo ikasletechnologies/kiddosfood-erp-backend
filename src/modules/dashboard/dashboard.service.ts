@@ -15,13 +15,20 @@ export class DashboardService {
     if (startDate && !endDate) periodEnd.setHours(23, 59, 59, 999);
 
     // Fetch stats in parallel using optimized domain services
-    const [inv, col, disp, ana, dealerCount, vendors, cashAccounts, productions, batches] = await Promise.all([
+    const [inv, col, disp, ana, dealerCount, vendorLedgerTotals, cashAccounts, productions, batches] = await Promise.all([
       DashboardInventoryService.getInventoryStats(franchiseId),
       DashboardCollectionsService.getCollectionsStats(franchiseId, startDate, endDate),
       DashboardDispatchService.getDispatchStats(franchiseId),
       DashboardAnalyticsService.getAnalyticsStats({ franchiseId, startDate, endDate, period }),
       prisma.dealer.count({ where: franchiseId ? { franchiseId } : {} }),
-      prisma.vendor.findMany({ include: { ledgerEntries: true } }),
+      // Previously fetched every vendor with its FULL ledger history
+      // (unbounded, grows forever) just to sum credits/debits in JS.
+      // groupBy pushes that sum to the DB — one row per (vendor, type)
+      // instead of one row per ledger entry ever recorded.
+      prisma.vendorLedger.groupBy({
+        by: ['vendorId', 'type'],
+        _sum: { amount: true }
+      }),
       prisma.account.findMany({
         where: {
           type: { in: ['CASH', 'BANK'] },
@@ -52,15 +59,16 @@ export class DashboardService {
       })
     ]);
 
-    // Calculate vendorPayables
+    // Calculate vendorPayables from the (vendor, type) sums above.
+    const balanceByVendor = new Map<string, number>();
+    for (const row of vendorLedgerTotals) {
+      const delta = (row._sum.amount || 0) * (row.type === 'CREDIT' ? 1 : -1);
+      balanceByVendor.set(row.vendorId, (balanceByVendor.get(row.vendorId) || 0) + delta);
+    }
     let vendorPayables = 0;
-    vendors.forEach(v => {
-      const entries = v.ledgerEntries || [];
-      const credits = entries.filter(e => e.type === 'CREDIT').reduce((s, e) => s + (e.amount || 0), 0);
-      const debits = entries.filter(e => e.type === 'DEBIT').reduce((s, e) => s + (e.amount || 0), 0);
-      const balance = credits - debits;
+    for (const balance of balanceByVendor.values()) {
       if (balance > 0) vendorPayables += balance;
-    });
+    }
 
     // Calculate dailyCashPosition
     const dailyCashPosition = cashAccounts.reduce((s, acc) => s + (acc.balance || 0), 0);

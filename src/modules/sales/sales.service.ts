@@ -2,18 +2,24 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
 
-// Number generators are DB-count-based (not in-memory counters) so they can't
-// collide against their @unique DB columns after a server restart.
-async function generateQuotationNumber() {
+// Atomic, collision-safe document numbering. A raw `.count()`-based scheme
+// (the old approach here) lets two concurrent requests read the same N
+// before either commits — the @unique column then hard-fails the second
+// insert instead of preventing the race. NumberSequence upsert is atomic
+// within the surrounding transaction (same pattern as
+// ProductionService.nextProductionBatchCode), so retries/concurrent
+// creates cannot reuse a number. Every Sales-chain document (Estimate,
+// Sales Order, Proforma, Tax Invoice) shares this one generator so there's
+// exactly one counter per prefix+year, not several independently-
+// incrementing schemes racing to produce the same string.
+async function nextDocumentNumber(tx: any, key: string, prefix: string, pad = 5): Promise<string> {
   const year = new Date().getFullYear();
-  const count = await prisma.quotation.count({ where: { createdAt: { gte: new Date(year, 0, 1) } } });
-  return `QT-${year}-${(count + 1).toString().padStart(5, '0')}`;
-}
-
-async function generateSalesOrderNumber() {
-  const year = new Date().getFullYear();
-  const count = await prisma.salesOrder.count({ where: { createdAt: { gte: new Date(year, 0, 1) } } });
-  return `SO-${year}-${(count + 1).toString().padStart(5, '0')}`;
+  const seq = await tx.numberSequence.upsert({
+    where: { key: `${key}_${year}` },
+    create: { key: `${key}_${year}`, value: 1 },
+    update: { value: { increment: 1 } },
+  });
+  return `${prefix}-${year}-${String(seq.value).padStart(pad, '0')}`;
 }
 
 async function generateReturnNumber() {
@@ -65,19 +71,18 @@ export class SalesService {
       orderBy: { createdAt: 'desc' }
     });
 
-    const orderIds = quotations.map(q => q.convertedOrderId).filter(Boolean) as string[];
-    if (orderIds.length > 0) {
-      const orders = await prisma.salesOrder.findMany({
-        where: { id: { in: orderIds } },
-        select: { id: true, orderNumber: true }
-      });
-      const orderMap = new Map(orders.map(o => [o.id, o.orderNumber]));
-      return quotations.map(q => ({
-        ...q,
-        convertedOrderNumber: q.convertedOrderId ? orderMap.get(q.convertedOrderId) : null
-      }));
-    }
-    return quotations.map(q => ({ ...q, convertedOrderNumber: null }));
+    // Estimate converts to a Sales Order now (convertedOrderId), not
+    // straight to a Tax Invoice — convertedInvoiceId only gets set on a
+    // Quotation via the old (now-unused) direct path and stays null for
+    // every new conversion, so this resolves the Sales Order's number.
+    const salesOrderIds = quotations.map(q => q.convertedOrderId).filter(Boolean) as string[];
+    const salesOrderMap = salesOrderIds.length
+      ? new Map((await prisma.salesOrder.findMany({ where: { id: { in: salesOrderIds } }, select: { id: true, orderNumber: true } })).map(o => [o.id, o.orderNumber]))
+      : new Map<string, string>();
+    return quotations.map(q => ({
+      ...q,
+      convertedOrderNumber: q.convertedOrderId ? salesOrderMap.get(q.convertedOrderId) || null : null
+    }));
   }
 
   static async getQuotationById(id: string) {
@@ -86,13 +91,13 @@ export class SalesService {
       include: { customer: true, items: true }
     });
     if (quotation && quotation.convertedOrderId) {
-      const order = await prisma.salesOrder.findUnique({
+      const salesOrder = await prisma.salesOrder.findUnique({
         where: { id: quotation.convertedOrderId },
         select: { orderNumber: true }
       });
       return {
         ...quotation,
-        convertedOrderNumber: order?.orderNumber || null
+        convertedOrderNumber: salesOrder?.orderNumber || null
       };
     }
     return quotation ? { ...quotation, convertedOrderNumber: null } : null;
@@ -116,9 +121,9 @@ export class SalesService {
     const discount = data.discountAmount || 0;
     const customerName = await resolveCustomerName(data.customerId, data.customerName);
 
-    return prisma.quotation.create({
+    return prisma.$transaction(async (tx) => tx.quotation.create({
       data: {
-        quotationNumber: data.quotationNumber || await generateQuotationNumber(),
+        quotationNumber: data.quotationNumber || await nextDocumentNumber(tx, 'QT', 'QT'),
         customerId: data.customerId,
         customerName,
         customerPhone: data.customerPhone,
@@ -146,7 +151,7 @@ export class SalesService {
         }
       },
       include: { customer: true, items: true }
-    });
+    }));
   }
 
   static async updateQuotation(id: string, data: {
@@ -232,65 +237,247 @@ export class SalesService {
     });
   }
 
-  static async convertQuotationToOrder(
+  // ─── Document chain conversions ────────────────────────────────────────────
+  // Estimate -> Sales Order -> Proforma Invoice -> Tax Invoice -> Payment.
+  // Every step here: (1) validates the source doc and rejects a repeat
+  // conversion via a real DB-unique marker (not just an app-level check —
+  // see the @unique columns on SalesOrder.proformaInvoiceId and
+  // ProformaInvoice.convertedInvoiceId), (2) copies every field forward so
+  // the user never re-enters data, (3) runs inside one $transaction so a
+  // failure never leaves the source doc marked converted without the target
+  // doc actually existing.
+
+  // Estimate -> Sales Order. This replaces the old convertQuotationToInvoice,
+  // which skipped straight to a Tax Invoice — wrong per the confirmed chain.
+  static async convertQuotationToSalesOrder(
     quotationId: string,
-    createdBy?: string,
-    trackingData?: {
-      trackingNumber?: string;
-      courierName?: string;
-      deliveryDate?: string;
-      deliveryAddress?: string;
-    }
+    createdBy: string,
+    trackingData?: { trackingNumber?: string; courierName?: string; deliveryDate?: string; deliveryAddress?: string; }
   ) {
-    const quotation = await prisma.quotation.findUnique({
-      where: { id: quotationId },
-      include: { items: true, customer: true }
-    });
-    if (!quotation) throw new Error('Quotation not found');
-
-    const salesOrder = await prisma.salesOrder.create({
-      data: {
-        orderNumber: await generateSalesOrderNumber(),
-        quotationId,
-        customerId: quotation.customerId,
-        customerName: quotation.customerName || quotation.customer?.name,
-        subTotal: quotation.subTotal,
-        taxAmount: quotation.taxAmount,
-        discountAmount: quotation.discountAmount,
-        totalAmount: quotation.totalAmount,
-        deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
-        deliveryAddress: trackingData?.deliveryAddress || undefined,
-        trackingNumber: trackingData?.trackingNumber || undefined,
-        courierName: trackingData?.courierName || undefined,
-        notes: quotation.notes,
-        createdBy,
-        items: {
-          create: quotation.items.map((item) => ({
-            productId: item.productId,
-            productName: item.productName,
-            quantity: item.quantity,
-            unit: item.unit,
-            rate: item.rate,
-            taxPercent: item.taxPercent,
-            taxAmount: item.taxAmount,
-            totalAmount: item.totalAmount
-          }))
+    return prisma.$transaction(async (tx) => {
+      const quotation = await tx.quotation.findUnique({ where: { id: quotationId }, include: { items: true } });
+      if (!quotation) throw new Error('Estimate not found.');
+      if (quotation.status !== 'SENT') {
+        if (quotation.status === 'CONVERTED' && quotation.convertedOrderId) {
+          // Already converted — not an error, the caller (controller) turns
+          // this into "return the existing Sales Order" so a duplicate
+          // click never creates a second one.
+          const existing = await tx.salesOrder.findUnique({ where: { id: quotation.convertedOrderId }, include: { items: true } });
+          if (existing) return existing;
         }
-      },
-      include: { items: true }
-    });
-
-    await prisma.quotation.update({
-      where: { id: quotationId },
-      data: {
-        status: 'CONVERTED',
-        convertedOrderId: salesOrder.id,
-        trackingNumber: trackingData?.trackingNumber || undefined,
-        courierName: trackingData?.courierName || undefined
+        throw new Error(`Only an Estimate with status SENT can be converted to a Sales Order (current status: ${quotation.status}).`);
       }
-    });
 
-    return salesOrder;
+      const salesOrder = await tx.salesOrder.create({
+        data: {
+          orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
+          quotationId: quotation.id,
+          customerId: quotation.customerId,
+          customerName: quotation.customerName,
+          status: 'DRAFT',
+          subTotal: quotation.subTotal,
+          taxAmount: quotation.taxAmount,
+          discountAmount: quotation.discountAmount,
+          totalAmount: quotation.totalAmount,
+          deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
+          deliveryAddress: trackingData?.deliveryAddress || undefined,
+          trackingNumber: trackingData?.trackingNumber || undefined,
+          courierName: trackingData?.courierName || undefined,
+          notes: quotation.notes,
+          createdBy,
+          items: {
+            create: quotation.items.map((item) => ({
+              productId: item.productId,
+              productName: item.productName,
+              quantity: item.quantity,
+              unit: item.unit,
+              rate: item.rate,
+              taxPercent: item.taxPercent,
+              taxAmount: item.taxAmount,
+              totalAmount: item.totalAmount,
+            })),
+          },
+        },
+        include: { items: true },
+      });
+
+      await tx.quotation.update({
+        where: { id: quotationId },
+        data: { status: 'CONVERTED', convertedOrderId: salesOrder.id },
+      });
+
+      return salesOrder;
+    });
+  }
+
+  // Sales Order -> Proforma Invoice.
+  static async convertSalesOrderToProforma(salesOrderId: string, createdBy: string) {
+    return prisma.$transaction(async (tx) => {
+      const salesOrder = await tx.salesOrder.findUnique({ where: { id: salesOrderId }, include: { items: true } });
+      if (!salesOrder) throw new Error('Sales Order not found.');
+      if (salesOrder.proformaInvoiceId) {
+        const existing = await tx.proformaInvoice.findUnique({ where: { id: salesOrder.proformaInvoiceId }, include: { items: true } });
+        if (existing) return existing;
+      }
+      if (salesOrder.status !== 'CONFIRMED') {
+        throw new Error(`Only a CONFIRMED Sales Order can generate a Proforma Invoice (current status: ${salesOrder.status}).`);
+      }
+
+      const proforma = await tx.proformaInvoice.create({
+        data: {
+          proformaNumber: await nextDocumentNumber(tx, 'PI', 'PI'),
+          sourceSalesOrderId: salesOrder.id,
+          customerId: salesOrder.customerId,
+          customerName: salesOrder.customerName,
+          status: 'DRAFT',
+          subTotal: salesOrder.subTotal,
+          taxAmount: salesOrder.taxAmount,
+          discountAmount: salesOrder.discountAmount,
+          totalAmount: salesOrder.totalAmount,
+          notes: salesOrder.notes,
+          createdBy,
+          items: {
+            create: salesOrder.items.map((item) => ({
+              productId: item.productId,
+              productName: item.productName,
+              quantity: item.quantity,
+              unit: item.unit,
+              rate: item.rate,
+              taxPercent: item.taxPercent,
+              taxAmount: item.taxAmount,
+              totalAmount: item.totalAmount,
+            })),
+          },
+        },
+        include: { items: true },
+      });
+
+      await tx.salesOrder.update({
+        where: { id: salesOrderId },
+        data: { proformaInvoiceId: proforma.id },
+      });
+
+      return proforma;
+    });
+  }
+
+  // Proforma Invoice -> Tax Invoice (Order + Invoice).
+  static async convertProformaToInvoice(proformaInvoiceId: string, createdBy: string) {
+    const proforma = await prisma.proformaInvoice.findUnique({ where: { id: proformaInvoiceId }, include: { items: true } });
+    if (!proforma) throw new Error('Proforma Invoice not found.');
+    if (proforma.convertedInvoiceId) {
+      const existing = await prisma.order.findUnique({ where: { id: proforma.convertedInvoiceId }, include: { orderItems: true, invoice: true } });
+      if (existing) return existing;
+    }
+    if (proforma.status === 'CANCELLED') {
+      throw new Error('Cannot convert a cancelled Proforma Invoice.');
+    }
+
+    const missingProduct = proforma.items.find(i => !i.productId);
+    if (missingProduct) {
+      throw new Error(`Item "${missingProduct.productName}" is missing a valid Product ID. Custom items without an inventory mapping cannot be converted to a Tax Invoice.`);
+    }
+
+    // The full source chain, when this Proforma came from a Sales Order
+    // that itself came from an Estimate — kept for traceability even though
+    // Order only has direct FKs to the immediate parent (proforma) and the
+    // original Estimate (sourceQuotationId), not the Sales Order itself.
+    const sourceSalesOrder = proforma.sourceSalesOrderId
+      ? await prisma.salesOrder.findUnique({ where: { id: proforma.sourceSalesOrderId } })
+      : null;
+
+    let franchiseId: string | undefined;
+    const hq = await prisma.franchise.findFirst({ where: { isHQ: true } });
+    if (hq) franchiseId = hq.id;
+    else {
+      const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
+      if (first) franchiseId = first.id;
+      else throw new Error('No active franchise found to assign the invoice.');
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const newOrder = await tx.order.create({
+        data: {
+          invoiceNum: await nextDocumentNumber(tx, 'INV', 'INV'),
+          customerId: proforma.customerId,
+          franchiseId: franchiseId!,
+          orderType: 'TAX_INVOICE',
+          status: 'PENDING',
+          paymentStatus: 'UNPAID',
+          subTotal: proforma.subTotal,
+          taxAmount: proforma.taxAmount,
+          discountAmount: proforma.discountAmount,
+          totalAmount: proforma.totalAmount,
+          sourceQuotationId: sourceSalesOrder?.quotationId || undefined,
+          sourceProformaInvoiceId: proforma.id,
+          orderItems: {
+            create: proforma.items.map((item) => ({
+              productId: item.productId!,
+              quantity: item.quantity,
+              price: item.rate,
+              taxAmount: item.taxAmount,
+              totalAmount: item.totalAmount,
+            })),
+          },
+        },
+        include: { orderItems: true },
+      });
+
+      // Initial payment state is always zero — a Tax Invoice never carries
+      // money forward from the Estimate/Proforma stage (see money rules:
+      // no cash/bank movement before this point). 'UNPAID' regardless of
+      // whatever total is owed; Customer Payments is the only thing
+      // allowed to move this status (see FinanceService.createPayment).
+      await tx.invoice.create({
+        data: {
+          orderId: newOrder.id,
+          totalAmount: proforma.subTotal,
+          taxAmount: proforma.taxAmount,
+          finalAmount: proforma.totalAmount,
+          status: 'UNPAID',
+          description: `Generated from Proforma Invoice ${proforma.proformaNumber}`,
+          notes: proforma.notes,
+        },
+      });
+
+      await tx.proformaInvoice.update({
+        where: { id: proformaInvoiceId },
+        data: { status: 'CONVERTED', convertedInvoiceId: newOrder.id },
+      });
+
+      if (sourceSalesOrder) {
+        await tx.salesOrder.update({
+          where: { id: sourceSalesOrder.id },
+          data: { status: 'PROCESSING' },
+        });
+      }
+
+      return newOrder;
+    });
+  }
+
+  static async getProformaInvoices(filters: { status?: string; customerId?: string; search?: string }) {
+    const where: any = {};
+    if (filters.status) where.status = filters.status;
+    if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.search) {
+      where.OR = [
+        { proformaNumber: { contains: filters.search, mode: 'insensitive' } },
+        { customerName: { contains: filters.search, mode: 'insensitive' } },
+      ];
+    }
+    return prisma.proformaInvoice.findMany({
+      where,
+      include: { customer: true, items: true },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  static async getProformaInvoiceById(id: string) {
+    return prisma.proformaInvoice.findUnique({
+      where: { id },
+      include: { customer: true, items: true },
+    });
   }
 
   // ─── Sales Orders ────────────────────────────────────────────────────────────
@@ -346,9 +533,9 @@ export class SalesService {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
 
-    return prisma.salesOrder.create({
+    return prisma.$transaction(async (tx) => tx.salesOrder.create({
       data: {
-        orderNumber: await generateSalesOrderNumber(),
+        orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
         customerId: data.customerId,
         customerName: data.customerName,
         subTotal,
@@ -373,14 +560,19 @@ export class SalesService {
         }
       },
       include: { customer: true, items: true }
-    });
+    }));
   }
 
   static async updateSalesOrder(id: string, data: any) {
+    // proformaInvoiceId is a duplicate-prevention marker only the atomic
+    // convertSalesOrderToProforma() transaction is allowed to set — a
+    // generic PATCH must never let a client fake "a Proforma already
+    // exists" (or clear a real one) directly.
+    const { proformaInvoiceId, ...safeData } = data;
     return prisma.salesOrder.update({
       where: { id },
       data: {
-        ...data,
+        ...safeData,
         status: data.status as any,
         deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined
       },

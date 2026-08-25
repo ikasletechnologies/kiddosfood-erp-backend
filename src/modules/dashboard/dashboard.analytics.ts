@@ -19,8 +19,45 @@ export class DashboardAnalyticsService {
     const fOrderWhere: Prisma.FranchiseOrderWhereInput = franchiseId ? { franchiseId } : {};
     const poWhere: Prisma.ProcurementOrderWhereInput = franchiseId ? { franchiseId } : {};
 
-    // Period revenue
-    const [posRevenue, franchiseOrdersToday] = await Promise.all([
+    // For 'all'/'year' periods, limit COGS/bucket lookback to the last 12
+    // months to avoid loading years of history.
+    const cogsWindowStart = (period === 'all' || period === 'year')
+      ? (() => { const d = new Date(periodEnd); d.setMonth(d.getMonth() - 12); d.setDate(1); d.setHours(0, 0, 0, 0); return d; })()
+      : today;
+
+    // The historicalSales chart always covers a fixed trailing window ending
+    // at periodEnd, independent of `today` (see the bucket-boundary math
+    // below) — precompute that window's start once so the bucket-data
+    // pre-fetch below covers exactly the range the loop will filter against.
+    const daysCount = period === 'month' ? 30 : 7;
+    const bucketsWindowStart = period === 'today'
+      ? today
+      : (period === 'all' || period === 'year')
+        ? cogsWindowStart
+        : (() => { const d = new Date(periodEnd); d.setDate(d.getDate() - (daysCount - 1)); d.setHours(0, 0, 0, 0); return d; })();
+
+    // Every query below is independent of every other's result — they only
+    // depend on the date range/franchise filters computed above — so they're
+    // all fired together instead of one after another. This is the single
+    // biggest win for dashboard load time: previously the historicalSales
+    // chart alone issued up to 60 sequential-per-bucket aggregate queries
+    // (2 per hour/day/month bucket); it's now folded into one lean row-fetch
+    // per model (orderRows/franchiseOrderRows, mirroring the cogsMovements
+    // pre-fetch pattern already used below) and bucketed in memory.
+    const [
+      posRevenue,
+      franchiseOrdersToday,
+      prevOrderRevenue,
+      prevFranchiseOrderRevenue,
+      cogsMovements,
+      orderRows,
+      franchiseOrderRows,
+      b2bRevenue,
+      periodExpenses,
+      periodPurchase,
+      topSellerGroups,
+      recentOrdersRaw,
+    ] = await Promise.all([
       prisma.order.aggregate({
         where: { ...whereClause, createdAt: { gte: today, lte: periodEnd } },
         _sum: { totalAmount: true },
@@ -30,7 +67,63 @@ export class DashboardAnalyticsService {
         where: { ...fOrderWhere, createdAt: { gte: today, lte: periodEnd } },
         _sum: { totalAmount: true },
         _count: { id: true }
-      })
+      }),
+      prisma.order.aggregate({
+        where: { ...whereClause, createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
+        _sum: { totalAmount: true }
+      }),
+      prisma.franchiseOrder.aggregate({
+        where: { ...fOrderWhere, createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
+        _sum: { totalAmount: true }
+      }),
+      // Pre-fetch SALES_OUT stock movements for the period (single query,
+      // avoids N+1 per bucket) — COGS for any bucket is derived by filtering
+      // this in memory (see getBucketCOGS below).
+      prisma.stockMovement.findMany({
+        where: {
+          movementType: 'SALES_OUT',
+          createdAt: { gte: cogsWindowStart, lte: periodEnd },
+          ...(franchiseId ? { item: { franchiseId } } : {})
+        },
+        select: {
+          quantity: true,
+          createdAt: true,
+          item: { select: { costPrice: true } }
+        }
+      }),
+      prisma.order.findMany({
+        where: { ...whereClause, createdAt: { gte: bucketsWindowStart, lte: periodEnd } },
+        select: { totalAmount: true, createdAt: true }
+      }),
+      prisma.franchiseOrder.findMany({
+        where: { ...fOrderWhere, createdAt: { gte: bucketsWindowStart, lte: periodEnd } },
+        select: { totalAmount: true, createdAt: true }
+      }),
+      prisma.order.aggregate({
+        where: { ...whereClause, orderType: 'B2B', createdAt: { gte: today, lte: periodEnd } },
+        _sum: { totalAmount: true }
+      }),
+      prisma.expense.aggregate({
+        where: { ...(franchiseId ? { franchiseId } : {}), date: { gte: today, lte: periodEnd } },
+        _sum: { amount: true }
+      }),
+      prisma.procurementOrder.aggregate({
+        where: { ...poWhere, createdAt: { gte: today, lte: periodEnd }, status: { not: 'CANCELLED' } },
+        _sum: { totalAmount: true }
+      }),
+      prisma.orderItem.groupBy({
+        by: ['productId'],
+        where: { order: { ...whereClause, createdAt: { gte: today, lte: periodEnd } } },
+        _sum: { quantity: true, totalAmount: true },
+        orderBy: { _sum: { quantity: 'desc' } },
+        take: 5
+      }),
+      prisma.order.findMany({
+        where: whereClause,
+        take: 5,
+        orderBy: { createdAt: 'desc' },
+        include: { customer: true }
+      }),
     ]);
 
     const totalRevenueToday = franchiseId
@@ -41,42 +134,13 @@ export class DashboardAnalyticsService {
       ? (posRevenue._count.id || 0)
       : (posRevenue._count.id || 0) + (franchiseOrdersToday._count.id || 0);
 
-    // Prev period revenue for trend
-    const prevRevenue = await Promise.all([
-      prisma.order.aggregate({
-        where: { ...whereClause, createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
-        _sum: { totalAmount: true }
-      }),
-      prisma.franchiseOrder.aggregate({
-        where: { ...fOrderWhere, createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
-        _sum: { totalAmount: true }
-      })
-    ]).then(([r1, r2]) => franchiseId
-      ? (r1._sum.totalAmount || 0)
-      : (r1._sum.totalAmount || 0) + (r2._sum.totalAmount || 0));
+    const prevRevenue = franchiseId
+      ? (prevOrderRevenue._sum.totalAmount || 0)
+      : (prevOrderRevenue._sum.totalAmount || 0) + (prevFranchiseOrderRevenue._sum.totalAmount || 0);
 
     const revenueChangePct = prevRevenue > 0
       ? (((totalRevenueToday - prevRevenue) / prevRevenue) * 100).toFixed(1)
       : "0.0";
-
-    // Pre-fetch SALES_OUT stock movements for the period (single query, avoids N+1 per bucket)
-    // For 'all'/'year' periods, limit to last 12 months to avoid loading years of data
-    const cogsWindowStart = (period === 'all' || period === 'year')
-      ? (() => { const d = new Date(periodEnd); d.setMonth(d.getMonth() - 12); d.setDate(1); d.setHours(0, 0, 0, 0); return d; })()
-      : today;
-
-    const cogsMovements = await prisma.stockMovement.findMany({
-      where: {
-        movementType: 'SALES_OUT',
-        createdAt: { gte: cogsWindowStart, lte: periodEnd },
-        ...(franchiseId ? { item: { franchiseId } } : {})
-      },
-      select: {
-        quantity: true,
-        createdAt: true,
-        item: { select: { costPrice: true } }
-      }
-    });
 
     // COGS for a time bucket: sum of |qty| × costPrice for all SALES_OUT in range
     function getBucketCOGS(from: Date, to: Date): number {
@@ -85,93 +149,66 @@ export class DashboardAnalyticsService {
         .reduce((sum, m) => sum + Math.abs(m.quantity) * (m.item.costPrice || 0), 0);
     }
 
+    // Sales/orders for a time bucket, from the pre-fetched row sets above —
+    // same in-memory-filter pattern as getBucketCOGS, so a bucket's window
+    // never needs its own round trip.
+    function getBucketOrders(from: Date, to: Date) {
+      let sum = 0, count = 0;
+      for (const o of orderRows) if (o.createdAt >= from && o.createdAt <= to) { sum += o.totalAmount; count++; }
+      return { sum, count };
+    }
+    function getBucketFranchiseOrders(from: Date, to: Date) {
+      let sum = 0, count = 0;
+      for (const o of franchiseOrderRows) if (o.createdAt >= from && o.createdAt <= to) { sum += o.totalAmount; count++; }
+      return { sum, count };
+    }
+
     const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    function buildBucket(label: string, d: Date, de: Date) {
+      const r1 = getBucketOrders(d, de);
+      const r2 = getBucketFranchiseOrders(d, de);
+      const cogs = getBucketCOGS(d, de);
+      const sales = franchiseId ? r1.sum : (r1.sum + r2.sum);
+      const purchase = franchiseId ? (cogs + r2.sum) : cogs;
+      return {
+        date: label,
+        sales,
+        purchase,
+        profit: sales - purchase,
+        orders: r1.count + (franchiseId ? 0 : r2.count)
+      };
+    }
 
     let historicalSales: any[] = [];
 
     if (period === 'today') {
-      historicalSales = await Promise.all(
-        Array.from({ length: 24 }, (_, i) => {
-          const d = new Date(today);
-          d.setHours(i, 0, 0, 0);
-          const de = new Date(d);
-          de.setHours(i, 59, 59, 999);
-
-          return Promise.all([
-            prisma.order.aggregate({ where: { ...whereClause, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            prisma.franchiseOrder.aggregate({ where: { ...fOrderWhere, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            Promise.resolve(getBucketCOGS(d, de))
-          ]).then(([r1, r2, cogs]) => {
-            const sales = franchiseId ? (r1._sum.totalAmount || 0) : ((r1._sum.totalAmount || 0) + (r2._sum.totalAmount || 0));
-            const purchase = franchiseId ? (cogs + (r2._sum.totalAmount || 0)) : cogs;
-            return {
-              date: `${i}:00`,
-              sales,
-              purchase,
-              profit: sales - purchase,
-              orders: (r1._count.id || 0) + (franchiseId ? 0 : (r2._count.id || 0))
-            };
-          });
-        })
-      );
+      historicalSales = Array.from({ length: 24 }, (_, i) => {
+        const d = new Date(today);
+        d.setHours(i, 0, 0, 0);
+        const de = new Date(d);
+        de.setHours(i, 59, 59, 999);
+        return buildBucket(`${i}:00`, d, de);
+      });
     } else if (period === 'all' || period === 'year') {
-      historicalSales = await Promise.all(
-        Array.from({ length: 12 }, (_, i) => {
-          const d = new Date(periodEnd);
-          d.setMonth(d.getMonth() - (11 - i));
-          d.setDate(1); d.setHours(0, 0, 0, 0);
-          const de = new Date(d); de.setMonth(de.getMonth() + 1); de.setDate(0); de.setHours(23, 59, 59, 999);
-
-          return Promise.all([
-            prisma.order.aggregate({ where: { ...whereClause, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            prisma.franchiseOrder.aggregate({ where: { ...fOrderWhere, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            Promise.resolve(getBucketCOGS(d, de))
-          ]).then(([r1, r2, cogs]) => {
-            const sales = franchiseId ? (r1._sum.totalAmount || 0) : ((r1._sum.totalAmount || 0) + (r2._sum.totalAmount || 0));
-            const purchase = franchiseId ? (cogs + (r2._sum.totalAmount || 0)) : cogs;
-            return {
-              date: MONTHS[d.getMonth()],
-              sales,
-              purchase,
-              profit: sales - purchase,
-              orders: (r1._count.id || 0) + (franchiseId ? 0 : (r2._count.id || 0))
-            };
-          });
-        })
-      );
+      historicalSales = Array.from({ length: 12 }, (_, i) => {
+        const d = new Date(periodEnd);
+        d.setMonth(d.getMonth() - (11 - i));
+        d.setDate(1); d.setHours(0, 0, 0, 0);
+        const de = new Date(d); de.setMonth(de.getMonth() + 1); de.setDate(0); de.setHours(23, 59, 59, 999);
+        return buildBucket(MONTHS[d.getMonth()], d, de);
+      });
     } else {
-      const daysCount = period === 'month' ? 30 : 7;
-      historicalSales = await Promise.all(
-        Array.from({ length: daysCount }, (_, i) => {
-          const d = new Date(periodEnd);
-          d.setDate(d.getDate() - (daysCount - 1 - i));
-          d.setHours(0, 0, 0, 0);
-          const de = new Date(d); de.setHours(23, 59, 59, 999);
-
-          return Promise.all([
-            prisma.order.aggregate({ where: { ...whereClause, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            prisma.franchiseOrder.aggregate({ where: { ...fOrderWhere, createdAt: { gte: d, lte: de } }, _sum: { totalAmount: true }, _count: { id: true } }),
-            Promise.resolve(getBucketCOGS(d, de))
-          ]).then(([r1, r2, cogs]) => {
-            const sales = franchiseId ? (r1._sum.totalAmount || 0) : ((r1._sum.totalAmount || 0) + (r2._sum.totalAmount || 0));
-            const purchase = franchiseId ? (cogs + (r2._sum.totalAmount || 0)) : cogs;
-            return {
-              date: daysCount > 7 ? `${d.getDate()}/${d.getMonth() + 1}` : DAYS[d.getDay()],
-              sales,
-              purchase,
-              profit: sales - purchase,
-              orders: (r1._count.id || 0) + (franchiseId ? 0 : (r2._count.id || 0))
-            };
-          });
-        })
-      );
+      historicalSales = Array.from({ length: daysCount }, (_, i) => {
+        const d = new Date(periodEnd);
+        d.setDate(d.getDate() - (daysCount - 1 - i));
+        d.setHours(0, 0, 0, 0);
+        const de = new Date(d); de.setHours(23, 59, 59, 999);
+        const label = daysCount > 7 ? `${d.getDate()}/${d.getMonth() + 1}` : DAYS[d.getDay()];
+        return buildBucket(label, d, de);
+      });
     }
-
-    const b2bRevenue = await prisma.order.aggregate({
-      where: { ...whereClause, orderType: 'B2B', createdAt: { gte: today, lte: periodEnd } },
-      _sum: { totalAmount: true }
-    });
 
     const revenueBreakdown = franchiseId
       ? [
@@ -183,18 +220,6 @@ export class DashboardAnalyticsService {
           { label: "Wholesale B2B", value: b2bRevenue._sum.totalAmount || 0 }
         ];
 
-    // Period expenses
-    const periodExpenses = await prisma.expense.aggregate({
-      where: { ...(franchiseId ? { franchiseId } : {}), date: { gte: today, lte: periodEnd } },
-      _sum: { amount: true }
-    });
-
-    // Procurement PO total (actual vendor payments — used for KPI card)
-    const periodPurchase = await prisma.procurementOrder.aggregate({
-      where: { ...poWhere, createdAt: { gte: today, lte: periodEnd }, status: { not: 'CANCELLED' } },
-      _sum: { totalAmount: true }
-    });
-
     // Total COGS for the period (used for KPI card if no POs exist)
     const totalCOGS = cogsMovements.reduce((sum, m) => sum + Math.abs(m.quantity) * (m.item.costPrice || 0), 0);
     const franchisePurchaseTotal = franchiseId ? (franchiseOrdersToday._sum.totalAmount || 0) : 0;
@@ -202,37 +227,26 @@ export class DashboardAnalyticsService {
       ? periodPurchase._sum.totalAmount || 0
       : totalCOGS) + franchisePurchaseTotal;
 
-    // Top selling products
-    const topSellers = await prisma.orderItem.groupBy({
-      by: ['productId'],
-      where: { order: { ...whereClause, createdAt: { gte: today, lte: periodEnd } } },
-      _sum: { quantity: true, totalAmount: true },
-      orderBy: { _sum: { quantity: 'desc' } },
-      take: 5
-    }).then(async (groups) => {
-      return Promise.all(groups.map(async (g) => {
-        const product = await prisma.product.findUnique({ where: { id: g.productId } });
-        return {
-          name: product?.name || "Unknown",
-          value: g._sum.quantity || 0,
-          unit: "Units",
-          growth: "0"
-        };
-      }));
-    });
+    // Top selling products — batched product lookup instead of one
+    // findUnique per group (was a 5-query N+1 on top of the groupBy).
+    const topSellerProductIds = topSellerGroups.map(g => g.productId);
+    const topSellerProducts = topSellerProductIds.length
+      ? await prisma.product.findMany({ where: { id: { in: topSellerProductIds } }, select: { id: true, name: true } })
+      : [];
+    const productNameById = new Map(topSellerProducts.map(p => [p.id, p.name]));
+    const topSellers = topSellerGroups.map(g => ({
+      name: productNameById.get(g.productId) || "Unknown",
+      value: g._sum.quantity || 0,
+      unit: "Units",
+      growth: "0"
+    }));
 
-    // Recent orders
-    const recentOrders = await prisma.order.findMany({
-      where: whereClause,
-      take: 5,
-      orderBy: { createdAt: 'desc' },
-      include: { customer: true }
-    }).then(orders => orders.map(o => ({
+    const recentOrders = recentOrdersRaw.map(o => ({
       id: o.invoiceNum,
       amount: o.totalAmount,
       status: o.status.toLowerCase(),
       customerName: o.customer?.name || "Walk-in"
-    })));
+    }));
 
     return {
       revenueToday: totalRevenueToday,

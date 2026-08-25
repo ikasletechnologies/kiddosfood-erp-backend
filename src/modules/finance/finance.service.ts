@@ -896,6 +896,24 @@ export class FinanceService {
         }
       }
 
+      // 2b. Overpayment guard for a Tax Invoice receipt — the invoice's
+      // paid/outstanding split is computed by summing Payment rows (see
+      // step 6 below), so a payment that pushes the total past what's owed
+      // would silently produce a negative outstanding balance downstream.
+      if (data.invoiceId && flow === 'IN' && status === 'PAID') {
+        const invoiceForGuard = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
+        if (!invoiceForGuard) throw new Error('Invoice not found.');
+        const paidSoFar = await tx.payment.aggregate({
+          where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
+          _sum: { paidAmount: true },
+        });
+        const alreadyPaid = paidSoFar._sum.paidAmount || 0;
+        const outstanding = invoiceForGuard.finalAmount - alreadyPaid;
+        if (amount > outstanding + 0.01) {
+          throw new Error(`Payment amount (₹${amount}) exceeds the outstanding balance (₹${outstanding.toFixed(2)}) on this invoice.`);
+        }
+      }
+
       // 3. Generate Payment Number
       // NOTE: was previously `data.entityType === 'VENDOR' || flow === 'OUT'`, which
       // mislabeled every non-vendor outflow (payroll, expenses, franchise settlements)
@@ -913,6 +931,7 @@ export class FinanceService {
           linkedDocType:  linkedDocType as any,
           linkedDocId:    linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
+          invoiceId:      data.invoiceId || undefined,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       entityId,
           paymentMode:    resolvedPaymentMode as any,
@@ -980,6 +999,32 @@ export class FinanceService {
                 }
              }
           }
+        }
+      }
+
+      // 5b. Customer payment against a Tax Invoice — recompute paid/
+      // outstanding/status from the actual sum of Payment rows every time
+      // (never trust a client-supplied status), and mirror it onto the
+      // Order the Invoice belongs to so both records agree. This is the
+      // ONLY place a Tax Invoice's payment status is allowed to change —
+      // it is never settable directly by the frontend.
+      if (data.invoiceId && status === 'PAID') {
+        const invoiceRow = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
+        if (invoiceRow) {
+          const totalPaid = await tx.payment.aggregate({
+            where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
+            _sum: { paidAmount: true },
+          });
+          const paidSoFar = totalPaid._sum.paidAmount || 0;
+          // 'PARTIAL' (not 'PARTIALLY_PAID') to match the existing status
+          // vocabulary already used by /sales/invoices' status badge map.
+          const newStatus = paidSoFar >= invoiceRow.finalAmount - 0.01
+            ? 'PAID'
+            : paidSoFar > 0
+            ? 'PARTIAL'
+            : 'UNPAID';
+          await tx.invoice.update({ where: { id: data.invoiceId }, data: { status: newStatus } });
+          await tx.order.update({ where: { id: invoiceRow.orderId }, data: { paymentStatus: newStatus } });
         }
       }
 
