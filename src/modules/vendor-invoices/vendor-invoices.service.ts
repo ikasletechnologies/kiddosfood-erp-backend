@@ -1,4 +1,6 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
+
 
 export class VendorInvoiceService {
   /**
@@ -15,7 +17,7 @@ export class VendorInvoiceService {
    * must not be billed at the full ordered quantity.
    */
   static computeCommercialsFromPO(
-    po: { poItems: { inventoryItemId: string | null; gstRate: number; quantity: number; price: number }[]; subtotal: number; cgst: number; sgst: number; igst: number; totalAmount: number; warehouseId?: string | null },
+    po: { poItems: { inventoryItemId: string | null; gstRate: number; quantity: number; price: number }[]; subtotal: number; cgst: number; sgst: number; igst: number; totalAmount: number; discountAmount?: number | null; freightCost?: number | null; warehouseId?: string | null },
     grnItems?: { materialId: string | null; acceptedQty: number; price: number; warehouseId?: string | null }[]
   ) {
     if (!grnItems || grnItems.length === 0) {
@@ -31,21 +33,54 @@ export class VendorInvoiceService {
       };
     }
 
-    let subtotal = 0, cgst = 0, sgst = 0, igst = 0;
+    const { Decimal } = Prisma;
+    let acceptedSubtotal = new Decimal(0);
+    let cgst = new Decimal(0);
+    let sgst = new Decimal(0);
+    let igst = new Decimal(0);
     let warehouseId: string | null = null;
+
+    // 1. Calculate accepted value and item-level taxes
     for (const gi of grnItems) {
       if (!gi.acceptedQty || gi.acceptedQty <= 0) continue;
       const poItem = po.poItems.find(p => p.inventoryItemId === gi.materialId);
-      const gstRate = poItem?.gstRate ?? 0;
-      const lineSubtotal = gi.acceptedQty * gi.price;
-      const lineTax = (lineSubtotal * gstRate) / 100;
-      subtotal += lineSubtotal;
-      cgst += lineTax / 2;
-      sgst += lineTax / 2;
+      const gstRate = new Decimal(poItem?.gstRate ?? 0);
+      
+      const lineSubtotal = new Decimal(gi.acceptedQty).times(gi.price);
+      const lineTax = lineSubtotal.times(gstRate).dividedBy(100);
+      
+      acceptedSubtotal = acceptedSubtotal.plus(lineSubtotal);
+      cgst = cgst.plus(lineTax.dividedBy(2));
+      sgst = sgst.plus(lineTax.dividedBy(2));
+      
       if (!warehouseId && gi.warehouseId) warehouseId = gi.warehouseId;
     }
-    const taxAmount = cgst + sgst + igst;
-    return { subtotal, cgst, sgst, igst, taxAmount, amount: subtotal + taxAmount, warehouseId };
+
+    // 2. Pro-rata PO Discount and Freight based on accepted value
+    const poSubtotal = new Decimal(po.subtotal || 1); // Avoid div by 0
+    const fulfillmentRatio = acceptedSubtotal.dividedBy(poSubtotal);
+    
+    const poDiscount = new Decimal(po.discountAmount || 0);
+    const poFreight = new Decimal(po.freightCost || 0);
+    
+    const proRataDiscount = poDiscount.times(fulfillmentRatio);
+    const proRataFreight = poFreight.times(fulfillmentRatio);
+
+    const taxAmount = cgst.plus(sgst).plus(igst);
+    
+    // Amount = Subtotal + Tax - Discount + Freight
+    const finalAmount = acceptedSubtotal.plus(taxAmount).minus(proRataDiscount).plus(proRataFreight);
+
+    // Return plain numbers rounded to 2 decimal places to match DB schema
+    return { 
+      subtotal: acceptedSubtotal.toDecimalPlaces(2).toNumber(), 
+      cgst: cgst.toDecimalPlaces(2).toNumber(), 
+      sgst: sgst.toDecimalPlaces(2).toNumber(), 
+      igst: igst.toDecimalPlaces(2).toNumber(), 
+      taxAmount: taxAmount.toDecimalPlaces(2).toNumber(), 
+      amount: finalAmount.toDecimalPlaces(2).toNumber(), 
+      warehouseId 
+    };
   }
 
   static async getAll(params: { vendorId?: string; status?: string } = {}) {

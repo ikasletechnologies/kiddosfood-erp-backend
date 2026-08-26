@@ -1,6 +1,8 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { ProcurementService } from '../procurement/procurement.service';
 import { InventoryService } from '../inventory/inventory.service';
+
 
 async function generateRFQNumber() {
   const year = new Date().getFullYear();
@@ -195,9 +197,61 @@ export class PurchaseService {
     procurementOrderId?: string;
     vendorId: string;
     reason: string;
+    returnSource?: string;
     items: Array<{ itemName: string; quantity: number; unit: string; rate: number }>;
   }) {
-    const refundAmount = data.items.reduce((s, i) => s + i.quantity * i.rate, 0);
+    const { Decimal } = Prisma;
+    const returnSource = data.returnSource || 'MANUAL';
+
+    // For NORMAL returns linked to a PO, derive the effective billed unit rate
+    // from the actual Purchase Bill to avoid trusting arbitrary frontend rate inputs.
+    // The effective rate = billAmount / totalBilledQty per line item.
+    let resolvedItems = data.items;
+
+    if (returnSource === 'MANUAL' && data.procurementOrderId) {
+      // Find the latest PENDING or APPROVED bill for this PO
+      const bill = await prisma.vendorInvoice.findFirst({
+        where: { poId: data.procurementOrderId },
+        include: { grn: { include: { items: true } } },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      if (bill && bill.grn) {
+        // Build a map: inventoryItemName -> effective billed unit rate
+        // billed unit rate = (billAmount / totalBilledQty)
+        // We apportion the bill amount by accepted value among items.
+        const grnItems = bill.grn.items.filter(i => (i.acceptedQty || 0) > 0);
+        const totalBilledValue = grnItems.reduce((s, i) => new Decimal(i.acceptedQty).times(i.price).plus(s), new Decimal(0));
+
+        // materialId -> effective rate per transaction unit
+        const effectiveRateMap = new Map<string, InstanceType<typeof Decimal>>();
+        for (const gi of grnItems) {
+          if (!gi.materialId) continue;
+          const lineValue = new Decimal(gi.acceptedQty).times(gi.price);
+          // Pro-rata share of bill's final amount
+          const ratio = totalBilledValue.isZero() ? new Decimal(1) : lineValue.dividedBy(totalBilledValue);
+          const allocatedBillAmount = new Decimal(bill.amount).times(ratio);
+          const effectiveRate = allocatedBillAmount.dividedBy(new Decimal(gi.acceptedQty));
+          effectiveRateMap.set(gi.materialId, effectiveRate);
+        }
+
+        // Override the rate on each return item with the effective billed rate
+        // if we can match it to a material in the GRN.
+        resolvedItems = await Promise.all(data.items.map(async (item) => {
+          const material = await prisma.inventoryItem.findFirst({
+            where: { name: { equals: item.itemName, mode: 'insensitive' } }
+          });
+          if (material && effectiveRateMap.has(material.id)) {
+            const effectiveRate = effectiveRateMap.get(material.id)!;
+            return { ...item, rate: effectiveRate.toDecimalPlaces(4).toNumber() };
+          }
+          return item; // fallback to frontend rate if no bill match
+        }));
+      }
+    }
+
+    const refundAmount = resolvedItems.reduce((s, i) =>
+      new Decimal(s).plus(new Decimal(i.quantity).times(i.rate)).toNumber(), 0);
 
     return prisma.purchaseReturn.create({
       data: {
@@ -205,14 +259,15 @@ export class PurchaseService {
         procurementOrderId: data.procurementOrderId,
         vendorId: data.vendorId,
         reason: data.reason,
+        returnSource,
         refundAmount,
         items: {
-          create: data.items.map((item) => ({
+          create: resolvedItems.map((item) => ({
             itemName: item.itemName,
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
-            totalAmount: item.quantity * item.rate
+            totalAmount: new Decimal(item.quantity).times(item.rate).toDecimalPlaces(4).toNumber()
           }))
         }
       },
@@ -234,50 +289,54 @@ export class PurchaseService {
       // 1. If transitioning to APPROVED or COMPLETED, trigger Inventory and Financial adjustments
       if ((status === 'APPROVED' || status === 'COMPLETED') && existing.status === 'PENDING') {
         
-        // A. Update Stock (Subtract)
-        for (const item of existing.items) {
-          // Find matching material by name (since returns can be ad-hoc or linked)
-          const material = await tx.inventoryItem.findFirst({
-            where: { name: { equals: item.itemName, mode: 'insensitive' } }
-          });
-
-          if (material) {
-            await InventoryService.recordMovement(tx, {
-              itemId: material.id,
-              type: 'RETURN_OUT',
-              quantity: -item.quantity,
-              referenceType: 'PURCHASE_RETURN',
-              referenceId: id,
-              note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
+        // A. Update Stock (Subtract) - ONLY if it's not a GRN rejection (which never entered inventory)
+        if (existing.returnSource !== 'GRN_REJECTION') {
+          for (const item of existing.items) {
+            // Find matching material by name (since returns can be ad-hoc or linked)
+            const material = await tx.inventoryItem.findFirst({
+              where: { name: { equals: item.itemName, mode: 'insensitive' } }
             });
+
+            if (material) {
+              await InventoryService.recordMovement(tx, {
+                itemId: material.id,
+                type: 'RETURN_OUT',
+                quantity: -item.quantity,
+                transactionUnit: item.unit,
+                referenceType: 'PURCHASE_RETURN',
+                referenceId: id,
+                note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
+              });
+            }
           }
         }
 
         // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor).
-        // NOTE: this must be a DEBIT, not a CREDIT — ProcurementService.getVendors()
-        // only counts RETURN entries as liability-reducing when type === 'DEBIT'.
-        // Posting a CREDIT here previously made an approved return *increase* the
-        // vendor's computed payable balance instead of decreasing it.
-        const lastEntry = await tx.vendorLedger.findFirst({
-          where: { vendorId: existing.vendorId },
-          orderBy: { createdAt: 'desc' }
-        });
-        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-        const nextBalance = currentBalance - (existing.refundAmount || 0);
+        // NOTE: this must be a DEBIT, not a CREDIT.
+        // We SKIP this for GRN_REJECTION because the rejected quantity was never
+        // included in the Purchase Bill to begin with, so no liability was created.
+        if (existing.returnSource !== 'GRN_REJECTION') {
+          const lastEntry = await tx.vendorLedger.findFirst({
+            where: { vendorId: existing.vendorId },
+            orderBy: { createdAt: 'desc' }
+          });
+          const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+          const nextBalance = currentBalance - (existing.refundAmount || 0);
 
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: existing.vendorId,
-            type: 'DEBIT',
-            amount: existing.refundAmount || 0,
-            balanceAfterTransaction: nextBalance,
-            sourceModule: 'PROCUREMENT',
-            referenceType: 'RETURN',
-            referenceId: id,
-            paymentMode: 'CASH',
-            note: `Purchase Return ${existing.returnNumber} — Liability Reduction`
-          }
-        });
+          await tx.vendorLedger.create({
+            data: {
+              vendorId: existing.vendorId,
+              type: 'DEBIT',
+              amount: existing.refundAmount || 0,
+              balanceAfterTransaction: nextBalance,
+              sourceModule: 'PROCUREMENT',
+              referenceType: 'RETURN',
+              referenceId: id,
+              paymentMode: 'CASH',
+              note: `Purchase Return ${existing.returnNumber} — Liability Reduction`
+            }
+          });
+        }
       }
 
       return tx.purchaseReturn.update({

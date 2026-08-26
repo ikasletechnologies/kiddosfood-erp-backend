@@ -1379,7 +1379,10 @@ model QuotationItem {
 model SalesOrder {
   id              String           @id @default(uuid())
   orderNumber     String           @unique
-  quotationId     String?
+  // One Sales Order per source Estimate — @unique is the DB-level duplicate-
+  // prevention guard for convertQuotationToSalesOrder, so retried/parallel
+  // requests never sneak in a second SO for the same Quotation ID.
+  quotationId     String?          @unique
   // One Proforma Invoice per Sales Order — the @unique is the DB-level
   // duplicate-prevention guard for "Create Proforma Invoice" (see
   // SalesService.convertSalesOrderToProforma), not just an app-level check.
@@ -1520,6 +1523,7 @@ model DeliveryChallan {
   salesOrderId      String?
   franchiseId       String?
   sourceFranchiseId String?
+  sourceInvoiceId   String?
   status            String                @default("DRAFT")
   challanDate       DateTime              @default(now())
   dueDate           DateTime?
@@ -1559,6 +1563,7 @@ model PurchaseReturn {
   procurementOrderId String?
   vendorId           String
   reason             String
+  returnSource       String               @default("MANUAL")
   status             String               @default("PENDING")
   refundAmount       Float
   createdAt          DateTime             @default(now())

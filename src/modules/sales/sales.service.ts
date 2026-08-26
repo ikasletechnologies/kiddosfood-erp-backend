@@ -1016,6 +1016,7 @@ export class SalesService {
     customerId?: string;
     dealerId?: string;
     salesOrderId?: string;
+    sourceInvoiceId?: string;
     franchiseId?: string;
     sourceFranchiseId?: string;
     challanDate?: string;
@@ -1048,6 +1049,7 @@ export class SalesService {
         customerId: data.customerId || null,
         dealerId: data.dealerId || null,
         salesOrderId: data.salesOrderId || null,
+        sourceInvoiceId: data.sourceInvoiceId || null,
         franchiseId: data.franchiseId || null,
         sourceFranchiseId: data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null,
         status: data.status || 'DRAFT',
