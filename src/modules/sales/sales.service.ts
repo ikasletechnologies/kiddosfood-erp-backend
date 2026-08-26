@@ -535,10 +535,15 @@ export class SalesService {
   }
 
   static async getSalesOrderById(id: string) {
-    return prisma.salesOrder.findUnique({
+    const order = await prisma.salesOrder.findUnique({
       where: { id },
-      include: { customer: true, items: true, returns: true, quotation: true }
+      include: { customer: true, items: true, returns: true }
     });
+    if (order?.quotationId) {
+      const quotation = await prisma.quotation.findUnique({ where: { id: order.quotationId } });
+      return { ...order, quotation };
+    }
+    return order;
   }
 
   static async createSalesOrder(data: {

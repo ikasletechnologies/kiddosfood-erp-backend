@@ -4,7 +4,7 @@ import prisma from "../lib/prisma";
 async function runTests() {
   console.log("Setting up test data...");
   const vendor = await prisma.vendor.findFirst() || await prisma.vendor.create({
-    data: { name: "Test Vendor", email: "vendor@test.com", phone: "1234567890", address: "123 Test St", balance: 0 }
+    data: { name: "Test Vendor", email: "vendor@test.com", contact: "1234567890", address: "123 Test St" }
   });
 
   const materialWeight = await prisma.inventoryItem.create({
