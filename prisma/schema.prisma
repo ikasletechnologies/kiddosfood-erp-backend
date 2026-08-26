@@ -1547,11 +1547,22 @@ model DeliveryChallan {
   subTotal          Float                 @default(0)
   taxAmount         Float                 @default(0)
   totalAmount       Float                 @default(0)
+  // One key per "Save Challan"/"Dispatch" submission — a retry/double-click
+  // returns the existing record instead of creating a second one. Mirrors
+  // Payment.idempotencyKey / SalesOrder.idempotencyKey.
+  idempotencyKey    String?               @unique
+  // Delivery confirmation — captured by the explicit "Mark Delivered"
+  // action (SalesService.markChallanDelivered), distinct from a generic
+  // status PATCH so these are never left blank on a CLOSED challan.
+  receivedBy        String?
+  deliveredAt       DateTime?
+  podReference      String?
   createdAt         DateTime              @default(now())
   updatedAt         DateTime              @updatedAt
   customer          Customer?             @relation(fields: [customerId], references: [id])
   dealer            Dealer?               @relation(fields: [dealerId], references: [id])
   items             DeliveryChallanItem[]
+  returns           DeliveryChallanReturn[]
 }
 
 model DeliveryChallanItem {
@@ -1567,6 +1578,46 @@ model DeliveryChallanItem {
   taxAmount   Float           @default(0)
   totalAmount Float           @default(0)
   challan     DeliveryChallan @relation(fields: [challanId], references: [id])
+  returns     DeliveryChallanReturnItem[]
+}
+
+// Physical goods returned against an already-dispatched Delivery Challan.
+// Deliberately separate from the DC itself (never edits the original
+// dispatched quantity — see SalesService.createDeliveryChallanReturn) and
+// from the financial Sales Return/Credit Note workflow (physical goods
+// movement vs. financial adjustment are different concepts; see
+// ReturnOrder for the sales-return side).
+model DeliveryChallanReturn {
+  id           String                    @id @default(uuid())
+  returnNumber String                    @unique
+  challanId    String
+  reason       String
+  otherReason  String?
+  status       String                    @default("PENDING") // PENDING -> RECEIVED
+  createdBy    String?
+  // Mirrors DeliveryChallan.idempotencyKey — a retry/double-click on
+  // "Create Return" returns the existing return instead of a second one.
+  idempotencyKey String?                 @unique
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+  challan      DeliveryChallan           @relation(fields: [challanId], references: [id])
+  items        DeliveryChallanReturnItem[]
+}
+
+model DeliveryChallanReturnItem {
+  id             String                @id @default(uuid())
+  returnId       String
+  challanItemId  String
+  productId      String?
+  productName    String
+  quantity       Float
+  unit           String                @default("NONE")
+  // Set at warehouse receipt time (RECEIVED), null while PENDING — a
+  // return is created the moment the party hands goods back, but its
+  // stock disposition isn't known until QC classifies the condition.
+  condition      String?               // GOOD | DAMAGED | EXPIRED | REJECTED | QUARANTINE
+  return         DeliveryChallanReturn @relation(fields: [returnId], references: [id])
+  challanItem    DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
 }
 
 model PurchaseReturn {
@@ -1923,6 +1974,12 @@ enum StockMovementType {
   ADJUSTMENT
   RETURN_OUT
   RECALL_RETURN_IN
+  // Delivery Challan return received in DAMAGED/EXPIRED/REJECTED/QUARANTINE
+  // condition — logged for traceability but deliberately does NOT call
+  // InventoryService.stockIn, so it never inflates available stock (see
+  // SalesService.receiveDeliveryChallanReturn). GOOD-condition returns use
+  // the existing RETURN_OUT's inverse via a normal stockIn instead.
+  RETURN_QUARANTINE_IN
 }
 
 enum GRNStatus {

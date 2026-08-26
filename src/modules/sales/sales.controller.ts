@@ -255,21 +255,89 @@ export class SalesController {
     }
   }
 
+  // Business-rule rejections (dedup checks, stock/quantity guards, invalid
+  // transitions) are client-fixable — 400, not 500 — so the frontend shows
+  // the actual message instead of a generic failure toast.
+  private static isDcBusinessError(message: string): boolean {
+    return /can only have one destination|not found|Cannot dispatch|Cannot return|Cannot change status|remains undispatched|Insufficient approved stock|Select at least one item|must be greater than zero|Dispatched .* already returned|hasn't dispatched yet|Only an IN_TRANSIT/i.test(message);
+  }
+
   static async createDeliveryChallan(req: Request, res: Response) {
     try {
-      const challan = await SalesService.createDeliveryChallan(req.body);
+      const userId = (req as any).user?.userId || 'system';
+      const challan = await SalesService.createDeliveryChallan(req.body, userId);
       res.status(201).json(challan);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
     }
   }
 
   static async updateDeliveryChallan(req: Request, res: Response) {
     try {
-      const challan = await SalesService.updateDeliveryChallan(req.params.id, req.body);
+      const userId = (req as any).user?.userId || 'system';
+      const challan = await SalesService.updateDeliveryChallan(req.params.id, req.body, userId);
       res.json(challan);
     } catch (error) {
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
+    }
+  }
+
+  static async markDeliveryChallanDelivered(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user?.userId || 'system';
+      const challan = await SalesService.markChallanDelivered(req.params.id, req.body, userId);
+      res.json(challan);
+    } catch (error) {
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
+    }
+  }
+
+  static async getTransitStock(req: Request, res: Response) {
+    try {
+      res.json(await SalesService.getTransitStock());
+    } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getDispatchTracking(req: Request, res: Response) {
+    try {
+      res.json(await SalesService.getDispatchTracking({ status: req.query.status as string }));
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getDeliveryChallanReturns(req: Request, res: Response) {
+    try {
+      res.json(await SalesService.getDeliveryChallanReturns({ challanId: req.query.challanId as string }));
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async createDeliveryChallanReturn(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user?.userId || 'system';
+      const ret = await SalesService.createDeliveryChallanReturn(req.body, userId);
+      res.status(201).json(ret);
+    } catch (error) {
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
+    }
+  }
+
+  static async receiveDeliveryChallanReturn(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user?.userId || 'system';
+      const ret = await SalesService.receiveDeliveryChallanReturn(req.params.id, req.body.itemConditions || [], userId);
+      res.json(ret);
+    } catch (error) {
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
     }
   }
 

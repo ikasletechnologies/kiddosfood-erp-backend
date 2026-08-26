@@ -668,6 +668,14 @@ app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMI
 app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallan);
 app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallan);
 app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateDeliveryChallan);
+app.post('/api/sales/delivery-challans/:id/deliver', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.markDeliveryChallanDelivered);
+
+app.get('/api/sales/transit-stock', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getTransitStock);
+app.get('/api/sales/dispatch-tracking', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDispatchTracking);
+
+app.get('/api/sales/delivery-challan-returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallanReturns);
+app.post('/api/sales/delivery-challan-returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallanReturn);
+app.post('/api/sales/delivery-challan-returns/:id/receive', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.receiveDeliveryChallanReturn);
 
 // ─── Purchase Module (RFQ & Returns) ─────────────────────────────────────────
 app.get('/api/purchase/rfqs', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getRFQs);

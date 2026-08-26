@@ -1098,8 +1098,37 @@ export class SalesService {
   static async getDeliveryChallanById(id: string) {
     return prisma.deliveryChallan.findUnique({
       where: { id },
-      include: { customer: true, dealer: true, items: true }
+      include: { customer: true, dealer: true, items: true, returns: { include: { items: true } } }
     });
+  }
+
+  // Invoice Qty vs Dispatch Qty (see schema comment on DeliveryChallan) —
+  // sums quantity already committed to OTHER non-cancelled DCs against the
+  // same source Tax Invoice, per product, so a second/third partial
+  // dispatch can never push the cumulative total past what was invoiced.
+  private static async getRemainingInvoiceQty(sourceInvoiceId: string, excludeChallanId?: string): Promise<Record<string, { invoiceQty: number; dispatchedQty: number; remaining: number }>> {
+    const order = await prisma.order.findUnique({ where: { id: sourceInvoiceId }, include: { orderItems: true } });
+    if (!order) throw new Error('Source Tax Invoice not found.');
+
+    const otherChallans = await prisma.deliveryChallan.findMany({
+      where: { sourceInvoiceId, status: { not: 'CANCELLED' }, ...(excludeChallanId ? { id: { not: excludeChallanId } } : {}) },
+      include: { items: true }
+    });
+
+    const dispatchedByProduct: Record<string, number> = {};
+    for (const dc of otherChallans) {
+      for (const item of dc.items) {
+        if (!item.productId) continue;
+        dispatchedByProduct[item.productId] = (dispatchedByProduct[item.productId] || 0) + item.quantity;
+      }
+    }
+
+    const result: Record<string, { invoiceQty: number; dispatchedQty: number; remaining: number }> = {};
+    for (const oi of order.orderItems) {
+      const dispatchedQty = dispatchedByProduct[oi.productId] || 0;
+      result[oi.productId] = { invoiceQty: oi.quantity, dispatchedQty, remaining: Math.max(0, oi.quantity - dispatchedQty) };
+    }
+    return result;
   }
 
   static async createDeliveryChallan(data: {
@@ -1118,119 +1147,481 @@ export class SalesService {
     notes?: string;
     termsConditions?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number; batchNumber?: string }>;
+    idempotencyKey?: string;
   }, userId: string = 'system') {
+    // A retry/double-click/API re-entry with the same key returns the
+    // already-created Challan instead of posting a second one — the DC has
+    // no source document to naturally dedup against (unlike Estimate->SO).
+    if (data.idempotencyKey) {
+      const existing = await prisma.deliveryChallan.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { customer: true, dealer: true, items: true } });
+      if (existing) return existing;
+    }
+
     SalesService.assertSingleDestination(data.customerId, data.dealerId, data.franchiseId);
     if (data.dealerId) {
       const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
       if (!dealer) throw new Error('Selected dealer not found.');
     }
 
+    // Invoice Qty vs Dispatch Qty: only enforced going IN_TRANSIT (a DRAFT
+    // is just a plan and may still change) and only for source-invoice-
+    // linked challans (a DIRECT challan has no invoice qty to cap against).
+    if (data.sourceInvoiceId && data.status === 'IN_TRANSIT') {
+      const remaining = await SalesService.getRemainingInvoiceQty(data.sourceInvoiceId);
+      for (const item of data.items) {
+        if (!item.productId) continue;
+        const r = remaining[item.productId];
+        if (!r) continue; // item not on the source invoice — allow (e.g. a substitute), don't block
+        if (item.quantity > r.remaining + 0.001) {
+          throw new Error(`Cannot dispatch ${item.quantity} of "${item.productName}" — only ${r.remaining} remains undispatched (Invoice Qty ${r.invoiceQty}, already dispatched ${r.dispatchedQty}).`);
+        }
+      }
+    }
+
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(
       data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 }))
     );
 
-    // Generate sequential challan number from DB count
-    const count = await prisma.deliveryChallan.count();
-    const challanNumber = `DC-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`;
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const challanNumber = await nextDocumentNumber(tx, 'DC', 'DC');
 
-    const newChallan = await prisma.deliveryChallan.create({
-      data: {
-        challanNumber,
-        customerId: data.customerId || null,
-        dealerId: data.dealerId || null,
-        salesOrderId: data.salesOrderId || null,
-        sourceInvoiceId: data.sourceInvoiceId || null,
-        franchiseId: data.franchiseId || null,
-        sourceFranchiseId: data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null,
-        status: data.status || 'DRAFT',
-        challanDate: data.challanDate ? new Date(data.challanDate) : new Date(),
-        dueDate: data.dueDate ? new Date(data.dueDate) : null,
-        vehicleNo: data.vehicleNo || null,
-        driverName: data.driverName || null,
-        stateOfSupply: data.stateOfSupply || null,
-        notes: data.notes || null,
-        termsConditions: data.termsConditions || null,
-        subTotal,
-        taxAmount,
-        totalAmount,
-        items: {
-          create: computed.map((i) => ({
-            productId: i.productId || null,
-            productName: i.productName,
-            batchNumber: (i as any).batchNumber || null,
-            quantity: i.quantity,
-            unit: i.unit || 'NONE',
-            rate: i.rate,
-            taxPercent: i.taxPercent || 0,
-            taxAmount: i.taxAmount,
-            totalAmount: i.totalAmount
-          }))
+        const newChallan = await tx.deliveryChallan.create({
+          data: {
+            challanNumber,
+            idempotencyKey: data.idempotencyKey || undefined,
+            customerId: data.customerId || null,
+            dealerId: data.dealerId || null,
+            salesOrderId: data.salesOrderId || null,
+            sourceInvoiceId: data.sourceInvoiceId || null,
+            franchiseId: data.franchiseId || null,
+            sourceFranchiseId: data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null,
+            status: data.status || 'DRAFT',
+            challanDate: data.challanDate ? new Date(data.challanDate) : new Date(),
+            dueDate: data.dueDate ? new Date(data.dueDate) : null,
+            vehicleNo: data.vehicleNo || null,
+            driverName: data.driverName || null,
+            stateOfSupply: data.stateOfSupply || null,
+            notes: data.notes || null,
+            termsConditions: data.termsConditions || null,
+            subTotal,
+            taxAmount,
+            totalAmount,
+            items: {
+              create: computed.map((i) => ({
+                productId: i.productId || null,
+                productName: i.productName,
+                batchNumber: (i as any).batchNumber || null,
+                quantity: i.quantity,
+                unit: i.unit || 'NONE',
+                rate: i.rate,
+                taxPercent: i.taxPercent || 0,
+                taxAmount: i.taxAmount,
+                totalAmount: i.totalAmount
+              }))
+            }
+          },
+          include: { customer: true, dealer: true, items: true }
+        });
+
+        if (newChallan.status === 'IN_TRANSIT') {
+          await SalesService.dispatchChallanStock(newChallan, userId, tx);
         }
-      },
-      include: { customer: true, dealer: true, items: true }
-    });
 
-    if (newChallan.status === 'IN_TRANSIT') {
-      await SalesService.dispatchChallanStock(newChallan, userId);
+        return newChallan;
+      });
+    } catch (err: any) {
+      if (data.idempotencyKey && err?.code === 'P2002') {
+        const winner = await prisma.deliveryChallan.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { customer: true, dealer: true, items: true } });
+        if (winner) return winner;
+      }
+      throw err;
     }
-
-    return newChallan;
   }
 
   static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string; customerId?: string | null; dealerId?: string | null; franchiseId?: string | null }, userId: string = 'system') {
-    const currentChallan = await prisma.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
-    if (!currentChallan) throw new Error('Delivery challan not found');
+    return prisma.$transaction(async (tx) => {
+      const currentChallan = await tx.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
+      if (!currentChallan) throw new Error('Delivery challan not found');
 
-    // Legacy rows/clients may still send/hold 'OPEN' — treat it as IN_TRANSIT
-    const currentStatus = currentChallan.status === 'OPEN' ? 'IN_TRANSIT' : currentChallan.status;
-    if (data.status === 'OPEN') data.status = 'IN_TRANSIT';
+      // Legacy rows/clients may still send/hold 'OPEN' — treat it as IN_TRANSIT
+      const currentStatus = currentChallan.status === 'OPEN' ? 'IN_TRANSIT' : currentChallan.status;
+      if (data.status === 'OPEN') data.status = 'IN_TRANSIT';
 
-    // Block moving away from CLOSED once delivered
-    if (currentStatus === 'CLOSED' && data.status && data.status !== 'CLOSED') {
-      throw new Error('Cannot change status of a closed delivery challan');
-    }
+      // Idempotent no-op: repeat "Dispatch"/"Mark Delivered" clicks land here
+      // with the SAME target status as the current one — status validation
+      // below would otherwise reject e.g. IN_TRANSIT -> IN_TRANSIT, but a
+      // duplicate click must be a harmless no-op, not an error toast.
+      if (data.status && data.status === currentStatus) {
+        return tx.deliveryChallan.findUnique({ where: { id }, include: { customer: true, dealer: true, items: true } });
+      }
 
-    if ('customerId' in data || 'dealerId' in data || 'franchiseId' in data) {
-      SalesService.assertSingleDestination(
-        'customerId' in data ? data.customerId : currentChallan.customerId,
-        'dealerId' in data ? data.dealerId : currentChallan.dealerId,
-        'franchiseId' in data ? data.franchiseId : currentChallan.franchiseId
-      );
-      if (data.dealerId) {
-        const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
-        if (!dealer) throw new Error('Selected dealer not found.');
+      // Block moving away from CLOSED once delivered
+      if (currentStatus === 'CLOSED' && data.status && data.status !== 'CLOSED') {
+        throw new Error('Cannot change status of a closed delivery challan');
+      }
+
+      if ('customerId' in data || 'dealerId' in data || 'franchiseId' in data) {
+        SalesService.assertSingleDestination(
+          'customerId' in data ? data.customerId : currentChallan.customerId,
+          'dealerId' in data ? data.dealerId : currentChallan.dealerId,
+          'franchiseId' in data ? data.franchiseId : currentChallan.franchiseId
+        );
+        if (data.dealerId) {
+          const dealer = await tx.dealer.findUnique({ where: { id: data.dealerId } });
+          if (!dealer) throw new Error('Selected dealer not found.');
+        }
+      }
+
+      // Invoice Qty vs Dispatch Qty guard also applies to Draft -> Dispatch
+      // (createDeliveryChallan only checks it for a challan created
+      // already-IN_TRANSIT — most challans start DRAFT then dispatch later).
+      if (currentChallan.sourceInvoiceId && currentStatus === 'DRAFT' && data.status === 'IN_TRANSIT') {
+        const remaining = await SalesService.getRemainingInvoiceQty(currentChallan.sourceInvoiceId, id);
+        for (const item of currentChallan.items) {
+          if (!item.productId) continue;
+          const r = remaining[item.productId];
+          if (!r) continue;
+          if (item.quantity > r.remaining + 0.001) {
+            throw new Error(`Cannot dispatch ${item.quantity} of "${item.productName}" — only ${r.remaining} remains undispatched (Invoice Qty ${r.invoiceQty}, already dispatched ${r.dispatchedQty}).`);
+          }
+        }
+      }
+
+      const updated = await tx.deliveryChallan.update({ where: { id }, data, include: { customer: true, dealer: true, items: true } });
+
+      // Handle Stock Transitions
+      if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT') {
+        await SalesService.dispatchChallanStock(updated, userId, tx);
+      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED') {
+        await SalesService.receiveChallanStock(updated, userId, tx);
+      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED') {
+        await SalesService.reverseChallanStock(updated, userId, tx);
+      }
+
+      return updated;
+    }, { timeout: 20000 });
+  }
+
+  // Explicit delivery confirmation — separate from a generic status PATCH so
+  // receivedBy/deliveredAt/podReference are never left blank on a CLOSED
+  // challan, and a repeat click is a safe no-op (already CLOSED -> return
+  // as-is) rather than a second stock receipt.
+  static async markChallanDelivered(id: string, data: { receivedBy?: string; deliveredAt?: string; podReference?: string }, userId: string = 'system') {
+    return prisma.$transaction(async (tx) => {
+      const currentChallan = await tx.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
+      if (!currentChallan) throw new Error('Delivery challan not found');
+      const currentStatus = currentChallan.status === 'OPEN' ? 'IN_TRANSIT' : currentChallan.status;
+
+      if (currentStatus === 'CLOSED') {
+        return tx.deliveryChallan.findUnique({ where: { id }, include: { customer: true, dealer: true, items: true } });
+      }
+      if (currentStatus !== 'IN_TRANSIT') {
+        throw new Error(`Only an IN_TRANSIT delivery challan can be marked Delivered (current status: ${currentStatus}).`);
+      }
+
+      const updated = await tx.deliveryChallan.update({
+        where: { id },
+        data: {
+          status: 'CLOSED',
+          receivedBy: data.receivedBy || null,
+          deliveredAt: data.deliveredAt ? new Date(data.deliveredAt) : new Date(),
+          podReference: data.podReference || null,
+        },
+        include: { customer: true, dealer: true, items: true }
+      });
+
+      await SalesService.receiveChallanStock(updated, userId, tx);
+      return updated;
+    }, { timeout: 20000 });
+  }
+
+  // Transit Stock — deliberately not its own table (see schema comment):
+  // derived read of every IN_TRANSIT challan, exploded per item, with the
+  // fields the Transit Stock view needs. "Warehouse" here is the source
+  // franchise's primary warehouse — see InventoryService.computeWarehouseStock
+  // for the same franchise<->warehouse attribution used for stock reports.
+  // Real UOM source of truth, in priority order: the DC line's own unit (if
+  // actually set to something other than the placeholder default) -> the
+  // dispatching franchise's InventoryItem for that SKU -> "NONE" only if
+  // truly nothing else is known. Fixes the "10 NONE" display bug, which
+  // came from trusting DeliveryChallanItem.unit's schema default blindly.
+  private static async resolveDisplayUnit(item: { unit: string; productId: string | null }, sourceFranchiseId: string | null): Promise<string> {
+    if (item.unit && item.unit !== 'NONE') return item.unit;
+    if (!item.productId || !sourceFranchiseId) return item.unit || 'NONE';
+    const product = await prisma.product.findUnique({ where: { id: item.productId }, select: { sku: true } });
+    if (!product?.sku) return item.unit || 'NONE';
+    const invItem = await prisma.inventoryItem.findFirst({ where: { franchiseId: sourceFranchiseId, sku: product.sku }, select: { unit: true } });
+    return invItem?.unit || item.unit || 'NONE';
+  }
+
+  private static resolvePartyType(dc: { customerId: string | null; dealerId: string | null; franchiseId: string | null }): string {
+    return dc.customerId ? 'CUSTOMER' : dc.dealerId ? 'DEALER' : dc.franchiseId ? 'FRANCHISE' : 'UNKNOWN';
+  }
+
+  static async getTransitStock() {
+    const challans = await prisma.deliveryChallan.findMany({
+      where: { status: 'IN_TRANSIT' },
+      include: { customer: true, dealer: true, items: true },
+      orderBy: { challanDate: 'desc' }
+    });
+
+    const franchiseIds = [...new Set([
+      ...challans.map(c => c.sourceFranchiseId),
+      ...challans.map(c => c.franchiseId),
+    ].filter(Boolean))] as string[];
+    const franchises = franchiseIds.length
+      ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } }, include: { primaryWarehouse: true } })
+      : [];
+    const franchiseById = new Map(franchises.map(f => [f.id, f]));
+
+    const rows: any[] = [];
+    for (const dc of challans) {
+      const partyType = SalesService.resolvePartyType(dc);
+      const partyName = dc.customer?.name || dc.dealer?.name || (dc.franchiseId ? franchiseById.get(dc.franchiseId)?.name : null) || null;
+      const sourceFranchise = dc.sourceFranchiseId ? franchiseById.get(dc.sourceFranchiseId) : null;
+      for (const item of dc.items) {
+        rows.push({
+          challanId: dc.id,
+          challanNumber: dc.challanNumber,
+          sourceDocument: dc.sourceInvoiceId ? 'SALES_INVOICE' : 'DIRECT',
+          sourceInvoiceId: dc.sourceInvoiceId,
+          salesOrderId: dc.salesOrderId,
+          partyType,
+          partyName,
+          franchiseId: dc.franchiseId,
+          sourceFranchiseId: dc.sourceFranchiseId,
+          sourceWarehouseName: sourceFranchise?.primaryWarehouse?.name || sourceFranchise?.name || null,
+          productId: item.productId,
+          productName: item.productName,
+          batchNumber: item.batchNumber,
+          quantity: item.quantity,
+          unit: await SalesService.resolveDisplayUnit(item, dc.sourceFranchiseId),
+          dispatchDate: dc.challanDate,
+          vehicleNo: dc.vehicleNo,
+          driverName: dc.driverName,
+          status: 'IN_TRANSIT',
+        });
       }
     }
+    return rows;
+  }
 
-    const updated = await prisma.deliveryChallan.update({ where: { id }, data, include: { customer: true, dealer: true, items: true } });
+  // Dispatch Tracking — shipment-level (one row per Delivery Challan, not
+  // per item, unlike Transit Stock which is quantity-level). Deliberately
+  // NOT its own table: DeliveryChallan already carries every field this
+  // view needs (status, vehicle, driver, dates, receivedBy/POD), so a
+  // separate DispatchTracking model would just be a duplicate dispatch
+  // record kept in sync by hand. "Dispatch ID" reuses the same DC-YYYY-N
+  // sequence value under a DSP- prefix rather than minting a second
+  // sequence for what is definitionally the same one-to-one shipment.
+  static async getDispatchTracking(filters: { status?: string } = {}) {
+    const challans = await prisma.deliveryChallan.findMany({
+      where: filters.status ? { status: filters.status === 'OPEN' ? 'IN_TRANSIT' : filters.status } : undefined,
+      include: { customer: true, dealer: true, items: true },
+      orderBy: { challanDate: 'desc' }
+    });
 
-    // Handle Stock Transitions
-    if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT') {
-      await SalesService.dispatchChallanStock(updated, userId);
-    } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED') {
-      await SalesService.receiveChallanStock(updated, userId);
-    } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED') {
-      await SalesService.reverseChallanStock(updated, userId);
+    const franchiseIds = [...new Set([
+      ...challans.map(c => c.sourceFranchiseId),
+      ...challans.map(c => c.franchiseId),
+    ].filter(Boolean))] as string[];
+    const franchises = franchiseIds.length
+      ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } } })
+      : [];
+    const franchiseById = new Map(franchises.map(f => [f.id, f]));
+
+    // sourceInvoiceId is an Order.id — resolve the human-readable invoice
+    // number for the ones that have one, in a single batched query.
+    const invoiceIds = [...new Set(challans.map(c => c.sourceInvoiceId).filter(Boolean))] as string[];
+    const orders = invoiceIds.length
+      ? await prisma.order.findMany({ where: { id: { in: invoiceIds } }, select: { id: true, invoiceNum: true } })
+      : [];
+    const invoiceNumById = new Map(orders.map(o => [o.id, o.invoiceNum]));
+
+    return challans.map(dc => {
+      const status = dc.status === 'OPEN' ? 'IN_TRANSIT' : dc.status;
+      const dispatchId = dc.challanNumber.replace(/^DC-/, 'DSP-');
+      const partyType = SalesService.resolvePartyType(dc);
+      const partyName = dc.customer?.name || dc.dealer?.name || (dc.franchiseId ? franchiseById.get(dc.franchiseId)?.name : null) || null;
+      return {
+        dispatchId,
+        challanId: dc.id,
+        challanNumber: dc.challanNumber,
+        sourceInvoiceId: dc.sourceInvoiceId,
+        invoiceNumber: dc.sourceInvoiceId ? invoiceNumById.get(dc.sourceInvoiceId) || null : null,
+        salesOrderId: dc.salesOrderId,
+        partyType,
+        partyName,
+        vehicleNo: dc.vehicleNo,
+        driverName: dc.driverName,
+        dispatchDate: dc.challanDate,
+        expectedDeliveryDate: dc.dueDate,
+        deliveredAt: dc.deliveredAt,
+        receivedBy: dc.receivedBy,
+        podReference: dc.podReference,
+        itemCount: dc.items.length,
+        totalQty: dc.items.reduce((s, i) => s + i.quantity, 0),
+        status,
+      };
+    });
+  }
+
+  // ─── Delivery Challan Returns ─────────────────────────────────────────────
+  // Physical goods return only — never touches Payment/Invoice/Order (see
+  // schema comment on DeliveryChallanReturn). Sections 22-31 of the dispatch
+  // spec: original dispatched quantity is never edited; each return is its
+  // own row, and cumulative returns can never exceed what was dispatched.
+
+  static async getDeliveryChallanReturns(filters: { challanId?: string } = {}) {
+    return prisma.deliveryChallanReturn.findMany({
+      where: filters.challanId ? { challanId: filters.challanId } : undefined,
+      include: { items: true, challan: true },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  static async createDeliveryChallanReturn(data: {
+    challanId: string;
+    reason: string;
+    otherReason?: string;
+    items: Array<{ challanItemId: string; quantity: number }>;
+    idempotencyKey?: string;
+  }, userId: string = 'system') {
+    if (data.idempotencyKey) {
+      const existing = await prisma.deliveryChallanReturn.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { items: true } });
+      if (existing) return existing;
     }
 
-    return updated;
+    const challan = await prisma.deliveryChallan.findUnique({ where: { id: data.challanId }, include: { items: true } });
+    if (!challan) throw new Error('Delivery challan not found.');
+    const status = challan.status === 'OPEN' ? 'IN_TRANSIT' : challan.status;
+    if (status !== 'IN_TRANSIT' && status !== 'CLOSED') {
+      throw new Error(`Cannot return goods from a challan that hasn't dispatched yet (current status: ${status}).`);
+    }
+    if (!data.items.length) throw new Error('Select at least one item to return.');
+
+    // Returnable = dispatched - sum of all previously returned qty for that
+    // exact challan line (across every prior return, PENDING or RECEIVED —
+    // a return already claims the qty the moment it's raised).
+    const priorReturnItems = await prisma.deliveryChallanReturnItem.findMany({
+      where: { challanItemId: { in: data.items.map(i => i.challanItemId) } }
+    });
+    const previouslyReturned: Record<string, number> = {};
+    for (const ri of priorReturnItems) {
+      previouslyReturned[ri.challanItemId] = (previouslyReturned[ri.challanItemId] || 0) + ri.quantity;
+    }
+
+    const itemsToCreate: Array<{ challanItemId: string; productId: string | null; productName: string; quantity: number; unit: string }> = [];
+    for (const reqItem of data.items) {
+      const dcItem = challan.items.find(i => i.id === reqItem.challanItemId);
+      if (!dcItem) throw new Error('Return line does not match any item on this delivery challan.');
+      const already = previouslyReturned[dcItem.id] || 0;
+      const returnable = dcItem.quantity - already;
+      if (reqItem.quantity <= 0) throw new Error(`Return quantity for "${dcItem.productName}" must be greater than zero.`);
+      if (reqItem.quantity > returnable + 0.001) {
+        throw new Error(`Cannot return ${reqItem.quantity} of "${dcItem.productName}" — Dispatched ${dcItem.quantity}, already returned ${already}, returnable ${returnable}.`);
+      }
+      itemsToCreate.push({ challanItemId: dcItem.id, productId: dcItem.productId, productName: dcItem.productName, quantity: reqItem.quantity, unit: dcItem.unit });
+    }
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const returnNumber = await nextDocumentNumber(tx, 'DCR', 'DCR');
+        return tx.deliveryChallanReturn.create({
+          data: {
+            returnNumber,
+            challanId: data.challanId,
+            reason: data.reason,
+            otherReason: data.otherReason || null,
+            status: 'PENDING',
+            createdBy: userId,
+            idempotencyKey: data.idempotencyKey || undefined,
+            items: { create: itemsToCreate }
+          },
+          include: { items: true }
+        });
+      });
+    } catch (err: any) {
+      if (data.idempotencyKey && err?.code === 'P2002') {
+        const winner = await prisma.deliveryChallanReturn.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { items: true } });
+        if (winner) return winner;
+      }
+      throw err;
+    }
+  }
+
+  // Warehouse receipt + condition check (sections 26-28). GOOD goes back
+  // into real available stock via the normal stockIn path; DAMAGED/EXPIRED/
+  // REJECTED/QUARANTINE get a zero-effect ledger row for traceability only
+  // (see RETURN_QUARANTINE_IN on StockMovementType) — deliberately never
+  // calls stockIn for those, so available stock is never silently inflated
+  // by unusable goods.
+  static async receiveDeliveryChallanReturn(returnId: string, itemConditions: Array<{ returnItemId: string; condition: 'GOOD' | 'DAMAGED' | 'EXPIRED' | 'REJECTED' | 'QUARANTINE' }>, userId: string = 'system') {
+    return prisma.$transaction(async (tx) => {
+      const ret = await tx.deliveryChallanReturn.findUnique({ where: { id: returnId }, include: { items: true, challan: true } });
+      if (!ret) throw new Error('Return not found.');
+      if (ret.status === 'RECEIVED') return tx.deliveryChallanReturn.findUnique({ where: { id: returnId }, include: { items: true } }); // idempotent no-op
+
+      const sourceId = ret.challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
+
+      for (const cond of itemConditions) {
+        const item = ret.items.find(i => i.id === cond.returnItemId);
+        if (!item) continue;
+        await tx.deliveryChallanReturnItem.update({ where: { id: item.id }, data: { condition: cond.condition } });
+        if (!item.productId || !sourceId) continue;
+
+        const product = await tx.product.findUnique({ where: { id: item.productId } });
+        if (!product || !product.sku) continue;
+        const sourceItem = await tx.inventoryItem.findFirst({ where: { franchiseId: sourceId, sku: product.sku } });
+        if (!sourceItem) continue;
+
+        if (cond.condition === 'GOOD') {
+          await InventoryService.stockIn({
+            itemId: sourceItem.id,
+            quantity: item.quantity,
+            referenceType: 'DELIVERY_CHALLAN_RETURN',
+            referenceId: ret.id,
+            note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
+            userId
+          }, tx as any);
+        } else {
+          // Traceable, zero-effect-on-available-stock ledger entry — see
+          // the RETURN_QUARANTINE_IN comment on the enum.
+          await tx.stockMovement.create({
+            data: {
+              itemId: sourceItem.id,
+              movementType: 'RETURN_QUARANTINE_IN',
+              quantity: item.quantity,
+              baseQty: 0,
+              referenceType: 'DELIVERY_CHALLAN_RETURN',
+              referenceId: ret.id,
+              note: `Received ${cond.condition} condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber}) — not added to available stock`,
+              createdBy: userId,
+            }
+          });
+        }
+      }
+
+      return tx.deliveryChallanReturn.update({ where: { id: returnId }, data: { status: 'RECEIVED' }, include: { items: true } });
+    }, { timeout: 20000 });
   }
 
   // --- Helper Stock Movement methods for DC ---
-  
-  private static async dispatchChallanStock(challan: any, userId: string) {
+
+  private static async dispatchChallanStock(challan: any, userId: string, tx: any = prisma) {
     const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
     if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to dispatch from
     for (const item of challan.items) {
       if (!item.productId) continue;
-      
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+
+      const product = await tx.product.findUnique({ where: { id: item.productId } });
       if (!product || !product.sku) continue;
-      
-      const sourceItem = await prisma.inventoryItem.findFirst({
+
+      const sourceItem = await tx.inventoryItem.findFirst({
         where: { franchiseId: sourceId, sku: product.sku }
       });
-      
+
       if (sourceItem) {
         await InventoryService.stockOut({
           itemId: sourceItem.id,
@@ -1238,26 +1629,30 @@ export class SalesService {
           referenceType: 'DELIVERY_CHALLAN',
           referenceId: challan.id,
           note: `Dispatched DC ${challan.challanNumber}`,
-          userId
-        }, prisma as any);
+          userId,
+          // Backend-enforced availability check (section 12) — without
+          // this, FIFO depletion silently under-fulfills past whatever
+          // stock actually exists instead of rejecting the dispatch.
+          strictFIFO: true,
+        }, tx as any);
       }
     }
   }
 
-  private static async receiveChallanStock(challan: any, userId: string) {
-    if (!challan.franchiseId) return; // if sent to customer directly, no receipt stock to handle
+  private static async receiveChallanStock(challan: any, userId: string, tx: any = prisma) {
+    if (!challan.franchiseId) return; // if sent to customer/dealer directly, no receipt stock to handle (see section 21)
 
     for (const item of challan.items) {
       if (!item.productId) continue;
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      const product = await tx.product.findUnique({ where: { id: item.productId } });
       if (!product || !product.sku) continue;
 
-      let targetItem = await prisma.inventoryItem.findFirst({
+      let targetItem = await tx.inventoryItem.findFirst({
         where: { franchiseId: challan.franchiseId, sku: product.sku }
       });
 
       if (!targetItem) {
-        targetItem = await prisma.inventoryItem.create({
+        targetItem = await tx.inventoryItem.create({
           data: {
             franchiseId: challan.franchiseId,
             sku: product.sku,
@@ -1277,23 +1672,23 @@ export class SalesService {
         referenceId: challan.id,
         note: `Received DC ${challan.challanNumber}`,
         userId
-      }, prisma as any);
+      }, tx as any);
     }
   }
 
-  private static async reverseChallanStock(challan: any, userId: string) {
+  private static async reverseChallanStock(challan: any, userId: string, tx: any = prisma) {
     const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
     if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to reverse against
     for (const item of challan.items) {
       if (!item.productId) continue;
-      
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+
+      const product = await tx.product.findUnique({ where: { id: item.productId } });
       if (!product || !product.sku) continue;
-      
-      const sourceItem = await prisma.inventoryItem.findFirst({
+
+      const sourceItem = await tx.inventoryItem.findFirst({
         where: { franchiseId: sourceId, sku: product.sku }
       });
-      
+
       if (sourceItem) {
         await InventoryService.stockIn({
           itemId: sourceItem.id,
@@ -1302,7 +1697,7 @@ export class SalesService {
           referenceId: challan.id,
           note: `Reversed DC ${challan.challanNumber}`,
           userId
-        }, prisma as any);
+        }, tx as any);
       }
     }
   }
