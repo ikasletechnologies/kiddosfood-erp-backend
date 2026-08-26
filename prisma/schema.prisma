@@ -909,6 +909,8 @@ model StockTransferItem {
 model Order {
   id                 String        @id @default(uuid())
   invoiceNum         String        @unique
+  partyType          PartyType?
+  partyId            String?
   customerId         String?
   branchId           String?
   franchiseId        String
@@ -1431,6 +1433,8 @@ model ProformaInvoice {
   id                 String                @id @default(uuid())
   proformaNumber     String                @unique
   sourceSalesOrderId String?               @unique
+  partyType          PartyType?
+  partyId            String?
   customerId         String?
   customerName       String?
   customerPhone      String?

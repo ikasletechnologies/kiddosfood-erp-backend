@@ -652,6 +652,9 @@ app.post('/api/sales/orders/:id/convert', authenticate, authorizeRole(['FRANCHIS
 
 app.get('/api/sales/proforma-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getProformaInvoices);
 app.get('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getProformaInvoice);
+app.post('/api/sales/proforma-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createProformaInvoice);
+app.put('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaInvoice);
+app.put('/api/sales/proforma-invoices/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaStatus);
 app.post('/api/sales/proforma-invoices/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertProformaInvoice);
 
 app.get('/api/sales/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getReturnOrders);

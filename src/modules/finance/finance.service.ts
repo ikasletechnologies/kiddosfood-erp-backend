@@ -1184,7 +1184,9 @@ export class FinanceService {
 
   static async createInvoice(data: {
     franchiseId: string;
-    customerId: string;
+    partyType?: string;
+    partyId?: string;
+    customerId?: string;
     items: {
       productId: string;
       qty: number;
@@ -1278,6 +1280,8 @@ export class FinanceService {
       const order = await tx.order.create({
         data: {
           invoiceNum,
+          partyType: (data.partyType || 'CUSTOMER') as any,
+          partyId: data.partyId,
           customerId: data.customerId,
           franchiseId: data.franchiseId,
           orderType: 'DINE_IN',
@@ -1358,30 +1362,32 @@ export class FinanceService {
         }
       }
 
-      await tx.customerLedger.create({
-        data: {
-          customerId: data.customerId,
-          type: 'DEBIT',
-          amount: totalAmount,
-          paymentMode: data.paymentMode || 'CASH',
-          referenceType: 'SALE',
-          referenceId: order.id,
-          note: `Tax Invoice Created — Invoice #${invoiceNum}`
-        }
-      });
-
-      if (received > 0) {
+      if (data.customerId) {
         await tx.customerLedger.create({
           data: {
             customerId: data.customerId,
-            type: 'CREDIT',
-            amount: received,
+            type: 'DEBIT',
+            amount: totalAmount,
             paymentMode: data.paymentMode || 'CASH',
-            referenceType: 'PAYMENT',
+            referenceType: 'SALE',
             referenceId: order.id,
-            note: `Payment Received for Invoice #${invoiceNum}`
+            note: `Tax Invoice Created — Invoice #${invoiceNum}`
           }
         });
+
+        if (received > 0) {
+          await tx.customerLedger.create({
+            data: {
+              customerId: data.customerId,
+              type: 'CREDIT',
+              amount: received,
+              paymentMode: data.paymentMode || 'CASH',
+              referenceType: 'PAYMENT',
+              referenceId: order.id,
+              note: `Payment Received for Invoice #${invoiceNum}`
+            }
+          });
+        }
       }
 
       // Automatically deduct inventory based on the items sold

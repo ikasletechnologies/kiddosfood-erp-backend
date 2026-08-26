@@ -160,6 +160,36 @@ export class SalesController {
     }
   }
 
+  static async createProformaInvoice(req: Request, res: Response) {
+    try {
+      const data = { ...req.body, createdBy: (req as any).user?.userId };
+      const proforma = await SalesService.createProformaInvoice(data);
+      res.status(201).json(proforma);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async updateProformaInvoice(req: Request, res: Response) {
+    try {
+      const proforma = await SalesService.updateProformaInvoice(req.params.id, req.body);
+      res.json(proforma);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async updateProformaStatus(req: Request, res: Response) {
+    try {
+      const { status } = req.body;
+      if (!status) return res.status(400).json({ error: 'Status is required' });
+      const proforma = await SalesService.updateProformaStatus(req.params.id, status);
+      res.json(proforma);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
   // ─── Return Orders ───────────────────────────────────────────────────────────
 
   static async getReturnOrders(req: Request, res: Response) {

@@ -348,6 +348,8 @@ export class SalesService {
         data: {
           proformaNumber: await nextDocumentNumber(tx, 'PI', 'PI'),
           sourceSalesOrderId: salesOrder.id,
+          partyType: salesOrder.partyType,
+          partyId: salesOrder.partyId,
           customerId: salesOrder.customerId,
           customerName: salesOrder.customerName,
           status: 'DRAFT',
@@ -417,9 +419,41 @@ export class SalesService {
     }
 
     return prisma.$transaction(async (tx) => {
+      // Ensure all items have a corresponding Product row since OrderItem
+      // requires a hard relation to Product in the schema. In cases where the
+      // frontend sent an InventoryItem ID, we create a matching Product on the fly.
+      for (const item of proforma.items) {
+        if (!item.productId) continue;
+        const existingProduct = await tx.product.findUnique({ where: { id: item.productId } });
+        if (!existingProduct) {
+          const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
+          if (invItem) {
+            await tx.product.create({
+              data: {
+                id: invItem.id, // Keep exact same ID so the FK succeeds
+                name: invItem.name,
+                sku: invItem.sku,
+                basePrice: invItem.customerPrice || invItem.basePrice || 0,
+                productType: 'FINISHED_GOOD',
+                category: invItem.category,
+                taxPercent: invItem.gstRate || 5,
+                hsnCode: invItem.hsnCode,
+                isActive: true,
+                isVeg: true,
+                is_menu_item: false
+              }
+            });
+          } else {
+            throw new Error(`Item "${item.productName}" is missing a valid mapped Product or InventoryItem.`);
+          }
+        }
+      }
+
       const newOrder = await tx.order.create({
         data: {
           invoiceNum: await nextDocumentNumber(tx, 'INV', 'INV'),
+          partyType: proforma.partyType || 'CUSTOMER',
+          partyId: proforma.partyId,
           customerId: proforma.customerId,
           franchiseId: franchiseId!,
           orderType: 'TAX_INVOICE',
@@ -477,6 +511,130 @@ export class SalesService {
     });
   }
 
+  static async createProformaInvoice(data: {
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId?: string;
+    customerId?: string;
+    customerName?: string;
+    customerPhone?: string;
+    customerEmail?: string;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    discountAmount?: number;
+    paymentTerms?: string;
+    notes?: string;
+    createdBy?: string;
+    proformaNumber?: string;
+    status?: any;
+  }) {
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
+    const discount = data.discountAmount || 0;
+    const partyType = data.partyType || 'CUSTOMER';
+    const customerId = partyType === 'CUSTOMER' ? data.customerId : undefined;
+    const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId, data.customerName) : (data.customerName || undefined);
+
+    return prisma.$transaction(async (tx) => tx.proformaInvoice.create({
+      data: {
+        proformaNumber: data.proformaNumber || await nextDocumentNumber(tx, 'PI', 'PI'),
+        partyType: partyType as any,
+        partyId: data.partyId,
+        customerId,
+        customerName,
+        customerPhone: data.customerPhone,
+        status: data.status || 'DRAFT',
+        subTotal,
+        taxAmount,
+        discountAmount: discount,
+        totalAmount: totalAmount - discount,
+        paymentTerms: data.paymentTerms,
+        notes: data.notes,
+        createdBy: data.createdBy,
+        items: {
+          create: computed.map((item) => ({
+            productId: item.productId,
+            productName: item.productName,
+            quantity: item.quantity,
+            unit: item.unit,
+            rate: item.rate,
+            taxPercent: item.taxPercent,
+            taxAmount: item.taxAmount,
+            totalAmount: item.totalAmount,
+          })),
+        },
+      },
+      include: { items: true, customer: true },
+    }));
+  }
+
+  static async updateProformaInvoice(id: string, data: {
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId?: string;
+    customerId?: string;
+    customerName?: string;
+    customerPhone?: string;
+    customerEmail?: string;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    discountAmount?: number;
+    paymentTerms?: string;
+    notes?: string;
+    status?: any;
+  }) {
+    const existing = await prisma.proformaInvoice.findUnique({ where: { id } });
+    if (!existing) throw new Error('Proforma Invoice not found');
+    if (existing.status !== 'DRAFT') throw new Error(`Cannot update Proforma Invoice in ${existing.status} status`);
+
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
+    const discount = data.discountAmount || 0;
+    const partyType = data.partyType || existing.partyType || 'CUSTOMER';
+    const customerId = partyType === 'CUSTOMER' ? (data.customerId || existing.customerId) : undefined;
+    const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId || undefined, data.customerName) : (data.customerName || undefined);
+
+    return prisma.$transaction(async (tx) => {
+      await tx.proformaInvoiceItem.deleteMany({ where: { proformaInvoiceId: id } });
+
+      return tx.proformaInvoice.update({
+        where: { id },
+        data: {
+          partyType: partyType as any,
+          partyId: data.partyId !== undefined ? data.partyId : existing.partyId,
+          customerId,
+          customerName,
+          customerPhone: data.customerPhone !== undefined ? data.customerPhone : existing.customerPhone,
+          status: data.status || existing.status,
+          subTotal,
+          taxAmount,
+          discountAmount: discount,
+          totalAmount: totalAmount - discount,
+          paymentTerms: data.paymentTerms !== undefined ? data.paymentTerms : existing.paymentTerms,
+          notes: data.notes !== undefined ? data.notes : existing.notes,
+          items: {
+            create: computed.map((item) => ({
+              productId: item.productId,
+              productName: item.productName,
+              quantity: item.quantity,
+              unit: item.unit,
+              rate: item.rate,
+              taxPercent: item.taxPercent,
+              taxAmount: item.taxAmount,
+              totalAmount: item.totalAmount,
+            })),
+          },
+        },
+        include: { items: true, customer: true },
+      });
+    });
+  }
+
+  static async updateProformaStatus(id: string, status: any) {
+    const existing = await prisma.proformaInvoice.findUnique({ where: { id } });
+    if (!existing) throw new Error('Proforma Invoice not found');
+    
+    return prisma.proformaInvoice.update({
+      where: { id },
+      data: { status },
+      include: { items: true, customer: true },
+    });
+  }
+
   static async getProformaInvoices(filters: { status?: string; customerId?: string; search?: string }) {
     const where: any = {};
     if (filters.status) where.status = filters.status;
@@ -487,18 +645,45 @@ export class SalesService {
         { customerName: { contains: filters.search, mode: 'insensitive' } },
       ];
     }
-    return prisma.proformaInvoice.findMany({
+    const results = await prisma.proformaInvoice.findMany({
       where,
       include: { customer: true, items: true },
       orderBy: { createdAt: 'desc' },
     });
+
+    const soIds = results.map((r: any) => r.sourceSalesOrderId).filter(Boolean) as string[];
+    let soMap = new Map<string, string>();
+    if (soIds.length > 0) {
+      const salesOrders = await prisma.salesOrder.findMany({
+        where: { id: { in: soIds } },
+        select: { id: true, orderNumber: true }
+      });
+      soMap = new Map(salesOrders.map(so => [so.id, so.orderNumber]));
+    }
+
+    return results.map((r: any) => ({
+      ...r,
+      sourceSalesOrderNumber: r.sourceSalesOrderId ? soMap.get(r.sourceSalesOrderId) : undefined
+    }));
   }
 
   static async getProformaInvoiceById(id: string) {
-    return prisma.proformaInvoice.findUnique({
+    const proforma = await prisma.proformaInvoice.findUnique({
       where: { id },
       include: { customer: true, items: true },
     });
+
+    if (proforma?.sourceSalesOrderId) {
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: proforma.sourceSalesOrderId },
+        select: { orderNumber: true }
+      });
+      if (so) {
+        (proforma as any).sourceSalesOrderNumber = so.orderNumber;
+      }
+    }
+
+    return proforma;
   }
 
   // ─── Sales Orders ────────────────────────────────────────────────────────────
