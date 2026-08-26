@@ -180,6 +180,21 @@ export class SalesService {
     trackingNumber?: string;
     courierName?: string;
   }) {
+    // Once an Estimate is CONVERTED it has a live Sales Order downstream —
+    // silently rewriting its party/items/status here (e.g. the shared
+    // create-form's autosave-on-back firing against an already-converted
+    // record) would desync the two with nothing to reconcile them. Mirrors
+    // the same guard on updateProformaInvoice. trackingNumber/courierName
+    // stay editable post-conversion (delivery info legitimately changes).
+    const existingForGuard = await prisma.quotation.findUnique({ where: { id } });
+    if (!existingForGuard) throw new Error('Estimate not found.');
+    if (existingForGuard.status === 'CONVERTED') {
+      const trackingOnly = Object.keys(data).every(k => ['trackingNumber', 'courierName'].includes(k) || data[k as keyof typeof data] === undefined);
+      if (!trackingOnly) {
+        throw new Error('Cannot update a converted Estimate — it already has a Sales Order.');
+      }
+    }
+
     const partyType = data.partyType;
     // Same CUSTOMER-only rule as createQuotation — but only override
     // customerId here when the caller actually sent a partyType (a plain
@@ -272,17 +287,21 @@ export class SalesService {
     createdBy: string,
     trackingData?: { trackingNumber?: string; courierName?: string; deliveryDate?: string; deliveryAddress?: string; }
   ) {
-    return prisma.$transaction(async (tx) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
       const quotation = await tx.quotation.findUnique({ where: { id: quotationId }, include: { items: true } });
       if (!quotation) throw new Error('Estimate not found.');
+
+      // Dedup check FIRST, unconditionally — checking it only inside the
+      // `status !== 'SENT'` branch (as this used to) meant that while the
+      // status was still 'SENT' (i.e. two rapid clicks/tabs both read it
+      // before either transaction committed), the existing-order check was
+      // skipped entirely and both could attempt to create a Sales Order.
+      if (quotation.convertedOrderId) {
+        const existing = await tx.salesOrder.findUnique({ where: { id: quotation.convertedOrderId }, include: { items: true } });
+        if (existing) return existing;
+      }
       if (quotation.status !== 'SENT') {
-        if (quotation.status === 'CONVERTED' && quotation.convertedOrderId) {
-          // Already converted — not an error, the caller (controller) turns
-          // this into "return the existing Sales Order" so a duplicate
-          // click never creates a second one.
-          const existing = await tx.salesOrder.findUnique({ where: { id: quotation.convertedOrderId }, include: { items: true } });
-          if (existing) return existing;
-        }
         throw new Error(`Only an Estimate with status SENT can be converted to a Sales Order (current status: ${quotation.status}).`);
       }
 
@@ -328,12 +347,26 @@ export class SalesService {
       });
 
       return salesOrder;
-    });
+      });
+    } catch (err: any) {
+      // True concurrent double-click/multi-tab race backstop — the DB-level
+      // @unique on SalesOrder.quotationId is what actually stops a second
+      // row from persisting; return the winner's row instead of erroring.
+      if (err?.code === 'P2002') {
+        const quotationNow = await prisma.quotation.findUnique({ where: { id: quotationId } });
+        if (quotationNow?.convertedOrderId) {
+          const existing = await prisma.salesOrder.findUnique({ where: { id: quotationNow.convertedOrderId }, include: { items: true } });
+          if (existing) return existing;
+        }
+      }
+      throw err;
+    }
   }
 
   // Sales Order -> Proforma Invoice.
   static async convertSalesOrderToProforma(salesOrderId: string, createdBy: string) {
-    return prisma.$transaction(async (tx) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
       const salesOrder = await tx.salesOrder.findUnique({ where: { id: salesOrderId }, include: { items: true } });
       if (!salesOrder) throw new Error('Sales Order not found.');
       if (salesOrder.proformaInvoiceId) {
@@ -375,13 +408,33 @@ export class SalesService {
         include: { items: true },
       });
 
+      // DRAFT -> CONFIRMED -> PROCESSING is the intended lifecycle: this is
+      // the one meaningful transition point ("this order's Proforma now
+      // exists, fulfillment is underway") — previously PROCESSING was only
+      // ever set two hops downstream (in convertProformaToInvoice, when the
+      // Proforma became a Tax Invoice), which left it looking like an
+      // unexplained, disconnected status in the Sales Order list.
       await tx.salesOrder.update({
         where: { id: salesOrderId },
-        data: { proformaInvoiceId: proforma.id },
+        data: { proformaInvoiceId: proforma.id, status: 'PROCESSING' },
       });
 
       return proforma;
-    });
+      });
+    } catch (err: any) {
+      // True concurrent double-click/multi-tab race backstop — the DB-level
+      // @unique on SalesOrder.proformaInvoiceId is what actually stops a
+      // second row from persisting; return the winner's row instead of
+      // erroring.
+      if (err?.code === 'P2002') {
+        const salesOrderNow = await prisma.salesOrder.findUnique({ where: { id: salesOrderId } });
+        if (salesOrderNow?.proformaInvoiceId) {
+          const existing = await prisma.proformaInvoice.findUnique({ where: { id: salesOrderNow.proformaInvoiceId }, include: { items: true } });
+          if (existing) return existing;
+        }
+      }
+      throw err;
+    }
   }
 
   // Proforma Invoice -> Tax Invoice (Order + Invoice).
@@ -502,12 +555,9 @@ export class SalesService {
         data: { status: 'CONVERTED', convertedInvoiceId: newOrder.id },
       });
 
-      if (sourceSalesOrder) {
-        await tx.salesOrder.update({
-          where: { id: sourceSalesOrder.id },
-          data: { status: 'PROCESSING' },
-        });
-      }
+      // sourceSalesOrder.status is already 'PROCESSING' by this point — set
+      // at Proforma-creation time in convertSalesOrderToProforma, the actual
+      // causal moment for that transition (see comment there).
 
       return newOrder;
       });
@@ -758,13 +808,26 @@ export class SalesService {
     deliveryAddress?: string;
     notes?: string;
     createdBy?: string;
+    idempotencyKey?: string;
   }) {
+    // Unlike convertQuotationToSalesOrder (deduped against its source
+    // Estimate) this is the direct-create path with no source document to
+    // key off — a retry/double-click/API re-entry with the same key must
+    // return the already-created SalesOrder instead of posting a second
+    // one. Mirrors FinanceService.createPayment's idempotencyKey handling.
+    if (data.idempotencyKey) {
+      const existing = await prisma.salesOrder.findUnique({ where: { idempotencyKey: data.idempotencyKey } });
+      if (existing) return existing;
+    }
+
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
 
-    return prisma.$transaction(async (tx) => tx.salesOrder.create({
+    try {
+      return await prisma.$transaction(async (tx) => tx.salesOrder.create({
       data: {
         orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
+        idempotencyKey: data.idempotencyKey || undefined,
         customerId: data.customerId,
         customerName: data.customerName,
         customerPhone: data.customerPhone,
@@ -790,7 +853,17 @@ export class SalesService {
         }
       },
       include: { customer: true, items: true }
-    }));
+      }));
+    } catch (err: any) {
+      // True concurrent double-click race: two requests both passed the
+      // idempotencyKey check above before either committed. The @unique
+      // constraint is the hard backstop — return the winner's row.
+      if (data.idempotencyKey && err?.code === 'P2002') {
+        const winner = await prisma.salesOrder.findUnique({ where: { idempotencyKey: data.idempotencyKey } });
+        if (winner) return winner;
+      }
+      throw err;
+    }
   }
 
   static async updateSalesOrder(id: string, data: any) {

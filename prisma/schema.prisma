@@ -1393,6 +1393,12 @@ model SalesOrder {
   // duplicate-prevention guard for "Create Proforma Invoice" (see
   // SalesService.convertSalesOrderToProforma), not just an app-level check.
   proformaInvoiceId String?        @unique
+  // One key per logical "Save Order" submission from the direct-create form
+  // (createSalesOrder has no source document to dedup against, unlike the
+  // Estimate-convert path above) — a retry/double-click/API re-entry with
+  // the same key returns the existing SalesOrder instead of creating a
+  // second one. Mirrors Payment.idempotencyKey.
+  idempotencyKey  String?          @unique
   // Copied forward from the source Estimate at conversion time — see
   // Quotation.partyType/partyId above for the same generic-party pattern.
   partyType       PartyType        @default(CUSTOMER)
