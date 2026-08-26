@@ -418,7 +418,8 @@ export class SalesService {
       else throw new Error('No active franchise found to assign the invoice.');
     }
 
-    return prisma.$transaction(async (tx) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
       // Ensure all items have a corresponding Product row since OrderItem
       // requires a hard relation to Product in the schema. In cases where the
       // frontend sent an InventoryItem ID, we create a matching Product on the fly.
@@ -455,6 +456,7 @@ export class SalesService {
           partyType: proforma.partyType || 'CUSTOMER',
           partyId: proforma.partyId,
           customerId: proforma.customerId,
+          customerName: proforma.customerName,
           franchiseId: franchiseId!,
           orderType: 'TAX_INVOICE',
           status: 'PENDING',
@@ -508,7 +510,22 @@ export class SalesService {
       }
 
       return newOrder;
-    });
+      });
+    } catch (err: any) {
+      // True concurrent double-click/multi-tab race: two requests both
+      // passed the `if (proforma.convertedInvoiceId)` check above before
+      // either committed. The DB-level @unique on convertedInvoiceId is the
+      // hard backstop — the loser hits P2002 here instead of creating a
+      // second Tax Invoice; return the winner's row instead of erroring.
+      if (err?.code === 'P2002') {
+        const proformaNow = await prisma.proformaInvoice.findUnique({ where: { id: proformaInvoiceId } });
+        if (proformaNow?.convertedInvoiceId) {
+          const existing = await prisma.order.findUnique({ where: { id: proformaNow.convertedInvoiceId }, include: { orderItems: true, invoice: true } });
+          if (existing) return existing;
+        }
+      }
+      throw err;
+    }
   }
 
   static async createProformaInvoice(data: {

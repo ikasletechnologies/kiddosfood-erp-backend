@@ -548,15 +548,43 @@ export class POSService {
   }
 
   static async getOrderById(id: string) {
-    return prisma.order.findUnique({
+    const order = await prisma.order.findUnique({
       where: { id },
-      include: { 
-        orderItems: { include: { product: true } }, 
-        customer: true, 
+      include: {
+        orderItems: { include: { product: true } },
+        customer: true,
         payments: true,
-        franchise: true 
+        franchise: true
       }
     });
+    if (!order) return null;
+
+    // Party name resolution: Order.customerName is a point-in-time snapshot
+    // (see SalesService.convertProformaToInvoice) so Orders created before
+    // that field existed, or a Customer whose name changed since, still need
+    // a live fallback. The `customer` relation above only ever covers
+    // partyType CUSTOMER — DEALER/FRANCHISE have no FK relation on Order.
+    let customerName = order.customerName || order.customer?.name || null;
+    if (!customerName && order.partyId) {
+      if (order.partyType === 'DEALER') {
+        const dealer = await prisma.dealer.findUnique({ where: { id: order.partyId } });
+        customerName = dealer?.name || null;
+      } else if (order.partyType === 'FRANCHISE') {
+        const franchise = await prisma.franchise.findUnique({ where: { id: order.partyId } });
+        customerName = franchise?.name || null;
+      }
+    }
+
+    let sourceProformaNumber: string | null = null;
+    if (order.sourceProformaInvoiceId) {
+      const proforma = await prisma.proformaInvoice.findUnique({
+        where: { id: order.sourceProformaInvoiceId },
+        select: { proformaNumber: true }
+      });
+      sourceProformaNumber = proforma?.proformaNumber || null;
+    }
+
+    return { ...order, customerName, sourceProformaNumber };
   }
 
   static async addPayment(orderId: string, data: any) {

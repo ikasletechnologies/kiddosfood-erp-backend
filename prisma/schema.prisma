@@ -912,6 +912,12 @@ model Order {
   partyType          PartyType?
   partyId            String?
   customerId         String?
+  // Snapshot display name for the party at invoice time — mirrors
+  // Quotation/SalesOrder/ProformaInvoice.customerName. Needed because
+  // Dealer/Franchise parties have no FK relation here (only customerId ->
+  // Customer), so without this the Tax Invoice view has no way to show
+  // who the invoice is for.
+  customerName       String?
   branchId           String?
   franchiseId        String
   orderType          String        @default("DINE_IN")

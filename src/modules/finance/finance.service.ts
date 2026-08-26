@@ -498,6 +498,21 @@ export class FinanceService {
     });
   }
 
+  // entityId is a foreign id into one of several master tables depending on
+  // entityType (CUSTOMER/DEALER/FRANCHISE/VENDOR) — Payment has no FK/relation
+  // for it (it's deliberately generic across modules), so resolving a display
+  // name means a manual per-type lookup instead of an `include`.
+  private static async resolvePartyName(entityType: string | null, entityId: string | null): Promise<string | null> {
+    if (!entityId) return null;
+    switch (entityType) {
+      case 'CUSTOMER': return (await prisma.customer.findUnique({ where: { id: entityId } }))?.name || null;
+      case 'DEALER': return (await prisma.dealer.findUnique({ where: { id: entityId } }))?.name || null;
+      case 'FRANCHISE': return (await prisma.franchise.findUnique({ where: { id: entityId } }))?.name || null;
+      case 'VENDOR': return (await prisma.vendor.findUnique({ where: { id: entityId } }))?.name || null;
+      default: return null;
+    }
+  }
+
   static async getPayments(franchiseId?: string) {
     const payments = await prisma.payment.findMany({
       where: {
@@ -507,22 +522,39 @@ export class FinanceService {
       orderBy: { createdAt: 'desc' }
     });
 
-    return payments.map(p => ({
-      id: p.id,
-      paymentNumber: p.paymentNumber,
-      date: p.createdAt.toISOString(),
-      entity: p.entityId || p.transactionRef || "Manual Entry",
-      flow: p.entityType === 'VENDOR' ? 'OUT' : 'IN',
-      method: p.paymentMode,
-      amount: p.paidAmount,
-      status: p.status,
-      reference: p.transactionRef || "",
-      type: p.type,
-      sourceModule: p.sourceModule,
-      linkedDocType: p.linkedDocType,
-      linkedDocId: p.linkedDocId,
-      isCancelled: p.isCancelled,
-      accountName: p.account?.name || "Unknown",
+    return Promise.all(payments.map(async p => {
+      const partyName = await this.resolvePartyName(p.entityType, p.entityId);
+      return {
+        id: p.id,
+        paymentNumber: p.paymentNumber,
+        // Both naming conventions are kept: `date`/`entity`/`method`/`amount`
+        // for existing consumers (accounting/payments, franchise/payments),
+        // `createdAt`/`paidAmount`/`paymentMode`/`entityId`/`entityType` for
+        // consumers that read the raw Payment field names directly (sales
+        // Payment-In list).
+        date: p.createdAt.toISOString(),
+        createdAt: p.createdAt.toISOString(),
+        entity: partyName || p.transactionRef || "Manual Entry",
+        partyName: partyName,
+        entityId: p.entityId,
+        entityType: p.entityType,
+        flow: p.entityType === 'VENDOR' ? 'OUT' : 'IN',
+        method: p.paymentMode,
+        paymentMode: p.paymentMode,
+        amount: p.paidAmount,
+        paidAmount: p.paidAmount,
+        status: p.status,
+        reference: p.transactionRef || "",
+        type: p.type,
+        sourceModule: p.sourceModule,
+        linkedDocType: p.linkedDocType,
+        linkedDocId: p.linkedDocId,
+        invoiceId: p.invoiceId,
+        orderId: p.order?.id || p.invoice?.orderId || null,
+        invoiceNum: p.order?.invoiceNum || null,
+        isCancelled: p.isCancelled,
+        accountName: p.account?.name || "Unknown",
+      };
     }));
   }
 
@@ -815,7 +847,13 @@ export class FinanceService {
    */
   static async createPayment(data: any) {
     const amount    = parseFloat(data.amount);
-    const flow      = data.flow as 'IN' | 'OUT';       
+    // Server-side backstop for the ₹0/negative payment guard — the frontend
+    // already checks this, but this is the only place that must actually
+    // enforce it, since a client-supplied amount can never be trusted.
+    if (!(amount > 0)) {
+      throw new Error('Invalid payment amount: must be greater than zero.');
+    }
+    const flow      = data.flow as 'IN' | 'OUT';
     const status    = (data.status || 'PAID') as string;
     const sourceId = data.sourceAccount as string;    
     const sourceModule = (data.sourceModule || 'MANUAL');
@@ -900,17 +938,25 @@ export class FinanceService {
       // paid/outstanding split is computed by summing Payment rows (see
       // step 6 below), so a payment that pushes the total past what's owed
       // would silently produce a negative outstanding balance downstream.
-      if (data.invoiceId && flow === 'IN' && status === 'PAID') {
+      // Also resolves the Order this Invoice belongs to — Payment.orderId
+      // is what franchise-scoped queries (FinanceService.getPayments) key
+      // off, so a Payment with invoiceId set but orderId left null would
+      // silently vanish from any franchise-filtered Payments list.
+      let orderIdForInvoice: string | undefined;
+      if (data.invoiceId) {
         const invoiceForGuard = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
         if (!invoiceForGuard) throw new Error('Invoice not found.');
-        const paidSoFar = await tx.payment.aggregate({
-          where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
-          _sum: { paidAmount: true },
-        });
-        const alreadyPaid = paidSoFar._sum.paidAmount || 0;
-        const outstanding = invoiceForGuard.finalAmount - alreadyPaid;
-        if (amount > outstanding + 0.01) {
-          throw new Error(`Payment amount (₹${amount}) exceeds the outstanding balance (₹${outstanding.toFixed(2)}) on this invoice.`);
+        orderIdForInvoice = invoiceForGuard.orderId;
+        if (flow === 'IN' && status === 'PAID') {
+          const paidSoFar = await tx.payment.aggregate({
+            where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
+            _sum: { paidAmount: true },
+          });
+          const alreadyPaid = paidSoFar._sum.paidAmount || 0;
+          const outstanding = invoiceForGuard.finalAmount - alreadyPaid;
+          if (amount > outstanding + 0.01) {
+            throw new Error(`Invalid payment amount: ₹${amount} exceeds the outstanding balance (₹${outstanding.toFixed(2)}) on this invoice.`);
+          }
         }
       }
 
@@ -932,6 +978,7 @@ export class FinanceService {
           linkedDocId:    linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
           invoiceId:      data.invoiceId || undefined,
+          orderId:        data.orderId || orderIdForInvoice || undefined,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       entityId,
           paymentMode:    resolvedPaymentMode as any,
