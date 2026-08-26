@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { ProductService } from './product.service';
+import { ProductService, DuplicateProductError } from './product.service';
 import prisma from '../../lib/prisma';
 import { FranchiseService } from '../franchise/franchise.service';
 
@@ -68,8 +68,30 @@ export class ProductController {
     try {
       const product = await ProductService.create(req.body);
       res.status(201).json(product);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      if (error instanceof DuplicateProductError) {
+        return res.status(400).json({ error: error.message, code: 'DUPLICATE_SKU' });
+      }
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * POST /api/products/bulk-import
+   * Body: { rows: Array<{ category?, name, size?, unit?, gstPercent? }> }
+   * Creates Finished Good catalog entries only — no stock. Never aborts on
+   * a single bad row; returns per-row success/duplicate/invalid buckets.
+   */
+  static async bulkImport(req: Request, res: Response) {
+    try {
+      const rows = req.body?.rows;
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(400).json({ error: 'rows must be a non-empty array' });
+      }
+      const result = await ProductService.bulkCreateFinishedGoods(rows);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
   }
 

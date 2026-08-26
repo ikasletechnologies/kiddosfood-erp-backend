@@ -2,22 +2,65 @@ import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
 import { FranchiseService } from '../franchise/franchise.service';
 
+// Thrown when a Product.sku collides with an existing row — distinguished
+// from other failures so callers (single create + bulk import) can report a
+// clean "already exists" instead of letting the raw Prisma P2002 unique-
+// constraint error surface as an opaque 500.
+export class DuplicateProductError extends Error {
+  sku: string;
+  constructor(sku: string) {
+    super(`A product with SKU "${sku}" already exists`);
+    this.name = 'DuplicateProductError';
+    this.sku = sku;
+  }
+}
+
+// Mirrors src/lib/utils/erp.ts's generateSKU() on the frontend (used by the
+// standalone Add Product screen) so a SKU for the same
+// category/name/size comes out identical no matter which surface created
+// it. Keep these two in sync if the prefix map or cleaning rules change.
+const SKU_PREFIX_MAP: Record<string, string> = {
+  RAW_MATERIAL: 'RM',
+  RAW_GRAINS: 'RM-GR',
+  RAW_OILS: 'RM-OL',
+  RAW_SPICES: 'RM-SP',
+  PACKAGING_POUCH: 'PK-PH',
+  PACKAGING_LABEL: 'PK-LB',
+  PACKAGING_CARTON: 'PK-CT',
+  SEMI_FINISHED: 'SF',
+  FINISHED_GOOD: 'FG',
+  CONSUMABLE: 'CN',
+  MAINTENANCE: 'MN',
+};
+
+export function generateSku(category: string, name: string, size?: string): string {
+  const prefix = SKU_PREFIX_MAP[category] || 'MISC';
+  const cleanName = name.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+  const cleanSize = size ? size.toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
+  return `${prefix}-${cleanName || 'ITEM'}${cleanSize ? '-' + cleanSize : ''}`;
+}
+
 // Keep the Product catalog and the HQ Finished-Goods inventory ledger in sync no matter
 // which screen created the record (standalone Product form vs. Inventory Item Master).
 // Mirrors the reverse sync in inventory.service.ts (InventoryItem -> Product).
-async function syncInventoryItemForProduct(tx: any, product: { id: string; name: string; sku: string | null; basePrice: number; productType: ProductType }) {
+// GST is a single value per Finished Good: Product.taxPercent is authoritative
+// and always pushed onto the linked InventoryItem.gstRate here, so the two
+// screens that read either field never disagree on the tax rate.
+async function syncInventoryItemForProduct(tx: any, product: { id: string; name: string; sku: string | null; basePrice: number; taxPercent: number; productType: ProductType }) {
   if (product.productType !== ProductType.FINISHED_GOOD) return;
 
   const hq = await FranchiseService.getHqFranchiseOrNull(tx);
   if (!hq) return; // No HQ configured yet — nothing to sync against.
 
+  // Match by SKU alone when the product has one — falling back to name would
+  // wrongly collapse two distinctly-SKU'd weight variants of the same name
+  // (e.g. IDLI PODI 150G / 250G) onto a single InventoryItem, since they
+  // share a name but must each keep their own stock record. Name-only
+  // matching is only correct for the legacy case of a product with no SKU.
   const existing = await tx.inventoryItem.findFirst({
-    where: {
-      OR: [
-        ...(product.sku ? [{ sku: product.sku }] : []),
-        { name: { equals: product.name, mode: 'insensitive' } },
-      ],
-    },
+    where: product.sku
+      ? { sku: product.sku }
+      : { name: { equals: product.name, mode: 'insensitive' } },
   });
 
   if (existing) {
@@ -27,6 +70,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
         name: product.name,
         basePrice: product.basePrice || 0,
         customerPrice: product.basePrice || 0,
+        gstRate: product.taxPercent,
         franchiseId: existing.franchiseId || hq.id,
       },
     });
@@ -41,6 +85,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
         franchiseId: hq.id,
         basePrice: product.basePrice || 0,
         customerPrice: product.basePrice || 0,
+        gstRate: product.taxPercent,
       },
     });
   }
@@ -106,6 +151,15 @@ export class ProductService {
    */
   static async create(data: any) {
     const productType: ProductType = data.productType ?? ProductType.FINISHED_GOOD;
+
+    // Pre-check rather than letting the DB's unique constraint on `sku`
+    // surface as a raw Prisma P2002 — callers (single create + bulk import)
+    // need a clean, catchable "already exists" instead of an opaque 500.
+    if (data.sku) {
+      const existing = await prisma.product.findUnique({ where: { sku: data.sku } });
+      if (existing) throw new DuplicateProductError(data.sku);
+    }
+
     return prisma.$transaction(async (tx) => {
       const product = await tx.product.create({
         data: {
@@ -131,6 +185,61 @@ export class ProductService {
       await syncInventoryItemForProduct(tx, product);
       return product;
     });
+  }
+
+  /**
+   * Bulk-create Finished Good catalog entries (e.g. from an Excel import).
+   * Each row becomes its own Product + synced HQ InventoryItem via the same
+   * create() path above — no stock is ever created here; this only builds
+   * the master/catalog. A per-row failure (duplicate SKU or anything else)
+   * is collected and reported, never aborts the rest of the batch.
+   */
+  static async bulkCreateFinishedGoods(rows: Array<{
+    category?: string;
+    name: string;
+    size?: string;
+    unit?: string;
+    gstPercent?: number;
+  }>) {
+    const created: Array<{ id: string; name: string; sku: string | null }> = [];
+    const duplicates: Array<{ name: string; sku: string; reason: string }> = [];
+    const invalid: Array<{ name: string; reason: string }> = [];
+
+    for (const row of rows) {
+      const name = (row.name || '').trim();
+      if (!name) {
+        invalid.push({ name: row.name || '', reason: 'Missing name' });
+        continue;
+      }
+
+      const sizeUnit = row.size ? `${row.size}${row.unit || ''}` : '';
+      const sku = generateSku('FINISHED_GOOD', name, sizeUnit);
+      const gstPercent = row.gstPercent !== undefined && row.gstPercent !== null && !isNaN(Number(row.gstPercent))
+        ? Number(row.gstPercent)
+        : 5;
+
+      try {
+        const product = await this.create({
+          name,
+          sku,
+          basePrice: 0,
+          category: row.category || null,
+          taxPercent: gstPercent,
+          productType: ProductType.FINISHED_GOOD,
+          isVeg: true,
+          is_menu_item: true,
+        });
+        created.push({ id: product.id, name: product.name, sku: product.sku });
+      } catch (error: any) {
+        if (error instanceof DuplicateProductError) {
+          duplicates.push({ name, sku, reason: error.message });
+        } else {
+          invalid.push({ name, reason: error?.message || 'Unknown error' });
+        }
+      }
+    }
+
+    return { success: created.length, created, duplicates, invalid };
   }
 
   static async getById(id: string) {
