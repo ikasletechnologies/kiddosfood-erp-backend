@@ -537,7 +537,7 @@ export class SalesService {
   static async getSalesOrderById(id: string) {
     return prisma.salesOrder.findUnique({
       where: { id },
-      include: { customer: true, items: true, returns: true }
+      include: { customer: true, items: true, returns: true, quotation: true }
     });
   }
 
