@@ -1,3 +1,4 @@
+import '../scripts/guard-destructive-db-command';
 import prisma from '../src/lib/prisma';
 
 async function clearDatabase() {

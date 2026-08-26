@@ -462,14 +462,12 @@ export class SalesService {
       ? await prisma.salesOrder.findUnique({ where: { id: proforma.sourceSalesOrderId } })
       : null;
 
-    let franchiseId: string | undefined;
-    const hq = await prisma.franchise.findFirst({ where: { isHQ: true } });
-    if (hq) franchiseId = hq.id;
-    else {
-      const first = await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
-      if (first) franchiseId = first.id;
-      else throw new Error('No active franchise found to assign the invoice.');
-    }
+    // "First active franchise" is not a valid definition of HQ — the Tax
+    // Invoice this creates must be owned by the real HQ franchise, not an
+    // arbitrary branch that happened to be created first.
+    const hq = await FranchiseService.getHqFranchiseOrNull();
+    if (!hq) throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise before converting to a Tax Invoice.');
+    const franchiseId = hq.id;
 
     try {
       return await prisma.$transaction(async (tx) => {

@@ -42,13 +42,13 @@ export class ProductController {
 
       // If HQ stock is requested, or if no context is available for a Super Admin
       if (stockSource === 'HQ' || (!franchiseId && user?.role === 'SUPER_ADMIN')) {
+        // "First active franchise" is not a valid definition of HQ — an
+        // arbitrary branch silently standing in for HQ here is exactly how
+        // POS/Stock Hub ended up disagreeing with each other before. If
+        // there's genuinely no HQ configured, return the empty/unfiltered
+        // catalog rather than guess.
         const hq = await FranchiseService.getHqFranchiseOrNull();
-        // Falling back to "any active franchise" here is a last-resort default
-        // so the page still renders something — it is not a claim that the
-        // fallback franchise is HQ (that determination now only ever comes
-        // from Franchise.isHQ via getHqFranchiseOrNull above).
-        const first = hq ? null : await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
-        franchiseId = hq?.id || first?.id || "";
+        franchiseId = hq?.id || "";
       }
       
       console.log(`📦 [ProductAPI] Fetching products for Franchise: ${franchiseId || 'NONE'}`);
@@ -109,8 +109,11 @@ export class ProductController {
     try {
       const product = await ProductService.update(req.params.id, req.body);
       res.json(product);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      if (error instanceof DuplicateProductError) {
+        return res.status(400).json({ error: error.message, code: 'DUPLICATE_SKU' });
+      }
+      res.status(500).json({ error: error.message });
     }
   }
 

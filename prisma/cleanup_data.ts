@@ -1,9 +1,14 @@
+import '../scripts/guard-destructive-db-command';
 import prisma from '../src/lib/prisma';
 
 /**
- * Removes all business/operational data from the database.
+ * Removes all business/operational data from the database — every Order,
+ * Payment, Invoice, Customer, Vendor, Production run, etc.
  * Preserves: Franchise, User, Role, Permission, RolePermission records.
- * Safe to run on live DB — will not touch admin accounts or franchise setup.
+ * NOT "safe to run on live DB" in any everyday sense — it deletes every
+ * real business transaction that exists. Guarded against the shared
+ * Supabase DB (see guard-destructive-db-command.ts); only bypass that
+ * guard for a deliberate, confirmed wipe.
  */
 async function cleanupData() {
   console.log('🧹 Starting targeted data cleanup...');

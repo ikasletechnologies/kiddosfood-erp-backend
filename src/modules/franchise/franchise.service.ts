@@ -2,14 +2,32 @@ import prisma from '../../lib/prisma';
 import { AuthService } from '../auth/auth.service';
 
 export class FranchiseService {
+  // Enforces the "exactly one HQ" invariant getHqFranchise[OrNull] already
+  // assumes at read time — without this, nothing stopped a second
+  // isHQ:true franchise from being created, which would only surface later
+  // as every HQ-dependent module (Inventory/POS/Procurement/...) throwing.
+  // excludeId lets update() check against every OTHER franchise while
+  // editing the current HQ itself (which legitimately already has isHQ:true).
+  private static async assertSingleHQ(tx: any, isHQ: boolean | undefined, excludeId?: string) {
+    if (!isHQ) return;
+    const existing = await tx.franchise.findFirst({
+      where: { isHQ: true, ...(excludeId ? { id: { not: excludeId } } : {}) }
+    });
+    if (existing) {
+      throw new Error(`"${existing.name}" is already the HQ franchise. Exactly one franchise may have isHQ=true — unset it there first.`);
+    }
+  }
+
   static async create(input: any) {
     const { adminUser, ...franchiseData } = input;
-    
+
     return prisma.$transaction(async (tx) => {
+      await FranchiseService.assertSingleHQ(tx, franchiseData.isHQ);
+
       // 1. Create Franchise with sanitized data
       // Hash the dashboard password if provided
-      const dashboardPasswordHash = franchiseData.dashboardPassword 
-        ? await AuthService.hashPassword(franchiseData.dashboardPassword) 
+      const dashboardPasswordHash = franchiseData.dashboardPassword
+        ? await AuthService.hashPassword(franchiseData.dashboardPassword)
         : null;
 
       const franchise = await tx.franchise.create({
@@ -19,6 +37,7 @@ export class FranchiseService {
           ownerName: franchiseData.ownerName,
           contactNum: franchiseData.contactNum,
           status: franchiseData.status || 'ACTIVE',
+          isHQ: franchiseData.isHQ ?? false,
           dashboardPassword: dashboardPasswordHash
         }
       });
@@ -139,14 +158,21 @@ export class FranchiseService {
       contactNum: input.contactNum,
       status: input.status
     };
+    if (input.isHQ !== undefined) data.isHQ = input.isHQ;
+    if (input.primaryWarehouseId !== undefined) data.primaryWarehouseId = input.primaryWarehouseId;
 
     if (input.dashboardPassword) {
       data.dashboardPassword = await AuthService.hashPassword(input.dashboardPassword);
     }
 
-    return prisma.franchise.update({
-      where: { id },
-      data
+    return prisma.$transaction(async (tx) => {
+      if (input.isHQ !== undefined) {
+        await FranchiseService.assertSingleHQ(tx, input.isHQ, id);
+      }
+      return tx.franchise.update({
+        where: { id },
+        data
+      });
     });
   }
 

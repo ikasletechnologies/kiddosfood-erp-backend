@@ -363,10 +363,12 @@ export class POSService {
 
     let fid = data.franchiseId;
     if (!fid) {
+      // "First active franchise" is not a valid definition of HQ (see
+      // FranchiseService.getHqFranchise) — an arbitrary branch silently
+      // absorbing a checkout meant for HQ is worse than a clear error here.
       const hq = await FranchiseService.getHqFranchiseOrNull();
-      const first = hq ? null : await prisma.franchise.findFirst({ where: { status: 'ACTIVE' } });
-      fid = hq?.id || first?.id;
-      if (!fid) throw new Error('No franchises found in the system. Please create one first.');
+      fid = hq?.id;
+      if (!fid) throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise before checking out without an explicit franchise.');
     }
 
     const result = await prisma.$transaction(async (tx) => {

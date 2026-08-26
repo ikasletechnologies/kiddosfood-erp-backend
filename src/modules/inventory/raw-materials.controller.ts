@@ -20,26 +20,17 @@ export class RawMaterialsController {
       if (exists) return requestedId;
     }
 
-    // 2. Default to HQ
+    // 2. Default to the one real HQ franchise (Franchise.isHQ) — the only
+    // module-wide definition of HQ. No "first available franchise" or
+    // silent auto-create-a-differently-named-HQ fallback: either the HQ
+    // that already exists is used, or the caller finds out clearly that
+    // one needs to be configured (via FranchiseService.create, which
+    // enforces the single-HQ invariant) rather than a second, conflicting
+    // "HQ" getting minted here under a different name/id.
     const hq = await FranchiseService.getHqFranchiseOrNull();
     if (hq) return hq.id;
 
-    // 3. Fallback to first available
-    const first = await prisma.franchise.findFirst();
-    if (first) return first.id;
-
-    // 4. ABSOLUTE FALLBACK: no franchises exist at all — create the one-and-only HQ.
-    console.log('⚠️ No franchises found. Creating a default HQ franchise...');
-    const root = await prisma.franchise.create({
-      data: {
-        name: 'Main Headquarters',
-        location: 'Default Location',
-        ownerName: 'Super Admin',
-        contactNum: '0000000000',
-        isHQ: true,
-      }
-    });
-    return root.id;
+    throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise first.');
   }
 
   /**

@@ -30,8 +30,46 @@ function mapCategoryToDb(category?: string): ItemCategory {
   return ItemCategory.RAW_MATERIAL;
 }
 
+// Keeps the Product catalog in sync with an HQ FINISHED_GOOD/SEMI_FINISHED
+// InventoryItem — shared by createItem and updateItem so there's exactly
+// one matching rule instead of two copies that can drift.
+//
+// Matches by SKU first: once a product has a SKU, it's the reliable unique
+// key (mirrors matchesProduct() on the frontend). The name-only fallback
+// is scoped to `sku: null` — a legacy product that never got a real SKU —
+// so it can never grab a DIFFERENT, already-SKU'd product just because it
+// happens to share a display name (e.g. the 500G/250G weight variants of
+// the same product name, which the bulk-import flow explicitly creates as
+// two distinct SKUs). Without that scope, a name match could try to
+// overwrite an unrelated product's SKU and hit its unique constraint.
+async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory }) {
+  const existingProduct = await tx.product.findFirst({ where: { sku: item.sku } })
+    ?? await tx.product.findFirst({ where: { name: { equals: item.name, mode: 'insensitive' }, sku: null } });
 
-
+  if (!existingProduct) {
+    await tx.product.create({
+      data: {
+        name: item.name,
+        sku: item.sku,
+        basePrice: item.basePrice || 0,
+        isActive: true,
+        productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
+        category: 'Automated Sync'
+      }
+    });
+    console.log(`✅ [Sync] Created new product for HQ Inventory Item: ${item.name}`);
+  } else {
+    await tx.product.update({
+      where: { id: existingProduct.id },
+      data: {
+        name: item.name,
+        sku: item.sku,
+        basePrice: item.basePrice || 0
+      }
+    });
+    console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
+  }
+}
 
 export class InventoryService {
   // Compute current stock from movement ledger — single source of truth
@@ -316,11 +354,28 @@ export class InventoryService {
       if (data.franchisePrice !== undefined) createData.franchisePrice = Number(data.franchisePrice) || 0;
       if (data.dealerPrice !== undefined) createData.dealerPrice = Number(data.dealerPrice) || 0;
       if (data.customerPrice !== undefined) createData.customerPrice = Number(data.customerPrice) || 0;
-      if (isHQ) {
-        createData.basePrice = Number(data.franchisePrice) || Number(data.basePrice) || 0;
-      } else {
-        if (data.basePrice !== undefined) createData.basePrice = Number(data.basePrice) || 0;
+
+      // Inherit an existing Product's price when the caller didn't supply
+      // one — without this, creating the (missing) InventoryItem for an
+      // already-priced Finished Good product (e.g. the Stock Hub "Edit"
+      // auto-create-on-first-click flow) defaults to ₹0 here, and then this
+      // same function's own Product-sync below pushes that ₹0 back onto
+      // the product, silently erasing a real price the moment someone
+      // first opens the Item Master for it.
+      let inheritedBasePrice: number | undefined;
+      if (data.basePrice === undefined && data.franchisePrice === undefined) {
+        const matchingProduct = await tx.product.findFirst({ where: { sku } });
+        if (matchingProduct && matchingProduct.basePrice) inheritedBasePrice = matchingProduct.basePrice;
       }
+
+      if (isHQ) {
+        createData.basePrice = Number(data.franchisePrice) || Number(data.basePrice) || inheritedBasePrice || 0;
+      } else {
+        if (data.basePrice !== undefined || inheritedBasePrice !== undefined) {
+          createData.basePrice = Number(data.basePrice) || inheritedBasePrice || 0;
+        }
+      }
+      if (inheritedBasePrice !== undefined && data.customerPrice === undefined) createData.customerPrice = inheritedBasePrice;
 
       const item = await tx.inventoryItem.create({
         data: createData,
@@ -343,38 +398,15 @@ export class InventoryService {
       
       if (orderableCategories.includes(item.category)) {
         if (isHQ) {
-          const existingProduct = await tx.product.findFirst({
-            where: { 
-              OR: [
-                { sku: item.sku },
-                { name: { equals: item.name, mode: 'insensitive' } }
-              ]
-            }
-          });
-
-          if (!existingProduct) {
-            await tx.product.create({
-              data: {
-                name: item.name,
-                sku: item.sku,
-                basePrice: item.basePrice || 0,
-                isActive: true,
-                productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
-                category: 'Automated Sync'
-              }
-            });
-            console.log(`✅ [Sync] Created new product for HQ Inventory Item: ${item.name}`);
-          } else {
-            // Update existing product to match inventory (Name/SKU)
-            await tx.product.update({
-              where: { id: existingProduct.id },
-              data: { 
-                name: item.name, 
-                sku: item.sku,
-                basePrice: item.basePrice || 0
-              }
-            });
-            console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
+          // This whole sync is best-effort background consistency, not
+          // something the user's actual Save action should ever hard-fail
+          // on — a sync collision used to bubble up as a raw 500 (P2002)
+          // and abort the entire create, even though the InventoryItem
+          // itself (and its stock movement) had already succeeded.
+          try {
+            await syncProductFromInventoryItem(tx, item);
+          } catch (syncErr: any) {
+            console.warn(`[Sync] Skipped Product sync for "${item.name}" (${item.sku}):`, syncErr.message);
           }
         }
       }
@@ -394,7 +426,12 @@ export class InventoryService {
     }
 
     const franchiseId = safeData.franchiseId || (await prisma.inventoryItem.findUnique({ where: { id }, select: { franchiseId: true } }))?.franchiseId;
-    let isHQ = false;
+    // No franchiseId at all -> HQ-scoped, same convention createItem uses
+    // (see its comment). This used to default to `isHQ = false` instead,
+    // so an HQ item created with no franchiseId (the normal case — see
+    // createItem) never had its Product-sync run on subsequent edits, only
+    // on its initial create.
+    let isHQ = true;
     if (franchiseId) {
       const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId } });
       isHQ = franchise?.isHQ || false;
@@ -474,38 +511,16 @@ export class InventoryService {
       }
     }
 
-    // Sync on update as well if category is orderable
+    // Sync on update as well if category is orderable — same best-effort
+    // resilience as createItem: this must never fail the user's actual
+    // Save (see syncProductFromInventoryItem for the matching rule).
     const orderableCategories: ItemCategory[] = [ItemCategory.FINISHED_GOOD, ItemCategory.SEMI_FINISHED];
     if (orderableCategories.includes(updated.category)) {
       if (isHQ) {
-        const existing = await prisma.product.findFirst({
-          where: { 
-            OR: [
-              { sku: updated.sku },
-              { name: { equals: updated.name, mode: 'insensitive' } }
-            ]
-          }
-        });
-        if (!existing) {
-          await prisma.product.create({
-            data: {
-              name: updated.name,
-              sku: updated.sku,
-              basePrice: updated.basePrice || 0,
-              isActive: true,
-              productType: updated.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
-              category: 'Automated Sync'
-            }
-          });
-        } else {
-          await prisma.product.update({
-            where: { id: existing.id },
-            data: { 
-              name: updated.name, 
-              sku: updated.sku,
-              basePrice: updated.basePrice || 0
-            }
-          });
+        try {
+          await syncProductFromInventoryItem(prisma, updated);
+        } catch (syncErr: any) {
+          console.warn(`[Sync] Skipped Product sync for "${updated.name}" (${updated.sku}):`, syncErr.message);
         }
       }
     }

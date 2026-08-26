@@ -50,7 +50,18 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
   if (product.productType !== ProductType.FINISHED_GOOD) return;
 
   const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-  if (!hq) return; // No HQ configured yet — nothing to sync against.
+  // franchiseId: null is the equally-established "HQ-scoped" convention
+  // used elsewhere (see InventoryService.createItem, and
+  // FinishedGoodsStockClient's isHqFranchise, which treats both a real
+  // isHQ-flagged franchise AND a null franchiseId as HQ). Previously this
+  // returned early whenever no franchise was flagged isHQ yet — which is
+  // this deployment's actual current state — silently skipping the sync
+  // entirely. That's why bulk-imported Finished Goods (Product.create ->
+  // this function) never got a matching InventoryItem at all: not by
+  // design, just this early-exit with no fallback. Falls forward to null
+  // now instead, exactly like every other "no HQ configured" call site in
+  // this codebase already does.
+  const hqFranchiseId = hq?.id ?? null;
 
   // Match by SKU alone when the product has one — falling back to name would
   // wrongly collapse two distinctly-SKU'd weight variants of the same name
@@ -71,7 +82,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
         basePrice: product.basePrice || 0,
         customerPrice: product.basePrice || 0,
         gstRate: product.taxPercent,
-        franchiseId: existing.franchiseId || hq.id,
+        franchiseId: existing.franchiseId ?? hqFranchiseId,
       },
     });
   } else {
@@ -82,7 +93,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
         category: ItemCategory.FINISHED_GOOD,
         currentStock: 0,
         unit: 'PC',
-        franchiseId: hq.id,
+        franchiseId: hqFranchiseId,
         basePrice: product.basePrice || 0,
         customerPrice: product.basePrice || 0,
         gstRate: product.taxPercent,
@@ -110,13 +121,29 @@ export class ProductService {
       const skus = products.map(p => p.sku).filter(Boolean) as string[];
       const names = products.map(p => p.name);
 
-      console.log(`🔍 [ProductAPI] Sourcing stock from Franchise: ${franchiseId}`);
+      // A null-franchiseId InventoryItem is the established "HQ-scoped"
+      // convention used elsewhere (see InventoryService.createItem and
+      // FinishedGoodsStockClient's isHqFranchise) — a strict `franchiseId`
+      // equality match here never matches those rows at all, so an HQ item
+      // with real stock silently vanished from POS. Only widen the match
+      // to include null when this call is actually resolving HQ's own
+      // stock (franchiseId IS the real HQ's id, via getHqFranchiseOrNull —
+      // the one central resolver every HQ-dependent module must use, never
+      // an independent "first active franchise" guess) — a genuine
+      // branch's own POS must still see only what's been explicitly
+      // dispatched to it, never HQ's central stock for free.
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      const resolvingHQStock = !hq || hq.id === franchiseId;
+      const scopeFilter = resolvingHQStock
+        ? { OR: [{ franchiseId }, { franchiseId: null }] }
+        : { franchiseId };
+
+      console.log(`🔍 [ProductAPI] Sourcing stock from Franchise: ${franchiseId}${resolvingHQStock ? ' (+ HQ-scoped/null items)' : ''}`);
       const inventory = await prisma.inventoryItem.findMany({
-        where: { 
-          franchiseId,
-          OR: [
-            { sku: { in: skus } },
-            { name: { in: names, mode: 'insensitive' } }
+        where: {
+          AND: [
+            scopeFilter,
+            { OR: [{ sku: { in: skus } }, { name: { in: names, mode: 'insensitive' } }] }
           ]
         },
         include: { baseUnit: true, conversions: { include: { unit: true } } }
@@ -190,9 +217,14 @@ export class ProductService {
   /**
    * Bulk-create Finished Good catalog entries (e.g. from an Excel import).
    * Each row becomes its own Product + synced HQ InventoryItem via the same
-   * create() path above — no stock is ever created here; this only builds
-   * the master/catalog. A per-row failure (duplicate SKU or anything else)
-   * is collected and reported, never aborts the rest of the batch.
+   * create() path above — no STOCK is ever created here (currentStock
+   * stays 0; that only ever comes from PO -> GRN or an explicit opening/
+   * adjustment), this only builds the master/catalog. sellingPrice sets
+   * Product.basePrice — a separate concept from stock qty, and the only
+   * thing POS actually reads for the price it shows; omit it and the
+   * product is created at ₹0 (importable now, priced before going live).
+   * A per-row failure (duplicate SKU or anything else) is collected and
+   * reported, never aborts the rest of the batch.
    */
   static async bulkCreateFinishedGoods(rows: Array<{
     category?: string;
@@ -200,6 +232,7 @@ export class ProductService {
     size?: string;
     unit?: string;
     gstPercent?: number;
+    sellingPrice?: number;
   }>) {
     const created: Array<{ id: string; name: string; sku: string | null }> = [];
     const duplicates: Array<{ name: string; sku: string; reason: string }> = [];
@@ -217,12 +250,15 @@ export class ProductService {
       const gstPercent = row.gstPercent !== undefined && row.gstPercent !== null && !isNaN(Number(row.gstPercent))
         ? Number(row.gstPercent)
         : 5;
+      const sellingPrice = row.sellingPrice !== undefined && row.sellingPrice !== null && !isNaN(Number(row.sellingPrice))
+        ? Number(row.sellingPrice)
+        : 0;
 
       try {
         const product = await this.create({
           name,
           sku,
-          basePrice: 0,
+          basePrice: sellingPrice,
           category: row.category || null,
           taxPercent: gstPercent,
           productType: ProductType.FINISHED_GOOD,
@@ -257,6 +293,14 @@ export class ProductService {
     const current = await prisma.product.findUniqueOrThrow({ where: { id } });
     const productType: ProductType = data.productType ?? current.productType;
     const basePrice = data.basePrice !== undefined ? Number(data.basePrice) : current.basePrice;
+
+    // Same pre-check as create() — a SKU edit that collides with a
+    // DIFFERENT product must surface as a clean, catchable error instead
+    // of a raw Prisma P2002 unique-constraint 500.
+    if (data.sku !== undefined && data.sku !== current.sku) {
+      const existing = await prisma.product.findUnique({ where: { sku: data.sku } });
+      if (existing && existing.id !== id) throw new DuplicateProductError(data.sku);
+    }
 
     return prisma.$transaction(async (tx) => {
       const product = await tx.product.update({

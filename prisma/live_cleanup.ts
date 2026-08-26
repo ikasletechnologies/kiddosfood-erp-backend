@@ -5,6 +5,8 @@ import bcrypt from 'bcryptjs';
 // 1. Explicitly load .env from the backend root folder BEFORE any database imports
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
+import '../scripts/guard-destructive-db-command';
+
 async function main() {
   console.log('🚀 STARTING DATABASE PURGE FOR PRODUCTION GO-LIVE...');
   console.log('   Purging all transactional, operational, and test seed data.');
