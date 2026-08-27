@@ -250,6 +250,8 @@ export class GRNService {
               cgst: commercials.cgst,
               sgst: commercials.sgst,
               igst: commercials.igst,
+              discountAmount: commercials.discountAmount || 0,
+              freightCost: commercials.freightCost || 0,
               warehouseId: commercials.warehouseId,
               status: 'PENDING',
               billDate: new Date()

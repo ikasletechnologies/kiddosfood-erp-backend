@@ -28,6 +28,8 @@ export class VendorInvoiceService {
         sgst: po.sgst,
         igst: po.igst,
         taxAmount: po.cgst + po.sgst + po.igst,
+        discountAmount: po.discountAmount || 0,
+        freightCost: po.freightCost || 0,
         amount: po.totalAmount,
         warehouseId: po.warehouseId || null,
       };
@@ -78,6 +80,8 @@ export class VendorInvoiceService {
       sgst: sgst.toDecimalPlaces(2).toNumber(), 
       igst: igst.toDecimalPlaces(2).toNumber(), 
       taxAmount: taxAmount.toDecimalPlaces(2).toNumber(), 
+      discountAmount: proRataDiscount.toDecimalPlaces(2).toNumber(),
+      freightCost: proRataFreight.toDecimalPlaces(2).toNumber(),
       amount: finalAmount.toDecimalPlaces(2).toNumber(), 
       warehouseId 
     };
@@ -135,12 +139,16 @@ export class VendorInvoiceService {
     grnId?: string;
     invoiceNumber?: string;
     amount: number;
+    subtotal?: number;
+    taxAmount?: number;
+    discountAmount?: number;
+    freightCost?: number;
     items?: any[];
     billDate?: string;
   }) {
     return prisma.$transaction(async (tx) => {
       let actualPoId = data.poId;
-      let commercials: { subtotal: number; cgst: number; sgst: number; igst: number; taxAmount: number; amount: number; warehouseId: string | null } | null = null;
+      let commercials: { subtotal: number; cgst: number; sgst: number; igst: number; taxAmount: number; discountAmount: number; freightCost: number; amount: number; warehouseId: string | null } | null = null;
 
       if (!actualPoId) {
         // Auto-generate a Direct Purchase Order — nothing to derive tax from
@@ -150,6 +158,8 @@ export class VendorInvoiceService {
             vendorId: data.vendorId,
             status: 'RECEIVED', // Direct purchase is already received
             totalAmount: data.amount,
+            discountAmount: data.discountAmount || 0,
+            freightCost: data.freightCost || 0,
             poNumber: `DPO-${Date.now().toString().slice(-6)}`,
             purchaseType: 'RAW_MATERIAL',
             received: true,
@@ -202,11 +212,13 @@ export class VendorInvoiceService {
               poId: actualPoId || targetInvoice.poId,
               invoiceNumber: data.invoiceNumber || targetInvoice.invoiceNumber,
               amount: commercials?.amount ?? data.amount,
-              subtotal: commercials?.subtotal,
-              taxAmount: commercials?.taxAmount,
+              subtotal: commercials?.subtotal ?? data.subtotal,
+              taxAmount: commercials?.taxAmount ?? data.taxAmount,
               cgst: commercials?.cgst,
               sgst: commercials?.sgst,
               igst: commercials?.igst,
+              discountAmount: commercials?.discountAmount ?? data.discountAmount ?? 0,
+              freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
               warehouseId: commercials?.warehouseId,
               billDate: data.billDate ? new Date(data.billDate) : undefined,
             }
@@ -223,11 +235,13 @@ export class VendorInvoiceService {
             grnId: data.grnId || null,
             invoiceNumber: data.invoiceNumber || `BILL-${Date.now().toString().slice(-6)}`,
             amount: commercials?.amount ?? data.amount,
-            subtotal: commercials?.subtotal,
-            taxAmount: commercials?.taxAmount,
+            subtotal: commercials?.subtotal ?? data.subtotal,
+            taxAmount: commercials?.taxAmount ?? data.taxAmount,
             cgst: commercials?.cgst,
             sgst: commercials?.sgst,
             igst: commercials?.igst,
+            discountAmount: commercials?.discountAmount ?? data.discountAmount ?? 0,
+            freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
             warehouseId: commercials?.warehouseId,
             status: 'PENDING',
             billDate: data.billDate ? new Date(data.billDate) : new Date()
