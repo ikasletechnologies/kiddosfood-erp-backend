@@ -225,51 +225,69 @@ export class POSService {
                },
              });
            } else {
-             // FALLBACK: If no recipe exists, try to deduct directly from InventoryItem with matching SKU or Name
+             // FALLBACK: If no recipe exists, deduct directly from the
+             // InventoryItem with matching SKU or Name. order.franchiseId is
+             // a real Franchise id (Order.franchiseId is a required column,
+             // never null) — but InventoryItem scoping uses the separate
+             // null-means-HQ convention, so it must be resolved through the
+             // same canonical converter every other writer uses, not
+             // compared to order.franchiseId directly. Comparing directly
+             // is exactly what silently found nothing for every correctly
+             // HQ-scoped (franchiseId=NULL) item once normalized.
+             const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, order.franchiseId);
              const inventoryItem = await tx.inventoryItem.findFirst({
                where: {
                  OR: [
                    { sku: product.sku || '___NON_EXISTENT___' },
                    { name: { equals: product.name, mode: 'insensitive' } }
                  ],
-                 franchiseId: order.franchiseId
+                 franchiseId: scopeFranchiseId
                }
              });
 
-             if (inventoryItem) {
-                // Apply unit conversion
-                const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, orderItem.unit || 'NONE', orderItem.quantity, tx);
-                const requiredBaseQty = conversionResult.requiredBaseQty;
-                const unitId = conversionResult.unitId;
-
-                if (inventoryItem.currentStock < requiredBaseQty) {
-                  throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
-                }
-
-                // This is the path finished goods sold as-is (produced via the
-                // Production module) take — so `fifo` here reflects the exact
-                // ProductBatch(es) this sale drew from (see InventoryBatch.productBatchId).
-                const { fifo } = await InventoryService.recordMovement(tx, {
-                  itemId: inventoryItem.id,
-                  type: 'SALES_OUT',
-                  quantity: -orderItem.quantity, // original selected quantity
-                  baseQty: -requiredBaseQty,     // converted base quantity
-                  transactionUnit: unitId,
-                  referenceType: 'ORDER',
-                  referenceId: order.id,
-                  note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
-                });
-
-                const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
-                const totalCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
-                await tx.orderItem.update({
-                  where: { id: orderItem.id },
-                  data: {
-                    unitCost: orderItem.quantity > 0 ? totalCost / orderItem.quantity : 0,
-                    totalCost,
-                  },
-                });
+             // A silent no-op here used to let the sale, payment, and
+             // account balance all complete while reporting
+             // inventory_deducted=true with zero stock actually moved — and
+             // that flag then permanently blocked any retry (see the
+             // "Safety 2" guard above). Failing the whole transaction is
+             // the safe behavior: no Order, no Payment, no Account update,
+             // no false inventory_deducted, until the real mapping exists.
+             if (!inventoryItem) {
+               throw new Error(`Inventory item not found for SKU ${product.sku || product.name} — cannot complete this sale.`);
              }
+
+             // Apply unit conversion
+             const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, orderItem.unit || 'NONE', orderItem.quantity, tx);
+             const requiredBaseQty = conversionResult.requiredBaseQty;
+             const unitId = conversionResult.unitId;
+
+             if (inventoryItem.currentStock < requiredBaseQty) {
+               throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
+             }
+
+             // This is the path finished goods sold as-is (produced via the
+             // Production module) take — so `fifo` here reflects the exact
+             // ProductBatch(es) this sale drew from (see InventoryBatch.productBatchId).
+             const { fifo } = await InventoryService.recordMovement(tx, {
+               itemId: inventoryItem.id,
+               type: 'SALES_OUT',
+               quantity: -orderItem.quantity, // original selected quantity
+               baseQty: -requiredBaseQty,     // converted base quantity
+               transactionUnit: unitId,
+               referenceType: 'ORDER',
+               referenceId: order.id,
+               note: `Direct auto-deduction for Order ${order.invoiceNum} (No recipe)`
+             });
+
+             const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
+             const totalCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+             await tx.orderItem.update({
+               where: { id: orderItem.id },
+               data: {
+                 unitCost: orderItem.quantity > 0 ? totalCost / orderItem.quantity : 0,
+                 totalCost,
+               },
+             });
            }
          }
        }
@@ -465,40 +483,53 @@ export class POSService {
               lineCost += (fifo?.totalCost || 0) + untracked * (invItem?.costPrice || 0);
             }
           } else {
-            // Direct deduction fallback
+            // Direct deduction fallback. fid is a real Franchise id (never
+            // null) but InventoryItem scoping uses the separate null-means-
+            // HQ convention — resolve through the same canonical converter
+            // every other writer uses rather than comparing to fid
+            // directly, which silently found nothing for every correctly
+            // HQ-scoped (franchiseId=NULL) item once normalized.
+            const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
             const inventoryItem = await tx.inventoryItem.findFirst({
               where: {
                 OR: [
                   { sku: product.sku || '___NONE_EXISTENT___' },
                   { name: { equals: pName, mode: 'insensitive' } }
                 ],
-                franchiseId: fid
+                franchiseId: scopeFranchiseId
               }
             });
 
-            if (inventoryItem) {
-              const itemUnit = (item as any).unit || 'NONE';
-              const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, itemUnit, item.quantity, tx);
-              const requiredBaseQty = conversionResult.requiredBaseQty;
-              const unitId = conversionResult.unitId;
-
-              if (inventoryItem.currentStock < requiredBaseQty) {
-                throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
-              }
-
-              const { fifo } = await InventoryService.recordMovement(tx, {
-                itemId: inventoryItem.id,
-                type: 'SALES_OUT',
-                quantity: -item.quantity,
-                baseQty: -requiredBaseQty,
-                transactionUnit: unitId,
-                referenceType: 'ORDER',
-                referenceId: order.id,
-                note: `Direct stock reduction: ${item.quantity}x ${product.name}`
-              });
-              const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
-              lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+            // A silent no-op here used to let the whole transaction (Order,
+            // Payment, Account balance) commit while inventory_deducted got
+            // set true with zero stock actually moved. Throwing rolls back
+            // this entire $transaction — no Order, no Payment, no Account
+            // update — instead of reporting a sale that never happened.
+            if (!inventoryItem) {
+              throw new Error(`Inventory item not found for SKU ${product.sku || pName} — cannot complete this sale.`);
             }
+
+            const itemUnit = (item as any).unit || 'NONE';
+            const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, itemUnit, item.quantity, tx);
+            const requiredBaseQty = conversionResult.requiredBaseQty;
+            const unitId = conversionResult.unitId;
+
+            if (inventoryItem.currentStock < requiredBaseQty) {
+              throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
+            }
+
+            const { fifo } = await InventoryService.recordMovement(tx, {
+              itemId: inventoryItem.id,
+              type: 'SALES_OUT',
+              quantity: -item.quantity,
+              baseQty: -requiredBaseQty,
+              transactionUnit: unitId,
+              referenceType: 'ORDER',
+              referenceId: order.id,
+              note: `Direct stock reduction: ${item.quantity}x ${product.name}`
+            });
+            const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
+            lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
           }
 
           if (orderItem) {
