@@ -131,46 +131,13 @@ app.get('/', (_req: Request, res: Response) => {
   });
 });
 
-// Health check + Ninja Seed
-app.get('/health', async (req: Request, res: Response) => {
-  if (req.query.seed === 'true') {
-    try {
-      // 1. Ensure HQ exists — but never if a real HQ (Franchise.isHQ=true)
-      // already exists under some other id, since that would silently
-      // create a second HQ franchise alongside it.
-      const existingHq = await FranchiseService.getHqFranchiseOrNull();
-      if (!existingHq) {
-        await prisma.franchise.create({
-          data: {
-            name: 'Kiddos Food Headquarters',
-            location: 'Mumbai',
-            ownerName: 'Super Admin',
-            contactNum: '9999999999',
-            status: 'ACTIVE',
-            isHQ: true
-          }
-        });
-      }
-
-      // 2. Ensure basic warehouse exists
-      const existingWarehouse = await prisma.warehouse.findFirst({ where: { type: 'MAIN' } });
-      if (!existingWarehouse) {
-        await prisma.warehouse.create({
-          data: {
-            name: 'Central Warehouse',
-            nameKey: 'centralwarehouse',
-            location: 'Mumbai',
-            type: 'MAIN'
-          }
-        });
-      }
-
-      return res.json({ status: 'ok', message: 'SEED_SUCCESS' });
-    } catch (e: any) {
-      console.error('Seed Error:', e);
-      return res.status(500).json({ error: e.message });
-    }
-  }
+// Health check. Previously also carried a `?seed=true` branch that
+// unauthenticated-ly auto-created an HQ franchise and a "Central Warehouse"
+// (unlinked to any franchise) — exactly the silent-auto-creation pattern
+// the setup wizard exists to eliminate, reachable by anyone who hit this
+// URL, including uptime/health-check pingers. HQ and its warehouse are now
+// only ever created through the explicit setup wizard (see src/modules/setup).
+app.get('/health', async (_req: Request, res: Response) => {
   res.json({ status: 'ok', message: 'Food ERP API is running' });
 });
 

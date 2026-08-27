@@ -1,6 +1,75 @@
 import prisma from '../../lib/prisma';
+import { FranchiseService } from '../franchise/franchise.service';
+
+// Warehouse selection elsewhere in the app is name-driven (dropdowns, stock
+// lookups) — a near-duplicate name like "Home (Hopes)" next to "Home"
+// silently splits stock across two records with no way to tell them apart.
+// nameKey carries a DB-level unique constraint (see schema) so this is
+// enforced even under concurrent requests, not just by the pre-check below.
+function normalizeWarehouseName(s: string) {
+  return s.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
 export class WarehouseService {
+  // The single warehouse-creation path — every caller (the generic admin
+  // endpoint, the setup wizard) goes through this so there's one place that
+  // owns the nameKey/duplicate-name rule and the optional franchise link,
+  // instead of each caller re-implementing it slightly differently.
+  static async create(data: { name: string; code?: string; location?: string; type?: string; status?: string; franchiseId?: string }) {
+    if (!data.name || !data.name.trim()) {
+      throw new Error('Warehouse name is required');
+    }
+    const nameKey = normalizeWarehouseName(data.name);
+
+    return prisma.$transaction(async (tx) => {
+      const clash = await tx.warehouse.findUnique({ where: { nameKey } });
+      if (clash) {
+        throw new Error(`A warehouse named "${clash.name}" already exists. Use that one instead of creating a near-duplicate.`);
+      }
+
+      if (data.franchiseId) {
+        const franchise = await tx.franchise.findUnique({ where: { id: data.franchiseId } });
+        if (!franchise) throw new Error('Franchise not found.');
+        if (franchise.primaryWarehouseId) {
+          throw new Error('This franchise already has a primary warehouse configured.');
+        }
+      }
+
+      const warehouse = await tx.warehouse.create({
+        data: {
+          name: data.name.trim(),
+          nameKey,
+          location: data.location,
+          type: data.type,
+          code: data.code,
+          status: data.status,
+        },
+      });
+
+      if (data.franchiseId) {
+        await tx.franchise.update({
+          where: { id: data.franchiseId },
+          data: { primaryWarehouseId: warehouse.id },
+        });
+      }
+
+      return warehouse;
+    });
+  }
+
+  // Setup-wizard-specific: resolves HQ server-side (never trusts a
+  // browser-supplied franchiseId for something as foundational as "which
+  // franchise is HQ"), and is idempotent — a double-click, a page refresh,
+  // or revisiting /setup after it already succeeded returns the existing
+  // warehouse instead of creating a second one or erroring.
+  static async createHqWarehouse(data: { name: string; code?: string; location?: string }) {
+    const hq = await FranchiseService.getHqFranchise();
+    if (hq.primaryWarehouseId) {
+      const existing = await prisma.warehouse.findUnique({ where: { id: hq.primaryWarehouseId } });
+      if (existing) return existing;
+    }
+    return this.create({ ...data, type: 'MAIN', franchiseId: hq.id });
+  }
   /**
    * Get the primary warehouse and its bins for a given franchise.
    */
