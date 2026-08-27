@@ -42,7 +42,7 @@ export class InventoryController {
   static async createItem(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       
       const item = await InventoryService.createItem({ ...req.body, franchiseId });
       res.status(201).json(item);

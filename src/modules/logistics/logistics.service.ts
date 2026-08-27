@@ -75,7 +75,7 @@ export class LogisticsService {
     // may source from anywhere. Destination is left open either way: a
     // branch sending stock elsewhere doesn't expose/alter anyone else's data.
     if (data.requestingUser) {
-      const enforcedFromBranchId = IsolationUtil.enforceFranchiseMatch(data.requestingUser, data.fromBranchId);
+      const enforcedFromBranchId = await IsolationUtil.enforceFranchiseMatch(data.requestingUser, data.fromBranchId);
       if (!enforcedFromBranchId) {
         throw new Error('Your account has no branch assigned — cannot determine a source branch for this transfer.');
       }

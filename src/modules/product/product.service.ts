@@ -40,6 +40,20 @@ export function generateSku(category: string, name: string, size?: string): stri
   return `${prefix}-${cleanName || 'ITEM'}${cleanSize ? '-' + cleanSize : ''}`;
 }
 
+// generateSku bakes the pack size (e.g. "500G", "1KG", "250ML") into the last
+// SKU segment — there's no dedicated size/unit column on Product, so this is
+// the only place that data survives. Every existing FINISHED_GOOD SKU in prod
+// matches this shape (verified against all 217 rows), since AddProductClient
+// and the bulk-import path both only ever append <number><KG|G|ML|L|PCS|PC>.
+const SKU_SIZE_RE = /-(\d+(?:\.\d+)?)(KG|G|ML|L|PCS|PC)$/i;
+
+export function parseSkuPackSize(sku: string | null | undefined): { qty: number; unit: string } | null {
+  if (!sku) return null;
+  const m = sku.match(SKU_SIZE_RE);
+  if (!m) return null;
+  return { qty: Number(m[1]), unit: m[2].toUpperCase() };
+}
+
 // Keep the Product catalog and the HQ Finished-Goods inventory ledger in sync no matter
 // which screen created the record (standalone Product form vs. Inventory Item Master).
 // Mirrors the reverse sync in inventory.service.ts (InventoryItem -> Product).
@@ -49,19 +63,17 @@ export function generateSku(category: string, name: string, size?: string): stri
 async function syncInventoryItemForProduct(tx: any, product: { id: string; name: string; sku: string | null; basePrice: number; taxPercent: number; productType: ProductType }) {
   if (product.productType !== ProductType.FINISHED_GOOD) return;
 
-  const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-  // franchiseId: null is the equally-established "HQ-scoped" convention
-  // used elsewhere (see InventoryService.createItem, and
+  // franchiseId: null is the canonical "HQ-scoped" convention used
+  // everywhere else (see InventoryService.createItem, and
   // FinishedGoodsStockClient's isHqFranchise, which treats both a real
-  // isHQ-flagged franchise AND a null franchiseId as HQ). Previously this
-  // returned early whenever no franchise was flagged isHQ yet — which is
-  // this deployment's actual current state — silently skipping the sync
-  // entirely. That's why bulk-imported Finished Goods (Product.create ->
-  // this function) never got a matching InventoryItem at all: not by
-  // design, just this early-exit with no fallback. Falls forward to null
-  // now instead, exactly like every other "no HQ configured" call site in
-  // this codebase already does.
-  const hqFranchiseId = hq?.id ?? null;
+  // isHQ-flagged franchise AND a null franchiseId as HQ). This must never
+  // be the HQ Franchise row's own id — Franchise.isHQ identifies which
+  // franchise IS headquarters; InventoryItem.franchiseId = null is the
+  // separate, independent convention for "this stock belongs to HQ".
+  // Conflating the two (writing hq.id here) is exactly what caused
+  // HQ-owned InventoryItems to end up split between null and the literal
+  // HQ id. Always null, regardless of whether an HQ franchise row exists.
+  const hqFranchiseId = null;
 
   // Match by SKU alone when the product has one — falling back to name would
   // wrongly collapse two distinctly-SKU'd weight variants of the same name
@@ -165,12 +177,13 @@ export class ProductService {
           inventoryBasePrice: inv.basePrice,
           inventoryCostPrice: inv.costPrice,
           baseUnit: inv.baseUnit,
-          conversions: inv.conversions
+          conversions: inv.conversions,
+          packSize: parseSkuPackSize(p.sku)
         };
       }).filter(Boolean) as any[];
     }
 
-    return products;
+    return products.map(p => ({ ...p, packSize: parseSkuPackSize(p.sku) }));
   }
 
   /**

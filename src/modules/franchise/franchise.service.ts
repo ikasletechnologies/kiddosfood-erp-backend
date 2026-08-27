@@ -119,6 +119,19 @@ export class FranchiseService {
     return rows[0] || null;
   }
 
+  // The single place that converts a real Franchise id into the value an
+  // InventoryItem should actually be scoped with. Franchise.isHQ identifies
+  // WHICH franchise is headquarters; InventoryItem.franchiseId = null is
+  // the separate, independent convention for "this stock belongs to HQ" —
+  // conflating the two (storing the HQ franchise's own id on an
+  // InventoryItem) is what split HQ stock between null and a literal id.
+  // Every writer that resolves a franchise id and then creates/looks up an
+  // InventoryItem with it must run the id through here first.
+  static async toInventoryScopeId(tx: any, franchiseId: string): Promise<string | null> {
+    const franchise = await tx.franchise.findUnique({ where: { id: franchiseId }, select: { isHQ: true } });
+    return franchise?.isHQ ? null : franchiseId;
+  }
+
   static async getById(id: string) {
     const franchise = await prisma.franchise.findUnique({
       where: { id },
