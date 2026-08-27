@@ -235,15 +235,15 @@ export class POSService {
              // is exactly what silently found nothing for every correctly
              // HQ-scoped (franchiseId=NULL) item once normalized.
              const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, order.franchiseId);
-             const inventoryItem = await tx.inventoryItem.findFirst({
-               where: {
-                 OR: [
-                   { sku: product.sku || '___NON_EXISTENT___' },
-                   { name: { equals: product.name, mode: 'insensitive' } }
-                 ],
-                 franchiseId: scopeFranchiseId
-               }
-             });
+             // Match by SKU alone when the product has one — OR-ing in a
+             // name match let two distinctly-SKU'd weight variants sharing
+             // the same product name (e.g. 250G/500G) collide, since
+             // findFirst has no reason to prefer the SKU-matching row over
+             // any other row the name also matches. Name-only lookup is
+             // only correct for the legacy case of a product with no SKU.
+             const inventoryItem = product.sku
+               ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+               : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
 
              // A silent no-op here used to let the sale, payment, and
              // account balance all complete while reporting
@@ -490,15 +490,14 @@ export class POSService {
             // directly, which silently found nothing for every correctly
             // HQ-scoped (franchiseId=NULL) item once normalized.
             const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
-            const inventoryItem = await tx.inventoryItem.findFirst({
-              where: {
-                OR: [
-                  { sku: product.sku || '___NONE_EXISTENT___' },
-                  { name: { equals: pName, mode: 'insensitive' } }
-                ],
-                franchiseId: scopeFranchiseId
-              }
-            });
+            // Match by SKU alone when the product has one — see the
+            // identical fix/comment in deductInventoryIfNecessary above.
+            // OR-ing in a name match let same-named weight variants
+            // (e.g. 250G/500G) collide onto whichever row the name also
+            // matched, ignoring the more specific SKU match.
+            const inventoryItem = product.sku
+              ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+              : await tx.inventoryItem.findFirst({ where: { name: { equals: pName, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
 
             // A silent no-op here used to let the whole transaction (Order,
             // Payment, Account balance) commit while inventory_deducted got

@@ -217,6 +217,7 @@ app.get('/api/invoices/:orderId', authenticate, authorizeRole(['FRANCHISE_ADMIN'
 app.get('/api/products', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductController.getAll);
 app.post('/api/products', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.create);
 app.post('/api/products/bulk-import', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.bulkImport);
+app.post('/api/products/link', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.linkExistingProduct);
 app.get('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductController.getOne);
 app.patch('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.update);
 app.delete('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.delete);

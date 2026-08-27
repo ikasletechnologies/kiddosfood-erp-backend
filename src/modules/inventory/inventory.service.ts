@@ -299,14 +299,26 @@ export class InventoryService {
       }
     }
 
-    const sku = (data.sku && typeof data.sku === 'string')
-      ? data.sku.toUpperCase()
+    const targetFranchiseId = (data.franchiseId && typeof data.franchiseId === 'string' && data.franchiseId.trim().length > 0)
+      ? data.franchiseId.trim()
+      : null;
+
+    const sku = (data.sku && typeof data.sku === 'string' && data.sku.trim().length > 0)
+      ? data.sku.trim().toUpperCase()
       : `RM-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
+    // Validate SKU uniqueness for this target scope before creation
+    const existingSkuItem = await prisma.inventoryItem.findFirst({
+      where: {
+        sku: { equals: sku, mode: 'insensitive' },
+        franchiseId: targetFranchiseId,
+      }
+    });
+    if (existingSkuItem) {
+      throw new Error(`An item with SKU "${sku}" already exists in the catalog.`);
+    }
+
     return prisma.$transaction(async tx => {
-      const targetFranchiseId = (data.franchiseId && typeof data.franchiseId === 'string' && data.franchiseId.trim().length > 0)
-        ? data.franchiseId.trim()
-        : null;
 
       // No franchiseId given at all — historically treated as an HQ-scoped
       // item (falls through to the isHQ pricing branch below).
