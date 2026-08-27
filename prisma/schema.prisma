@@ -530,6 +530,8 @@ model VendorInvoice {
   cgst             Float?
   sgst             Float?
   igst             Float?
+  discountAmount   Float?           @default(0)
+  freightCost      Float?           @default(0)
   // How much of this invoice's gross amount has been settled via vendor
   // advance (as opposed to a cash/bank Payment) — kept separate so the
   // invoice's own gross `amount` never gets silently reduced by a
