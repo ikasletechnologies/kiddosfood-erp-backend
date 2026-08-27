@@ -69,7 +69,7 @@ export class RawMaterialsController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const enforcedId = DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
+      const enforcedId = await DataIsolator.enforceFranchiseMatch(user, req.body.franchiseId);
       const franchiseId = enforcedId || req.body.franchiseId || null;
 
       console.log(`[RawMaterials] Creating global/franchise item (franchise: ${franchiseId || 'GLOBAL'})`);

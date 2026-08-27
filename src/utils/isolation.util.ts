@@ -1,4 +1,5 @@
 import { TokenPayload } from '../lib/jwt.util';
+import { FranchiseService } from '../modules/franchise/franchise.service';
 
 
 /**
@@ -14,10 +15,10 @@ export class IsolationUtil {
     if (user.role === 'SUPER_ADMIN') {
       return {}; // No filter, can see all
     }
-    
+
     if (!user.franchiseId) {
       console.warn(`[IsolationUtil] User ${user.userId} has no assigned franchise. Falling back to no filter.`);
-      return {}; 
+      return {};
     }
 
     return { franchiseId: user.franchiseId };
@@ -28,10 +29,20 @@ export class IsolationUtil {
    * @param user Authenticated user
    * @param targetFranchiseId The franchise ID provided in the request body
    */
-  static enforceFranchiseMatch(user: TokenPayload, targetFranchiseId?: string) {
-    if (user.role === 'SUPER_ADMIN') return targetFranchiseId || user.franchiseId; // HQ can assign to any branch
-    
+  static async enforceFranchiseMatch(user: TokenPayload, targetFranchiseId?: string): Promise<string | null> {
+    if (user.role === 'SUPER_ADMIN') {
+      if (targetFranchiseId) return targetFranchiseId; // HQ can assign to any branch
+      // No explicit target — resolve the real HQ fresh from the DB instead
+      // of trusting user.franchiseId, a claim baked into the JWT at
+      // login/refresh time that can drift from the DB and has no
+      // guaranteed relationship to "is this account HQ-scoped" (this is
+      // exactly how a stale token minted an InventoryItem with the literal
+      // HQ franchise id instead of the canonical HQ-scope null).
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      return hq?.id ?? user.franchiseId ?? null;
+    }
+
     // For FRANCHISE_ADMIN, use their own franchise ID exclusively
-    return user.franchiseId;
+    return user.franchiseId ?? null;
   }
 }

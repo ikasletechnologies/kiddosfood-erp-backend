@@ -56,7 +56,7 @@ export class CustomerController {
 
       // SUPER_ADMIN may target any franchise (including HQ) via req.body.franchiseId;
       // FRANCHISE_ADMIN is always forced to their own franchise, ignoring the body.
-      data.franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      data.franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
 
       const customer = await CustomerService.create(data);
       res.status(201).json(customer);

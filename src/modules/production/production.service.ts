@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { WasteService } from '../waste/waste.service';
+import { FranchiseService } from '../franchise/franchise.service';
 import { ProductionStatus } from '@prisma/client';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
@@ -76,25 +77,12 @@ export class ProductionService {
       // resolve it server-side instead of trusting every caller to always
       // supply one (a SUPER_ADMIN with no franchise assigned + a frontend
       // fetch that hasn't resolved yet was hitting this and crashing the launch).
-      let franchiseId = data.franchiseId;
-      if (!franchiseId) {
-        let fallbackFranchise = await tx.franchise.findFirst({ orderBy: { createdAt: 'asc' } });
-        if (!fallbackFranchise) {
-          // Genuinely none exist — this is internal bookkeeping the user
-          // never sees or manages for production, so self-heal instead of
-          // blocking the run on a setup step that shouldn't matter to them.
-          fallbackFranchise = await tx.franchise.create({
-            data: {
-              name: 'Default',
-              location: 'N/A',
-              ownerName: 'N/A',
-              contactNum: 'N/A',
-              status: 'ACTIVE',
-            },
-          });
-        }
-        franchiseId = fallbackFranchise.id;
-      }
+      // Always the real HQ franchise, never "whichever franchise happens to
+      // be oldest" — that heuristic silently drifted onto whatever row had
+      // the earliest createdAt (in practice, root-franchise) and, with zero
+      // franchises, used to self-heal by creating an untracked, unflagged
+      // "Default" franchise that bypassed FranchiseService.create entirely.
+      const franchiseId: string = data.franchiseId ?? (await FranchiseService.getHqFranchise(tx)).id;
 
       // Calculate scalar based on batches (frontend sends number of batches/runs)
       // If recipe yield is 5 and we run it 2 times, scalar is 2.
@@ -489,6 +477,11 @@ export class ProductionService {
       if (needsTargetItem) {
         const franchiseId = batch.franchiseId || batch.production?.franchiseId;
         if (!franchiseId) throw new Error('Franchise ID not found for batch');
+        // Production.franchiseId is a required real Franchise id (used
+        // as-is below for WasteEntry) — but the InventoryItem it produces
+        // must follow the null-means-HQ convention, so route it through
+        // the canonical converter rather than storing the HQ id literally.
+        const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
 
         // The finished-good's real unit is whatever the recipe yields it in
         // (e.g. "KG") — packageBatch's weight parser converts packet sizes
@@ -501,7 +494,7 @@ export class ProductionService {
 
         let targetItem = await tx.inventoryItem.findFirst({
           where: {
-            franchiseId,
+            franchiseId: invFranchiseId,
             OR: [
               { sku: bulkSku },
               { name: bulkName },
@@ -518,7 +511,7 @@ export class ProductionService {
               currentStock: 0,
               unit: finishedGoodUnit,
               minimumStock: 5,
-              franchiseId,
+              franchiseId: invFranchiseId,
             },
           });
         } else if (!RECOGNIZED_PACK_UNITS.includes(targetItem.unit.toLowerCase()) && RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
@@ -633,7 +626,7 @@ export class ProductionService {
   // item for a batch and self-heals a stale generic 'unit' label so the
   // g/kg conversion below stays correct. Throws if there's no bulk item at
   // all — a batch can't be packaged (started or confirmed) without one.
-  private static async resolveBulkItem(tx: any, batch: any, franchiseId: string) {
+  private static async resolveBulkItem(tx: any, batch: any, franchiseId: string | null) {
     const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
 
     let bulkItem = await tx.inventoryItem.findFirst({
@@ -696,8 +689,9 @@ export class ProductionService {
 
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
+      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
 
-      let bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
+      let bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
 
       // Row-lock the bulk item so two concurrent Start Packaging calls for
       // this batch (a double-click, two tabs, two operators) can't both read
@@ -852,8 +846,9 @@ export class ProductionService {
 
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
+      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
 
-      const bulkItem = await this.resolveBulkItem(tx, batch, franchiseId);
+      const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
 
       const unitMultiplier = this.parseWeight(packaging.packetSize, bulkItem.unit);
       const totalWeightNeeded = packaging.quantityPackets * unitMultiplier;
@@ -874,7 +869,7 @@ export class ProductionService {
       const { retailSku, retailName } = this.deriveRetailIdentity(bulkItem, packaging.packetSize, !!batch.product);
 
       let retailItem = await tx.inventoryItem.findFirst({
-        where: { franchiseId, sku: retailSku },
+        where: { franchiseId: invFranchiseId, sku: retailSku },
       });
       if (!retailItem) {
         retailItem = await tx.inventoryItem.create({
@@ -885,7 +880,7 @@ export class ProductionService {
             currentStock: 0,
             unit: 'packet',
             minimumStock: 10,
-            franchiseId,
+            franchiseId: invFranchiseId,
             basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
             costPrice: bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0,
           },

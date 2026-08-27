@@ -7,7 +7,7 @@ export class ProductionController {
     try {
       const { recipeId, quantity, franchiseId, warehouseId, customerId, productionType, expiryDate, operatorId } = req.body;
       const user = (req as any).user;
-      const enforcedFranchiseId = IsolationUtil.enforceFranchiseMatch(user, franchiseId);
+      const enforcedFranchiseId = await IsolationUtil.enforceFranchiseMatch(user, franchiseId);
 
       const result = await ProductionService.startProduction({
         recipeId,

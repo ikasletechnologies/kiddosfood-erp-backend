@@ -35,7 +35,7 @@ export class WasteController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       const warehouseId = req.body.warehouseId as string | undefined;
       const entry = await WasteService.create({ ...req.body, franchiseId, warehouseId });
       res.status(201).json(entry);

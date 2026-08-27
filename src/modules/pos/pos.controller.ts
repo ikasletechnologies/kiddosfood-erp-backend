@@ -37,7 +37,7 @@ export class POSController {
         paymentMode
       } = req.body;
 
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, bodyFranchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, bodyFranchiseId);
 
       // Resolve recipeId → productId for each item
       const resolvedItems = await Promise.all(
@@ -111,7 +111,7 @@ export class POSController {
   static async getTodaySettlement(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
       const settlement = await POSService.getTodaySettlement(await resolveFranchiseIdOrHq(franchiseId));
       res.json(settlement);
     } catch (error: any) {
@@ -122,7 +122,7 @@ export class POSController {
   static async getLatestSettlement(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
       const settlement = await POSService.getLatestSettlement(await resolveFranchiseIdOrHq(franchiseId));
       res.json(settlement);
     } catch (error: any) {
@@ -133,7 +133,7 @@ export class POSController {
   static async closeDay(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       const settlement = await POSService.closeDay(await resolveFranchiseIdOrHq(franchiseId), req.body, user?.email || user?.userId);
       res.status(201).json(settlement);
     } catch (error: any) {

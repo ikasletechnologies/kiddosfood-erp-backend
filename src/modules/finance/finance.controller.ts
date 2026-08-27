@@ -281,7 +281,7 @@ export class FinanceController {
   static async createInvoice(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
 
       const invoice = await FinanceService.createInvoice({
         ...req.body,
@@ -346,8 +346,8 @@ export class FinanceController {
   static async addExpense(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
       const expense = await FinanceService.addExpense({ ...req.body, franchiseId });
       res.status(201).json(expense);
     } catch (error: any) {
@@ -371,9 +371,9 @@ export class FinanceController {
   static async recordPayment(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      
-      const payment = await FinanceService.createPayment({ 
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
+      const payment = await FinanceService.createPayment({
         ...req.body, 
         franchiseId,
         createdBy: user?.fullName || user?.email || 'System'

@@ -24,7 +24,7 @@ export class DealerController {
       const user = (req as any).user;
       // SUPER_ADMIN may target any franchise (including HQ) via req.body.franchiseId;
       // FRANCHISE_ADMIN is always forced to their own franchise, ignoring the body.
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       if (!franchiseId) {
         return res.status(400).json({ error: 'franchiseId is required' });
       }

@@ -8,8 +8,8 @@ export class OrderController {
   static async createOrder(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
       const order = await POSService.createOrder({ ...req.body, franchiseId });
       res.status(201).json({ orderId: order.id, order });
     } catch (error: any) {
@@ -56,8 +56,8 @@ export class OrderController {
   static async checkout(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
       const order = await POSService.checkout({ ...req.body, franchiseId });
       res.status(201).json(order);
     } catch (error: any) {

@@ -31,7 +31,7 @@ export class AccountController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       const account = await AccountService.createAccount({ ...req.body, franchiseId });
       res.status(201).json(account);
     } catch (error: any) {

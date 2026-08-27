@@ -33,7 +33,7 @@ export class ChequeController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       
       const cheque = await ChequeService.create({ ...req.body, franchiseId });
       res.status(201).json(cheque);

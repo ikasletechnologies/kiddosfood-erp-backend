@@ -47,6 +47,7 @@ import BusinessPartnerRoutes from './modules/business-partners';
 import { DraftsController } from './modules/drafts/drafts.controller';
 import { WorkflowApprovalsController } from './modules/workflow-approvals/workflow-approvals.controller';
 import WarehouseRoutes from './modules/warehouse/warehouse.routes';
+import SetupRoutes from './modules/setup/setup.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -568,6 +569,9 @@ app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']
 
 // Warehouse
 app.use('/api/warehouse', WarehouseRoutes);
+
+// System Setup — first-run HQ/warehouse setup status
+app.use('/api/setup', SetupRoutes);
 
 // CRM — Pipelines
 app.get('/api/crm/pipelines', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CRMController.getPipelines);

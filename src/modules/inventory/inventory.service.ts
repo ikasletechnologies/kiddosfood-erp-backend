@@ -330,7 +330,12 @@ export class InventoryService {
             }
           });
         }
-        data.franchiseId = franchise.id;
+        // Franchise.isHQ identifies WHICH franchise is headquarters;
+        // InventoryItem.franchiseId = null is the separate convention for
+        // "this stock belongs to HQ" — storing the HQ franchise's own id
+        // here instead of null is what split HQ inventory between null and
+        // a literal id (see syncInventoryItemForProduct's identical fix).
+        data.franchiseId = franchise.isHQ ? null : franchise.id;
         isHQ = franchise.isHQ;
       } else {
         data.franchiseId = null;

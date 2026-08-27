@@ -18,7 +18,7 @@ export class CartonController {
   static async create(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
       const carton = await CartonService.create({ ...req.body, franchiseId, createdBy: user?.userId });
       res.status(201).json(carton);
     } catch (error) {
