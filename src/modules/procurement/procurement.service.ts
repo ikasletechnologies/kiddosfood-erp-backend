@@ -411,9 +411,11 @@ export class ProcurementService {
       totalPurchased: totalOwedByUs,
       totalPaid: totalPaidToThem,
       totalPayments,
+      totalReturns,
       balance: balance,
       due: balance > 0 ? balance : 0,
       advance: Math.max(0, rawAdvance - reservedAdvance),
+      advanceCredit: rawAdvance,
       suppliedMaterials
     };
   }
@@ -1328,8 +1330,76 @@ export class ProcurementService {
   }
 
   static async getVendorLedger(vendorId: string, _filters: any = {}) {
+    // 0. Auto-repair: sync any completed purchase returns for this vendor that are not yet in VendorLedger
+    try {
+      const completedReturns = await prisma.purchaseReturn.findMany({
+        where: {
+          vendorId,
+          status: { in: ['COMPLETED', 'APPROVED'] }
+        },
+        include: {
+          procurementOrder: { include: { invoices: true } },
+          items: true
+        }
+      });
+
+      for (const pr of completedReturns) {
+        const returnAmount = Number(pr.refundAmount) || 0;
+        if (returnAmount <= 0) continue;
+
+        const alreadyPosted = await prisma.vendorLedger.findFirst({
+          where: {
+            vendorId: pr.vendorId,
+            referenceType: 'RETURN',
+            OR: [
+              { referenceId: pr.id },
+              { referenceId: pr.returnNumber }
+            ]
+          }
+        });
+
+        if (!alreadyPosted) {
+          await prisma.$transaction(async (tx) => {
+            const lastEntry = await tx.vendorLedger.findFirst({
+              where: { vendorId: pr.vendorId },
+              orderBy: { createdAt: 'desc' }
+            });
+            const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
+            const nextBalance = currentBalance - returnAmount;
+
+            let invoiceId: string | undefined = undefined;
+            let billRefNote = '';
+            const linkedInvoice = pr.procurementOrder?.invoices?.[0];
+            if (linkedInvoice) {
+              invoiceId = linkedInvoice.id;
+              billRefNote = ` against Purchase Bill ${linkedInvoice.invoiceNumber}`;
+            }
+
+            await tx.vendorLedger.create({
+              data: {
+                vendorId: pr.vendorId,
+                type: 'DEBIT',
+                amount: returnAmount,
+                balanceAfterTransaction: nextBalance,
+                sourceModule: 'PROCUREMENT',
+                referenceType: 'RETURN',
+                referenceId: pr.returnNumber,
+                invoiceId,
+                paymentMode: 'CASH',
+                note: `Purchase Return ${pr.returnNumber}${billRefNote}`,
+                createdAt: pr.createdAt || new Date()
+              }
+            });
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[ProcurementService] auto-sync returns error:', err);
+    }
+
     const ledger = await prisma.vendorLedger.findMany({
       where: { vendorId },
+      include: { invoice: true },
       orderBy: { createdAt: 'asc' }
     });
 
@@ -1337,14 +1407,40 @@ export class ProcurementService {
       .filter(e => (e.referenceType === 'PAYMENT' || e.referenceType === 'ADVANCE') && e.referenceId)
       .map(e => e.referenceId as string);
 
-    const payments = paymentIds.length > 0
-      ? await prisma.payment.findMany({
-          where: { id: { in: paymentIds } },
-          select: { id: true, paymentNumber: true, transactionRef: true }
-        })
-      : [];
+    const returnRefs = ledger
+      .filter(e => (e.referenceType === 'RETURN' || (e.referenceType as any) === 'PURCHASE_RETURN') && e.referenceId)
+      .map(e => e.referenceId as string);
 
-    const paymentMap = new Map(payments.map(p => [p.id, p]));
+    const [payments, returns] = await Promise.all([
+      paymentIds.length > 0
+        ? prisma.payment.findMany({
+            where: { id: { in: paymentIds } },
+            select: { id: true, paymentNumber: true, transactionRef: true }
+          })
+        : [],
+      returnRefs.length > 0
+        ? prisma.purchaseReturn.findMany({
+            where: {
+              OR: [
+                { id: { in: returnRefs } },
+                { returnNumber: { in: returnRefs } }
+              ]
+            },
+            include: {
+              procurementOrder: { include: { invoices: true } },
+              items: true
+            }
+          })
+        : []
+    ]);
+
+    const paymentMap = new Map<string, any>();
+    payments.forEach((p: any) => paymentMap.set(p.id, p));
+    const returnMap = new Map<string, any>();
+    returns.forEach(r => {
+      returnMap.set(r.id, r);
+      returnMap.set(r.returnNumber, r);
+    });
     
     let runningBalance = 0;
     return ledger.map(entry => {
@@ -1355,12 +1451,19 @@ export class ProcurementService {
       }
 
       const paymentInfo = entry.referenceId ? paymentMap.get(entry.referenceId) : null;
+      const returnInfo = entry.referenceId ? returnMap.get(entry.referenceId) : null;
+
+      const returnNumber = returnInfo?.returnNumber || (entry.referenceType === 'RETURN' ? entry.referenceId : null);
+      const originalInvoiceNumber = entry.invoice?.invoiceNumber || returnInfo?.procurementOrder?.invoices?.[0]?.invoiceNumber || null;
 
       return { 
         ...entry, 
         runningBalance,
         paymentNumber: paymentInfo?.paymentNumber || null,
-        transactionRef: paymentInfo?.transactionRef || null
+        transactionRef: paymentInfo?.transactionRef || null,
+        returnNumber,
+        returnItems: returnInfo?.items || [],
+        originalInvoiceNumber
       };
     }).reverse();
   }
