@@ -20,12 +20,25 @@ async function getHqFranchise(tx: any) {
 }
 
 async function findHqStockItem(tx: any, hqId: string, product: { sku: string | null; name: string }) {
+  const scopeFilter = { OR: [{ franchiseId: hqId }, { franchiseId: null }] };
+
+  if (product.sku) {
+    const itemBySku = await tx.inventoryItem.findFirst({
+      where: {
+        AND: [
+          scopeFilter,
+          { sku: product.sku }
+        ]
+      }
+    });
+    if (itemBySku) return itemBySku;
+  }
+
   return tx.inventoryItem.findFirst({
     where: {
-      franchiseId: hqId,
-      OR: [
-        ...(product.sku ? [{ sku: product.sku }] : []),
-        { name: { contains: product.name, mode: 'insensitive' } }
+      AND: [
+        scopeFilter,
+        { name: { equals: product.name, mode: 'insensitive' } }
       ]
     }
   });
@@ -295,9 +308,10 @@ export class FranchiseOrderService {
           where: { id },
           include: { items: true },
         });
+        const hq = await FranchiseService.getHqFranchiseOrNull(tx);
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            await deductBatchStock(tx, item.productId, item.quantity, order.franchiseId, id, fullOrder!.orderNumber);
+            await deductBatchStock(tx, item.productId, item.quantity, hq?.id, id, fullOrder!.orderNumber);
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -488,11 +502,11 @@ export class FranchiseOrderService {
 }
 
 // FIFO batch deduction
-async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, franchiseId?: string, orderId?: string, orderNumber?: string) {
+async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string) {
   const batches = await tx.productBatch.findMany({
     where: {
       productId,
-      ...(franchiseId ? { franchiseId } : {}),
+      ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
       quantity: { gt: 0 },
       OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
     },
@@ -516,15 +530,7 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
     const hq = await FranchiseService.getHqFranchiseOrNull(tx);
 
     if (hq) {
-      const invItem = await tx.inventoryItem.findFirst({
-        where: {
-          franchiseId: hq.id,
-          OR: [
-            ...(product.sku ? [{ sku: product.sku }] : []),
-            { name: { equals: product.name, mode: 'insensitive' } }
-          ]
-        }
-      });
+      const invItem = await findHqStockItem(tx, hq.id, product);
 
       if (invItem) {
         // Ledger-backed decrement — this used to bypass StockMovement
