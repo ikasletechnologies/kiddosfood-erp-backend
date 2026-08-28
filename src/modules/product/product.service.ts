@@ -346,4 +346,42 @@ export class ProductService {
   static async delete(id: string) {
     return prisma.product.delete({ where: { id } });
   }
+
+  static async linkExistingProduct(data: { inventoryItemId: string; productId: string }) {
+    return prisma.$transaction(async (tx) => {
+      const item = await tx.inventoryItem.findUnique({ where: { id: data.inventoryItemId } });
+      if (!item) throw new Error('Inventory item not found');
+
+      const product = await tx.product.findUnique({ where: { id: data.productId } });
+      if (!product) throw new Error('Product not found');
+
+      if (product.sku && item.sku && product.sku.toUpperCase() !== item.sku.toUpperCase()) {
+        throw new Error(`Cannot link these products because their SKUs are different.\nInventory SKU: ${item.sku}\nProduct SKU: ${product.sku}.\nCreate a Product using the existing inventory SKU (${item.sku}) instead, or select a Product with the same SKU.`);
+      }
+
+      await tx.inventoryItem.update({
+        where: { id: item.id },
+        data: {
+          name: product.name,
+          basePrice: product.basePrice || item.basePrice || 0,
+          gstRate: product.taxPercent,
+        },
+      });
+
+      if (item.sku.toUpperCase().startsWith('RCP-')) {
+        const recipeCode = item.sku.split('-').slice(0, 2).join('-');
+        const recipe = await tx.recipe.findFirst({
+          where: { OR: [{ recipeCode }, { name: { equals: item.name, mode: 'insensitive' } }] },
+        });
+        if (recipe) {
+          await tx.recipe.update({
+            where: { id: recipe.id },
+            data: { productId: product.id },
+          });
+        }
+      }
+
+      return { success: true, item, product };
+    });
+  }
 }

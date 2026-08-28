@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { WarehouseService } from '../warehouse/warehouse.service';
 import prisma from '../../lib/prisma';
 
 function normalizeWarehouseName(s: string) {
@@ -231,48 +232,14 @@ export class InventoryController {
   static async createWarehouse(req: Request, res: Response) {
     try {
       const { name, location, type, code, status, franchiseId } = req.body;
-      if (!name || !name.trim()) {
-        return res.status(400).json({ error: 'Warehouse name is required' });
-      }
-
-      // Warehouse selection elsewhere in the app is name-driven (dropdowns,
-      // stock lookups) — a near-duplicate name like "Home (Hopes)" next to
-      // "Home" silently splits stock across two records with no way to tell
-      // them apart. `nameKey` carries a DB-level unique constraint (see
-      // schema) so this is enforced even under concurrent requests, not just
-      // by this pre-check — the pre-check only exists to give a friendlier
-      // error than a raw constraint violation in the common (non-racing) case.
-      const nameKey = normalizeWarehouseName(name);
-      const clash = await prisma.warehouse.findUnique({ where: { nameKey } });
-      if (clash) {
-        return res.status(400).json({ error: `A warehouse named "${clash.name}" already exists. Use that one instead of creating a near-duplicate.` });
-      }
-
-      if (franchiseId) {
-        const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId }});
-        if (!franchise) return res.status(404).json({ error: 'Franchise not found.' });
-        if (franchise.primaryWarehouseId) {
-          return res.status(400).json({ error: 'This franchise already has a primary warehouse configured.' });
-        }
-      }
-
-      const warehouse = await prisma.warehouse.create({
-        data: { name: name.trim(), nameKey, location, type, code, status }
-      });
-      
-      if (franchiseId) {
-        await prisma.franchise.update({
-          where: { id: franchiseId },
-          data: { primaryWarehouseId: warehouse.id }
-        });
-      }
-
+      const warehouse = await WarehouseService.create({ name, location, type, code, status, franchiseId });
       res.status(201).json(warehouse);
     } catch (error: any) {
       if (error.code === 'P2002') {
         return res.status(400).json({ error: 'A warehouse with that name already exists.' });
       }
-      res.status(500).json({ error: error.message });
+      const isValidationError = /required|already exists|not found|already has a primary/i.test(error.message || '');
+      res.status(isValidationError ? 400 : 500).json({ error: error.message });
     }
   }
 

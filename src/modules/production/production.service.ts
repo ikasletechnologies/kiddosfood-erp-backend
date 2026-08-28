@@ -4,6 +4,7 @@ import { WasteService } from '../waste/waste.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { ProductionStatus } from '@prisma/client';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
+import { generateSku } from '../product/product.service';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -866,7 +867,38 @@ export class ProductionService {
         throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
 
-      const { retailSku, retailName } = this.deriveRetailIdentity(bulkItem, packaging.packetSize, !!batch.product);
+      const linkedProduct = (batch as any).product || (batch as any).production?.recipe?.product;
+      let retailSku: string;
+      let retailName: string;
+
+      if (linkedProduct?.sku) {
+        retailSku = linkedProduct.sku;
+        retailName = linkedProduct.name;
+      } else {
+        const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
+        retailSku = generateSku('FINISHED_GOOD', baseName, packaging.packetSize);
+        const packetSizeMatch = packaging.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
+        const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : packaging.packetSize;
+        retailName = baseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
+          ? baseName
+          : `${baseName} ${formattedPacketSize}`;
+
+        // Idempotent automatic catalog Product creation for unlinked recipe
+        let product = await tx.product.findUnique({ where: { sku: retailSku } });
+        if (!product) {
+          product = await tx.product.create({
+            data: {
+              name: retailName,
+              sku: retailSku,
+              category: 'FINISHED_GOOD',
+              productType: 'FINISHED_GOOD',
+              basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
+              taxPercent: 5,
+              isActive: true,
+            },
+          });
+        }
+      }
 
       let retailItem = await tx.inventoryItem.findFirst({
         where: { franchiseId: invFranchiseId, sku: retailSku },
