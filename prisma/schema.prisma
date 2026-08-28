@@ -1352,6 +1352,11 @@ model Quotation {
   customerPhone    String?
   customerEmail    String?
   validUntil       DateTime?
+  // GST place of supply as of the accepted Estimate — carried forward
+  // verbatim to the converted SalesOrder (see convertQuotationToSalesOrder)
+  // rather than re-asked, since it determines CGST+SGST vs IGST and must
+  // stay consistent with the totals the customer already accepted.
+  stateOfSupply    String?
   status           QuotationStatus @default(DRAFT)
   subTotal         Float
   taxAmount        Float
@@ -1413,6 +1418,21 @@ model SalesOrder {
   taxAmount       Float
   discountAmount  Float            @default(0)
   totalAmount     Float
+  // The date this Sales Order itself was created/committed — distinct from
+  // Quotation.createdAt (the estimate's own date) and never copied from the
+  // source Estimate's validUntil, which is a price-offer expiry, not an
+  // order date. Set once at creation (direct-create or conversion) and not
+  // meant to move afterward.
+  orderDate       DateTime?        @default(now())
+  // Fulfilment/payment commitment date — a distinct business concept from
+  // Quotation.validUntil ("this price offer expires on..."). Editable after
+  // creation, unlike orderDate.
+  dueDate         DateTime?
+  // GST place of supply. On a quotation-converted order this is copied
+  // forward from Quotation.stateOfSupply (see convertQuotationToSalesOrder)
+  // rather than re-entered, since changing it can flip CGST+SGST vs IGST
+  // and desync the order from the totals the customer already accepted.
+  stateOfSupply   String?
   deliveryDate    DateTime?
   deliveryAddress String?
   trackingNumber  String?

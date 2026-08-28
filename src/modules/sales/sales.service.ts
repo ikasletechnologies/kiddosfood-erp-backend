@@ -111,6 +111,7 @@ export class SalesService {
     customerPhone?: string;
     customerEmail?: string;
     validUntil?: string;
+    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     termsConditions?: string;
@@ -138,6 +139,7 @@ export class SalesService {
         customerPhone: data.customerPhone,
         customerEmail: data.customerEmail,
         validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
+        stateOfSupply: data.stateOfSupply,
         status: (data.status as any) || undefined,
         subTotal,
         taxAmount,
@@ -174,6 +176,7 @@ export class SalesService {
     notes?: string;
     termsConditions?: string;
     validUntil?: string;
+    stateOfSupply?: string;
     items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     quotationNumber?: string;
@@ -211,6 +214,7 @@ export class SalesService {
       notes: data.notes,
       termsConditions: data.termsConditions,
       validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
+      stateOfSupply: data.stateOfSupply,
       quotationNumber: data.quotationNumber,
       trackingNumber: data.trackingNumber,
       courierName: data.courierName
@@ -285,7 +289,7 @@ export class SalesService {
   static async convertQuotationToSalesOrder(
     quotationId: string,
     createdBy: string,
-    trackingData?: { trackingNumber?: string; courierName?: string; deliveryDate?: string; deliveryAddress?: string; }
+    trackingData?: { trackingNumber?: string; courierName?: string; deliveryDate?: string; deliveryAddress?: string; dueDate?: string; }
   ) {
     try {
       return await prisma.$transaction(async (tx) => {
@@ -305,6 +309,18 @@ export class SalesService {
         throw new Error(`Only an Estimate with status SENT can be converted to a Sales Order (current status: ${quotation.status}).`);
       }
 
+      // Order Date is the conversion moment itself — never the quotation's
+      // own date or its validUntil. Due Date is a separate sales-order
+      // fulfilment/payment commitment: honor an explicit override from the
+      // convert modal, otherwise default to a week out — deliberately not
+      // Quotation.validUntil, which means "this price offer expires on...",
+      // a different business concept (see conversation/spec this followed).
+      const orderDate = new Date();
+      const DEFAULT_DUE_DAYS = 7;
+      const dueDate = trackingData?.dueDate
+        ? new Date(trackingData.dueDate)
+        : new Date(orderDate.getTime() + DEFAULT_DUE_DAYS * 24 * 60 * 60 * 1000);
+
       const salesOrder = await tx.salesOrder.create({
         data: {
           orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
@@ -319,6 +335,12 @@ export class SalesService {
           taxAmount: quotation.taxAmount,
           discountAmount: quotation.discountAmount,
           totalAmount: quotation.totalAmount,
+          orderDate,
+          dueDate,
+          // Carried forward, not re-asked — see the schema comment on
+          // SalesOrder.stateOfSupply for why this must match the quotation
+          // the customer already accepted rather than being editable here.
+          stateOfSupply: quotation.stateOfSupply,
           deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
           deliveryAddress: trackingData?.deliveryAddress || undefined,
           trackingNumber: trackingData?.trackingNumber || undefined,
@@ -804,6 +826,9 @@ export class SalesService {
     discountAmount?: number;
     deliveryDate?: string;
     deliveryAddress?: string;
+    orderDate?: string;
+    dueDate?: string;
+    stateOfSupply?: string;
     notes?: string;
     createdBy?: string;
     idempotencyKey?: string;
@@ -833,6 +858,9 @@ export class SalesService {
         taxAmount,
         discountAmount: discount,
         totalAmount: totalAmount - discount,
+        orderDate: data.orderDate ? new Date(data.orderDate) : new Date(),
+        dueDate: data.dueDate ? new Date(data.dueDate) : undefined,
+        stateOfSupply: data.stateOfSupply,
         deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
         deliveryAddress: data.deliveryAddress,
         notes: data.notes,
@@ -875,7 +903,12 @@ export class SalesService {
       data: {
         ...safeData,
         status: data.status as any,
-        deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined
+        deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
+        // orderDate is set once at creation (direct-create or conversion)
+        // and isn't meant to move afterward — only convert it through if a
+        // caller explicitly sends one; dueDate stays freely editable.
+        orderDate: data.orderDate ? new Date(data.orderDate) : undefined,
+        dueDate: data.dueDate ? new Date(data.dueDate) : undefined
       },
       include: { items: true }
     });
