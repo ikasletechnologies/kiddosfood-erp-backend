@@ -989,33 +989,61 @@ export class SalesService {
     reason: string;
     items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string }>;
     refundMethod?: string;
+    idempotencyKey?: string;
   }) {
+    // Idempotency: a retry/double-click/API re-entry carrying the same key
+    // must return the already-created return instead of posting a second
+    // one — mirrors FinanceService.createPayment's idempotencyKey handling.
+    if (data.idempotencyKey) {
+      const existing = await prisma.returnOrder.findUnique({
+        where: { idempotencyKey: data.idempotencyKey },
+        include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+      });
+      if (existing) return existing;
+    }
+
     const refundAmount = data.items.reduce((sum, item) => sum + item.quantity * item.rate, 0);
 
-    return prisma.returnOrder.create({
-      data: {
-        returnNumber: await generateReturnNumber(),
-        salesOrderId: data.salesOrderId,
-        franchiseOrderId: data.franchiseOrderId,
-        posOrderId: data.posOrderId,
-        customerId: data.customerId,
-        franchiseId: data.franchiseId,
-        reason: data.reason,
-        refundAmount,
-        refundMethod: data.refundMethod,
-        items: {
-          create: data.items.map((item) => ({
-            productId: item.productId,
-            productName: item.productName,
-            quantity: item.quantity,
-            rate: item.rate,
-            totalAmount: item.quantity * item.rate,
-            condition: item.condition
-          }))
-        }
-      },
-      include: { customer: true, franchise: true, posOrder: true, items: true }
-    });
+    try {
+      return await prisma.returnOrder.create({
+        data: {
+          returnNumber: await generateReturnNumber(),
+          salesOrderId: data.salesOrderId,
+          franchiseOrderId: data.franchiseOrderId,
+          posOrderId: data.posOrderId,
+          customerId: data.customerId,
+          franchiseId: data.franchiseId,
+          reason: data.reason,
+          refundAmount,
+          refundMethod: data.refundMethod,
+          idempotencyKey: data.idempotencyKey || undefined,
+          items: {
+            create: data.items.map((item) => ({
+              productId: item.productId,
+              productName: item.productName,
+              quantity: item.quantity,
+              rate: item.rate,
+              totalAmount: item.quantity * item.rate,
+              condition: item.condition
+            }))
+          }
+        },
+        include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+      });
+    } catch (err: any) {
+      // True concurrent race: two requests both passed the check above
+      // before either committed, and the loser hit the idempotencyKey
+      // unique constraint. Return the winner's row rather than failing a
+      // legitimate retry.
+      if (data.idempotencyKey && err?.code === 'P2002') {
+        const winner = await prisma.returnOrder.findUnique({
+          where: { idempotencyKey: data.idempotencyKey },
+          include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+        });
+        if (winner) return winner;
+      }
+      throw err;
+    }
   }
 
   static async updateReturnOrder(id: string, data: { status?: string; approvedBy?: string }) {

@@ -1541,6 +1541,11 @@ model ReturnOrder {
   franchiseId      String?
   franchiseOrderId String?
   posOrderId       String?
+  // Client-supplied key (one per "Submit Return Request" form session) so a
+  // retry/double-click/network re-entry with the same key returns the
+  // already-created return instead of creating a second one. Mirrors
+  // Payment.idempotencyKey / SalesOrder.idempotencyKey.
+  idempotencyKey   String?         @unique
   items            ReturnItem[]
   customer         Customer?       @relation(fields: [customerId], references: [id])
   franchise        Franchise?      @relation(fields: [franchiseId], references: [id])
