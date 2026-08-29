@@ -560,13 +560,46 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
+      const { startDate, endDate, fromDate, toDate, partyType, search, datasetType } = req.query;
+      if (datasetType && !['RECEIVABLE', 'PAYABLE'].includes(datasetType as string)) {
+        return res.status(400).json({ error: "Invalid datasetType. Must be 'RECEIVABLE' or 'PAYABLE'." });
+      }
       const report = await FinanceService.getAllPartiesData(
         franchiseId,
-        startDate as string,
-        endDate as string
+        (startDate as string) || (fromDate as string),
+        (endDate as string) || (toDate as string),
+        {
+          partyType: partyType as any,
+          search: search as string,
+          datasetType: datasetType as any
+        }
       );
       res.json(report);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getPartyInvoices(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { partyType, partyId } = req.query;
+
+      if (!partyType || !partyId) {
+        return res.status(400).json({ error: 'partyType and partyId are required.' });
+      }
+      if (!['CUSTOMER', 'DEALER', 'FRANCHISE'].includes(partyType as string)) {
+        return res.status(400).json({ error: 'Invalid partyType. Must be CUSTOMER, DEALER, or FRANCHISE.' });
+      }
+
+      const invoices = await FinanceService.getPartyInvoices({
+        franchiseId,
+        partyType: partyType as 'CUSTOMER' | 'DEALER' | 'FRANCHISE',
+        partyId: partyId as string
+      });
+      res.json(invoices);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

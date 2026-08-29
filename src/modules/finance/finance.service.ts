@@ -300,10 +300,18 @@ export class FinanceService {
   }
 
   static async getCashFlow(franchiseId?: string | null) {
-
-    const accounts = await prisma.account.findMany({
-      where: franchiseId ? { franchiseId } : { franchiseId: null }
-    });
+    // Reuse AccountService.getAccounts — the exact source of truth the
+    // Bank Accounts page already reads correctly — instead of re-querying
+    // `prisma.account` with a literal `franchiseId: null` filter. That
+    // literal-null query silently returned zero rows for SUPER_ADMIN/HQ
+    // callers (the common case, since neither this endpoint nor its
+    // frontend caller ever pass a franchiseId), because Account rows are
+    // stored under the real HQ franchise id (see AccountService.getAccounts'
+    // "literal-HQ-id convention" note), never franchiseId: null. That
+    // mismatch — not bad type classification — is why every summary card
+    // here showed ₹0 while Bank Accounts, which resolves the same `null`
+    // input to the real HQ id first, showed correct balances.
+    const accounts = await AccountService.getAccounts(franchiseId);
 
     const totalCash = accounts.filter(a => a.type === 'CASH').reduce((s, a) => s + a.balance, 0);
     const totalBank = accounts.filter(a => a.type === 'BANK').reduce((s, a) => s + a.balance, 0);
@@ -522,8 +530,38 @@ export class FinanceService {
       orderBy: { createdAt: 'desc' }
     });
 
+    // Expense traceability — same additive-lookup pattern as
+    // AccountService.getAccountById's `expenseById` join: linkedDocId has
+    // no Prisma relation, so batch-resolve payee/category for every
+    // EXPENSE-sourced payment here instead of leaving a fully-known source
+    // (an Expense payment) to fall through to "Manual Entry".
+    const expenseIds = Array.from(new Set(
+      payments.filter(p => p.sourceModule === 'EXPENSE' && p.linkedDocId).map(p => p.linkedDocId as string)
+    ));
+    const linkedExpenses = expenseIds.length
+      ? await prisma.expense.findMany({ where: { id: { in: expenseIds } }, select: { id: true, payee: true, category: true } })
+      : [];
+    const expenseById = new Map(linkedExpenses.map(e => [e.id, e]));
+
     return Promise.all(payments.map(async p => {
       const partyName = await this.resolvePartyName(p.entityType, p.entityId);
+
+      // Fallback description for a payment whose party isn't resolvable via
+      // resolvePartyName (Expense stores payee/category text in entityId,
+      // not a Vendor id — see addExpense/recordExpensePayment — so the
+      // VENDOR lookup above always misses for it) and has no transactionRef
+      // either. Only used when both of those are already absent, so no
+      // currently-correct entity string changes.
+      let sourceLabel: string | null = null;
+      if (p.sourceModule === 'EXPENSE') {
+        const linkedExpense = p.linkedDocId ? expenseById.get(p.linkedDocId) : undefined;
+        const payee = linkedExpense?.payee || p.entityId || null;
+        const category = linkedExpense?.category || null;
+        sourceLabel = payee ? `Expense - ${payee}` : category ? `Expense Payment - ${category}` : null;
+      } else if (p.sourceModule === 'POS' && p.order?.customerName) {
+        sourceLabel = `POS Payment - ${p.order.customerName}`;
+      }
+
       return {
         id: p.id,
         paymentNumber: p.paymentNumber,
@@ -534,7 +572,7 @@ export class FinanceService {
         // Payment-In list).
         date: p.createdAt.toISOString(),
         createdAt: p.createdAt.toISOString(),
-        entity: partyName || p.transactionRef || "Manual Entry",
+        entity: partyName || p.transactionRef || sourceLabel || "Manual Entry",
         partyName: partyName,
         entityId: p.entityId,
         entityType: p.entityType,
@@ -1361,6 +1399,17 @@ export class FinanceService {
         }
       });
 
+      // "Collect payment now" at invoice-creation time is routed through the
+      // same central FinanceService.createPayment() mechanism the standalone
+      // Record Payment flow (payment-in) already uses correctly, instead of
+      // a bespoke inline Payment-create + Account.balance increment. This
+      // was previously duplicated here and — critically — always wrote
+      // status: 'PAID' and moved real money even when `received` only
+      // partially covered the invoice, bypassing createPayment's overpayment
+      // guard and its single source of truth for recomputing Invoice/Order
+      // status from the real summed Payment rows. When received is 0 (the
+      // honest default for a draft/credit invoice), nothing is created here
+      // at all — no Payment row, no balance movement.
       if (received > 0) {
         const paymentMode = data.paymentMode || 'CASH';
         const accountTypeMap: Record<string, string> = {
@@ -1370,43 +1419,32 @@ export class FinanceService {
           'BANK_TRANSFER': 'BANK'
         };
         const targetType = accountTypeMap[paymentMode] || 'CASH';
-        const defaultAccount = await tx.account.findFirst({
-          where: { 
-            type: targetType as any,
-            franchiseId: data.franchiseId
-          }
-        });
+        const isNonCustomerParty = !!data.partyType && data.partyType !== 'CUSTOMER';
 
-        const paymentNumber = await tx.payment.count({
-          where: { createdAt: { gte: new Date(year, 0, 1) } }
+        await this.createPayment({
+          tx,
+          amount: received,
+          flow: 'IN',
+          status: 'PAID',
+          sourceAccount: targetType,
+          method: paymentMode,
+          franchiseId: data.franchiseId,
+          invoiceId: invoice.id,
+          orderId: order.id,
+          entityType: isNonCustomerParty ? data.partyType : 'CUSTOMER',
+          entityId: isNonCustomerParty ? data.partyId : data.customerId,
+          type: 'INVOICE_LINKED',
+          // PaymentSourceModule has no 'INVOICE' value — 'POS' is what the
+          // previous inline Payment.create used here too, and getPayments'
+          // party-name resolution (sourceModule === 'POS' && order.customerName)
+          // and the Cash Flow report both key off it, so keeping it avoids
+          // silently reclassifying every "collect payment now" Tax Invoice
+          // payment out of the bucket both already handle correctly.
+          sourceModule: 'POS',
+          linkedDocType: 'INVOICE',
+          linkedDocId: invoice.id,
+          createdBy: data.createdBy || 'SYSTEM'
         });
-        const pNum = `PAY-${year}-${(paymentNumber + 1).toString().padStart(4, '0')}`;
-
-        await tx.payment.create({
-          data: {
-            orderId: order.id,
-            invoiceId: invoice.id,
-            paymentNumber: pNum,
-            paidAmount: received,
-            paymentMode: paymentMode as any,
-            status: 'PAID',
-            accountId: defaultAccount?.id ?? undefined,
-            entityType: 'CUSTOMER',
-            entityId: data.customerId,
-            type: 'INVOICE_LINKED',
-            sourceModule: 'POS',
-            linkedDocType: 'INVOICE',
-            linkedDocId: invoice.id,
-            createdBy: data.createdBy || 'SYSTEM'
-          }
-        });
-
-        if (defaultAccount) {
-          await tx.account.update({
-            where: { id: defaultAccount.id },
-            data: { balance: { increment: received } }
-          });
-        }
       }
 
       if (data.customerId) {
@@ -3657,7 +3695,183 @@ export class FinanceService {
     return Object.values(groupMap);
   }
 
-  static async getAllPartiesData(franchiseId?: string, startDate?: string, endDate?: string) {
+  /**
+   * Receivables side of getAllPartiesData (CUSTOMER/DEALER/FRANCHISE) — real
+   * outstanding balance summed per party from actual Tax Invoices (Order+
+   * Invoice+Payment), NOT CustomerLedger. Deliberately not ledger-sourced:
+   * POSService.checkout and the fixed FinanceService.createInvoice never
+   * reliably post SALE/PAYMENT ledger entries for every flow (see
+   * CustomerService.getOutstandingBalances, which this generalizes to
+   * DEALER/FRANCHISE using the same partyType/partyId fields
+   * DealerService.getTransactions already keys off).
+   *
+   * Per-order outstanding = order.totalAmount − Σ(non-cancelled
+   * Payment.paidAmount for that order/invoice). Orders with no resolvable
+   * real party (Walk-in: partyType CUSTOMER with no customerId, or a
+   * Dealer/Franchise sale with no partyId) are excluded — there is no real
+   * debtor identity to attach that balance to, and lumping every Walk-in
+   * sale into one shared fake "Walk-in Customer" bucket would mix unrelated
+   * people's debts. In practice this exclusion is close to a no-op: POS
+   * checkout (the only flow that creates Walk-in orders) always writes
+   * paymentStatus: 'PAID', so a real unpaid Walk-in balance should not occur
+   * — see PosService.checkout.
+   */
+  private static async getPartyReceivables(params: {
+    franchiseId?: string;
+    dateFilter: any;
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+  }): Promise<Array<{ id: string; partyType: string; name: string; email: string | null; phone: string | null; currentBalance: number; creditLimit: number | null }>> {
+    const { franchiseId, dateFilter, partyType } = params;
+
+    const orders = await prisma.order.findMany({
+      where: {
+        status: { not: 'CANCELLED' },
+        ...(franchiseId ? { franchiseId } : {}),
+        ...dateFilter
+      },
+      select: {
+        partyType: true,
+        partyId: true,
+        customerId: true,
+        totalAmount: true,
+        payments: { select: { paidAmount: true, isCancelled: true, status: true } }
+      }
+    });
+
+    // key = `${partyType}:${partyId}`
+    const balances = new Map<string, number>();
+    for (const o of orders) {
+      const resolvedType = o.partyType || 'CUSTOMER';
+      const resolvedId = resolvedType === 'CUSTOMER' ? o.customerId : o.partyId;
+      if (!resolvedId) continue; // No real master-table row for this party (Walk-in etc) — not trackable.
+      if (partyType && resolvedType !== partyType) continue;
+
+      const paid = o.payments
+        .filter((p) => !p.isCancelled && p.status !== 'CANCELLED')
+        .reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const due = (o.totalAmount || 0) - paid;
+      if (due <= 0.01) continue; // Fully-paid (or overpaid, which the createPayment guard should prevent) — nothing outstanding.
+
+      const key = `${resolvedType}:${resolvedId}`;
+      balances.set(key, (balances.get(key) || 0) + due);
+    }
+
+    if (balances.size === 0) return [];
+
+    const customerIds: string[] = [];
+    const dealerIds: string[] = [];
+    const franchiseIds: string[] = [];
+    for (const key of balances.keys()) {
+      const [pt, id] = key.split(':');
+      if (pt === 'CUSTOMER') customerIds.push(id);
+      else if (pt === 'DEALER') dealerIds.push(id);
+      else if (pt === 'FRANCHISE') franchiseIds.push(id);
+    }
+
+    // Empty `in: []` simply returns no rows in Prisma — always issuing all
+    // three queries (instead of conditionally skipping empty id lists) keeps
+    // the return types uniform, which is what lets TS infer the Map
+    // constructions below correctly.
+    const [customers, dealers, franchises] = await Promise.all([
+      prisma.customer.findMany({ where: { id: { in: customerIds } } }),
+      prisma.dealer.findMany({ where: { id: { in: dealerIds } } }),
+      prisma.franchise.findMany({ where: { id: { in: franchiseIds } } })
+    ]);
+    const customerMap = new Map(customers.map((c) => [c.id, c] as const));
+    const dealerMap = new Map(dealers.map((d) => [d.id, d] as const));
+    const franchiseMap = new Map(franchises.map((f) => [f.id, f] as const));
+
+    const rows: Array<{ id: string; partyType: string; name: string; email: string | null; phone: string | null; currentBalance: number; creditLimit: number | null }> = [];
+    for (const [key, balance] of balances.entries()) {
+      const [pt, id] = key.split(':');
+      if (pt === 'CUSTOMER') {
+        const c = customerMap.get(id);
+        if (!c) continue; // Customer record no longer exists — skip rather than show an orphaned row.
+        rows.push({ id, partyType: pt, name: c.name, email: c.email, phone: c.phone, currentBalance: Number(balance.toFixed(2)), creditLimit: c.creditLimit ?? null });
+      } else if (pt === 'DEALER') {
+        const d = dealerMap.get(id);
+        if (!d) continue;
+        // Dealer has no creditLimit column in the schema — return null rather
+        // than fabricating a value (Customer/Franchise both have a real one).
+        rows.push({ id, partyType: pt, name: d.name, email: d.email, phone: d.phone, currentBalance: Number(balance.toFixed(2)), creditLimit: null });
+      } else if (pt === 'FRANCHISE') {
+        const f = franchiseMap.get(id);
+        if (!f) continue;
+        rows.push({ id, partyType: pt, name: f.name, email: null, phone: f.contactNum, currentBalance: Number(balance.toFixed(2)), creditLimit: f.creditLimit ?? null });
+      }
+    }
+
+    return rows;
+  }
+
+  /**
+   * Receivables drill-down: every individual invoice (Order+Payment) for one
+   * CUSTOMER/DEALER/FRANCHISE party, not just the aggregate getPartyReceivables
+   * returns. Same outstanding-balance formula (order.totalAmount − Σ
+   * non-cancelled Payment.paidAmount) applied per-order instead of summed
+   * across orders, so a paid-off invoice and a still-outstanding one for the
+   * same party are both visible with their own status. Each invoice also
+   * carries its full payment history (including cancelled payments, flagged
+   * via isCancelled, for traceability) — paymentNumber/date/method/account
+   * are all real Payment/Account fields, never a raw id. Read-only —
+   * touches no Payment/Order rows.
+   */
+  static async getPartyInvoices(params: {
+    franchiseId?: string;
+    partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId: string;
+  }) {
+    const { franchiseId, partyType, partyId } = params;
+    const idFilter = partyType === 'CUSTOMER'
+      ? { customerId: partyId }
+      : { partyId, partyType: partyType as any };
+
+    const orders = await prisma.order.findMany({
+      where: {
+        status: { not: 'CANCELLED' },
+        ...(franchiseId ? { franchiseId } : {}),
+        ...idFilter
+      },
+      include: {
+        payments: { include: { account: true }, orderBy: { createdAt: 'asc' } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    return orders.map((o) => {
+      const validPayments = o.payments.filter((p) => !p.isCancelled && p.status !== 'CANCELLED');
+      const paid = Number(validPayments.reduce((sum, p) => sum + (p.paidAmount || 0), 0).toFixed(2));
+      const rawBalance = Number(((o.totalAmount || 0) - paid).toFixed(2));
+      const balance = rawBalance < 0 ? 0 : rawBalance;
+      const status: 'PAID' | 'PARTIAL' | 'UNPAID' = balance <= 0.01 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID');
+
+      return {
+        orderId: o.id, // Internal key only — never render this in the UI, render invoiceNumber instead.
+        invoiceNumber: o.invoiceNum,
+        createdAt: o.createdAt,
+        invoiceTotal: o.totalAmount,
+        paidAmount: paid,
+        balance,
+        status,
+        payments: o.payments.map((p) => ({
+          paymentNumber: p.paymentNumber || '—',
+          date: p.createdAt,
+          method: p.paymentMode,
+          account: p.account?.name || 'Unknown',
+          amount: p.paidAmount,
+          isCancelled: p.isCancelled,
+          status: p.status
+        }))
+      };
+    });
+  }
+
+  static async getAllPartiesData(
+    franchiseId?: string,
+    startDate?: string,
+    endDate?: string,
+    opts?: { partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' | 'ALL'; search?: string; datasetType?: 'RECEIVABLE' | 'PAYABLE' }
+  ) {
     const dateFilter: any = {};
     if (startDate || endDate) {
       dateFilter.createdAt = {
@@ -3666,37 +3880,43 @@ export class FinanceService {
       };
     }
 
-    const [customers, vendors] = await Promise.all([
-      prisma.customer.findMany({
-        where: franchiseId ? { franchiseId } : undefined,
-        include: { ledgerEntries: { where: dateFilter } }
-      }),
-      prisma.vendor.findMany({
-        include: { ledgerEntries: { where: dateFilter } }
-      })
+    const requestedPartyType = opts?.partyType && opts.partyType !== 'ALL' ? opts.partyType : undefined;
+
+    // datasetType is an explicit, required-in-practice partition between the
+    // Receivables view (CUSTOMER/DEALER/FRANCHISE only — Vendor must NEVER
+    // appear here, even under "All Party Types") and the Payables view
+    // (VENDOR only). This is a query-layer constraint, not a downstream
+    // balance-sign heuristic: previously "All Party Types" on the
+    // Receivables page sent no partyType at all, which fell through to the
+    // same "give me everything" default the generic Reports > All Parties
+    // page relies on — so a Vendor with a positive ledger balance leaked
+    // into the Receivables table. Reports > All Parties (the only caller
+    // that omits datasetType) still gets the original combined
+    // customers+vendors dataset, unchanged.
+    const includeReceivables = opts?.datasetType !== 'PAYABLE';
+    const includeVendors = opts?.datasetType !== 'RECEIVABLE' && !requestedPartyType;
+
+    const [receivableRows, vendors] = await Promise.all([
+      includeReceivables
+        ? this.getPartyReceivables({ franchiseId, dateFilter, partyType: requestedPartyType })
+        : Promise.resolve([]),
+      includeVendors
+        ? prisma.vendor.findMany({ include: { ledgerEntries: { where: dateFilter } } })
+        : Promise.resolve([])
     ]);
 
-    const parties: any[] = [];
+    const parties: any[] = receivableRows.map((r) => ({
+      id: r.id,
+      partyType: r.partyType,
+      name: r.name,
+      email: r.email,
+      phone: r.phone,
+      currentBalance: r.currentBalance,
+      creditLimit: r.creditLimit
+    }));
 
-    customers.forEach(c => {
-      const currentBalance = c.ledgerEntries.reduce((sum, entry) => {
-        if (entry.type === 'DEBIT') return sum + entry.amount;
-        if (entry.type === 'CREDIT') return sum - entry.amount;
-        return sum;
-      }, 0);
-
-      parties.push({
-        id: c.id,
-        name: c.name,
-        email: c.email,
-        phone: c.phone,
-        currentBalance,
-        creditLimit: null
-      });
-    });
-
-    vendors.forEach(v => {
-      const currentBalance = v.ledgerEntries.reduce((sum, entry) => {
+    vendors.forEach((v: any) => {
+      const currentBalance = v.ledgerEntries.reduce((sum: number, entry: any) => {
         if (entry.type === 'CREDIT') return sum - entry.amount;
         if (entry.type === 'DEBIT') return sum + entry.amount;
         return sum;
@@ -3704,6 +3924,7 @@ export class FinanceService {
 
       parties.push({
         id: v.id,
+        partyType: 'VENDOR',
         name: v.name,
         email: v.email,
         phone: v.contact,
@@ -3712,7 +3933,16 @@ export class FinanceService {
       });
     });
 
-    return parties.sort((a, b) => a.name.localeCompare(b.name));
+    const search = opts?.search?.trim().toLowerCase();
+    const filtered = search
+      ? parties.filter((p) =>
+          (p.name || '').toLowerCase().includes(search) ||
+          (p.phone || '').toLowerCase().includes(search) ||
+          (p.email || '').toLowerCase().includes(search)
+        )
+      : parties;
+
+    return filtered.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   static async getSalePurchaseByItemData(franchiseId: string, startDate?: string, endDate?: string) {

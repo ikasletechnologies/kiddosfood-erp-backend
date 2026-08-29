@@ -1201,93 +1201,17 @@ export class ProcurementService {
     });
   }
 
-  static async receiveGoods(poId: string) {
-    const result = await prisma.$transaction(async (tx) => {
-      const po = await tx.procurementOrder.findUnique({
-        where: { id: poId },
-        include: { poItems: true }
-      });
-      if (!po) throw new Error('Purchase Order not found');
-      if (po.received) throw new Error('Goods already received for this PO');
-
-      for (const item of po.poItems) {
-        if (!item.inventoryItemId) continue;
-        const billNumber = `BILL-${po.poNumber || po.id.substring(0, 8)}-REC`;
-        await tx.inventoryBatch.create({
-          data: {
-            inventoryItemId: item.inventoryItemId,
-            batchNumber: billNumber,
-            initialQty: item.quantity,
-            currentQty: item.quantity,
-            unitCost: item.price,
-            status: 'QC_HOLD'
-          }
-        });
-      }
-
-      await tx.goodsReceipt.create({
-        data: {
-          poId: po.id,
-          status: 'COMPLETED',
-          items: {
-            create: po.poItems.map((item) => ({
-              materialId: item.inventoryItemId,
-              quantity: item.quantity,
-              receivedQty: item.quantity,
-              acceptedQty: item.quantity,
-              rejectedQty: 0,
-              price: item.price,
-              unit: item.unit,
-              qcStatus: 'PENDING'
-            }))
-          }
-        }
-      });
-
-      // FINANCIAL TRIGGER: Recognize liability on Receipt
-      const totalValue = po.poItems.reduce((acc, it) => acc + (it.quantity * it.price), 0);
-      
-      // Calculate tax factor from PO totals
-      const taxFactor = po.subtotal > 0 ? po.totalAmount / po.subtotal : 1;
-      const totalWithTax = totalValue * taxFactor;
-
-      if (totalWithTax > 0) {
-        const lastEntry = await tx.vendorLedger.findFirst({
-          where: { vendorId: po.vendorId },
-          orderBy: { createdAt: 'desc' }
-        });
-        const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: po.vendorId,
-            type: 'CREDIT', // Liability increases
-            amount: totalWithTax,
-            balanceAfterTransaction: currentBalance + totalWithTax,
-            paymentMode: 'CASH',
-            sourceModule: 'PROCUREMENT',
-            referenceType: 'PURCHASE',
-            referenceId: po.id,
-            note: `Direct Receipt for PO #${po.poNumber || po.id.slice(0,8)}`
-          }
-        });
-      }
-
-      const updatedPo = await tx.procurementOrder.update({
-        where: { id: poId },
-        data: { status: 'RECEIVED', received: true },
-        include: { poItems: true, goodsReceipts: { include: { items: true } } }
-      });
-
-      await this.settleVendorOrders(po.vendorId, tx);
-
-      return tx.procurementOrder.findUnique({
-        where: { id: poId },
-        include: { poItems: true, goodsReceipts: { include: { items: true } } }
-      });
-    });
-
-    return result;
+  /**
+   * Disabled. This legacy path used to write VendorLedger directly from the
+   * PO's own price/quantity, bypassing GRN → VendorInvoice →
+   * recognizeLiability entirely — an unguarded second liability-posting
+   * route with no idempotency check shared with recognizeLiability's
+   * invoiceId guard. Nothing in the current frontend calls it. The only
+   * supported receiving path is:
+   * POST /api/grn/from-po/:poId → PATCH /api/grn/:id/approve.
+   */
+  static async receiveGoods(poId: string): Promise<any> {
+    throw new Error('This legacy direct-receive endpoint is disabled. Use the GRN flow instead: create a GRN from the PO, then approve it.');
   }
 
   static async filterVendors(filters: any) {

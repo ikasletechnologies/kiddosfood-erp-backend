@@ -187,7 +187,20 @@ model DailySettlement {
   cashTotal    Float     @default(0)
   upiTotal     Float     @default(0)
   cardTotal    Float     @default(0)
+  // Sum of any PaymentMode outside CASH/UPI/CARD (BANK_TRANSFER, CHEQUE,
+  // NEFT, RTGS, IMPS) collected the same day — kept separate so the three
+  // UI cards never silently swallow a payment mode they don't render.
+  otherTotal   Float     @default(0)
+  // Sales value of the day's completed Orders — this is the reconciliation
+  // target that cashTotal+upiTotal+cardTotal+otherTotal must equal before
+  // close is allowed (see POSService.closeDay).
   grandTotal   Float     @default(0)
+  // Approved-return refund payouts recorded the same day (flow OUT,
+  // sourceModule POS, linkedDocType DIRECT). Not netted into the mode
+  // totals above — kept explicit per the "don't corrupt payment totals"
+  // rule — netTotal is grandTotal - refundTotal.
+  refundTotal  Float     @default(0)
+  netTotal     Float     @default(0)
   orderCount   Int       @default(0)
   closedBy     String?
   createdAt    DateTime  @default(now())
@@ -486,15 +499,20 @@ model GoodsReceipt {
 }
 
 model GoodsReceiptItem {
-  id             String            @id @default(uuid())
-  grnId          String
-  materialId     String?
-  quantity       Float
-  receivedQty    Float
-  acceptedQty    Float
-  rejectedQty    Float
-  price          Float
-  unit           String            @default("UNIT")
+  id                  String            @id @default(uuid())
+  grnId               String
+  materialId          String?
+  quantity            Float
+  receivedQty         Float
+  acceptedQty         Float
+  rejectedQty         Float
+  price               Float
+  poPrice             Float?
+  priceOverridden     Boolean           @default(false)
+  priceOverrideReason String?
+  priceOverrideBy     String?
+  priceOverrideAt     DateTime?
+  unit                String            @default("UNIT")
   binId          String?
   expDate        DateTime?
   lotNumber      String?
@@ -1413,7 +1431,6 @@ model SalesOrder {
   customerId      String?
   customerName    String?
   customerPhone   String?
-  stateOfSupply   String?
   status          SalesOrderStatus @default(DRAFT)
   subTotal        Float
   taxAmount       Float

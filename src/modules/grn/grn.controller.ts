@@ -33,7 +33,11 @@ export class GRNController {
 
   static async createFromPO(req: Request, res: Response) {
     try {
-      const grn = await GRNService.createFromPO(req.params.poId, req.body);
+      const user = (req as any).user;
+      const grn = await GRNService.createFromPO(req.params.poId, {
+        ...req.body,
+        performedBy: user?.email || user?.userId
+      });
       res.status(201).json(grn);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

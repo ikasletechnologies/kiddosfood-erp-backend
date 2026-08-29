@@ -130,11 +130,25 @@ export class POSController {
     }
   }
 
+  // Live (pre-close) Day Closing numbers — computed the same way closeDay
+  // validates against, so what the cashier sees on screen is guaranteed to
+  // be what settlement will check, not an independent client-side guess.
+  static async getDailySummary(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string);
+      const summary = await POSService.getDailySummary(await resolveFranchiseIdOrHq(franchiseId));
+      res.json(summary);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async closeDay(req: Request, res: Response) {
     try {
       const user = (req as any).user;
       const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
-      const settlement = await POSService.closeDay(await resolveFranchiseIdOrHq(franchiseId), req.body, user?.email || user?.userId);
+      const settlement = await POSService.closeDay(await resolveFranchiseIdOrHq(franchiseId), user?.email || user?.userId);
       res.status(201).json(settlement);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

@@ -353,6 +353,7 @@ app.get('/api/reports/party-by-item', authenticate, authorizeRole(['FRANCHISE_AD
 app.get('/api/reports/sale-purchase-by-party', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByParty);
 app.get('/api/reports/sale-purchase-by-party-group', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByPartyGroup);
 app.get('/api/reports/all-parties', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getAllPartiesReport);
+app.get('/api/reports/party-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPartyInvoices);
 
 // Root Level Category Reports
 app.get('/api/reports/production', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getProductionReport);
@@ -501,6 +502,7 @@ app.post('/api/pos/checkout', authenticate, authorizeRole(['FRANCHISE_ADMIN']), 
 app.get('/api/pos/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getOrders);
 app.get('/api/pos/settlement/today', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getTodaySettlement);
 app.get('/api/pos/settlement/latest', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getLatestSettlement);
+app.get('/api/pos/settlement/summary', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getDailySummary);
 app.post('/api/pos/settlement/close', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.closeDay);
 
 // KDS — Kitchen Display System

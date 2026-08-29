@@ -417,6 +417,18 @@ export class POSService {
     // generic "Manual Entry" string (see resolvePartyName/getPayments).
     const displayName = data.customerName || (resolvedPartyType === 'DEALER' ? 'Dealer' : 'Walk-in Customer');
 
+    // A settled business day is a closed accounting period — its snapshot
+    // (see closeDay) must not silently drift because a new sale landed in
+    // the same calendar day after close. The next calendar day opens a new
+    // session automatically (startOfToday() advances), so this only blocks
+    // same-day sales after that day's terminal has already been closed.
+    const existingSettlement = await prisma.dailySettlement.findUnique({
+      where: { franchiseId_businessDate: { franchiseId: fid, businessDate: this.startOfToday() } }
+    });
+    if (existingSettlement) {
+      throw new Error('This business day has already been closed (Day Settlement complete). Start a new business day before recording new sales.');
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       const order = await tx.order.create({
         data: {
@@ -694,25 +706,116 @@ export class POSService {
     });
   }
 
-  static async closeDay(franchiseId: string, data: {
-    cashTotal: number; upiTotal: number; cardTotal: number; grandTotal: number; orderCount: number;
-  }, closedBy?: string) {
+  // Authoritative Day Closing numbers, computed live from the actual
+  // Order/Payment tables — never from client-supplied totals. This is the
+  // single source of truth both the pre-close summary screen and closeDay's
+  // reconciliation check read from, so they can never disagree with each
+  // other the way the old (client-aggregated, wrong-field-name) summary did.
+  static async getDailySummary(franchiseId: string) {
     const businessDate = this.startOfToday();
+    const nextDay = new Date(businessDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const dateRange = { gte: businessDate, lt: nextDay };
+
+    // Gross sales value: completed Orders only. CANCELLED/REFUNDED orders
+    // never contributed a settled receipt and must not inflate the day's
+    // reconciliation target.
+    const orders = await prisma.order.findMany({
+      where: { franchiseId, status: 'COMPLETED', createdAt: dateRange },
+      select: { totalAmount: true }
+    });
+    const orderCount = orders.length;
+    const grandTotal = orders.reduce((sum, o) => sum + o.totalAmount, 0);
+
+    // Actual settled receipts for those sales — this Payment.paymentMode
+    // value (canonical PaymentMode enum: CASH/UPI/CARD/...) is the source
+    // of truth for the mode breakdown, never the Order row (Order has no
+    // payment-mode column at all — the old UI was reading a field,
+    // `order.paymentMode`, that never existed on that model).
+    const receipts = await prisma.payment.findMany({
+      where: {
+        sourceModule: 'POS',
+        linkedDocType: 'INVOICE',
+        status: 'PAID',
+        isCancelled: false,
+        createdAt: dateRange,
+        order: { franchiseId }
+      },
+      select: { paymentMode: true, paidAmount: true }
+    });
+
+    let cashTotal = 0, upiTotal = 0, cardTotal = 0, otherTotal = 0;
+    for (const p of receipts) {
+      if (p.paymentMode === 'CASH') cashTotal += p.paidAmount;
+      else if (p.paymentMode === 'UPI') upiTotal += p.paidAmount;
+      else if (p.paymentMode === 'CARD') cardTotal += p.paidAmount;
+      else otherTotal += p.paidAmount;
+    }
+    const collectionTotal = cashTotal + upiTotal + cardTotal + otherTotal;
+
+    // Approved-return refund payouts issued the same day (see
+    // SalesService.recordRefund — flow OUT, sourceModule POS, linkedDocType
+    // DIRECT). These have no orderId, so they're scoped by the settling
+    // account's franchise instead.
+    const refundPayments = await prisma.payment.findMany({
+      where: {
+        sourceModule: 'POS',
+        linkedDocType: 'DIRECT',
+        status: 'PAID',
+        isCancelled: false,
+        createdAt: dateRange,
+        account: { franchiseId }
+      },
+      select: { paidAmount: true }
+    });
+    const refundTotal = refundPayments.reduce((sum, p) => sum + p.paidAmount, 0);
+    const netTotal = collectionTotal - refundTotal;
+
+    return {
+      businessDate,
+      orderCount,
+      grandTotal,
+      cashTotal,
+      upiTotal,
+      cardTotal,
+      otherTotal,
+      collectionTotal,
+      refundTotal,
+      netTotal,
+      // Every current POS sale is paid in full at checkout (Counter Billing
+      // has no partial/credit-sale path — "Franchise Credit" sales go
+      // through a separate FranchiseOrder ledger entirely, not this Order
+      // table), so collected receipts must equal gross sales value exactly.
+      reconciled: Math.abs(collectionTotal - grandTotal) < 0.01
+    };
+  }
+
+  static async closeDay(franchiseId: string, closedBy?: string) {
+    const summary = await this.getDailySummary(franchiseId);
 
     const existing = await prisma.dailySettlement.findUnique({
-      where: { franchiseId_businessDate: { franchiseId, businessDate } }
+      where: { franchiseId_businessDate: { franchiseId, businessDate: summary.businessDate } }
     });
-    if (existing) throw new Error('Today has already been settled.');
+    if (existing) throw new Error('Business day already settled.');
+
+    if (!summary.reconciled) {
+      throw new Error(
+        `Settlement mismatch detected. Payment mode total ₹${summary.collectionTotal.toFixed(2)} does not match expected collection ₹${summary.grandTotal.toFixed(2)}.`
+      );
+    }
 
     return prisma.dailySettlement.create({
       data: {
         franchiseId,
-        businessDate,
-        cashTotal: data.cashTotal || 0,
-        upiTotal: data.upiTotal || 0,
-        cardTotal: data.cardTotal || 0,
-        grandTotal: data.grandTotal || 0,
-        orderCount: data.orderCount || 0,
+        businessDate: summary.businessDate,
+        cashTotal: summary.cashTotal,
+        upiTotal: summary.upiTotal,
+        cardTotal: summary.cardTotal,
+        otherTotal: summary.otherTotal,
+        grandTotal: summary.grandTotal,
+        refundTotal: summary.refundTotal,
+        netTotal: summary.netTotal,
+        orderCount: summary.orderCount,
         closedBy
       }
     });

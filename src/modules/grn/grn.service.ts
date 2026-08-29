@@ -64,6 +64,7 @@ export class GRNService {
       receivedBy?: string;
       freightCost?: number;
       unloadingCost?: number;
+      performedBy?: string;
       items: Array<{
         materialId: string;
         orderedQty: number;
@@ -71,6 +72,7 @@ export class GRNService {
         acceptedQty: number;
         rejectedQty: number;
         price: number;
+        priceOverrideReason?: string;
         qcStatus?: string;
         vendorBatchNo?: string;
         mfgDate?: string;
@@ -99,12 +101,28 @@ export class GRNService {
         items: {
           create: data.items.map((item) => {
             const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
-            const qty = Number(item.orderedQty ?? poItem?.quantity ?? 0);
-            const price = Number(item.price ?? poItem?.price ?? 0);
+            if (!poItem) throw new Error(`Item ${item.materialId} does not belong to Purchase Order ${po.poNumber || poId}`);
+
+            const qty = Number(item.orderedQty ?? poItem.quantity ?? 0);
+            const poPrice = Number(poItem.price ?? 0);
+            const price = Number(item.price ?? poPrice);
             const received = Number(item.receivedQty ?? 0);
             const rejected = Number(item.rejectedQty ?? 0);
-            const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected)); 
-            
+            const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected));
+
+            if (price < 0) throw new Error(`Actual unit price for ${poItem.inventoryItemId} cannot be negative`);
+            if (received < 0) throw new Error(`Received quantity for ${poItem.inventoryItemId} cannot be negative`);
+            if (rejected < 0 || rejected > received) throw new Error(`Rejected quantity for ${poItem.inventoryItemId} must be between 0 and received quantity`);
+
+            // Actual price is the received-value source of truth (feeds
+            // computeCommercialsFromPO → VendorInvoice → VendorLedger). The
+            // PO's own price/totalAmount is never touched — poPrice here is
+            // kept purely as the audit-trail reference point.
+            const priceOverridden = Math.abs(price - poPrice) > 0.001;
+            if (priceOverridden && !(item.priceOverrideReason || '').trim()) {
+              throw new Error(`Actual unit price for ${poItem.inventoryItemId} differs from PO price (₹${poPrice}) — an override reason is required`);
+            }
+
             return {
               materialId: item.materialId,
               quantity: qty,
@@ -112,6 +130,11 @@ export class GRNService {
               acceptedQty: accepted,
               rejectedQty: rejected,
               price: price,
+              poPrice: poPrice,
+              priceOverridden,
+              priceOverrideReason: priceOverridden ? item.priceOverrideReason!.trim() : null,
+              priceOverrideBy: priceOverridden ? (data.performedBy || null) : null,
+              priceOverrideAt: priceOverridden ? new Date() : null,
               unit: poItem?.unit || 'UNIT',
               qcStatus: (item.qcStatus as any) || 'PENDING',
               vendorBatchNo: item.vendorBatchNo,
@@ -140,6 +163,17 @@ export class GRNService {
       if (!grn) throw new Error('GRN not found');
       if (grn.status === 'COMPLETED') throw new Error('GRN already approved');
       if (grn.status === 'CANCELLED') throw new Error('Cannot approve a cancelled GRN');
+
+      // Defense in depth: createFromPO already enforces this at entry, but
+      // approval is the actual financial trigger (posts VendorLedger via
+      // the auto-generated bill below), so re-validate against whatever is
+      // actually persisted rather than trusting it was never bypassed.
+      for (const item of grn.items) {
+        if (item.price < 0) throw new Error(`Item ${item.materialId} has an invalid negative price`);
+        if (item.priceOverridden && !(item.priceOverrideReason || '').trim()) {
+          throw new Error(`Item ${item.materialId} has a price override with no reason recorded — cannot approve`);
+        }
+      }
 
       let allReceived = true;
       let someReceived = false;
