@@ -35,6 +35,43 @@ export class DealerController {
     }
   }
 
+  static async getById(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const dealer = await DealerService.getById(req.params.id, ownFranchiseId);
+      if (!dealer) return res.status(404).json({ error: 'Dealer not found' });
+      res.json(dealer);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async update(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const { name, email, phone, address, status } = req.body;
+      const dealer = await DealerService.update(req.params.id, { name, email, phone, address, status }, ownFranchiseId);
+      res.json(dealer);
+    } catch (error) {
+      const status = (error as Error).message === 'Dealer not found' ? 404 : 400;
+      res.status(status).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getTransactions(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const transactions = await DealerService.getTransactions(req.params.id, ownFranchiseId);
+      res.json(transactions);
+    } catch (error) {
+      const status = (error as Error).message === 'Dealer not found' ? 404 : 500;
+      res.status(status).json({ error: (error as Error).message });
+    }
+  }
+
   static async delete(req: Request, res: Response) {
     try {
       const user = (req as any).user;
