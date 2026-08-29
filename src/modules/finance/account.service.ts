@@ -129,14 +129,46 @@ export class AccountService {
   }
 
   static async getAccountById(id: string) {
-    return prisma.account.findUnique({
+    const account = await prisma.account.findUnique({
       where: { id },
       include: {
-        payments: { orderBy: { createdAt: 'desc' }, take: 20 },
+        payments: {
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+          // Additive join purely for transaction-history traceability (does
+          // not affect balance/routing logic below). Payment already stores
+          // its own copies of the bill number (linkedDocId) and party type
+          // (entityType), but has no FK for a display name — entityId is a
+          // generic id into whichever master table entityType names, with
+          // no `include`-able relation. Order.customerName is the snapshot
+          // POSService.checkout() already writes at sale time for every
+          // party type (Customer/Dealer/Franchise alike — see
+          // Order.customerName's schema comment), so this join resolves
+          // "who paid" with zero extra per-payment lookups instead of a
+          // three-way Customer/Dealer/Franchise special case here.
+          include: { order: { select: { invoiceNum: true, partyType: true, customerName: true } } }
+        },
         expenses: { orderBy: { date: 'desc' }, take: 20 },
         vendorLedgers: { orderBy: { createdAt: 'desc' }, take: 20 },
         customerLedgers: { orderBy: { createdAt: 'desc' }, take: 20 }
       }
     });
+
+    if (!account) return null;
+
+    return {
+      ...account,
+      // Reference fields the account-detail transaction history row needs
+      // to trace a POS-generated payment back to its sale: Bill Number,
+      // Party Type, Party Name. Falls back to the payment's own fields for
+      // any row not linked to an Order (e.g. a manual/expense entry), so
+      // existing non-POS rows keep rendering exactly as before.
+      payments: account.payments.map((p) => ({
+        ...p,
+        billNumber: p.linkedDocId || p.order?.invoiceNum || null,
+        partyType: p.entityType || p.order?.partyType || null,
+        partyName: p.order?.customerName || p.transactionRef || null,
+      }))
+    };
   }
 }
