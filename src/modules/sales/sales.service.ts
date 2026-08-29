@@ -112,7 +112,6 @@ export class SalesService {
     customerEmail?: string;
     validUntil?: string;
     stateOfSupply?: string;
-    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     termsConditions?: string;
@@ -140,7 +139,6 @@ export class SalesService {
         customerPhone: data.customerPhone,
         customerEmail: data.customerEmail,
         validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
-        stateOfSupply: data.stateOfSupply,
         stateOfSupply: data.stateOfSupply || undefined,
         status: (data.status as any) || undefined,
         subTotal,
@@ -179,7 +177,6 @@ export class SalesService {
     notes?: string;
     termsConditions?: string;
     validUntil?: string;
-    stateOfSupply?: string;
     items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     quotationNumber?: string;
@@ -218,7 +215,6 @@ export class SalesService {
       termsConditions: data.termsConditions,
       stateOfSupply: data.stateOfSupply !== undefined ? (data.stateOfSupply || null) : undefined,
       validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
-      stateOfSupply: data.stateOfSupply,
       quotationNumber: data.quotationNumber,
       trackingNumber: data.trackingNumber,
       courierName: data.courierName
@@ -334,7 +330,6 @@ export class SalesService {
           customerId: quotation.customerId,
           customerName: quotation.customerName,
           customerPhone: quotation.customerPhone,
-          stateOfSupply: quotation.stateOfSupply || undefined,
           status: 'DRAFT',
           subTotal: quotation.subTotal,
           taxAmount: quotation.taxAmount,
@@ -841,7 +836,6 @@ export class SalesService {
     deliveryAddress?: string;
     orderDate?: string;
     dueDate?: string;
-    stateOfSupply?: string;
     notes?: string;
     createdBy?: string;
     idempotencyKey?: string;
@@ -874,7 +868,6 @@ export class SalesService {
         totalAmount: totalAmount - discount,
         orderDate: data.orderDate ? new Date(data.orderDate) : new Date(),
         dueDate: data.dueDate ? new Date(data.dueDate) : undefined,
-        stateOfSupply: data.stateOfSupply,
         deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
         deliveryAddress: data.deliveryAddress,
         notes: data.notes,
