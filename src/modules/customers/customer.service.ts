@@ -2,7 +2,7 @@ import prisma from '../../lib/prisma';
 
 export class CustomerService {
   static async getAll(search?: string, franchiseId?: string) {
-    return prisma.customer.findMany({
+    const customers = await prisma.customer.findMany({
       where: {
         ...(franchiseId && { franchiseId }),
         ...(search && {
@@ -22,6 +22,49 @@ export class CustomerService {
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    // Outstanding "Amount" (To Receive/To Pay) — real current balance, not a
+    // snapshot. Computed the same way the Transactions tab computes each
+    // order's own balance (totalAmount minus non-cancelled payments), summed
+    // across ALL of the customer's orders (not the 5-row preview above) and
+    // added to the signed opening balance carried on the Customer row.
+    // Deliberately NOT sourced from CustomerLedger: POSService.checkout —
+    // the actual POS sale path — never posts SALE/PAYMENT ledger entries
+    // (only the separate native step-by-step flow does), so ledger totals
+    // would silently read zero for real POS sales. Order+Payment are the
+    // one source both flows always write to.
+    const balanceByCustomer = await this.getOutstandingBalances(customers.map((c) => c.id));
+
+    return customers.map((c) => ({
+      ...c,
+      balance: (c.openingBalance || 0) + (balanceByCustomer.get(c.id) || 0)
+    }));
+  }
+
+  /** customerId -> sum(order.totalAmount - non-cancelled payments) across ALL of that customer's orders. */
+  private static async getOutstandingBalances(customerIds: string[]): Promise<Map<string, number>> {
+    const result = new Map<string, number>();
+    if (customerIds.length === 0) return result;
+
+    const orders = await prisma.order.findMany({
+      where: { customerId: { in: customerIds } },
+      select: {
+        customerId: true,
+        totalAmount: true,
+        payments: { select: { paidAmount: true, isCancelled: true, status: true } }
+      }
+    });
+
+    for (const o of orders) {
+      if (!o.customerId) continue;
+      const paid = o.payments
+        .filter((p) => !p.isCancelled && p.status !== 'CANCELLED')
+        .reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const due = (o.totalAmount || 0) - paid;
+      result.set(o.customerId, (result.get(o.customerId) || 0) + due);
+    }
+
+    return result;
   }
 
   static async getById(id: string, franchiseId?: string) {
@@ -59,12 +102,44 @@ export class CustomerService {
     if (billingAddress && !customerData.address) {
       customerData.address = billingAddress;
     }
-    return prisma.customer.create({
+    const customer = await prisma.customer.create({
       data: {
         ...customerData,
         asOfDate: customerData.asOfDate ? new Date(customerData.asOfDate) : undefined,
       }
     });
+
+    // Post a real CustomerLedger entry for a non-zero opening balance instead
+    // of leaving it as a number that only lives on the Customer row with no
+    // accounting trail. openingBalance is already signed by the caller
+    // (AddPartyModal: positive = customer owes us / "To Receive", negative =
+    // we owe them / "To Pay" — see form.openingBalanceType handling there),
+    // so DEBIT for positive, CREDIT for negative mirrors the same
+    // DEBIT=owed-to-us / CREDIT=paid-to-us convention getLedgerSummary already
+    // uses. A zero opening balance posts nothing — no entry needed for "no
+    // balance". paymentMode is a placeholder (no real money moved for an
+    // opening balance), matching the same placeholder used for the SALE
+    // debit entry in POSService.updateOrderStatus.
+    const opening = Number(customer.openingBalance) || 0;
+    if (opening !== 0) {
+      try {
+        await prisma.customerLedger.create({
+          data: {
+            customerId: customer.id,
+            type: opening > 0 ? 'DEBIT' : 'CREDIT',
+            amount: Math.abs(opening),
+            paymentMode: 'CASH',
+            referenceType: 'OPENING_BALANCE',
+            referenceId: customer.id,
+            note: 'Opening balance'
+          }
+        });
+      } catch (ledgerErr) {
+        console.error('[Accounting] Failed to post opening balance ledger entry', ledgerErr);
+      }
+    }
+
+    return customer;
   }
 
   static async update(id: string, data: {
