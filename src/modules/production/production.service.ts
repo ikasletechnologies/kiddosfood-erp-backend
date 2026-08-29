@@ -267,15 +267,13 @@ export class ProductionService {
         });
       }
 
-      await tx.production.update({
+      return tx.production.update({
         where: { id: production.id },
         data: {
           materialCost,
           totalCost: materialCost + (production.laborCost || 0) + (production.overheadCost || 0),
         },
       });
-
-      return production;
     });
   }
 
@@ -447,18 +445,16 @@ export class ProductionService {
       }
 
       const rejection = data.rejectionQty || 0;
-      // Enforced here, not just in the UI — accepted + rejected must equal
-      // what was actually produced. Approved quantity is always derived from
-      // that, never entered separately, so the two can't drift apart.
       if (rejection < 0 || rejection > batch.quantity) {
         throw new Error(`Rejected quantity must be between 0 and the produced quantity (${batch.quantity})`);
       }
       const approvedQty = Math.max(0, batch.quantity - rejection);
-      // Status is derived from the actual split, not trusted from the
-      // caller — a batch is only fully APPROVED when nothing was rejected,
-      // only fully REJECTED when nothing was approved, otherwise it's a
-      // genuine partial outcome.
       const qcStatus = rejection <= 0 ? 'APPROVED' : approvedQty <= 0 ? 'REJECTED' : 'PARTIALLY_APPROVED';
+
+      const totalBatchCost = batch.totalCost || batch.production?.totalCost || batch.production?.materialCost || 0;
+      const effectiveBulkUnitCost = approvedQty > 0
+        ? Number((totalBatchCost / approvedQty).toFixed(4))
+        : (batch.unitCost || 0);
 
       const updatedBatch = await tx.productBatch.update({
         where: { id: data.batchId },
@@ -469,6 +465,7 @@ export class ProductionService {
           textureCheck: data.textureCheck,
           rejectionQty: rejection,
           approvedQty: approvedQty,
+          unitCost: effectiveBulkUnitCost,
           qcRemarks: data.qcRemarks || null,
         },
       });
@@ -478,17 +475,7 @@ export class ProductionService {
       if (needsTargetItem) {
         const franchiseId = batch.franchiseId || batch.production?.franchiseId;
         if (!franchiseId) throw new Error('Franchise ID not found for batch');
-        // Production.franchiseId is a required real Franchise id (used
-        // as-is below for WasteEntry) — but the InventoryItem it produces
-        // must follow the null-means-HQ convention, so route it through
-        // the canonical converter rather than storing the HQ id literally.
         const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
-
-        // The finished-good's real unit is whatever the recipe yields it in
-        // (e.g. "KG") — packageBatch's weight parser converts packet sizes
-        // relative to this unit, so a generic placeholder here silently
-        // broke that conversion (a "unit"-labeled bulk item can't be told
-        // apart from grams/kilograms, producing wildly wrong stock math).
         const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
 
         const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
@@ -523,12 +510,7 @@ export class ProductionService {
         }
 
         if (approvedQty > 0) {
-          // Carries the batch's real FIFO-derived material cost into a fresh
-          // InventoryBatch for the finished good, so a later sale draws from
-          // (and gets costed at) this batch's actual cost — not a generic
-          // average — exactly like raw materials already do off GRN batches.
-          // transactionUnit records the yield's business unit (e.g. "KG") on
-          // the ledger; recordMovement normalizes to targetItem.unit internally.
+          // Credits approved bulk stock carrying the effective cost (total batch cost / approvedQty)
           await InventoryService.recordMovement(tx, {
             itemId: targetItem.id,
             type: 'PRODUCTION_IN',
@@ -536,11 +518,11 @@ export class ProductionService {
             transactionUnit: finishedGoodUnit,
             referenceType: 'PRODUCTION',
             referenceId: batch.productionId || batch.id,
-            note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected)`,
+            note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected at effective unit cost ₹${effectiveBulkUnitCost.toFixed(4)})`,
             userId: data.userId,
             warehouseId: batch.production?.warehouseId || undefined,
             receiveAtCost: {
-              unitCost: batch.unitCost || 0,
+              unitCost: effectiveBulkUnitCost,
               batchNumber: batch.batchCode || undefined,
               mfgDate: batch.mfgDate,
               expDate: batch.expiryDate,
@@ -549,10 +531,6 @@ export class ProductionService {
           });
         }
 
-        // Rejected quantity never entered inventory, so this is a WasteEntry
-        // record only (for cost/traceability reporting) — not a stock movement,
-        // since there's no stock to deduct. Previously the rejected quantity was
-        // simply discarded with no trace at all.
         if (rejection > 0) {
           await tx.wasteEntry.create({
             data: {
@@ -919,14 +897,15 @@ export class ProductionService {
         });
       }
 
-      // Only the GOOD quantity ever becomes sellable Finished Goods. Credited
-      // as a real lot (receiveAtCost + productBatchId), not just a plain
-      // currentStock bump — that's what makes this batch's FG output
-      // traceable afterward: subsequent sales/transfers/waste already deplete
-      // InventoryBatch lots FIFO for any item that has them (see
-      // depleteBatchesFIFO), so "Available FG" for this batch can be read
-      // back later as this lot's remaining currentQty instead of a frozen
-      // historical produced-count.
+      // Total bulk cost allocated to this packaging run
+      const allocatedBulkCost = totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
+      // Effective unit cost per good packet (allocated bulk cost absorbed by good packets)
+      const effectiveRetailUnitCost = good > 0
+        ? Number((allocatedBulkCost / good).toFixed(4))
+        : (bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0);
+
+      // Only the GOOD quantity ever becomes sellable Finished Goods.
+      // Credited at effectiveRetailUnitCost so good packets absorb packaging rejection.
       if (good > 0) {
         await InventoryService.recordMovement(tx, {
           itemId: retailItem.id,
@@ -934,11 +913,11 @@ export class ProductionService {
           quantity: good,
           referenceType: 'PACKAGING',
           referenceId: batch.id,
-          note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode}`,
+          note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode} at effective unit cost ₹${effectiveRetailUnitCost.toFixed(4)}`,
           userId: data.userId,
           warehouseId: batch.production?.warehouseId || undefined,
           receiveAtCost: {
-            unitCost: retailItem.costPrice || 0,
+            unitCost: effectiveRetailUnitCost,
             batchNumber: batch.batchCode || undefined,
             mfgDate: batch.mfgDate,
             expDate: batch.expiryDate,
@@ -957,7 +936,7 @@ export class ProductionService {
           reason: 'DAMAGED',
           note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
           productPackagingId: packaging.id,
-          unitCost: retailItem.costPrice || undefined,
+          unitCost: effectiveRetailUnitCost || undefined,
         }));
       }
       if (spoiled > 0) {
@@ -969,7 +948,7 @@ export class ProductionService {
           reason: 'SPOILAGE',
           note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
           productPackagingId: packaging.id,
-          unitCost: retailItem.costPrice || undefined,
+          unitCost: effectiveRetailUnitCost || undefined,
         }));
       }
 
