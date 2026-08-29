@@ -1011,8 +1011,15 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { itemId, startDate, endDate } = req.query;
-      const report = await FinanceService.getInventoryLedgerReportData(franchiseId, itemId as string, startDate as string, endDate as string);
+      const { itemId, startDate, endDate, page, pageSize } = req.query;
+      const report = await FinanceService.getInventoryLedgerReportData(
+        franchiseId,
+        itemId as string,
+        startDate as string,
+        endDate as string,
+        page ? parseInt(page as string, 10) : undefined,
+        pageSize ? parseInt(pageSize as string, 10) : undefined
+      );
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

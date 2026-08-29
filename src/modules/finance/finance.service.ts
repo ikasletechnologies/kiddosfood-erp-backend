@@ -3,6 +3,21 @@ import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { ItemCategory } from '@prisma/client';
 
+function splitTaxBySupplyState(taxAmount: number, stateOfSupply?: string | null, franchiseLocation?: string | null) {
+  const totalTax = Number(taxAmount || 0);
+  const supply = stateOfSupply?.trim().toLowerCase();
+  const seller = franchiseLocation?.trim().toLowerCase();
+  const isInterState = Boolean(supply && seller && supply !== seller);
+
+  if (isInterState) {
+    return { igst: totalTax, cgst: 0, sgst: 0 };
+  }
+
+  const cgst = Number((totalTax / 2).toFixed(2));
+  const sgst = Number((totalTax - cgst).toFixed(2));
+  return { igst: 0, cgst, sgst };
+}
+
 export class FinanceService {
   /**
    * Automatically generate an Invoice for a completed order
@@ -1617,7 +1632,17 @@ export class FinanceService {
             include: {
               inventoryItem: true
             }
-          }
+          },
+          goodsReceipts: {
+            include: {
+              items: {
+                include: {
+                  inventoryItem: true
+                }
+              }
+            }
+          },
+          invoices: true
         },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -1626,22 +1651,69 @@ export class FinanceService {
     ]);
 
     const data = pos.map(po => {
+      // Flatten all GRN items for this PO
+      const allGrnItems = po.goodsReceipts.flatMap(grn => grn.items || []);
+
+      const mappedItems = po.poItems.map(item => {
+        const matchingGrnItem = allGrnItems.find(
+          g => g.materialId === item.inventoryItemId || (g as any).inventoryItem?.name === item.inventoryItem?.name
+        );
+
+        const poPrice = item.price || 0;
+        const actualGrnPrice = matchingGrnItem ? matchingGrnItem.price : poPrice;
+        const priceVariance = Number((actualGrnPrice - poPrice).toFixed(2));
+        const priceVariancePercent = poPrice > 0 ? Number((((actualGrnPrice - poPrice) / poPrice) * 100).toFixed(2)) : 0;
+
+        const isFullyReceived = po.status === 'RECEIVED' || po.status === 'CLOSED';
+        const receivedQty = matchingGrnItem
+          ? (matchingGrnItem.acceptedQty || matchingGrnItem.receivedQty || 0)
+          : (isFullyReceived ? item.quantity : 0);
+        const rejectedQty = matchingGrnItem ? (matchingGrnItem.rejectedQty || 0) : 0;
+        const pendingQty = Math.max(0, (item.quantity || 0) - receivedQty);
+
+        const lineTaxableValue = Number(((matchingGrnItem ? receivedQty : item.quantity) * actualGrnPrice).toFixed(2));
+
+        return {
+          itemId: item.inventoryItemId || item.id,
+          itemName: item.inventoryItem?.name || 'Unknown Material',
+          unit: item.unit || item.inventoryItem?.unit || 'UNIT',
+          orderedQty: item.quantity,
+          receivedQty,
+          rejectedQty,
+          pendingQty,
+          poPrice,
+          actualGrnPrice,
+          priceVariance,
+          priceVariancePercent,
+          priceOverridden: Boolean(matchingGrnItem?.priceOverridden),
+          taxableValue: lineTaxableValue
+        };
+      });
+
+      const totalBillAmount = po.invoices && po.invoices.length > 0
+        ? po.invoices.reduce((sum, inv) => sum + (inv.amount || 0), 0)
+        : po.totalAmount;
+
       return {
         id: po.id,
         createdAt: po.createdAt,
         poNumber: po.poNumber || po.id,
         vendorName: po.vendor?.name || '—',
+        vendorGstin: po.vendor?.gstNumber || '—',
+        vendorState: po.vendor?.state || '—',
         status: po.status,
         paymentMode: po.paymentStatus === 'PAID' ? 'CASH' : 'CREDIT',
+        paymentStatus: po.paymentStatus,
+        subtotal: po.subtotal || 0,
+        cgst: po.cgst || 0,
+        sgst: po.sgst || 0,
+        igst: po.igst || 0,
+        freight: po.freightCost || 0,
         totalAmount: po.totalAmount,
+        finalBillAmount: totalBillAmount,
         advancePaid: po.paid || po.advancePaid || 0,
         balance: po.balance,
-        items: po.poItems.map(item => ({
-          itemId: item.inventoryItemId || item.id,
-          itemName: item.inventoryItem?.name || 'Unknown Material',
-          qty: item.quantity,
-          price: item.price
-        })),
+        items: mappedItems,
         isCancelled: po.status === 'CANCELLED',
         createdBy: 'System',
         approvedBy: po.approvedBy || 'System'
@@ -3051,36 +3123,74 @@ export class FinanceService {
     return Object.values(categoryMap);
   }
 
-  static async getStockDetailData(franchiseId: string, startDate?: string, endDate?: string) {
+  static async getStockDetailData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
+    const start = startDate ? new Date(startDate) : undefined;
+    const end = endDate ? new Date(endDate) : undefined;
+
     const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
-      include: {
-        movements: {
-          where: {
-            ...(startDate || endDate ? {
-              createdAt: {
-                ...(startDate ? { gte: new Date(startDate) } : {}),
-                ...(endDate ? { lte: new Date(endDate) } : {})
-              }
-            } : {})
-          }
-        }
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        isActive: true
       },
       orderBy: { name: 'asc' }
     });
 
+    const itemIds = items.map(i => i.id);
+
+    const [priorMovements, periodMovements] = await Promise.all([
+      start ? prisma.stockMovement.findMany({
+        where: {
+          itemId: { in: itemIds },
+          createdAt: { lt: start }
+        }
+      }) : Promise.resolve([]),
+      prisma.stockMovement.findMany({
+        where: {
+          itemId: { in: itemIds },
+          ...(start || end ? {
+            createdAt: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          } : {})
+        }
+      })
+    ]);
+
+    const priorInwardTypes = ['PURCHASE_IN', 'PRODUCTION_IN', 'TRANSFER_IN', 'RECALL_RETURN_IN'];
+    const priorOutwardTypes = ['SALES_OUT', 'PRODUCTION_OUT', 'WASTE_OUT', 'TRANSFER_OUT', 'RETURN_OUT', 'RETURN_QUARANTINE_IN'];
+
+    const priorMap: Record<string, number> = {};
+    priorMovements.forEach(m => {
+      if (!priorMap[m.itemId]) priorMap[m.itemId] = 0;
+      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
+        priorMap[m.itemId] += m.quantity;
+      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
+        priorMap[m.itemId] -= Math.abs(m.quantity);
+      }
+    });
+
+    const periodInMap: Record<string, number> = {};
+    const periodOutMap: Record<string, number> = {};
+    periodMovements.forEach(m => {
+      if (!periodInMap[m.itemId]) periodInMap[m.itemId] = 0;
+      if (!periodOutMap[m.itemId]) periodOutMap[m.itemId] = 0;
+
+      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
+        periodInMap[m.itemId] += m.quantity;
+      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
+        periodOutMap[m.itemId] += Math.abs(m.quantity);
+      }
+    });
+
     return items.map(item => {
-      const inMovements = item.movements.filter(m =>
-        m.movementType === 'PURCHASE_IN' || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)
-      );
-      const outMovements = item.movements.filter(m =>
-        m.movementType === 'SALES_OUT' || m.movementType === 'PRODUCTION_OUT' || m.movementType === 'WASTE_OUT'
-      );
-      const quantityIn = inMovements.reduce((s, m) => s + m.quantity, 0);
-      const quantityOut = outMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+      const beginningQuantity = start ? (priorMap[item.id] || 0) : 0;
+      const quantityIn = periodInMap[item.id] || 0;
+      const quantityOut = periodOutMap[item.id] || 0;
+      const closingQuantity = beginningQuantity + quantityIn - quantityOut;
+
       const purchasePrice = item.costPrice || 0;
       const salePrice = item.customerPrice || item.basePrice || 0;
-      const beginningQuantity = item.currentStock - quantityIn + quantityOut;
 
       return {
         itemName: item.name,
@@ -3089,14 +3199,18 @@ export class FinanceService {
         purchaseAmount: Number((quantityIn * purchasePrice).toFixed(2)),
         quantityOut: Number(quantityOut.toFixed(2)),
         saleAmount: Number((quantityOut * salePrice).toFixed(2)),
-        closingQuantity: Number(item.currentStock.toFixed(2))
+        closingQuantity: Number(closingQuantity.toFixed(2))
       };
     });
   }
 
-  static async getItemDetailData(franchiseId: string, itemName?: string, startDate?: string, endDate?: string) {
-    const whereClause: any = { franchiseId, isActive: true };
+  static async getItemDetailData(franchiseId?: string, itemName?: string, startDate?: string | Date, endDate?: string | Date) {
+    const whereClause: any = { isActive: true };
+    if (franchiseId) whereClause.franchiseId = franchiseId;
     if (itemName) whereClause.name = { contains: itemName, mode: 'insensitive' };
+
+    const start = startDate ? new Date(startDate) : undefined;
+    const end = endDate ? new Date(endDate) : undefined;
 
     const items = await prisma.inventoryItem.findMany({
       where: whereClause,
@@ -3104,42 +3218,66 @@ export class FinanceService {
         vendor: true,
         movements: {
           where: {
-            ...(startDate || endDate ? {
+            ...(start || end ? {
               createdAt: {
-                ...(startDate ? { gte: new Date(startDate) } : {}),
-                ...(endDate ? { lte: new Date(endDate) } : {})
+                ...(start ? { gte: start } : {}),
+                ...(end ? { lte: end } : {})
               }
             } : {})
           },
-          orderBy: { createdAt: 'desc' },
-          take: 20
+          orderBy: { createdAt: 'desc' }
         }
       },
       orderBy: { name: 'asc' }
     });
 
-    return items.map(item => ({
-      id: item.id,
-      name: item.name,
-      sku: item.sku,
-      category: item.category,
-      unit: item.unit,
-      hsnCode: item.hsnCode,
-      gstRate: item.gstRate,
-      currentStock: item.currentStock,
-      minimumStock: item.minimumStock,
-      costPrice: item.costPrice || 0,
-      basePrice: item.basePrice || 0,
-      customerPrice: item.customerPrice || 0,
-      vendorName: item.vendor?.name || '—',
-      recentMovements: item.movements.map(m => ({
-        date: m.createdAt.toISOString().split('T')[0],
-        type: m.movementType,
-        quantity: m.quantity,
-        referenceType: m.referenceType || '—',
-        note: m.note || '—'
-      }))
-    }));
+    const itemIds = items.map(i => i.id);
+    const priorMovements = start ? await prisma.stockMovement.findMany({
+      where: {
+        itemId: { in: itemIds },
+        createdAt: { lt: start }
+      }
+    }) : [];
+
+    const priorInwardTypes = ['PURCHASE_IN', 'PRODUCTION_IN', 'TRANSFER_IN', 'RECALL_RETURN_IN'];
+    const priorOutwardTypes = ['SALES_OUT', 'PRODUCTION_OUT', 'WASTE_OUT', 'TRANSFER_OUT', 'RETURN_OUT', 'RETURN_QUARANTINE_IN'];
+
+    const priorMap: Record<string, number> = {};
+    priorMovements.forEach(m => {
+      if (!priorMap[m.itemId]) priorMap[m.itemId] = 0;
+      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
+        priorMap[m.itemId] += m.quantity;
+      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
+        priorMap[m.itemId] -= Math.abs(m.quantity);
+      }
+    });
+
+    return items.map(item => {
+      const beginningQuantity = start ? (priorMap[item.id] || 0) : 0;
+      return {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        category: item.category,
+        unit: item.unit,
+        hsnCode: item.hsnCode,
+        gstRate: item.gstRate,
+        currentStock: item.currentStock,
+        minimumStock: item.minimumStock,
+        beginningQuantity: Number(beginningQuantity.toFixed(2)),
+        costPrice: item.costPrice || 0,
+        basePrice: item.basePrice || 0,
+        customerPrice: item.customerPrice || 0,
+        vendorName: item.vendor?.name || '—',
+        recentMovements: item.movements.map(m => ({
+          date: m.createdAt.toISOString().split('T')[0],
+          type: m.movementType,
+          quantity: m.quantity,
+          referenceType: m.referenceType || '—',
+          note: m.note || '—'
+        }))
+      };
+    });
   }
 
   static async getBankStatementData(franchiseId: string, accountId?: string, startDate?: string, endDate?: string) {
@@ -3248,7 +3386,7 @@ export class FinanceService {
     return { data, totalDiscount };
   }
 
-  static async getGSTR1Data(franchiseId: string, startDate?: string, endDate?: string) {
+  static async getGSTR1Data(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
     const dateFilter: any = {};
     if (startDate || endDate) {
       dateFilter.createdAt = {
@@ -3257,9 +3395,14 @@ export class FinanceService {
       };
     }
 
+    const franchise = franchiseId
+      ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
+      : null;
+    const franchiseLocation = franchise?.location || null;
+
     const orders = await prisma.order.findMany({
       where: {
-        franchiseId,
+        ...(franchiseId ? { franchiseId } : {}),
         status: { in: ['COMPLETED', 'REFUNDED'] as any },
         ...dateFilter
       },
@@ -3267,17 +3410,36 @@ export class FinanceService {
       orderBy: { createdAt: 'desc' }
     });
 
-    const toRow = (o: any) => ({
-      invoiceNo: o.invoiceNum || o.id,
-      date: o.createdAt.toISOString().split('T')[0],
-      partyName: o.customer?.name || 'Cash Customer',
-      taxableValue: o.subTotal || 0,
-      igst: 0,
-      cgst: Number(((o.taxAmount || 0) / 2).toFixed(2)),
-      sgst: Number(((o.taxAmount || 0) / 2).toFixed(2)),
-      totalTax: o.taxAmount || 0,
-      totalAmount: o.totalAmount
-    });
+    const toRow = (o: any) => {
+      const split = splitTaxBySupplyState(o.taxAmount || 0, o.stateOfSupply, franchiseLocation);
+      const isB2B = Boolean(o.customer?.gstin && o.customer.gstin.trim() !== '');
+      const taxableValue = o.subTotal || 0;
+      const taxAmount = o.taxAmount || 0;
+      const taxRate = taxableValue > 0 ? Number(((taxAmount / taxableValue) * 100).toFixed(2)) : 0;
+
+      return {
+        invoiceNo: o.invoiceNum || o.id,
+        date: o.createdAt.toISOString().split('T')[0],
+        partyName: o.customer?.name || 'Cash Customer',
+        gstin: o.customer?.gstin || '—',
+        customerGstin: o.customer?.gstin || '—',
+        b2bType: isB2B ? 'B2B' : 'B2C',
+        placeOfSupply: o.stateOfSupply || '—',
+        value: o.totalAmount || 0,
+        taxRate,
+        cessRate: 0,
+        taxableValue: Number(taxableValue.toFixed(2)),
+        igst: Number(split.igst.toFixed(2)),
+        cgst: Number(split.cgst.toFixed(2)),
+        sgst: Number(split.sgst.toFixed(2)),
+        integratedTax: Number(split.igst.toFixed(2)),
+        centralTax: Number(split.cgst.toFixed(2)),
+        stateTax: Number(split.sgst.toFixed(2)),
+        cessAmount: 0,
+        totalTax: Number(taxAmount.toFixed(2)),
+        totalAmount: Number((o.totalAmount || 0).toFixed(2))
+      };
+    };
 
     const sale = orders.filter((o: any) => o.status === 'COMPLETED').map(toRow);
     const saleReturn = orders.filter((o: any) => o.status === 'REFUNDED').map(toRow);
@@ -3326,7 +3488,7 @@ export class FinanceService {
     };
   }
 
-  static async getGSTR3BData(franchiseId: string, startDate?: string, endDate?: string) {
+  static async getGSTR3BData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
     const dateFilter: any = {};
     if (startDate || endDate) {
       dateFilter.createdAt = {
@@ -3335,19 +3497,46 @@ export class FinanceService {
       };
     }
 
-    const [salesAgg, purchasesAgg] = await Promise.all([
-      prisma.order.aggregate({
-        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
-        _sum: { subTotal: true, taxAmount: true, totalAmount: true }
+    const franchise = franchiseId
+      ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
+      : null;
+    const franchiseLocation = franchise?.location || null;
+
+    const [orders, purchasesAgg] = await Promise.all([
+      prisma.order.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: 'COMPLETED',
+          ...dateFilter
+        },
+        select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true }
       }),
       prisma.procurementOrder.aggregate({
-        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { not: 'CANCELLED' as any },
+          ...dateFilter
+        },
         _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
       })
     ]);
 
-    const outputTaxable = salesAgg._sum.subTotal || 0;
-    const outputTax = salesAgg._sum.taxAmount || 0;
+    let outputTaxable = 0;
+    let outputTax = 0;
+    let outputIgst = 0;
+    let outputCgst = 0;
+    let outputSgst = 0;
+
+    orders.forEach(o => {
+      outputTaxable += o.subTotal || 0;
+      const t = o.taxAmount || 0;
+      outputTax += t;
+      const split = splitTaxBySupplyState(t, o.stateOfSupply, franchiseLocation);
+      outputIgst += split.igst;
+      outputCgst += split.cgst;
+      outputSgst += split.sgst;
+    });
+
     const inputCgst = purchasesAgg._sum.cgst || 0;
     const inputSgst = purchasesAgg._sum.sgst || 0;
     const inputIgst = purchasesAgg._sum.igst || 0;
@@ -3358,22 +3547,32 @@ export class FinanceService {
       outwardSupplies: [
         {
           description: 'Outward taxable supplies (other than zero rated, nil rated and exempted)',
-          taxableValue: outputTaxable,
-          igst: 0,
-          cgst: Number((outputTax / 2).toFixed(2)),
-          sgst: Number((outputTax / 2).toFixed(2)),
+          taxableValue: Number(outputTaxable.toFixed(2)),
+          igst: Number(outputIgst.toFixed(2)),
+          cgst: Number(outputCgst.toFixed(2)),
+          sgst: Number(outputSgst.toFixed(2)),
           cess: 0
         }
       ],
-      interStateSupplies: [],
+      interStateSupplies: outputIgst > 0 ? [
+        {
+          description: 'Supplies made to Unregistered Persons',
+          taxableValue: Number(outputTaxable.toFixed(2)),
+          integratedTax: Number(outputIgst.toFixed(2))
+        }
+      ] : [],
       eligibleITC: {
         available: [
-          { description: 'All other ITC', igst: inputIgst, cgst: inputCgst, sgst: inputSgst, cess: 0 }
+          { description: 'All other ITC', igst: Number(inputIgst.toFixed(2)), cgst: Number(inputCgst.toFixed(2)), sgst: Number(inputSgst.toFixed(2)), cess: 0 }
         ],
         ineligible: []
       },
       exemptSupplies: [],
-      summary: { totalOutputTax: outputTax, totalInputTax, netGstPayable }
+      summary: {
+        totalOutputTax: Number(outputTax.toFixed(2)),
+        totalInputTax: Number(totalInputTax.toFixed(2)),
+        netGstPayable: Number(netGstPayable.toFixed(2))
+      }
     };
   }
 
@@ -3435,7 +3634,7 @@ export class FinanceService {
     };
   }
 
-  static async getHsnSummaryData(franchiseId: string, startDate?: string, endDate?: string) {
+  static async getHsnSummaryData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
     const dateFilter: any = {};
     if (startDate || endDate) {
       dateFilter.createdAt = {
@@ -3444,9 +3643,21 @@ export class FinanceService {
       };
     }
 
+    const franchise = franchiseId
+      ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
+      : null;
+
     const orders = await prisma.order.findMany({
-      where: { franchiseId, status: 'COMPLETED', ...dateFilter },
-      include: { orderItems: { include: { product: true } } }
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        status: 'COMPLETED',
+        ...dateFilter
+      },
+      include: {
+        orderItems: {
+          include: { product: true }
+        }
+      }
     });
 
     const hsnMap: Record<string, {
@@ -3455,15 +3666,35 @@ export class FinanceService {
     }> = {};
 
     orders.forEach(o => {
+      const orderSubTotal = o.subTotal || 0;
+      const orderTax = o.taxAmount || 0;
+      const franchiseLocation = franchise?.location || null;
+
       o.orderItems.forEach(item => {
         const hsn = item.product?.hsnCode || 'NA';
-        if (!hsnMap[hsn]) hsnMap[hsn] = { hsn, totalValue: 0, taxableValue: 0, igstAmount: 0, cgstAmount: 0, sgstAmount: 0 };
-        const itemSubtotal = (item.quantity || 0) * (item.price || 0);
-        const itemTax = item.taxAmount || 0;
-        hsnMap[hsn].taxableValue += itemSubtotal;
-        hsnMap[hsn].cgstAmount += itemTax / 2;
-        hsnMap[hsn].sgstAmount += itemTax / 2;
-        hsnMap[hsn].totalValue += item.totalAmount || 0;
+        if (!hsnMap[hsn]) {
+          hsnMap[hsn] = { hsn, totalValue: 0, taxableValue: 0, igstAmount: 0, cgstAmount: 0, sgstAmount: 0 };
+        }
+
+        const lineSubtotal = (item.quantity || 0) * (item.price || 0);
+        const discountRatio = orderSubTotal > 0 ? (lineSubtotal / orderSubTotal) : 0;
+        const lineDiscount = (o.discountAmount || 0) * discountRatio;
+        const lineTaxable = Math.max(0, lineSubtotal - lineDiscount);
+
+        let lineTax = 0;
+        if (typeof item.taxAmount === 'number' && item.taxAmount > 0) {
+          lineTax = item.taxAmount;
+        } else if (orderSubTotal > 0) {
+          lineTax = (lineTaxable / orderSubTotal) * orderTax;
+        }
+
+        const split = splitTaxBySupplyState(lineTax, o.stateOfSupply, franchiseLocation);
+
+        hsnMap[hsn].taxableValue += lineTaxable;
+        hsnMap[hsn].igstAmount += split.igst;
+        hsnMap[hsn].cgstAmount += split.cgst;
+        hsnMap[hsn].sgstAmount += split.sgst;
+        hsnMap[hsn].totalValue += (item.totalAmount || (lineTaxable + lineTax));
       });
     });
 
@@ -3471,7 +3702,7 @@ export class FinanceService {
       hsn: h.hsn,
       totalValue: Number(h.totalValue.toFixed(2)),
       taxableValue: Number(h.taxableValue.toFixed(2)),
-      igstAmount: 0,
+      igstAmount: Number(h.igstAmount.toFixed(2)),
       cgstAmount: Number(h.cgstAmount.toFixed(2)),
       sgstAmount: Number(h.sgstAmount.toFixed(2)),
       addCess: null
@@ -3997,25 +4228,39 @@ export class FinanceService {
     }));
   }
 
-  static async getStockSummaryByItemData(franchiseId: string) {
+  static async getStockSummaryByItemData(franchiseId?: string) {
     const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        isActive: true
+      },
       orderBy: { name: 'asc' }
     });
 
-    return items.map(item => ({
-      id: item.id,
-      name: item.name,
-      sku: item.sku,
-      category: item.category,
-      unit: item.unit,
-      currentStock: item.currentStock || 0,
-      minStockLevel: item.minimumStock || 0,
-      costPrice: item.costPrice || 0,
-      sellingPrice: item.customerPrice || item.basePrice || 0,
-      stockValue: Number(((item.currentStock || 0) * (item.costPrice || 0)).toFixed(2)),
-      status: (item.currentStock || 0) <= (item.minimumStock || 0) ? 'LOW_STOCK' : 'ADEQUATE'
-    }));
+    return items.map(item => {
+      const currentStock = item.currentStock || 0;
+      const costPrice = item.costPrice || 0;
+      const sellingPrice = item.customerPrice || item.basePrice || 0;
+      const stockValue = Number((currentStock * costPrice).toFixed(2));
+      const potentialRetailValue = Number((currentStock * sellingPrice).toFixed(2));
+      const potentialMargin = Number((potentialRetailValue - stockValue).toFixed(2));
+
+      return {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        category: item.category,
+        unit: item.unit,
+        currentStock,
+        minStockLevel: item.minimumStock || 0,
+        costPrice,
+        sellingPrice,
+        stockValue,
+        potentialRetailValue,
+        potentialMargin,
+        status: currentStock <= (item.minimumStock || 0) ? 'LOW_STOCK' : 'ADEQUATE'
+      };
+    });
   }
 
   static async getProductionReportData(franchiseId?: string, startDate?: string, endDate?: string) {
@@ -4053,7 +4298,14 @@ export class FinanceService {
     };
   }
 
-  static async getInventoryLedgerReportData(franchiseId?: string, itemId?: string, startDate?: string, endDate?: string) {
+  static async getInventoryLedgerReportData(
+    franchiseId?: string,
+    itemId?: string,
+    startDate?: string | Date,
+    endDate?: string | Date,
+    page?: number,
+    pageSize?: number
+  ) {
     const where: any = {};
     if (franchiseId) {
       where.item = { franchiseId };
@@ -4068,32 +4320,69 @@ export class FinanceService {
       };
     }
 
+    const total = await prisma.stockMovement.count({ where });
+
     const movements = await prisma.stockMovement.findMany({
       where,
       include: {
-        item: { select: { id: true, name: true, sku: true, unit: true, category: true } },
+        item: { select: { id: true, name: true, sku: true, unit: true, category: true, costPrice: true, currentStock: true } },
         warehouse: { select: { id: true, name: true } }
       },
       orderBy: { createdAt: 'desc' },
-      take: 200
+      ...(page && pageSize ? {
+        skip: (page - 1) * pageSize,
+        take: pageSize
+      } : {})
     });
 
-    return movements.map(m => ({
-      id: m.id,
-      date: m.createdAt,
-      itemName: m.item?.name || 'Unknown',
-      sku: m.item?.sku,
-      category: m.item?.category,
-      movementType: m.movementType,
-      quantity: m.quantity,
-      baseQty: m.baseQty,
-      unit: m.item?.unit,
-      referenceType: m.referenceType,
-      referenceId: m.referenceId,
-      note: m.note,
-      warehouseName: m.warehouse?.name || 'Central',
-      performedBy: m.createdBy || 'System'
-    }));
+    const data = movements.map(m => {
+      const unitCost = m.item?.costPrice || 0;
+      const qtyIn = m.quantity > 0 ? m.quantity : 0;
+      const qtyOut = m.quantity < 0 ? Math.abs(m.quantity) : 0;
+      const totalCostIn = Number((qtyIn * unitCost).toFixed(2));
+      const totalCostOut = Number((qtyOut * unitCost).toFixed(2));
+      const valuationImpact = Number((m.quantity * unitCost).toFixed(2));
+      const runningStock = m.item?.currentStock || 0;
+      const runningStockValue = Number((runningStock * unitCost).toFixed(2));
+
+      return {
+        id: m.id,
+        date: m.createdAt,
+        itemName: m.item?.name || 'Unknown',
+        sku: m.item?.sku,
+        category: m.item?.category,
+        movementType: m.movementType,
+        quantity: m.quantity,
+        quantityIn: qtyIn,
+        quantityOut: qtyOut,
+        baseQty: m.baseQty,
+        unit: m.item?.unit,
+        unitCost: Number(unitCost.toFixed(2)),
+        totalCostIn,
+        totalCostOut,
+        valuationImpact,
+        runningStock,
+        runningStockValue,
+        referenceType: m.referenceType,
+        referenceId: m.referenceId,
+        batchNumber: m.referenceId || '—',
+        note: m.note,
+        warehouseName: m.warehouse?.name || 'Central',
+        performedBy: m.createdBy || 'System'
+      };
+    });
+
+    if (page && pageSize) {
+      return {
+        data,
+        total,
+        page,
+        pageSize,
+        totalPages: Math.ceil(total / pageSize)
+      };
+    }
+
+    return data;
   }
 
   static async getExpenseCategoryReportData(franchiseId?: string, startDate?: string, endDate?: string) {
@@ -4117,6 +4406,11 @@ export class FinanceService {
       };
     }
 
+    const franchise = filters.franchiseId
+      ? await prisma.franchise.findUnique({ where: { id: filters.franchiseId }, select: { location: true } })
+      : null;
+    const franchiseLocation = franchise?.location || null;
+
     const orders = await prisma.order.findMany({
       where,
       include: {
@@ -4127,17 +4421,78 @@ export class FinanceService {
       orderBy: { createdAt: 'desc' }
     });
 
-    const totalRevenue = orders.reduce((s, o) => s + (o.totalAmount || 0), 0);
-    const totalPaid = orders.reduce((s, o) => s + (o.paymentStatus === 'PAID' ? (o.totalAmount || 0) : o.payments.reduce((ps, p) => ps + p.paidAmount, 0)), 0);
+    let totalSubTotal = 0;
+    let totalDiscount = 0;
+    let totalTaxableValue = 0;
+    let totalCgst = 0;
+    let totalSgst = 0;
+    let totalIgst = 0;
+    let totalTax = 0;
+    let totalRevenue = 0;
+    let totalPaid = 0;
+
+    const mappedOrders = orders.map((o: any) => {
+      const subTotal = o.subTotal || 0;
+      const discountAmount = o.discountAmount || 0;
+      const taxableValue = Math.max(0, subTotal - discountAmount);
+      const taxAmount = o.taxAmount || 0;
+      const split = splitTaxBySupplyState(taxAmount, o.stateOfSupply, franchiseLocation);
+      const grandTotal = o.totalAmount || (taxableValue + taxAmount);
+      const paid = o.paymentStatus === 'PAID'
+        ? grandTotal
+        : (o.payments ? o.payments.reduce((ps: number, p: any) => ps + (p.paidAmount || 0), 0) : 0);
+
+      totalSubTotal += subTotal;
+      totalDiscount += discountAmount;
+      totalTaxableValue += taxableValue;
+      totalCgst += split.cgst;
+      totalSgst += split.sgst;
+      totalIgst += split.igst;
+      totalTax += taxAmount;
+      totalRevenue += grandTotal;
+      totalPaid += paid;
+
+      return {
+        id: o.id,
+        orderNumber: o.invoiceNum || o.id,
+        createdAt: o.createdAt,
+        customerName: o.customer?.name || 'Walk-in Customer',
+        customerPhone: o.customer?.phone || '—',
+        customerGstin: o.customer?.gstin || '—',
+        stateOfSupply: o.stateOfSupply || '—',
+        status: o.status,
+        paymentStatus: o.paymentStatus || 'PAID',
+        paymentMode: o.paymentType || 'CASH',
+        subTotal: Number(subTotal.toFixed(2)),
+        discountAmount: Number(discountAmount.toFixed(2)),
+        taxableValue: Number(taxableValue.toFixed(2)),
+        cgst: Number(split.cgst.toFixed(2)),
+        sgst: Number(split.sgst.toFixed(2)),
+        igst: Number(split.igst.toFixed(2)),
+        cess: 0,
+        taxAmount: Number(taxAmount.toFixed(2)),
+        totalAmount: Number(grandTotal.toFixed(2)),
+        paidAmount: Number(paid.toFixed(2)),
+        balanceAmount: Number(Math.max(0, grandTotal - paid).toFixed(2))
+      };
+    });
 
     return {
       summary: {
         totalOrders: orders.length,
+        totalSubTotal: Number(totalSubTotal.toFixed(2)),
+        totalDiscount: Number(totalDiscount.toFixed(2)),
+        totalTaxableValue: Number(totalTaxableValue.toFixed(2)),
+        totalCgst: Number(totalCgst.toFixed(2)),
+        totalSgst: Number(totalSgst.toFixed(2)),
+        totalIgst: Number(totalIgst.toFixed(2)),
+        totalTax: Number(totalTax.toFixed(2)),
         totalRevenue: Number(totalRevenue.toFixed(2)),
         totalPaid: Number(totalPaid.toFixed(2)),
-        totalPending: Number((totalRevenue - totalPaid).toFixed(2))
+        totalPending: Number(Math.max(0, totalRevenue - totalPaid).toFixed(2))
       },
-      orders
+      orders: mappedOrders,
+      data: mappedOrders
     };
   }
 
