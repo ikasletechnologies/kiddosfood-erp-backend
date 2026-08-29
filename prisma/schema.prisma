@@ -1413,6 +1413,7 @@ model SalesOrder {
   customerId      String?
   customerName    String?
   customerPhone   String?
+  stateOfSupply   String?
   status          SalesOrderStatus @default(DRAFT)
   subTotal        Float
   taxAmount       Float
@@ -1475,6 +1476,7 @@ model ProformaInvoice {
   customerId         String?
   customerName       String?
   customerPhone      String?
+  stateOfSupply      String?
   status             ProformaInvoiceStatus @default(DRAFT)
   subTotal           Float
   taxAmount          Float

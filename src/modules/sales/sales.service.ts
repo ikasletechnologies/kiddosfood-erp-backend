@@ -112,6 +112,7 @@ export class SalesService {
     customerEmail?: string;
     validUntil?: string;
     stateOfSupply?: string;
+    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     termsConditions?: string;
@@ -140,6 +141,7 @@ export class SalesService {
         customerEmail: data.customerEmail,
         validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
         stateOfSupply: data.stateOfSupply,
+        stateOfSupply: data.stateOfSupply || undefined,
         status: (data.status as any) || undefined,
         subTotal,
         taxAmount,
@@ -172,6 +174,7 @@ export class SalesService {
     customerName?: string;
     customerPhone?: string;
     customerEmail?: string;
+    stateOfSupply?: string;
     status?: string;
     notes?: string;
     termsConditions?: string;
@@ -213,6 +216,7 @@ export class SalesService {
       status: data.status as any,
       notes: data.notes,
       termsConditions: data.termsConditions,
+      stateOfSupply: data.stateOfSupply !== undefined ? (data.stateOfSupply || null) : undefined,
       validUntil: data.validUntil ? new Date(data.validUntil) : undefined,
       stateOfSupply: data.stateOfSupply,
       quotationNumber: data.quotationNumber,
@@ -330,6 +334,7 @@ export class SalesService {
           customerId: quotation.customerId,
           customerName: quotation.customerName,
           customerPhone: quotation.customerPhone,
+          stateOfSupply: quotation.stateOfSupply || undefined,
           status: 'DRAFT',
           subTotal: quotation.subTotal,
           taxAmount: quotation.taxAmount,
@@ -407,6 +412,8 @@ export class SalesService {
           partyId: salesOrder.partyId,
           customerId: salesOrder.customerId,
           customerName: salesOrder.customerName,
+          customerPhone: salesOrder.customerPhone,
+          stateOfSupply: salesOrder.stateOfSupply || undefined,
           status: 'DRAFT',
           subTotal: salesOrder.subTotal,
           taxAmount: salesOrder.taxAmount,
@@ -531,6 +538,7 @@ export class SalesService {
           customerId: proforma.customerId,
           customerName: proforma.customerName,
           franchiseId: franchiseId!,
+          stateOfSupply: proforma.stateOfSupply || undefined,
           orderType: 'TAX_INVOICE',
           status: 'PENDING',
           paymentStatus: 'UNPAID',
@@ -605,6 +613,7 @@ export class SalesService {
     customerName?: string;
     customerPhone?: string;
     customerEmail?: string;
+    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     paymentTerms?: string;
@@ -627,6 +636,7 @@ export class SalesService {
         customerId,
         customerName,
         customerPhone: data.customerPhone,
+        stateOfSupply: data.stateOfSupply || undefined,
         status: data.status || 'DRAFT',
         subTotal,
         taxAmount,
@@ -659,6 +669,7 @@ export class SalesService {
     customerName?: string;
     customerPhone?: string;
     customerEmail?: string;
+    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     paymentTerms?: string;
@@ -692,6 +703,7 @@ export class SalesService {
           discountAmount: discount,
           totalAmount: totalAmount - discount,
           paymentTerms: data.paymentTerms !== undefined ? data.paymentTerms : existing.paymentTerms,
+          stateOfSupply: data.stateOfSupply !== undefined ? (data.stateOfSupply || null) : (existing as any).stateOfSupply,
           notes: data.notes !== undefined ? data.notes : existing.notes,
           items: {
             create: computed.map((item) => ({
@@ -822,6 +834,7 @@ export class SalesService {
     customerId?: string;
     customerName?: string;
     customerPhone?: string;
+    stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
     deliveryDate?: string;
@@ -854,6 +867,7 @@ export class SalesService {
         customerId: data.customerId,
         customerName: data.customerName,
         customerPhone: data.customerPhone,
+        stateOfSupply: data.stateOfSupply || undefined,
         subTotal,
         taxAmount,
         discountAmount: discount,
