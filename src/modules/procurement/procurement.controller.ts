@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { ProcurementService } from './procurement.service';
+import { IsolationUtil } from '../../utils/isolation.util';
 
 export class ProcurementController {
   // --- Supplier (Vendor) Management ---
@@ -52,7 +53,10 @@ export class ProcurementController {
   // --- Purchase Order (Procurement Order) Management ---
   static async createPO(req: Request, res: Response) {
     try {
-      const po = await ProcurementService.createPurchaseOrder(req.body);
+      const user = (req as any).user;
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+
+      const po = await ProcurementService.createPurchaseOrder({ ...req.body, franchiseId });
       res.status(201).json(po);
     } catch (error: any) {
       console.error(`[ProcurementController] createPO Error:`, error);
@@ -60,9 +64,15 @@ export class ProcurementController {
     }
   }
 
-  static async getPOs(_req: Request, res: Response) {
+  static async getPOs(req: Request, res: Response) {
     try {
-      const pos = await ProcurementService.getPurchaseOrders();
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string || franchiseFilter.franchiseId)
+        : franchiseFilter.franchiseId;
+
+      const pos = await ProcurementService.getPurchaseOrders(franchiseId);
       res.json(pos);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -71,8 +81,12 @@ export class ProcurementController {
 
   static async getOne(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const po = await ProcurementService.getPurchaseOrderById(req.params.id);
       if (!po) return res.status(404).json({ error: 'Purchase Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && po.franchiseId && po.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this purchase order' });
+      }
       res.json(po);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -85,6 +99,13 @@ export class ProcurementController {
    */
   static async receiveGoods(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const po = await ProcurementService.getPurchaseOrderById(req.params.id);
+      if (!po) return res.status(404).json({ error: 'Purchase Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && po.franchiseId && po.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to receive this purchase order' });
+      }
+
       const updatedPO = await ProcurementService.receiveGoods(req.params.id);
       res.status(200).json(updatedPO);
     } catch (error: any) {
@@ -94,8 +115,15 @@ export class ProcurementController {
 
   static async updatePO(req: Request, res: Response) {
     try {
-      const po = await ProcurementService.updatePO(req.params.id, req.body);
-      res.json(po);
+      const user = (req as any).user;
+      const po = await ProcurementService.getPurchaseOrderById(req.params.id);
+      if (!po) return res.status(404).json({ error: 'Purchase Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && po.franchiseId && po.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to update this purchase order' });
+      }
+
+      const updatedPo = await ProcurementService.updatePO(req.params.id, req.body);
+      res.json(updatedPo);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
     }

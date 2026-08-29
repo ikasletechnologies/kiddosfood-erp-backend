@@ -352,10 +352,8 @@ export class FranchiseOrderService {
             });
 
             if (invItem) {
-              // Every stock change must leave a ledger trail — this used to
-              // increment currentStock directly with no StockMovement row,
-              // so the received quantity was invisible to the ledger and to
-              // computeStock()-based reads (getInventory/getItemById).
+              // Every stock change must leave a ledger trail — record receiveAtCost so
+              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
               await InventoryService.recordMovement(tx, {
                 itemId: invItem.id,
                 type: 'TRANSFER_IN',
@@ -363,18 +361,13 @@ export class FranchiseOrderService {
                 referenceType: 'FRANCHISE_ORDER',
                 referenceId: id,
                 note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
+                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
               });
             } else {
               // Create new inventory item for the franchise if it doesn't exist.
-              // InventoryItem.sku is unique across the whole system, so a branch-level
-              // row can't just reuse the master product's SKU once HQ already owns it —
-              // scope it to this franchise, with a random fallback on the (rare) collision.
-              let sku = product.sku
-                ? `${product.sku}-${order.franchiseId.substring(0, 6).toUpperCase()}`
-                : `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-              if (await tx.inventoryItem.findFirst({ where: { sku } })) {
-                sku = `${sku}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
-              }
+              // InventoryItem is scoped per franchise (@@unique([sku, franchiseId])),
+              // so the franchise row preserves the exact Product SKU.
+              let sku = product.sku || `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
               const newInvItem = await tx.inventoryItem.create({
                 data: {
@@ -385,13 +378,13 @@ export class FranchiseOrderService {
                   unit: 'PC', // Default or fetch from product
                   franchiseId: order.franchiseId,
                   basePrice: product.basePrice,
+                  costPrice: item.unitPrice,
                   isActive: true
                 }
               });
 
               // Opening balance for this branch item goes through the ledger
-              // too, same as every other inflow, instead of being baked into
-              // the create() call with no corresponding movement.
+              // with the exact wholesale acquisition price (item.unitPrice).
               await InventoryService.recordMovement(tx, {
                 itemId: newInvItem.id,
                 type: 'TRANSFER_IN',
@@ -399,6 +392,7 @@ export class FranchiseOrderService {
                 referenceType: 'FRANCHISE_ORDER',
                 referenceId: id,
                 note: `Initial stock received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
+                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
               });
             }
 

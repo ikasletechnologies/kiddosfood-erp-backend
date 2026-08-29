@@ -57,9 +57,15 @@ export class FinanceController {
 
   static async getLedgerSummary(req: Request, res: Response) {
     try {
-      const { startDate, endDate, franchiseId } = req.query;
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string || franchiseFilter.franchiseId)
+        : franchiseFilter.franchiseId;
+
+      const { startDate, endDate } = req.query;
       const summary = await FinanceService.getLedgerSummary({
-        franchiseId: franchiseId as string,
+        franchiseId,
         startDate: startDate ? new Date(startDate as string) : undefined,
         endDate: endDate ? new Date(endDate as string) : undefined
       });

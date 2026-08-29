@@ -19,6 +19,13 @@ export class OrderController {
 
   static async addItems(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const existing = await POSService.getOrderById(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && existing.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
+      }
+
       const items = req.body.items || [req.body]; // accept array or single object inside {items}
       const order = await POSService.addItemsToOrder(req.params.id, items);
       res.status(200).json(order);
@@ -29,6 +36,13 @@ export class OrderController {
 
   static async updateStatus(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const existing = await POSService.getOrderById(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && existing.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
+      }
+
       const { status } = req.body;
       const order = await POSService.updateOrderStatus(req.params.id, status);
       res.json(order);
@@ -42,10 +56,17 @@ export class OrderController {
 
   static async addPayment(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const existing = await POSService.getOrderById(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && existing.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
+      }
+
       // Ensure 'method' maps to enum ('CASH', 'UPI', 'CARD')
       const method = req.body.method || req.body.paymentMode || 'CASH';
       const accountId = req.body.accountId;
-      const order = await POSService.payOrder(req.params.id, method, accountId, (req as any).user?.userId);
+      const order = await POSService.payOrder(req.params.id, method, accountId, user?.userId);
       res.status(200).json(order);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -70,7 +91,7 @@ export class OrderController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
-      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const franchiseId = user.role === 'SUPER_ADMIN' ? (req.query.franchiseId as string || franchiseFilter.franchiseId) : franchiseFilter.franchiseId;
 
       const filters: any = {};
       if (franchiseId) filters.franchiseId = franchiseId;
@@ -85,8 +106,12 @@ export class OrderController {
 
   static async getOne(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const order = await POSService.getOrderById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && order.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
+      }
       res.json(order);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -95,8 +120,12 @@ export class OrderController {
 
   static async getInvoice(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const order = await POSService.getOrderById(req.params.orderId);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && order.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
+      }
 
       res.json({
         invoiceNum: order.invoiceNum,

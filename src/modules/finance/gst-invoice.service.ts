@@ -37,7 +37,7 @@ export class GSTInvoiceService {
     });
 
     if (!order) throw new Error('Franchise order not found');
-    if (order.paymentStatus !== 'PAID') throw new Error('Invoice can only be generated after payment');
+    if (order.status === 'CANCELLED') throw new Error('Cannot generate invoice for a cancelled franchise order');
 
     const lineItems = order.items.map(item => {
       const gst = calculateGST(item.totalAmount, item.product.taxPercent ?? 5, isInterState);

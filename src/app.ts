@@ -234,10 +234,10 @@ app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), 
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getHistory);
 app.get('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), CartonController.getAll);
-app.post('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), CartonController.create);
-app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.startBatch);
-app.post('/api/production/:id/stop', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.stopBatch);
-app.patch('/api/production/:id/stage', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.advanceStage);
+app.post('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN']), CartonController.create);
+app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startBatch);
+app.post('/api/production/:id/stop', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.stopBatch);
+app.patch('/api/production/:id/stage', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.advanceStage);
 app.get('/api/production/:id/stage-history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getStageHistory);
 app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.approveBatch);
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
@@ -256,10 +256,10 @@ app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', '
 });
 app.get('/api/production/batches-all', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getAllBatches);
 app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPendingQC);
-app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.inspectBatch);
-app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.startPackaging);
-app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.confirmPackaging);
-app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.savePackagingVerification);
+app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.inspectBatch);
+app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPackaging);
+app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.confirmPackaging);
+app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.savePackagingVerification);
 app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
 // Batch Recall — eligibility/state are shared source of truth for both the
 // registry list and the inspector panel; mutation endpoints are transactional

@@ -1093,8 +1093,11 @@ export class ProcurementService {
     });
   }
 
-  static async getPurchaseOrders() {
+  static async getPurchaseOrders(franchiseId?: string) {
     const orders = await prisma.procurementOrder.findMany({
+      where: {
+        ...(franchiseId ? { franchiseId } : {})
+      },
       include: { 
         vendor: true, 
         poItems: { include: { inventoryItem: true } }, 

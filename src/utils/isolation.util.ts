@@ -17,8 +17,8 @@ export class IsolationUtil {
     }
 
     if (!user.franchiseId) {
-      console.warn(`[IsolationUtil] User ${user.userId} has no assigned franchise. Falling back to no filter.`);
-      return {};
+      console.warn(`[IsolationUtil] User ${user.userId} (${user.role}) has no assigned franchise. Restricting access.`);
+      return { franchiseId: '__UNASSIGNED__' };
     }
 
     return { franchiseId: user.franchiseId };

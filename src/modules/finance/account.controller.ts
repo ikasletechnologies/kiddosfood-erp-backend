@@ -18,9 +18,13 @@ export class AccountController {
 
   static async getById(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
       const account = await AccountService.getAccountById(req.params.id);
       if (!account) {
         return res.status(404).json({ error: 'Account not found' });
+      }
+      if (user && user.role !== 'SUPER_ADMIN' && account.franchiseId && account.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this account' });
       }
       res.json(account);
     } catch (error: any) {
@@ -41,6 +45,14 @@ export class AccountController {
 
   static async delete(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const account = await AccountService.getAccountById(req.params.id);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      if (user && user.role !== 'SUPER_ADMIN' && account.franchiseId && account.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to delete this account' });
+      }
       await AccountService.deleteAccount(req.params.id);
       res.status(204).send();
     } catch (error: any) {
