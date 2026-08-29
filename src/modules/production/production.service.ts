@@ -23,6 +23,14 @@ function resolveBulkIdentity(
   product: { id: string; sku: string | null; name: string } | null | undefined,
   recipe: { recipeCode: string | null; name: string } | null | undefined,
 ): { bulkSku: string; bulkName: string } {
+  if (recipe) {
+    const baseCode = recipe.recipeCode || recipe.name || 'RECIPE';
+    const bulkSku = baseCode.toUpperCase().endsWith('-BULK') ? baseCode.toUpperCase() : `${baseCode.toUpperCase()}-BULK`;
+    const baseName = recipe.name || baseCode;
+    const bulkName = baseName.endsWith(' - Bulk') ? baseName : `${baseName} - Bulk`;
+    return { bulkSku, bulkName };
+  }
+
   if (product) {
     const bulkSku = product.sku
       ? (product.sku.endsWith('-BULK') ? product.sku : `${product.sku}-BULK`)
@@ -31,11 +39,7 @@ function resolveBulkIdentity(
     return { bulkSku, bulkName };
   }
 
-  const baseCode = recipe?.recipeCode || recipe?.name || 'RECIPE';
-  const bulkSku = baseCode.toUpperCase().endsWith('-BULK') ? baseCode.toUpperCase() : `${baseCode.toUpperCase()}-BULK`;
-  const baseName = recipe?.name || baseCode;
-  const bulkName = baseName.endsWith(' - Bulk') ? baseName : `${baseName} - Bulk`;
-  return { bulkSku, bulkName };
+  return { bulkSku: 'RECIPE-BULK', bulkName: 'RECIPE - Bulk' };
 }
 
 export class ProductionService {
@@ -776,6 +780,7 @@ export class ProductionService {
     goodQty: number;
     damagedQty: number;
     spoiledQty: number;
+    productId?: string;
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
@@ -823,6 +828,21 @@ export class ProductionService {
         throw new Error(`Good + Damaged + Spoiled (${good + damaged + spoiled}) must equal the planned packaging quantity (${packaging.quantityPackets}).`);
       }
 
+      let selectedProduct: any = null;
+      if (data.productId) {
+        selectedProduct = await tx.product.findUnique({ where: { id: data.productId } });
+        if (!selectedProduct) {
+          throw new Error('Selected sellable product not found.');
+        }
+        if (selectedProduct.isActive === false) {
+          throw new Error('Selected sellable product is inactive.');
+        }
+        await tx.productBatch.update({
+          where: { id: batch.id },
+          data: { productId: selectedProduct.id }
+        });
+      }
+
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
       if (!franchiseId) throw new Error('Franchise ID not found for batch');
       const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
@@ -845,7 +865,7 @@ export class ProductionService {
         throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
       }
 
-      const linkedProduct = (batch as any).product || (batch as any).production?.recipe?.product;
+      const linkedProduct = selectedProduct || (batch as any).product || (batch as any).production?.recipe?.product;
       let retailSku: string;
       let retailName: string;
 

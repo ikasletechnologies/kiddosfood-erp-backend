@@ -158,13 +158,14 @@ export class ProductionController {
   // and Finished Goods get created.
   static async confirmPackaging(req: Request, res: Response) {
     try {
-      const { goodQty, damagedQty, spoiledQty } = req.body;
+      const { goodQty, damagedQty, spoiledQty, productId } = req.body;
       const user = (req as any).user;
       const result = await ProductionService.confirmPackaging({
         packagingId: req.params.id,
         goodQty: Number(goodQty),
         damagedQty: Number(damagedQty),
         spoiledQty: Number(spoiledQty),
+        productId: productId ? String(productId) : undefined,
         userId: user?.userId
       });
       res.json(result);
