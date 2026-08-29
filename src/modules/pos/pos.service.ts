@@ -358,11 +358,19 @@ export class POSService {
   /**
    * Main POS Checkout Flow (Legacy, wraps old calls)
    */
-  static async checkout(data: { 
-    franchiseId?: string, 
-    customerId?: string, 
+  static async checkout(data: {
+    franchiseId?: string,
+    customerId?: string,
+    // Actual party type/id for the sale — the frontend already collects a
+    // Customer/Dealer/Franchise selection for Counter Billing, but this
+    // legacy checkout previously discarded it entirely (see BUG 1: it wrote
+    // a fake 'WALK_IN' string as if it were a real Customer.id FK and always
+    // hardcoded entityType to 'CUSTOMER', even for Dealer sales).
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE',
+    partyId?: string,
+    customerName?: string,
     accountId?: string,
-    items: { productId: string, quantity: number, price: number }[],
+    items: { productId: string, quantity: number, price: number, taxPercent?: number }[],
     subTotal: number,
     taxAmount: number,
     discountAmount: number,
@@ -389,12 +397,35 @@ export class POSService {
       if (!fid) throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise before checking out without an explicit franchise.');
     }
 
+    // Resolve the real party this sale is attributed to. data.customerId
+    // only ever carries a real Customer.id (frontend leaves it undefined for
+    // Walk-in and for Dealer sales); data.partyId is the analogous id for a
+    // non-customer party (e.g. a selected Dealer) when one actually exists.
+    // Neither is a fake sentinel — when there's no real master-table row
+    // (Walk-in, or a Dealer with no record on file), both stay undefined so
+    // Payment.entityId is never set to a made-up id like 'WALK_IN'.
+    const resolvedPartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
+      data.partyType === 'DEALER' ? 'DEALER' :
+      data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
+    const hasRealCustomer = !!(data.customerId && !/walk[-_ ]?in/i.test(data.customerId));
+    const hasRealParty = resolvedPartyType !== 'CUSTOMER' && !!data.partyId;
+    const resolvedPartyId = hasRealParty ? data.partyId : undefined;
+    const resolvedEntityId = hasRealCustomer ? data.customerId : resolvedPartyId;
+    // Fallback label used only when there's no real master-table id to
+    // resolve a display name from — flows into Payment.transactionRef so
+    // FinanceService.getPayments shows it instead of falling through to the
+    // generic "Manual Entry" string (see resolvePartyName/getPayments).
+    const displayName = data.customerName || (resolvedPartyType === 'DEALER' ? 'Dealer' : 'Walk-in Customer');
+
     const result = await prisma.$transaction(async (tx) => {
       const order = await tx.order.create({
         data: {
           invoiceNum: `INV-${Date.now()}`,
           franchiseId: fid,
-          customerId: (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) ? data.customerId : null,
+          customerId: hasRealCustomer ? data.customerId : null,
+          partyType: resolvedPartyType,
+          partyId: resolvedPartyId || null,
+          customerName: data.customerName || null,
           subTotal: data.subTotal || (data as any).subtotal || 0,
           taxAmount: data.taxAmount,
           discountAmount: data.discountAmount,
@@ -402,13 +433,25 @@ export class POSService {
           status: 'COMPLETED',
           paymentStatus: 'PAID',
           orderItems: {
-            create: data.items.map((item: any) => ({
-              productId: item.productId || item.id,
-              quantity: item.quantity,
-              price: item.price || item.unitPrice || 0,
-              taxAmount: Number(((item.price || item.unitPrice || 0) * 0.05).toFixed(2)),
-              totalAmount: Number(((item.price || item.unitPrice || 0) * item.quantity).toFixed(2))
-            }))
+            create: data.items.map((item: any) => {
+              const unitPrice = item.price || item.unitPrice || 0;
+              const lineTotal = Number((unitPrice * item.quantity).toFixed(2));
+              // Real per-product tax rate, scaled by quantity — this was
+              // hardcoded to 5% of unit price only (ignoring quantity and
+              // the product's actual taxPercent), which desynced this
+              // per-line figure from the order-level GST already computed
+              // correctly by the frontend (BUG 3).
+              const taxPct = (item.taxPercent !== undefined && item.taxPercent !== null)
+                ? Number(item.taxPercent)
+                : 5;
+              return {
+                productId: item.productId || item.id,
+                quantity: item.quantity,
+                price: unitPrice,
+                taxAmount: Number((lineTotal * (taxPct / 100)).toFixed(2)),
+                totalAmount: lineTotal
+              };
+            })
           },
         },
         include: { orderItems: true, customer: true }
@@ -445,8 +488,12 @@ export class POSService {
         sourceModule: 'POS',
         linkedDocType: 'INVOICE',
         linkedDocId: order.invoiceNum,
-        entityType: 'CUSTOMER',
-        entityId: data.customerId || 'WALK_IN',
+        entityType: resolvedPartyType,
+        entityId: resolvedEntityId,
+        // Only actually used by FinanceService.createPayment/getPayments as
+        // a display fallback when entityId can't be resolved to a real
+        // master-table row (Walk-in, or a Dealer with no record) — see BUG 1.
+        note: displayName,
         orderId: order.id,
         franchiseId: fid,
         createdBy: 'POS_CHECKOUT'

@@ -140,6 +140,7 @@ export class FranchiseOrderService {
         totalAmount: number;
         productType: ProductType;
       }> = [];
+      let lineTax = 0;
 
       for (const reqItem of data.items) {
         const product = products.find(p => p.id === reqItem.productId)!;
@@ -177,10 +178,14 @@ export class FranchiseOrderService {
           totalAmount,
           productType: product.productType,
         });
+        // Per-product tax rate (matches how POSService.checkout/the Counter
+        // Billing frontend compute GST) instead of a flat 5% applied to the
+        // whole order regardless of what's actually in it.
+        lineTax += Number((totalAmount * (product.taxPercent / 100)).toFixed(2));
       }
 
       const subtotal    = orderItems.reduce((s, i) => s + i.totalAmount, 0);
-      const taxAmount   = Math.round(subtotal * 0.05); // 5% GST
+      const taxAmount   = Number(lineTax.toFixed(2));
       const delivery    = 50; // Flat delivery charge
       const grandTotal  = subtotal + taxAmount + delivery;
 
