@@ -38,17 +38,11 @@ export class AccountService {
     });
   }
 
-  static async getAccounts(franchiseId?: string | null) {
-    // No explicit scope requested (SUPER_ADMIN's default "give me my own
-    // accounts" view) means "HQ's accounts". Account uses the literal-HQ-id
-    // convention — createAccount (via IsolationUtil.enforceFranchiseMatch)
-    // stores the real HQ franchise id, never null — unlike InventoryItem,
-    // which uses franchiseId=NULL for HQ. Resolving through
-    // FranchiseService here keeps list and create consistent instead of
-    // querying for a franchiseId value no HQ account actually has.
-    const scopeFranchiseId = franchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null;
+  static async getAccounts(franchiseId?: any) {
+    const realFranchiseId = (typeof franchiseId === 'object' && franchiseId !== null) ? franchiseId.franchiseId : franchiseId;
+    const scopeFranchiseId = (typeof realFranchiseId === 'string' && realFranchiseId) ? realFranchiseId : ((await FranchiseService.getHqFranchiseOrNull())?.id || null);
     const accounts = await prisma.account.findMany({
-      where: { franchiseId: scopeFranchiseId },
+      where: { ...(scopeFranchiseId ? { franchiseId: scopeFranchiseId } : {}) },
       orderBy: { name: 'asc' },
       include: {
         // Only posted, non-cancelled payments count as "activity" — same

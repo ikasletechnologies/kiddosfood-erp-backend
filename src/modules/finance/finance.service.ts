@@ -29,6 +29,30 @@ function buildCreatedAtFilter(startDate?: string | Date, endDate?: string | Date
   return { createdAt: range };
 }
 
+function normalizeReportFilters(param1?: any, param2?: any, param3?: any, param4?: any): {
+  franchiseId?: string;
+  startDate?: string | Date;
+  endDate?: string | Date;
+  category?: string;
+  extra?: any;
+} {
+  if (typeof param1 === 'object' && param1 !== null && !(param1 instanceof Date)) {
+    return {
+      franchiseId: typeof param1.franchiseId === 'string' ? param1.franchiseId : undefined,
+      startDate: param1.startDate || param1.fromDate,
+      endDate: param1.endDate || param1.toDate,
+      category: param1.category || param2,
+      extra: param1
+    };
+  }
+  return {
+    franchiseId: typeof param1 === 'string' ? param1 : undefined,
+    startDate: param2,
+    endDate: param3,
+    category: param4
+  };
+}
+
 function splitTaxBySupplyState(taxAmount: number, stateOfSupply?: string | null, franchiseLocation?: string | null) {
   const totalTax = Number(taxAmount || 0);
   const supply = stateOfSupply?.trim().toLowerCase();
@@ -642,14 +666,15 @@ export class FinanceService {
     }));
   }
 
-  static async getGstReportData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getGstReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const [sales, purchases] = await Promise.all([
       prisma.order.findMany({
@@ -664,7 +689,7 @@ export class FinanceService {
         where: {
           ...(franchiseId ? { franchiseId } : {}),
           ...dateFilter,
-          status: 'DELIVERED'
+          status: { not: 'CANCELLED' as any }
         },
         include: { vendor: true }
       })
@@ -697,14 +722,15 @@ export class FinanceService {
     return { data, totalTaxIn, totalTaxOut };
   }
 
-  static async getGstRateReportData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getGstRateReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const [orders, purchases] = await Promise.all([
       prisma.order.findMany({
@@ -712,7 +738,7 @@ export class FinanceService {
         include: { orderItems: { include: { product: true } } }
       }),
       prisma.procurementOrder.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: 'DELIVERED' },
+        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: { not: 'CANCELLED' as any } },
         include: { poItems: true }
       })
     ]);
@@ -740,7 +766,7 @@ export class FinanceService {
     });
 
     purchases.forEach(p => {
-      p.poItems.forEach(item => {
+      (p.poItems || []).forEach(item => {
         const rate = item.gstRate ?? 5;
         const bracket = nearestBracket(rate);
         if (rateMap[bracket]) {
@@ -765,14 +791,15 @@ export class FinanceService {
     };
   }
 
-  static async getTcsReceivableData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getTcsReceivableData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const sales = await prisma.order.findMany({
       where: {
@@ -804,20 +831,21 @@ export class FinanceService {
     return { data, totalPurchaseWithTcs, totalTcs };
   }
 
-  static async getTdsPayableData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getTdsPayableData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const purchases = await prisma.procurementOrder.findMany({
       where: {
         ...(franchiseId ? { franchiseId } : {}),
         ...dateFilter,
-        status: 'DELIVERED'
+        status: { not: 'CANCELLED' as any }
       },
       include: { vendor: true },
       orderBy: { createdAt: 'desc' }
@@ -845,14 +873,15 @@ export class FinanceService {
     return { data, totalPurchaseWithTds, totalTds };
   }
 
-  static async getTdsReceivableData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getTdsReceivableData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const sales = await prisma.order.findMany({
       where: {
@@ -886,14 +915,15 @@ export class FinanceService {
     return { data, totalSaleWithTds, totalTds };
   }
 
-  static async getForm27eqData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getForm27eqData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const sales = await prisma.order.findMany({
       where: {
@@ -1544,16 +1574,15 @@ export class FinanceService {
     const limit = Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = (page - 1) * limit;
 
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
     const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
+      ...(start ? { gte: start } : {}),
+      ...(end ? { lte: end } : {})
     };
 
     const whereClause: any = {
       ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
-      ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+      ...((start || end) ? { createdAt: dateQuery } : {}),
       ...(filters.customerId ? { customerId: filters.customerId } : {}),
       ...(filters.paymentStatus ? { paymentStatus: filters.paymentStatus as any } : {})
     };
@@ -1617,8 +1646,8 @@ export class FinanceService {
 
   static async getPurchasesReportDetails(filters: {
     franchiseId?: string;
-    startDate?: Date;
-    endDate?: Date;
+    startDate?: Date | string;
+    endDate?: Date | string;
     vendorId?: string;
     status?: string;
     search?: string;
@@ -1626,23 +1655,20 @@ export class FinanceService {
     limit?: number;
   }) {
     const page = Math.max(1, Number(filters.page) || 1);
-    // A search hits the full matching set regardless of page size, so it
-    // isn't limited to whatever page happened to load first.
     const limit = filters.search
       ? 1000
       : Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = filters.search ? 0 : (page - 1) * limit;
 
-    const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
+    const { start: pStart, end: pEnd } = parseInclusiveDates(filters.startDate, filters.endDate);
+    const poDateQuery = {
+      ...(pStart ? { gte: pStart } : {}),
+      ...(pEnd ? { lte: pEnd } : {})
     };
 
     const whereClause: any = {
       ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
-      ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+      ...((pStart || pEnd) ? { createdAt: poDateQuery } : {}),
       ...(filters.vendorId ? { vendorId: filters.vendorId } : {}),
       ...(filters.status ? { status: filters.status as any } : {}),
       ...(filters.search ? {
@@ -1793,22 +1819,23 @@ export class FinanceService {
 
   static async getDayBookReport(filters: {
     franchiseId?: string;
-    startDate?: Date;
-    endDate?: Date;
+    startDate?: Date | string;
+    endDate?: Date | string;
     paymentMode?: string;
     voucherType?: string;
     page?: number;
     limit?: number;
   }) {
     const franchiseWhere = this.paymentFranchiseWhere(filters.franchiseId);
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
 
     let openingBalance = 0;
-    if (filters.startDate) {
+    if (start) {
       const preInflows = await prisma.payment.aggregate({
         where: {
           ...franchiseWhere,
           NOT: this.PAYMENT_OUTFLOW_FILTER,
-          createdAt: { lt: filters.startDate },
+          createdAt: { lt: start },
           status: 'PAID',
           isCancelled: false
         },
@@ -1818,7 +1845,7 @@ export class FinanceService {
       const preOutflows = await prisma.payment.aggregate({
         where: {
           AND: [franchiseWhere, this.PAYMENT_OUTFLOW_FILTER],
-          createdAt: { lt: filters.startDate },
+          createdAt: { lt: start },
           status: 'PAID',
           isCancelled: false
         },
@@ -1835,17 +1862,15 @@ export class FinanceService {
     const skip = (page - 1) * limit;
 
     const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
+      ...(start ? { gte: start } : {}),
+      ...(end ? { lte: end } : {})
     };
 
     const whereClause: any = {
       ...franchiseWhere,
       status: 'PAID',
       isCancelled: false,
-      ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+      ...((start || end) ? { createdAt: dateQuery } : {}),
       ...(filters.paymentMode ? { paymentMode: filters.paymentMode as any } : {}),
       ...(filters.voucherType ? { sourceModule: filters.voucherType as any } : {})
     };
@@ -1908,8 +1933,8 @@ export class FinanceService {
 
   static async getFinancialTransactionsReport(filters: {
     franchiseId?: string;
-    startDate?: Date;
-    endDate?: Date;
+    startDate?: Date | string;
+    endDate?: Date | string;
     type?: string;
     status?: string;
     page?: number;
@@ -1919,17 +1944,16 @@ export class FinanceService {
     const limit = Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = (page - 1) * limit;
 
+    const { start: txStart, end: txEnd } = parseInclusiveDates(filters.startDate, filters.endDate);
     const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
-      } : {})
+      ...(txStart ? { gte: txStart } : {}),
+      ...(txEnd ? { lte: txEnd } : {})
     };
 
     const whereClause: any = {
       ...this.paymentFranchiseWhere(filters.franchiseId),
       isCancelled: false,
-      ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+      ...((txStart || txEnd) ? { createdAt: dateQuery } : {}),
       ...(filters.status ? { status: filters.status } : { status: 'PAID' })
     };
 
@@ -2015,15 +2039,20 @@ export class FinanceService {
     return `PAY-${year}-${seq.toString().padStart(4, '0')}`;
   }
 
-  static async getTrialBalanceReport(filters: {
-    franchiseId?: string;
-    startDate?: Date;
-    endDate?: Date;
-  }) {
+  static async getTrialBalanceReport(filtersInput?: any) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(filtersInput);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
+
     // 1. Fetch Cash, Bank, and UPI accounts
     const accounts = await prisma.account.findMany({
       where: {
-        franchiseId: filters.franchiseId,
+        ...(franchiseId ? { franchiseId } : {}),
         status: "ACTIVE"
       }
     });
@@ -2034,15 +2063,10 @@ export class FinanceService {
 
     // 2. Fetch Customer ledger entries for dynamic Sundry Debtors
     const customers = await prisma.customer.findMany({
-      where: { franchiseId: filters.franchiseId },
+      where: { ...(franchiseId ? { franchiseId } : {}) },
       include: {
         ledgerEntries: {
-          where: {
-            createdAt: {
-              ...(filters.startDate ? { gte: filters.startDate } : {}),
-              ...(filters.endDate ? { lte: filters.endDate } : {})
-            }
-          }
+          where: dateFilter
         }
       }
     });
@@ -2074,12 +2098,9 @@ export class FinanceService {
     // 3. Fetch Procurement Orders to calculate Sundry Creditors liability
     const pos = await prisma.procurementOrder.findMany({
       where: {
-        franchiseId: filters.franchiseId,
-        status: { not: "CANCELLED" },
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
+        ...(franchiseId ? { franchiseId } : {}),
+        status: { not: "CANCELLED" as any },
+        ...dateFilter
       }
     });
 
@@ -2092,12 +2113,9 @@ export class FinanceService {
     // 4. Calculate Sales Revenue
     const salesAggregate = await prisma.order.aggregate({
       where: {
-        franchiseId: filters.franchiseId,
-        status: { not: "CANCELLED" },
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
+        ...(franchiseId ? { franchiseId } : {}),
+        status: { not: "CANCELLED" as any },
+        ...dateFilter
       },
       _sum: { totalAmount: true }
     });
@@ -2106,26 +2124,26 @@ export class FinanceService {
     // 5. Calculate Purchase Costs
     const purchaseAggregate = await prisma.procurementOrder.aggregate({
       where: {
-        franchiseId: filters.franchiseId,
-        status: { not: "CANCELLED" },
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
+        ...(franchiseId ? { franchiseId } : {}),
+        status: { not: "CANCELLED" as any },
+        ...dateFilter
       },
       _sum: { totalAmount: true }
     });
     const totalPurchases = purchaseAggregate._sum.totalAmount || 0;
 
     // 6. Calculate Indirect Expenses
+    const expenseDateFilter = (start || end) ? {
+      date: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
     const expenseAggregate = await prisma.expense.aggregate({
       where: {
-        franchiseId: filters.franchiseId,
+        ...(franchiseId ? { franchiseId } : {}),
         isCancelled: false,
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
+        ...expenseDateFilter
       },
       _sum: { amount: true }
     });
@@ -2301,17 +2319,20 @@ export class FinanceService {
 
   static async getBillWiseProfitReport(filters: {
     franchiseId?: string;
-    startDate?: Date;
-    endDate?: Date;
+    startDate?: Date | string;
+    endDate?: Date | string;
   }) {
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
     const orders = await prisma.order.findMany({
       where: {
-        franchiseId: filters.franchiseId,
+        ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
         status: "COMPLETED",
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
+        ...((start || end) ? {
+          createdAt: {
+            ...(start ? { gte: start } : {}),
+            ...(end ? { lte: end } : {})
+          }
+        } : {})
       },
       include: {
         customer: true,
@@ -3283,21 +3304,23 @@ export class FinanceService {
     });
   }
 
-  static async getBankStatementData(franchiseId: string, accountId?: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getBankStatementData(franchiseIdOrFilters?: any, accountIdParam?: string, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate, extra } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const accountId = typeof franchiseIdOrFilters === 'object' && franchiseIdOrFilters !== null ? franchiseIdOrFilters.accountId : accountIdParam;
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     let accountIds: string[] = [];
     if (accountId && accountId !== 'NONE') {
       accountIds = [accountId];
     } else {
       const bankAccounts = await prisma.account.findMany({
-        where: { franchiseId, type: 'BANK' }
+        where: { ...(franchiseId ? { franchiseId } : {}), type: 'BANK' }
       });
       accountIds = bankAccounts.map((a: any) => a.id);
     }
@@ -3322,7 +3345,7 @@ export class FinanceService {
         accountId: { in: accountIds },
         isCancelled: false,
         status: 'PAID',
-        ...(startDate ? { createdAt: { lt: new Date(startDate) } } : {})
+        ...(start ? { createdAt: { lt: start } } : {})
       }
     });
 
@@ -3356,18 +3379,19 @@ export class FinanceService {
     return { data, closingBalance: runningBalance };
   }
 
-  static async getDiscountReportData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getDiscountReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const sales = await prisma.order.findMany({
       where: {
-        franchiseId,
+        ...(franchiseId ? { franchiseId } : {}),
         discountAmount: { gt: 0 },
         status: 'COMPLETED',
         ...dateFilter
@@ -3389,7 +3413,8 @@ export class FinanceService {
     return { data, totalDiscount };
   }
 
-  static async getGSTR1Data(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
+  static async getGSTR1Data(franchiseIdOrFilters?: any, startDateParam?: string | Date, endDateParam?: string | Date) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
     const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
     const orders = await prisma.order.findMany({
@@ -3403,9 +3428,6 @@ export class FinanceService {
     });
 
     const toRow = (o: any) => {
-      // Resolved per-order (not from a single outer franchiseId) so a
-      // consolidated multi-franchise view still splits each order's tax
-      // against its own selling franchise's state, not a shared default.
       const split = splitTaxBySupplyState(o.taxAmount || 0, o.stateOfSupply, o.franchise?.location || null);
       const isB2B = Boolean(o.customer?.gstNumber && o.customer.gstNumber.trim() !== '');
       const taxableValue = o.subTotal || 0;
@@ -3447,16 +3469,13 @@ export class FinanceService {
     };
   }
 
-  static async getGSTR2Data(franchiseId: string, startDate?: string, endDate?: string) {
+  static async getGSTR2Data(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
     const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
-    // ITC must reflect what the vendor actually billed, not what the PO
-    // committed to — PO price/tax and the real vendor invoice can diverge
-    // (see VendorInvoice's schema comment), so this reads VendorInvoice
-    // rather than ProcurementOrder header fields.
     const invoices = await prisma.vendorInvoice.findMany({
       where: {
-        procurementOrder: { franchiseId, status: { not: 'CANCELLED' as any } },
+        procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
         ...dateFilter
       },
       include: { vendor: true, procurementOrder: { select: { poNumber: true } } },
@@ -3485,7 +3504,8 @@ export class FinanceService {
     };
   }
 
-  static async getGSTR3BData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
+  static async getGSTR3BData(franchiseIdOrFilters?: any, startDateParam?: string | Date, endDateParam?: string | Date) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
     const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
     const [orders, purchasesAgg] = await Promise.all([
@@ -3497,7 +3517,6 @@ export class FinanceService {
         },
         select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
       }),
-      // Same source as getGSTR2Data: the vendor's actual invoice, not the PO.
       prisma.vendorInvoice.aggregate({
         where: {
           procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
@@ -3517,8 +3536,6 @@ export class FinanceService {
       outputTaxable += o.subTotal || 0;
       const t = o.taxAmount || 0;
       outputTax += t;
-      // Resolved per-order so a consolidated multi-franchise view still
-      // splits each order against its own selling franchise's state.
       const split = splitTaxBySupplyState(t, o.stateOfSupply, o.franchise?.location || null);
       outputIgst += split.igst;
       outputCgst += split.cgst;
@@ -3564,7 +3581,9 @@ export class FinanceService {
     };
   }
 
-  static async getGSTR9Data(franchiseId?: string, financialYear?: string) {
+  static async getGSTR9Data(franchiseIdOrFilters?: any, financialYearParam?: string) {
+    const franchiseId = typeof franchiseIdOrFilters === 'string' ? franchiseIdOrFilters : (franchiseIdOrFilters?.franchiseId);
+    const financialYear = typeof franchiseIdOrFilters === 'object' && franchiseIdOrFilters?.financialYear ? franchiseIdOrFilters.financialYear : financialYearParam;
     const fy = financialYear || '2025-2026';
     const [startYearStr] = fy.split('-');
     const startYear = parseInt(startYearStr, 10);
@@ -3576,15 +3595,10 @@ export class FinanceService {
       : null;
 
     const [orders, purchasesAgg] = await Promise.all([
-      // findMany (not aggregate) so each order's IGST/CGST/SGST split can be
-      // resolved against its own selling franchise's state — an aggregate
-      // sum has no per-order state to split by.
       prisma.order.findMany({
         where: { ...(franchiseId ? { franchiseId } : {}), status: 'COMPLETED', createdAt: { gte: fyStart, lte: fyEnd } },
         select: { subTotal: true, taxAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
       }),
-      // Same source as getGSTR2Data/getGSTR3BData: the vendor's actual
-      // invoice, not the PO.
       prisma.vendorInvoice.aggregate({
         where: {
           procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
@@ -3646,14 +3660,15 @@ export class FinanceService {
     };
   }
 
-  static async getHsnSummaryData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getHsnSummaryData(franchiseIdOrFilters?: any, startDateParam?: string | Date, endDateParam?: string | Date) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const franchise = franchiseId
       ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
@@ -3721,17 +3736,22 @@ export class FinanceService {
     }));
   }
 
-  static async getSacReportData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.date = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getSaleSummaryByHSNData(franchiseIdOrFilters?: any, startDateParam?: string | Date, endDateParam?: string | Date) {
+    return this.getHsnSummaryData(franchiseIdOrFilters, startDateParam, endDateParam);
+  }
+
+  static async getSacReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      date: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const expenses = await prisma.expense.findMany({
-      where: { franchiseId, isCancelled: false, ...dateFilter },
+      where: { ...(franchiseId ? { franchiseId } : {}), isCancelled: false, ...dateFilter },
       orderBy: { date: 'desc' }
     });
 
@@ -3747,17 +3767,18 @@ export class FinanceService {
     return Object.values(sacMap);
   }
 
-  static async getItemDiscountReportData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getItemDiscountReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const orders = await prisma.order.findMany({
-      where: { franchiseId, discountAmount: { gt: 0 }, status: 'COMPLETED', ...dateFilter },
+      where: { ...(franchiseId ? { franchiseId } : {}), discountAmount: { gt: 0 }, status: 'COMPLETED', ...dateFilter },
       include: { orderItems: { include: { product: true } } },
       orderBy: { createdAt: 'desc' }
     });
@@ -3785,22 +3806,23 @@ export class FinanceService {
     return { data, totalDiscount: data.reduce((s, r) => s + r.totalDiscountAmount, 0) };
   }
 
-  static async getSalePurchaseByCategoryData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getSalePurchaseByCategoryData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const [orders, purchases] = await Promise.all([
       prisma.order.findMany({
-        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        where: { ...(franchiseId ? { franchiseId } : {}), status: 'COMPLETED', ...dateFilter },
         include: { orderItems: { include: { product: true } } }
       }),
       prisma.procurementOrder.findMany({
-        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        where: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any }, ...dateFilter },
         include: { poItems: { include: { inventoryItem: true } } }
       })
     ]);
@@ -3826,9 +3848,9 @@ export class FinanceService {
     return Object.values(categoryMap);
   }
 
-  static async getStockByCategoryData(franchiseId: string) {
+  static async getStockByCategoryData(franchiseId?: string) {
     const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
+      where: { ...(franchiseId ? { franchiseId } : {}), isActive: true },
       orderBy: { category: 'asc' }
     });
 
@@ -3849,15 +3871,17 @@ export class FinanceService {
     }));
   }
 
-  static async getExpensesReportData(franchiseId?: string, startDate?: string, endDate?: string, category?: string) {
+  static async getExpensesReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string) {
+    const { franchiseId, startDate, endDate, category } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam, categoryParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
     const where: any = {
       ...(franchiseId ? { franchiseId } : {}),
       isCancelled: false
     };
-    if (startDate || endDate) {
+    if (start || end) {
       where.date = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
       };
     }
     if (category) where.category = category;
@@ -3892,6 +3916,14 @@ export class FinanceService {
         count: expenses.length
       }
     };
+  }
+
+  static async getExpenseCategoryReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
+    return this.getExpensesReportData(franchiseIdOrFilters, startDateParam, endDateParam);
+  }
+
+  static async getExpenseItemReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string) {
+    return this.getExpensesReportData(franchiseIdOrFilters, startDateParam, endDateParam, categoryParam);
   }
 
   static async getSalePurchaseByPartyGroupData(franchiseId: string, startDate?: string, endDate?: string) {
@@ -4397,16 +4429,6 @@ export class FinanceService {
     return data;
   }
 
-  static async getExpenseCategoryReportData(franchiseId?: string, startDate?: string, endDate?: string) {
-    const res = await FinanceService.getExpensesReportData(franchiseId, startDate, endDate);
-    return res.categoryBreakdown;
-  }
-
-  static async getExpenseItemReportData(franchiseId?: string, startDate?: string, endDate?: string, category?: string) {
-    const res = await FinanceService.getExpensesReportData(franchiseId, startDate, endDate, category);
-    return res.expenses;
-  }
-
   static async getSaleOrdersReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string; status?: string }) {
     const where: any = {};
     if (filters.franchiseId) where.franchiseId = filters.franchiseId;
@@ -4543,6 +4565,46 @@ export class FinanceService {
       totalAmount: item.totalAmount || (item.quantity * item.price),
       totalCost: item.totalCost || 0
     }));
+  }
+
+  static async getSaleOrderItemReportData(filters: any) {
+    return this.getSaleOrderItemsReportData(filters || {});
+  }
+
+  static async getLoanStatementData(filters: any) {
+    return this.getLoanStatement(filters || {});
+  }
+
+  static async getTDSReceivableData(franchiseId?: any, startDate?: any, endDate?: any) {
+    return this.getTdsReceivableData(franchiseId, startDate, endDate);
+  }
+
+  static async getTrialBalance(filters: any) {
+    return this.getTrialBalanceReport(filters || {});
+  }
+
+  static async getSACReportData(a?: any, b?: any, c?: any) {
+    return this.getSacReportData(a, b, c);
+  }
+
+  static async getGSTReportData(a?: any, b?: any, c?: any) {
+    return this.getGstReportData(a, b, c);
+  }
+
+  static async getGSTRateReportData(a?: any, b?: any, c?: any) {
+    return this.getGstRateReportData(a, b, c);
+  }
+
+  static async getForm27EQData(a?: any, b?: any, c?: any) {
+    return this.getForm27eqData(a, b, c);
+  }
+
+  static async getTCSReceivableData(a?: any, b?: any, c?: any) {
+    return this.getTcsReceivableData(a, b, c);
+  }
+
+  static async getTDSPayableData(a?: any, b?: any, c?: any) {
+    return this.getTdsPayableData(a, b, c);
   }
 
   static async getFranchiseReportData(franchiseId?: string) {
