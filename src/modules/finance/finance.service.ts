@@ -1,7 +1,7 @@
 import prisma from '../../lib/prisma';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
-import { ItemCategory } from '@prisma/client';
+import { ItemCategory, PaymentMode } from '@prisma/client';
 
 function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
   let start: Date | undefined = undefined;
@@ -1524,12 +1524,23 @@ export class FinanceService {
       }
 
       if (data.customerId) {
+        const resolveLedgerPaymentMode = (mode?: string): PaymentMode => {
+          if (!mode || mode === 'CREDIT') return PaymentMode.CASH;
+          if (mode === 'BANK') return PaymentMode.BANK_TRANSFER;
+          if (Object.values(PaymentMode).includes(mode as PaymentMode)) {
+            return mode as PaymentMode;
+          }
+          return PaymentMode.CASH;
+        };
+
+        const ledgerPaymentMode = resolveLedgerPaymentMode(data.paymentMode);
+
         await tx.customerLedger.create({
           data: {
             customerId: data.customerId,
             type: 'DEBIT',
             amount: totalAmount,
-            paymentMode: data.paymentMode || 'CASH',
+            paymentMode: ledgerPaymentMode,
             referenceType: 'SALE',
             referenceId: order.id,
             note: `Tax Invoice Created — Invoice #${invoiceNum}`
@@ -1542,7 +1553,7 @@ export class FinanceService {
               customerId: data.customerId,
               type: 'CREDIT',
               amount: received,
-              paymentMode: data.paymentMode || 'CASH',
+              paymentMode: ledgerPaymentMode,
               referenceType: 'PAYMENT',
               referenceId: order.id,
               note: `Payment Received for Invoice #${invoiceNum}`
