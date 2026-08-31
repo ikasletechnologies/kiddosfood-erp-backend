@@ -3576,22 +3576,24 @@ export class FinanceService {
     };
   }
 
-  static async getGSTR9Data(franchiseId: string, financialYear?: string) {
+  static async getGSTR9Data(franchiseId?: string, financialYear?: string) {
     const fy = financialYear || '2025-2026';
     const [startYearStr] = fy.split('-');
     const startYear = parseInt(startYearStr, 10);
     const fyStart = new Date(startYear, 3, 1);
     const fyEnd = new Date(startYear + 1, 2, 31, 23, 59, 59);
 
-    const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId } });
+    const franchise = franchiseId
+      ? await prisma.franchise.findUnique({ where: { id: franchiseId } })
+      : null;
 
     const [salesAgg, purchasesAgg] = await Promise.all([
       prisma.order.aggregate({
-        where: { franchiseId, status: 'COMPLETED', createdAt: { gte: fyStart, lte: fyEnd } },
+        where: { ...(franchiseId ? { franchiseId } : {}), status: 'COMPLETED', createdAt: { gte: fyStart, lte: fyEnd } },
         _sum: { subTotal: true, taxAmount: true, totalAmount: true }
       }),
       prisma.procurementOrder.aggregate({
-        where: { franchiseId, status: { not: 'CANCELLED' as any }, createdAt: { gte: fyStart, lte: fyEnd } },
+        where: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any }, createdAt: { gte: fyStart, lte: fyEnd } },
         _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
       })
     ]);
