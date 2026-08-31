@@ -903,21 +903,56 @@ export class SalesService {
     // proformaInvoiceId is a duplicate-prevention marker only the atomic
     // convertSalesOrderToProforma() transaction is allowed to set — a
     // generic PATCH must never let a client fake "a Proforma already
-    // exists" (or clear a real one) directly.
-    const { proformaInvoiceId, ...safeData } = data;
-    return prisma.salesOrder.update({
-      where: { id },
-      data: {
-        ...safeData,
-        status: data.status as any,
-        deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
-        // orderDate is set once at creation (direct-create or conversion)
-        // and isn't meant to move afterward — only convert it through if a
-        // caller explicitly sends one; dueDate stays freely editable.
-        orderDate: data.orderDate ? new Date(data.orderDate) : undefined,
-        dueDate: data.dueDate ? new Date(data.dueDate) : undefined
-      },
-      include: { items: true }
+    // exists" (or clear a real one) directly. items is handled separately
+    // below (nested create, not a raw array), so it must not be spread
+    // as-is into Prisma's `data` — that's what used to crash this call.
+    const { proformaInvoiceId, items, ...safeData } = data;
+
+    const updateData: any = {
+      ...safeData,
+      status: data.status as any,
+      deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
+      // orderDate is set once at creation (direct-create or conversion)
+      // and isn't meant to move afterward — only convert it through if a
+      // caller explicitly sends one; dueDate stays freely editable.
+      orderDate: data.orderDate ? new Date(data.orderDate) : undefined,
+      dueDate: data.dueDate ? new Date(data.dueDate) : undefined
+    };
+
+    return prisma.$transaction(async (tx) => {
+      if (items) {
+        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(items as any[]);
+        const discount = data.discountAmount || 0;
+
+        updateData.subTotal = subTotal;
+        updateData.taxAmount = taxAmount;
+        updateData.discountAmount = discount;
+        updateData.totalAmount = totalAmount - discount;
+
+        // Same replace-all-items pattern as updateQuotation/updateProformaInvoice:
+        // the frontend never sends SalesOrderItem.id, so there's nothing to
+        // upsert/sync against — delete and recreate inside the transaction.
+        await tx.salesOrderItem.deleteMany({ where: { salesOrderId: id } });
+
+        updateData.items = {
+          create: computed.map((item) => ({
+            productId: item.productId,
+            productName: item.productName,
+            quantity: item.quantity,
+            unit: item.unit,
+            rate: item.rate,
+            taxPercent: item.taxPercent || 0,
+            taxAmount: item.taxAmount,
+            totalAmount: item.totalAmount
+          }))
+        };
+      }
+
+      return tx.salesOrder.update({
+        where: { id },
+        data: updateData,
+        include: { items: true }
+      });
     });
   }
 
