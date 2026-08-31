@@ -496,15 +496,26 @@ export class SalesService {
     try {
       return await prisma.$transaction(async (tx) => {
       // Ensure all items have a corresponding Product row since OrderItem
-      // requires a hard relation to Product in the schema. In cases where the
-      // frontend sent an InventoryItem ID, we create a matching Product on the fly.
+      // requires a hard relation to Product in the schema. Proforma items
+      // carry an InventoryItem ID (not a Product ID) whenever the frontend
+      // picked from the InventoryItem catalog, and InventoryItem sync
+      // (see syncProductFromInventoryItem) already auto-creates a Product
+      // for that SKU under its own generated ID — so resolve by SKU before
+      // ever creating, or this collides with that existing Product's
+      // @unique sku the moment one already exists (which, for any synced
+      // Finished/Semi-Finished item, is effectively always).
+      const resolvedProductIds = new Map<string, string>(); // item.productId (as sent) -> real Product.id
       for (const item of proforma.items) {
         if (!item.productId) continue;
-        const existingProduct = await tx.product.findUnique({ where: { id: item.productId } });
+        let existingProduct = await tx.product.findUnique({ where: { id: item.productId } });
         if (!existingProduct) {
           const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
-          if (invItem) {
-            await tx.product.create({
+          if (!invItem) {
+            throw new Error(`Item "${item.productName}" is missing a valid mapped Product or InventoryItem.`);
+          }
+          existingProduct = await tx.product.findUnique({ where: { sku: invItem.sku } });
+          if (!existingProduct) {
+            existingProduct = await tx.product.create({
               data: {
                 id: invItem.id, // Keep exact same ID so the FK succeeds
                 name: invItem.name,
@@ -519,10 +530,9 @@ export class SalesService {
                 is_menu_item: false
               }
             });
-          } else {
-            throw new Error(`Item "${item.productName}" is missing a valid mapped Product or InventoryItem.`);
           }
         }
+        resolvedProductIds.set(item.productId, existingProduct.id);
       }
 
       const newOrder = await tx.order.create({
@@ -545,7 +555,7 @@ export class SalesService {
           sourceProformaInvoiceId: proforma.id,
           orderItems: {
             create: proforma.items.map((item) => ({
-              productId: item.productId!,
+              productId: resolvedProductIds.get(item.productId!)!,
               quantity: item.quantity,
               price: item.rate,
               taxAmount: item.taxAmount,
