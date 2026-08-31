@@ -674,7 +674,7 @@ app.delete('/api/purchase-requests/:id', authenticate, authorizeRole(['SUPER_ADM
 app.get('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.getAll);
 app.post('/api/franchise-orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.create);
 app.get('/api/franchise-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.getById);
-app.patch('/api/franchise-orders/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseOrderController.updateStatus);
+app.patch('/api/franchise-orders/:id/status', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.updateStatus);
 app.post('/api/franchise-orders/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseOrderController.recordPayment);
 
 // ─── GST Invoice (Phase 10) ────────────────────────────────────────────────────

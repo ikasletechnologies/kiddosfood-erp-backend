@@ -276,6 +276,15 @@ export class FranchiseOrderService {
     const order = await prisma.franchiseOrder.findUnique({ where: { id } });
     if (!order) throw new Error('Order not found');
 
+    // Receiving is a one-way, strictly-gated transition: only a currently
+    // DISPATCHED order can be marked DELIVERED. Blocks double-click, browser
+    // retry, and duplicate/concurrent requests from re-running the inventory
+    // credit below — checked here (before any work) and re-checked inside
+    // the transaction below (against a fresh read) to close the race window.
+    if (status === FranchiseOrderStatus.DELIVERED && order.status !== FranchiseOrderStatus.DISPATCHED) {
+      throw new Error(`Cannot mark order as DELIVERED: order is currently "${order.status}", not "DISPATCHED". This receipt may have already been processed.`);
+    }
+
     const updateData: any = { status };
 
     // On approval, decide the fulfillment path (straight from stock vs. needs production)
@@ -334,6 +343,13 @@ export class FranchiseOrderService {
           where: { id },
           include: { items: { include: { product: true } } },
         });
+
+        // Re-check inside the transaction against a fresh read, in case a
+        // concurrent request already delivered this order between the
+        // pre-check above and this transaction acquiring the row.
+        if (fullOrder!.status !== FranchiseOrderStatus.DISPATCHED) {
+          throw new Error(`Cannot mark order as DELIVERED: order is currently "${fullOrder!.status}", not "DISPATCHED". This receipt may have already been processed.`);
+        }
 
         // Loop through all order items to fulfill inventory updates
         for (const item of fullOrder!.items) {
