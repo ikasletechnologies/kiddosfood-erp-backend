@@ -3,6 +3,22 @@ import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { ItemCategory } from '@prisma/client';
 
+// Builds a Prisma date-range filter where `endDate` covers the whole day
+// (up to, but not including, the start of the next day) rather than cutting
+// off at 00:00:00 of that date — a plain `new Date(endDate)` used as `lte`
+// excludes same-day records entirely.
+function buildCreatedAtFilter(startDate?: string | Date, endDate?: string | Date): { createdAt?: { gte?: Date; lt?: Date } } {
+  if (!startDate && !endDate) return {};
+  const range: { gte?: Date; lt?: Date } = {};
+  if (startDate) range.gte = new Date(startDate);
+  if (endDate) {
+    const exclusiveEnd = new Date(endDate);
+    exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
+    range.lt = exclusiveEnd;
+  }
+  return { createdAt: range };
+}
+
 function splitTaxBySupplyState(taxAmount: number, stateOfSupply?: string | null, franchiseLocation?: string | null) {
   const totalTax = Number(taxAmount || 0);
   const supply = stateOfSupply?.trim().toLowerCase();
@@ -3387,18 +3403,7 @@ export class FinanceService {
   }
 
   static async getGSTR1Data(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
-
-    const franchise = franchiseId
-      ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
-      : null;
-    const franchiseLocation = franchise?.location || null;
+    const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
     const orders = await prisma.order.findMany({
       where: {
@@ -3406,13 +3411,16 @@ export class FinanceService {
         status: { in: ['COMPLETED', 'REFUNDED'] as any },
         ...dateFilter
       },
-      include: { customer: true, orderItems: { include: { product: true } } },
+      include: { customer: true, franchise: { select: { location: true } }, orderItems: { include: { product: true } } },
       orderBy: { createdAt: 'desc' }
     });
 
     const toRow = (o: any) => {
-      const split = splitTaxBySupplyState(o.taxAmount || 0, o.stateOfSupply, franchiseLocation);
-      const isB2B = Boolean(o.customer?.gstin && o.customer.gstin.trim() !== '');
+      // Resolved per-order (not from a single outer franchiseId) so a
+      // consolidated multi-franchise view still splits each order's tax
+      // against its own selling franchise's state, not a shared default.
+      const split = splitTaxBySupplyState(o.taxAmount || 0, o.stateOfSupply, o.franchise?.location || null);
+      const isB2B = Boolean(o.customer?.gstNumber && o.customer.gstNumber.trim() !== '');
       const taxableValue = o.subTotal || 0;
       const taxAmount = o.taxAmount || 0;
       const taxRate = taxableValue > 0 ? Number(((taxAmount / taxableValue) * 100).toFixed(2)) : 0;
@@ -3421,8 +3429,8 @@ export class FinanceService {
         invoiceNo: o.invoiceNum || o.id,
         date: o.createdAt.toISOString().split('T')[0],
         partyName: o.customer?.name || 'Cash Customer',
-        gstin: o.customer?.gstin || '—',
-        customerGstin: o.customer?.gstin || '—',
+        gstin: o.customer?.gstNumber || '—',
+        customerGstin: o.customer?.gstNumber || '—',
         b2bType: isB2B ? 'B2B' : 'B2C',
         placeOfSupply: o.stateOfSupply || '—',
         value: o.totalAmount || 0,
@@ -3453,32 +3461,34 @@ export class FinanceService {
   }
 
   static async getGSTR2Data(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+    const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
-    const purchases = await prisma.procurementOrder.findMany({
-      where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
-      include: { vendor: true, poItems: true },
+    // ITC must reflect what the vendor actually billed, not what the PO
+    // committed to — PO price/tax and the real vendor invoice can diverge
+    // (see VendorInvoice's schema comment), so this reads VendorInvoice
+    // rather than ProcurementOrder header fields.
+    const invoices = await prisma.vendorInvoice.findMany({
+      where: {
+        procurementOrder: { franchiseId, status: { not: 'CANCELLED' as any } },
+        ...dateFilter
+      },
+      include: { vendor: true, procurementOrder: { select: { poNumber: true } } },
       orderBy: { createdAt: 'desc' }
     });
 
-    const data = purchases.map(po => ({
-      poNumber: po.poNumber || po.id,
-      date: po.createdAt.toISOString().split('T')[0],
-      vendorName: po.vendor?.name || '—',
-      vendorGstin: po.vendor?.gstNumber || '—',
-      taxableValue: po.subtotal || 0,
-      igst: po.igst || 0,
-      cgst: po.cgst || 0,
-      sgst: po.sgst || 0,
-      totalTax: (po.igst || 0) + (po.cgst || 0) + (po.sgst || 0),
-      totalAmount: po.totalAmount,
-      status: po.status
+    const data = invoices.map(inv => ({
+      invoiceNumber: inv.invoiceNumber,
+      poNumber: inv.procurementOrder?.poNumber || inv.poId,
+      date: (inv.billDate || inv.createdAt).toISOString().split('T')[0],
+      vendorName: inv.vendor?.name || '—',
+      vendorGstin: inv.vendor?.gstNumber || '—',
+      taxableValue: inv.subtotal || 0,
+      igst: inv.igst || 0,
+      cgst: inv.cgst || 0,
+      sgst: inv.sgst || 0,
+      totalTax: (inv.igst || 0) + (inv.cgst || 0) + (inv.sgst || 0),
+      totalAmount: inv.amount,
+      status: inv.status
     }));
 
     return {
@@ -3489,18 +3499,7 @@ export class FinanceService {
   }
 
   static async getGSTR3BData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
-
-    const franchise = franchiseId
-      ? await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } })
-      : null;
-    const franchiseLocation = franchise?.location || null;
+    const dateFilter = buildCreatedAtFilter(startDate, endDate);
 
     const [orders, purchasesAgg] = await Promise.all([
       prisma.order.findMany({
@@ -3509,15 +3508,15 @@ export class FinanceService {
           status: 'COMPLETED',
           ...dateFilter
         },
-        select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true }
+        select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
       }),
-      prisma.procurementOrder.aggregate({
+      // Same source as getGSTR2Data: the vendor's actual invoice, not the PO.
+      prisma.vendorInvoice.aggregate({
         where: {
-          ...(franchiseId ? { franchiseId } : {}),
-          status: { not: 'CANCELLED' as any },
+          procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
           ...dateFilter
         },
-        _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
+        _sum: { subtotal: true, cgst: true, sgst: true, igst: true }
       })
     ]);
 
@@ -3531,7 +3530,9 @@ export class FinanceService {
       outputTaxable += o.subTotal || 0;
       const t = o.taxAmount || 0;
       outputTax += t;
-      const split = splitTaxBySupplyState(t, o.stateOfSupply, franchiseLocation);
+      // Resolved per-order so a consolidated multi-franchise view still
+      // splits each order against its own selling franchise's state.
+      const split = splitTaxBySupplyState(t, o.stateOfSupply, o.franchise?.location || null);
       outputIgst += split.igst;
       outputCgst += split.cgst;
       outputSgst += split.sgst;
@@ -3587,18 +3588,40 @@ export class FinanceService {
       ? await prisma.franchise.findUnique({ where: { id: franchiseId } })
       : null;
 
-    const [salesAgg, purchasesAgg] = await Promise.all([
-      prisma.order.aggregate({
+    const [orders, purchasesAgg] = await Promise.all([
+      // findMany (not aggregate) so each order's IGST/CGST/SGST split can be
+      // resolved against its own selling franchise's state — an aggregate
+      // sum has no per-order state to split by.
+      prisma.order.findMany({
         where: { ...(franchiseId ? { franchiseId } : {}), status: 'COMPLETED', createdAt: { gte: fyStart, lte: fyEnd } },
-        _sum: { subTotal: true, taxAmount: true, totalAmount: true }
+        select: { subTotal: true, taxAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
       }),
-      prisma.procurementOrder.aggregate({
-        where: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any }, createdAt: { gte: fyStart, lte: fyEnd } },
-        _sum: { subtotal: true, cgst: true, sgst: true, igst: true, totalAmount: true }
+      // Same source as getGSTR2Data/getGSTR3BData: the vendor's actual
+      // invoice, not the PO.
+      prisma.vendorInvoice.aggregate({
+        where: {
+          procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
+          createdAt: { gte: fyStart, lte: fyEnd }
+        },
+        _sum: { subtotal: true, cgst: true, sgst: true, igst: true }
       })
     ]);
 
-    const outputTax = salesAgg._sum.taxAmount || 0;
+    let outputTaxable = 0;
+    let outputTax = 0;
+    let outputIgst = 0;
+    let outputCgst = 0;
+    let outputSgst = 0;
+    orders.forEach(o => {
+      outputTaxable += o.subTotal || 0;
+      const t = o.taxAmount || 0;
+      outputTax += t;
+      const split = splitTaxBySupplyState(t, o.stateOfSupply, o.franchise?.location || null);
+      outputIgst += split.igst;
+      outputCgst += split.cgst;
+      outputSgst += split.sgst;
+    });
+
     const inputTax = (purchasesAgg._sum.cgst || 0) + (purchasesAgg._sum.sgst || 0) + (purchasesAgg._sum.igst || 0);
 
     return {
@@ -3612,10 +3635,10 @@ export class FinanceService {
         {
           section: '4A',
           description: 'Supplies made to registered/unregistered persons',
-          taxableValue: salesAgg._sum.subTotal || 0,
-          centralTax: Number((outputTax / 2).toFixed(2)),
-          stateTax: Number((outputTax / 2).toFixed(2)),
-          integratedTax: 0,
+          taxableValue: Number(outputTaxable.toFixed(2)),
+          centralTax: Number(outputCgst.toFixed(2)),
+          stateTax: Number(outputSgst.toFixed(2)),
+          integratedTax: Number(outputIgst.toFixed(2)),
           cess: 0
         },
         {
