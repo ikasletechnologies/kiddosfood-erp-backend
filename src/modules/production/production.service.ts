@@ -1029,10 +1029,12 @@ export class ProductionService {
     if (franchiseId) where.franchiseId = franchiseId;
     if (status) where.status = status;
     if (startDate || endDate) {
-      const createdAtFilter: any = {};
-      if (startDate) createdAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
-      if (endDate) createdAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
-      where.createdAt = createdAtFilter;
+      // Production has no createdAt column — producedAt is the model's own
+      // date field (also what this query already orders by below).
+      const producedAtFilter: any = {};
+      if (startDate) producedAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
+      if (endDate) producedAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
+      where.producedAt = producedAtFilter;
     }
     return prisma.production.findMany({
       where,
