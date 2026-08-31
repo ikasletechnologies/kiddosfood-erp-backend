@@ -4483,7 +4483,7 @@ export class FinanceService {
         createdAt: o.createdAt,
         customerName: o.customer?.name || 'Walk-in Customer',
         customerPhone: o.customer?.phone || '—',
-        customerGstin: o.customer?.gstin || '—',
+        customerGstin: o.customer?.gstNumber || '—',
         stateOfSupply: o.stateOfSupply || '—',
         status: o.status,
         paymentStatus: o.paymentStatus || 'PAID',
