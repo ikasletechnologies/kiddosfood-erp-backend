@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { FranchiseService } from '../franchise/franchise.service';
 
 export class SettingsService {
   /**
@@ -26,11 +27,28 @@ export class SettingsService {
    */
   static async getCompanyProfile() {
     const raw = await this.getSettingValue('COMPANY_PROFILE', '{}');
+    let profile: any;
     try {
-      return JSON.parse(raw);
+      profile = JSON.parse(raw);
     } catch {
-      return {};
+      profile = {};
     }
+
+    // The seller's GST registration state (needed to classify CGST+SGST vs
+    // IGST on every document — Sales Order, Proforma, Tax Invoice) has no
+    // dedicated field; it lives on this profile's `state`. When nobody has
+    // configured that yet, fall back to the real HQ franchise's location —
+    // the one place a seller state already exists in this system (and the
+    // same field GST reports already key off, see
+    // FinanceService/splitTaxBySupplyState) — rather than leaving `state`
+    // undefined, which callers have historically covered with their own
+    // hardcoded guesses that disagree with each other and with this value.
+    if (!profile.state) {
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      if (hq?.location) profile = { ...profile, state: hq.location };
+    }
+
+    return profile;
   }
 
   /**
