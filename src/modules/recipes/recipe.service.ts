@@ -101,12 +101,24 @@ export class RecipeService {
     });
   }
 
+  // Recipe Costing reports need per-recipe cost without an N+1 request per
+  // row — this reuses calculateCost's own line-costing loop against the
+  // recipeItems already loaded here, instead of a second query per recipe.
   static async getRecipes() {
-    return prisma.recipe.findMany({
-      include: { 
-        product: true, 
-        recipeItems: { include: { inventoryItem: true } } 
+    const recipes = await prisma.recipe.findMany({
+      include: {
+        product: true,
+        recipeItems: { include: { inventoryItem: true } }
       }
+    });
+    return recipes.map((recipe) => {
+      const { totalCost, breakdown } = RecipeService.computeCostBreakdown(recipe.recipeItems);
+      return {
+        ...recipe,
+        totalCost,
+        costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
+        costBreakdown: breakdown,
+      };
     });
   }
 
