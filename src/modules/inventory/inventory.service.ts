@@ -1086,7 +1086,17 @@ export class InventoryService {
   // Scoped by warehouse (where the material actually left from), not
   // franchise. franchiseId is kept as an optional secondary filter only.
   // Same 'ALL' opt-out convention as getRawMaterialStockSummary above.
-  static async getRawMaterialConsumption(warehouseId?: string, franchiseId?: string, category?: ItemCategory | 'ALL') {
+  static async getRawMaterialConsumption(
+    warehouseId?: string,
+    franchiseId?: string,
+    category?: ItemCategory | 'ALL',
+    startDate?: string,
+    endDate?: string
+  ) {
+    const createdAtFilter: any = {};
+    if (startDate) createdAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
+    if (endDate) createdAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
+
     const movements = await prisma.stockMovement.findMany({
       where: {
         item: {
@@ -1094,7 +1104,8 @@ export class InventoryService {
           ...(category === 'ALL' ? {} : { category: category || ItemCategory.RAW_MATERIAL })
         },
         quantity: { lt: 0 },
-        ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {})
+        ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {}),
+        ...(startDate || endDate ? { createdAt: createdAtFilter } : {})
       },
       include: {
         item: true

@@ -181,7 +181,7 @@ app.post('/api/workflow-approvals/:id/approve', authenticate, WorkflowApprovalsC
 // Inventory & Stock Management
 app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getInventory);
 app.get('/api/inventory/raw-materials/summary', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialStockSummary);
-app.get('/api/inventory/raw-materials/consumption', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialConsumption);
+app.get('/api/inventory/raw-materials/consumption', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getRawMaterialConsumption);
 app.get('/api/inventory/raw-materials/ledger', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialLedger);
 app.get('/api/inventory/items/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getItem);
 app.post('/api/inventory/items', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.createItem);

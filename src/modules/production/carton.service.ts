@@ -1,9 +1,17 @@
 import prisma from '../../lib/prisma';
 
 export class CartonService {
-  static async getAll(franchiseId?: string) {
+  static async getAll(franchiseId?: string, startDate?: string, endDate?: string) {
+    const where: any = {};
+    if (franchiseId) where.franchiseId = franchiseId;
+    if (startDate || endDate) {
+      const createdAtFilter: any = {};
+      if (startDate) createdAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
+      if (endDate) createdAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
+      where.createdAt = createdAtFilter;
+    }
     return prisma.carton.findMany({
-      where: franchiseId ? { franchiseId } : {},
+      where,
       include: { batch: { include: { product: true } } },
       orderBy: { createdAt: 'desc' }
     });

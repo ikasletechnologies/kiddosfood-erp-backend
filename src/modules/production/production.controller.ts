@@ -31,8 +31,11 @@ export class ProductionController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = (user.role === 'SUPER_ADMIN' ? req.query.franchiseId : franchiseFilter.franchiseId) as string;
+      const startDate = (req.query.startDate || req.query.dateFrom) as string | undefined;
+      const endDate = (req.query.endDate || req.query.dateTo) as string | undefined;
+      const status = req.query.status as string | undefined;
       
-      const history = await ProductionService.getProductionHistory(franchiseId);
+      const history = await ProductionService.getProductionHistory(franchiseId, startDate, endDate, status);
       res.json(history);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
@@ -180,7 +183,11 @@ export class ProductionController {
       const targetFranchiseId = user.role === 'SUPER_ADMIN'
         ? (req.query.franchiseId as string || undefined)
         : user.franchiseId;
-      const result = await ProductionService.getPendingQCBatches(targetFranchiseId);
+      const startDate = (req.query.startDate || req.query.dateFrom) as string | undefined;
+      const endDate = (req.query.endDate || req.query.dateTo) as string | undefined;
+      const qcStatus = req.query.qcStatus as string | undefined;
+
+      const result = await ProductionService.getPendingQCBatches(targetFranchiseId, startDate, endDate, qcStatus);
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

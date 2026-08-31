@@ -9,8 +9,8 @@ export class WasteService {
         ...(warehouseId ? { warehouseId } : {}),
         ...(dateFrom || dateTo ? {
           createdAt: {
-            ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
-            ...(dateTo ? { lte: new Date(dateTo) } : {})
+            ...(dateFrom ? { gte: new Date(dateFrom.includes('T') ? dateFrom : `${dateFrom}T00:00:00.000`) } : {}),
+            ...(dateTo ? { lte: new Date(dateTo.includes('T') ? dateTo : `${dateTo}T23:59:59.999`) } : {})
           }
         } : {})
       },

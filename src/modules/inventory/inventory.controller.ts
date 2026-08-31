@@ -310,8 +310,10 @@ export class InventoryController {
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
       const warehouseId = (req.query.warehouseId as string) || undefined;
       const category = (req.query.category as any) || undefined;
+      const startDate = (req.query.startDate || req.query.dateFrom) as string | undefined;
+      const endDate = (req.query.endDate || req.query.dateTo) as string | undefined;
 
-      const consumption = await InventoryService.getRawMaterialConsumption(warehouseId, franchiseId, category);
+      const consumption = await InventoryService.getRawMaterialConsumption(warehouseId, franchiseId, category, startDate, endDate);
       res.json(consumption);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

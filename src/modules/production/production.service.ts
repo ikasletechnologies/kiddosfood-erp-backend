@@ -1016,10 +1016,6 @@ export class ProductionService {
 
     if (packetUnit === targetUnit) return val;
 
-    // Delegate cross-unit conversion to the shared engine — this is the single
-    // source of truth for g↔kg and ml↔l conversions. The engine throws
-    // "Incompatible units" for cross-dimension pairs (e.g. g vs ml), which is
-    // the correct behavior: packaging units must match the bulk stock dimension.
     try {
       return convertMeasurement(val, packetUnit as ValidUnit, targetUnit as ValidUnit).toNumber();
     } catch {
@@ -1028,9 +1024,18 @@ export class ProductionService {
   }
 
 
-  static async getProductionHistory(franchiseId?: string) {
+  static async getProductionHistory(franchiseId?: string, startDate?: string, endDate?: string, status?: string) {
+    const where: any = {};
+    if (franchiseId) where.franchiseId = franchiseId;
+    if (status) where.status = status;
+    if (startDate || endDate) {
+      const createdAtFilter: any = {};
+      if (startDate) createdAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
+      if (endDate) createdAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
+      where.createdAt = createdAtFilter;
+    }
     return prisma.production.findMany({
-      where: franchiseId ? { franchiseId } : {},
+      where,
       include: {
         recipe: { include: { product: true, recipeItems: { include: { inventoryItem: true } } } },
         items: { include: { inventoryItem: true } },
@@ -1206,12 +1211,18 @@ export class ProductionService {
     );
   }
 
-  static async getPendingQCBatches(franchiseId?: string) {
+  static async getPendingQCBatches(franchiseId?: string, startDate?: string, endDate?: string, qcStatus?: string) {
+    const where: any = {};
+    if (franchiseId) where.franchiseId = franchiseId;
+    if (qcStatus) where.qcStatus = qcStatus;
+    if (startDate || endDate) {
+      const createdAtFilter: any = {};
+      if (startDate) createdAtFilter.gte = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000`);
+      if (endDate) createdAtFilter.lte = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999`);
+      where.createdAt = createdAtFilter;
+    }
     return prisma.productBatch.findMany({
-      where: {
-        qcStatus: 'PENDING',
-        ...(franchiseId ? { franchiseId } : {})
-      },
+      where,
       include: { product: true, franchise: true, production: { include: { recipe: true } } },
       orderBy: { createdAt: 'desc' },
     });

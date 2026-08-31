@@ -56,7 +56,16 @@ function calculateTotals<T extends { quantity: number; rate: number; taxPercent?
 export class SalesService {
   // ─── Quotations ──────────────────────────────────────────────────────────────
 
-  static async getQuotations(filters: {
+    // Helper to parse YYYY-MM-DD (or ISO) into Date with proper start/end boundaries
+    private static parseDate(str: string, endOfDay: boolean = false): Date {
+      // If string already contains time component, trust it
+      if (str.includes('T')) return new Date(str);
+      // Append appropriate time; treat as UTC to avoid timezone shifts
+      const suffix = endOfDay ? 'T23:59:59.999Z' : 'T00:00:00.000Z';
+      return new Date(str + suffix);
+    }
+
+    static async getQuotations(filters: {
     status?: string;
     customerId?: string;
     search?: string;
@@ -73,10 +82,10 @@ export class SalesService {
       const endStr = (filters.toDate || filters.endDate) as string;
       const createdAtFilter: any = {};
       if (startStr) {
-        createdAtFilter.gte = new Date(startStr.includes('T') ? startStr : `${startStr}T00:00:00.000`);
+        createdAtFilter.gte = SalesService.parseDate(startStr);
       }
       if (endStr) {
-        createdAtFilter.lte = new Date(endStr.includes('T') ? endStr : `${endStr}T23:59:59.999`);
+        createdAtFilter.lte = SalesService.parseDate(endStr, true);
       }
       where.createdAt = createdAtFilter;
     }

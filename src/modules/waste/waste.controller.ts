@@ -9,10 +9,12 @@ export class WasteController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
       const warehouseId = req.query.warehouseId as string | undefined;
+      const dateFrom = (req.query.dateFrom || req.query.startDate) as string | undefined;
+      const dateTo = (req.query.dateTo || req.query.endDate) as string | undefined;
 
       const entries = await WasteService.getAll(
-        req.query.dateFrom as string,
-        req.query.dateTo as string,
+        dateFrom,
+        dateTo,
         franchiseId,
         warehouseId
       );

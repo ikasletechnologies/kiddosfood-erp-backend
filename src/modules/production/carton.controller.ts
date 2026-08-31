@@ -8,7 +8,10 @@ export class CartonController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const cartons = await CartonService.getAll(franchiseId);
+      const startDate = (req.query.startDate || req.query.dateFrom) as string | undefined;
+      const endDate = (req.query.endDate || req.query.dateTo) as string | undefined;
+
+      const cartons = await CartonService.getAll(franchiseId, startDate, endDate);
       res.json(cartons);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
