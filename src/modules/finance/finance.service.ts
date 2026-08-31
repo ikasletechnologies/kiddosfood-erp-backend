@@ -3,19 +3,29 @@ import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { ItemCategory } from '@prisma/client';
 
-// Builds a Prisma date-range filter where `endDate` covers the whole day
-// (up to, but not including, the start of the next day) rather than cutting
-// off at 00:00:00 of that date — a plain `new Date(endDate)` used as `lte`
-// excludes same-day records entirely.
-function buildCreatedAtFilter(startDate?: string | Date, endDate?: string | Date): { createdAt?: { gte?: Date; lt?: Date } } {
-  if (!startDate && !endDate) return {};
-  const range: { gte?: Date; lt?: Date } = {};
-  if (startDate) range.gte = new Date(startDate);
-  if (endDate) {
-    const exclusiveEnd = new Date(endDate);
-    exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
-    range.lt = exclusiveEnd;
+function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
+  let start: Date | undefined = undefined;
+  let end: Date | undefined = undefined;
+  if (startDate) {
+    start = new Date(startDate);
   }
+  if (endDate) {
+    end = new Date(endDate);
+    if (end.getHours() === 0 && end.getMinutes() === 0 && end.getSeconds() === 0 && end.getMilliseconds() === 0) {
+      end.setHours(23, 59, 59, 999);
+    }
+  }
+  return { start, end };
+}
+
+// Builds a Prisma date-range filter where `endDate` covers the whole day
+// (up to 23:59:59.999 of that date) rather than cutting off at 00:00:00.
+function buildCreatedAtFilter(startDate?: string | Date, endDate?: string | Date): { createdAt?: { gte?: Date; lte?: Date } } {
+  if (!startDate && !endDate) return {};
+  const { start, end } = parseInclusiveDates(startDate, endDate);
+  const range: { gte?: Date; lte?: Date } = {};
+  if (start) range.gte = start;
+  if (end) range.lte = end;
   return { createdAt: range };
 }
 
@@ -115,10 +125,11 @@ export class FinanceService {
    * Profit & Loss with COGS logic
    */
   static async getProfitAndLoss(filters: { franchiseId?: string; startDate?: Date; endDate?: Date }) {
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
     const dateQuery = {
-      ...(filters.startDate || filters.endDate ? {
-        gte: filters.startDate,
-        lte: filters.endDate
+      ...(start || end ? {
+        gte: start,
+        lte: end
       } : {})
     };
 
@@ -126,7 +137,7 @@ export class FinanceService {
     const sales = await prisma.invoice.findMany({
       where: {
         status: 'PAID',
-        ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+        ...(start || end ? { createdAt: dateQuery } : {}),
         order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined
       },
       include: { order: { include: { orderItems: { include: { product: { include: { recipe: { include: { recipeItems: { include: { inventoryItem: { include: { vendors: true } } } } } } } } } } } } }
@@ -144,7 +155,11 @@ export class FinanceService {
 
     for (const inv of sales) {
       if (!inv.order) continue;
-      totalRevenue += inv.finalAmount;
+      // Tax-exclusive net sales revenue (subTotal before tax)
+      const subTotalRevenue = (inv.totalAmount !== undefined && inv.totalAmount !== null && inv.totalAmount > 0)
+        ? inv.totalAmount
+        : (inv.finalAmount - (inv.taxAmount || 0));
+      totalRevenue += subTotalRevenue;
       totalOutputTax += inv.taxAmount || 0;
       for (const item of inv.order.orderItems) {
         // `totalCost` is captured at sale time (see pos.service.ts) from the
@@ -185,8 +200,8 @@ export class FinanceService {
         franchiseId: filters.franchiseId,
         status: { not: 'CANCELLED' },
         createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
         }
       },
       _sum: { totalAmount: true, cgst: true, sgst: true, igst: true }
@@ -197,7 +212,7 @@ export class FinanceService {
     // 3. Expenses
     const expenses = await prisma.expense.aggregate({
       where: {
-        ...(filters.startDate || filters.endDate ? { date: dateQuery } : {}),
+        ...(start || end ? { date: dateQuery } : {}),
         franchiseId: filters.franchiseId,
         isCancelled: false
       },
@@ -217,7 +232,7 @@ export class FinanceService {
       grossProfit: grossProfit,
       expenses: totalExpenses,
       netProfit: grossProfit - totalExpenses,
-      period: filters
+      period: { franchiseId: filters.franchiseId, startDate: start, endDate: end }
     };
   }
 
@@ -1526,7 +1541,7 @@ export class FinanceService {
     limit?: number;
   }) {
     const page = Math.max(1, Number(filters.page) || 1);
-    const limit = Math.max(1, Math.min(100, Number(filters.limit) || 50));
+    const limit = Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = (page - 1) * limit;
 
     const dateQuery = {
@@ -1614,8 +1629,8 @@ export class FinanceService {
     // A search hits the full matching set regardless of page size, so it
     // isn't limited to whatever page happened to load first.
     const limit = filters.search
-      ? 100
-      : Math.max(1, Math.min(100, Number(filters.limit) || 50));
+      ? 1000
+      : Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = filters.search ? 0 : (page - 1) * limit;
 
     const dateQuery = {
@@ -1816,7 +1831,7 @@ export class FinanceService {
     }
 
     const page = Math.max(1, Number(filters.page) || 1);
-    const limit = Math.max(1, Math.min(100, Number(filters.limit) || 50));
+    const limit = Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = (page - 1) * limit;
 
     const dateQuery = {
@@ -1901,7 +1916,7 @@ export class FinanceService {
     limit?: number;
   }) {
     const page = Math.max(1, Number(filters.page) || 1);
-    const limit = Math.max(1, Math.min(100, Number(filters.limit) || 50));
+    const limit = Math.max(1, Math.min(1000, Number(filters.limit) || 50));
     const skip = (page - 1) * limit;
 
     const dateQuery = {
@@ -2159,7 +2174,11 @@ export class FinanceService {
     const bankBalance = accounts.filter(a => a.type === "BANK").reduce((s, a) => s + (a.balance || 0), 0);
     const upiBalance = accounts.filter(a => a.type === "UPI").reduce((s, a) => s + (a.balance || 0), 0);
 
-    // 2. Fetch Customer ledger entries for dynamic Sundry Debtors
+    // 2. Fetch Inventory Stock Valuation using operational costing (currentStock * costPrice)
+    const invReport = await this.getInventoryValuationReport(filters.franchiseId);
+    const inventoryValuation = invReport?.summary?.totalStockValue || 0;
+
+    // 3. Fetch Customer ledger entries for dynamic Sundry Debtors
     const customers = await prisma.customer.findMany({
       where: { franchiseId: filters.franchiseId },
       include: {
@@ -2191,7 +2210,7 @@ export class FinanceService {
       }
     }
 
-    // 3. Fetch Procurement Orders to calculate Sundry Creditors liability
+    // 4. Fetch Procurement Orders to calculate Sundry Creditors liability
     const pos = await prisma.procurementOrder.findMany({
       where: {
         franchiseId: filters.franchiseId,
@@ -2209,51 +2228,15 @@ export class FinanceService {
       sundryCreditorsBalance += unpaid;
     }
 
-    // 4. Calculate Sales Revenue
-    const salesAggregate = await prisma.order.aggregate({
-      where: {
-        franchiseId: filters.franchiseId,
-        status: { not: "CANCELLED" },
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
-      },
-      _sum: { totalAmount: true }
-    });
-    const totalSales = salesAggregate._sum.totalAmount || 0;
+    // 5. Fetch Profit & Loss metrics to align Net Profit accounting basis ((Revenue - COGS) - Expenses)
+    const plReport = await this.getProfitAndLoss(filters);
+    const totalSales = plReport.revenue;
+    const totalCOGS = plReport.cogs;
+    const totalExpenses = plReport.expenses;
+    const netProfit = plReport.netProfit;
 
-    // 5. Calculate Purchase Costs
-    const purchaseAggregate = await prisma.procurementOrder.aggregate({
-      where: {
-        franchiseId: filters.franchiseId,
-        status: { not: "CANCELLED" },
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
-      },
-      _sum: { totalAmount: true }
-    });
-    const totalPurchases = purchaseAggregate._sum.totalAmount || 0;
-
-    // 6. Calculate Indirect Expenses
-    const expenseAggregate = await prisma.expense.aggregate({
-      where: {
-        franchiseId: filters.franchiseId,
-        isCancelled: false,
-        createdAt: {
-          ...(filters.startDate ? { gte: filters.startDate } : {}),
-          ...(filters.endDate ? { lte: filters.endDate } : {})
-        }
-      },
-      _sum: { amount: true }
-    });
-    const totalExpenses = expenseAggregate._sum.amount || 0;
-
-    const currentAssetsAmount = cashBalance + bankBalance + upiBalance + totalDebtorsDebit;
+    const currentAssetsAmount = cashBalance + bankBalance + upiBalance + totalDebtorsDebit + inventoryValuation;
     const currentLiabilitiesAmount = sundryCreditorsBalance >= 0 ? sundryCreditorsBalance : 0;
-    const netProfit = totalSales - totalPurchases - totalExpenses;
 
     // Build sundry debtors breakdown
     const sundryDebtors: { name: string; amount: number }[] = [];
@@ -2285,7 +2268,10 @@ export class FinanceService {
       assets: [
         { name: "Fixed Assets", amount: 0, notes: "—" },
         { name: "Non Current Assets", amount: 0, notes: "—" },
-        { name: "Current Assets", amount: currentAssetsAmount > 0 ? currentAssetsAmount : 0, notes: "Includes Cash, Bank, and Debtor balances" },
+        { name: "Current Assets", amount: currentAssetsAmount > 0 ? currentAssetsAmount : 0, notes: "Includes Cash, Bank, Debtors, and Inventory Valuation" },
+        { name: "  • Cash & Bank Liquidity", amount: cashBalance + bankBalance + upiBalance, notes: "Cash, Bank, and UPI accounts" },
+        { name: "  • Sundry Debtors", amount: totalDebtorsDebit, notes: "Customer outstanding receivables" },
+        { name: "  • Inventory Stock Valuation", amount: inventoryValuation, notes: "Stock in hand valued at cost price" },
         { name: "Other Assets", amount: 0, notes: "—" }
       ],
       liabilities: [
@@ -2293,7 +2279,7 @@ export class FinanceService {
         { name: "Long-term Liabilities", amount: 0, notes: "—" },
         { name: "Current Liabilities", amount: currentLiabilitiesAmount, notes: "Includes Sundry Creditors / Vendor Payables" },
         { name: "Other Liabilities", amount: 0, notes: "—" },
-        { name: "Retained Earnings / Profit & Loss Balance", amount: netProfit, notes: "Balanced through net profit" }
+        { name: "Retained Earnings / Profit & Loss Balance", amount: netProfit, notes: "Aligned with Profit & Loss Net Profit ((Revenue - COGS) - Expenses)" }
       ],
       details: {
         sundryDebtors,
@@ -2303,11 +2289,12 @@ export class FinanceService {
         bankBalance,
         upiBalance,
         totalDebtorsDebit,
+        inventoryValuation,
         sundryCreditorsBalance,
-        netProfit,
         totalSales,
-        totalPurchases,
-        totalExpenses
+        totalCOGS,
+        totalExpenses,
+        netProfit
       }
     };
   }

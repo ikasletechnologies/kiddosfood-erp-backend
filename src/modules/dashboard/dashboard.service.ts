@@ -14,17 +14,28 @@ export class DashboardService {
     const periodEnd = endDate ? new Date(endDate) : new Date();
     if (startDate && !endDate) periodEnd.setHours(23, 59, 59, 999);
 
-    // Fetch stats in parallel using optimized domain services
-    const [inv, col, disp, ana, dealerCount, vendorLedgerTotals, cashAccounts, productions, batches] = await Promise.all([
+    // Fetch stats and report tables in parallel using optimized domain services
+    const [
+      inv,
+      col,
+      disp,
+      ana,
+      dealerCount,
+      vendorLedgerTotals,
+      cashAccounts,
+      productions,
+      batches,
+      recentPurchases,
+      recentB2BOrders,
+      recentFranchiseOrders,
+      recentB2CBills,
+      supplierPaymentsDue
+    ] = await Promise.all([
       DashboardInventoryService.getInventoryStats(franchiseId),
       DashboardCollectionsService.getCollectionsStats(franchiseId, startDate, endDate),
       DashboardDispatchService.getDispatchStats(franchiseId),
       DashboardAnalyticsService.getAnalyticsStats({ franchiseId, startDate, endDate, period }),
       prisma.dealer.count({ where: franchiseId ? { franchiseId } : {} }),
-      // Previously fetched every vendor with its FULL ledger history
-      // (unbounded, grows forever) just to sum credits/debits in JS.
-      // groupBy pushes that sum to the DB — one row per (vendor, type)
-      // instead of one row per ledger entry ever recorded.
       prisma.vendorLedger.groupBy({
         by: ['vendorId', 'type'],
         _sum: { amount: true }
@@ -56,10 +67,75 @@ export class DashboardService {
           rejectionQty: true,
           quantity: true
         }
+      }),
+      prisma.procurementOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          createdAt: { gte: today, lte: periodEnd },
+          status: { not: 'CANCELLED' }
+        },
+        take: 5,
+        orderBy: { createdAt: 'desc' },
+        include: { vendor: { select: { name: true } } }
+      }),
+      prisma.order.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          orderType: 'B2B',
+          status: { not: 'CANCELLED' },
+          createdAt: { gte: today, lte: periodEnd }
+        },
+        take: 5,
+        orderBy: { createdAt: 'desc' },
+        include: { customer: { select: { name: true } } }
+      }),
+      prisma.franchiseOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { in: ['DELIVERED', 'DISPATCHED'] as any },
+          createdAt: { gte: today, lte: periodEnd }
+        },
+        take: 5,
+        orderBy: { createdAt: 'desc' },
+        include: { franchise: { select: { name: true } } }
+      }),
+      prisma.order.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          orderType: { not: 'B2B' },
+          status: { not: 'CANCELLED' },
+          createdAt: { gte: today, lte: periodEnd }
+        },
+        take: 5,
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.procurementOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          paymentStatus: { in: ['UNPAID', 'PARTIAL'] },
+          status: { not: 'CANCELLED' }
+        },
+        take: 5,
+        orderBy: { createdAt: 'desc' },
+        include: { vendor: { select: { name: true } } }
       })
     ]);
 
-    // Calculate vendorPayables from the (vendor, type) sums above.
+    // Format B2B Sales Details combining B2B orders & completed Franchise orders
+    const recentB2BSales = [
+      ...recentB2BOrders.map(o => ({
+        invoiceNum: o.invoiceNum,
+        customerName: o.customerName || o.customer?.name || "B2B Client",
+        totalAmount: o.totalAmount
+      })),
+      ...recentFranchiseOrders.map(f => ({
+        invoiceNum: f.orderNumber,
+        customerName: (f as any).franchise?.name || "B2B Franchise Client",
+        totalAmount: f.totalAmount
+      }))
+    ].slice(0, 5);
+
+    // Calculate vendorPayables from ledger credit balances + unpaid PO balances
     const balanceByVendor = new Map<string, number>();
     for (const row of vendorLedgerTotals) {
       const delta = (row._sum.amount || 0) * (row.type === 'CREDIT' ? 1 : -1);
@@ -68,6 +144,10 @@ export class DashboardService {
     let vendorPayables = 0;
     for (const balance of balanceByVendor.values()) {
       if (balance > 0) vendorPayables += balance;
+    }
+    const unpaidPoTotal = supplierPaymentsDue.reduce((sum, po) => sum + (po.balance || po.totalAmount || 0), 0);
+    if (vendorPayables === 0 && unpaidPoTotal > 0) {
+      vendorPayables = unpaidPoTotal;
     }
 
     // Calculate dailyCashPosition
@@ -114,6 +194,11 @@ export class DashboardService {
       // Detailed operational lists (Connected to DB, no hardcoding)
       recentOrders: ana.recentOrders,
       lowStockAlerts: inv.lowStockAlerts,
+      lowStock: inv.lowStock,
+      recentPurchases,
+      recentB2BSales,
+      recentB2CBills,
+      supplierPaymentsDue,
       dealerOutstanding: col.dealerOutstanding,
       pendingDispatchQueue: disp.pendingDispatchQueue,
       inventoryAlerts: inv.inventoryAlerts,

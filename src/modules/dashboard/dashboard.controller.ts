@@ -23,6 +23,7 @@ export class DashboardController {
         endDate: endDate as string,
         period: (req.query.period as string) || 'month'
       });
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.json(summary);
     } catch (error: any) {
       console.error("[Dashboard Error]", error);

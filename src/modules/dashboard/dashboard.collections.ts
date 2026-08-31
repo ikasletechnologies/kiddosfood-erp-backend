@@ -18,7 +18,7 @@ export class DashboardCollectionsService {
     // unbounded and grows linearly with the dealer network. Batched below:
     // one customer fetch, then match dealers to customers in memory, then
     // one order fetch and one payment fetch across every matched customer.
-    const [paymentsToday, returnsToday, pendingCollectionsAggregate, dealers, customers] = await Promise.all([
+    const [paymentsToday, returnsToday, pendingCollectionsAggregate, pendingFranchiseOrdersAggregate, dealers, customers] = await Promise.all([
       prisma.payment.aggregate({
         where: {
           status: 'SUCCESS',
@@ -38,6 +38,14 @@ export class DashboardCollectionsService {
         where: {
           ...orderWhere,
           paymentStatus: { in: ['UNPAID', 'PARTIAL'] }
+        },
+        _sum: { totalAmount: true }
+      }),
+      prisma.franchiseOrder.aggregate({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          paymentStatus: { in: ['UNPAID', 'PARTIAL'] },
+          status: { not: 'CANCELLED' }
         },
         _sum: { totalAmount: true }
       }),
@@ -132,13 +140,14 @@ export class DashboardCollectionsService {
       };
     });
 
-    const totalDealerOutstanding = dealerOutstandingList.reduce((sum, d) => sum + d.due, 0);
+    const franchisePendingAmount = pendingFranchiseOrdersAggregate._sum.totalAmount || 0;
+    const totalDealerOutstanding = dealerOutstandingList.reduce((sum, d) => sum + d.due, 0) + franchisePendingAmount;
     const overdueDealersCount = dealerOutstandingList.filter(d => d.due > 0 && d.status !== 'GREEN').length;
 
     return {
       todayCollection: paymentsToday._sum.paidAmount || 0,
       salesReturnsToday: returnsToday._sum.refundAmount || 0,
-      pendingCollections: pendingCollectionsAggregate._sum.totalAmount || 0,
+      pendingCollections: (pendingCollectionsAggregate._sum.totalAmount || 0) + franchisePendingAmount,
       totalDealerOutstanding,
       overdueDealersCount,
       dealerOutstanding: dealerOutstandingList.slice(0, 10) // Limit dashboard view

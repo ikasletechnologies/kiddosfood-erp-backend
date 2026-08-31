@@ -71,8 +71,8 @@ export class DashboardInventoryService {
       return item.currentStock <= item.minimumStock;
     });
 
-    // Build Low Stock raw materials list
-    const lowStockAlerts = lowStockRawItems.map(item => {
+    // Build Low Stock raw materials and finished goods list
+    const lowStockList: Array<{ id: string; name: string; product: string; currentStock: number; current: number; required: number; unit: string; status: string; action: string }> = lowStockRawItems.map(item => {
       const physicalStock = item.currentStock; // already canonical
       let status = 'GREEN';
       if (physicalStock <= 0) {
@@ -88,21 +88,40 @@ export class DashboardInventoryService {
 
       return {
         id: item.id,
+        name: item.name,
         product: item.name,
+        currentStock: physicalStock,
         current: physicalStock,
         required: item.minimumStock,
-        unit: displayUnit,
+        unit: displayUnit || 'KG',
         status,
-        action: physicalStock <= 0 ? 'Request Refill' : 'Monitor'
+        action: physicalStock <= 0 ? 'Request Refill' : 'Reorder'
       };
     });
+
+    for (const batch of productBatches) {
+      if (batch.quantity <= 10) {
+        lowStockList.push({
+          id: batch.id,
+          name: batch.product?.name || 'Finished Good',
+          product: batch.product?.name || 'Finished Good',
+          currentStock: batch.quantity,
+          current: batch.quantity,
+          required: 10,
+          unit: batch.product?.sku || 'PC',
+          status: batch.quantity <= 0 ? 'RED' : 'YELLOW',
+          action: batch.quantity <= 0 ? 'Request Refill' : 'Reorder'
+        });
+      }
+    }
 
     return {
       inventoryValue,
       inventoryItemCount: inventoryItems.length,
       lowStockCount: lowStockRawItems.length + lowStockBatchCount,
       inventoryAlerts: inventoryAlerts.slice(0, 10), // Limit dashboard view
-      lowStockAlerts: lowStockAlerts.slice(0, 10)
+      lowStockAlerts: lowStockList.slice(0, 10),
+      lowStock: lowStockList.slice(0, 10)
     };
   }
 }
