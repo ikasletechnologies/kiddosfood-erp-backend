@@ -1,6 +1,17 @@
 import prisma from '../../lib/prisma';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
+interface RecipeItemWithInventory {
+  quantityRequired: number;
+  unit: string;
+  inventoryItem: {
+    name: string;
+    unit: string;
+    costPrice?: number | null;
+    basePrice?: number | null;
+  };
+}
+
 export class RecipeService {
   /**
    * Create or Update a Recipe for a Product
@@ -160,18 +171,24 @@ export class RecipeService {
 
     if (!recipe) throw new Error('Recipe not found');
 
-    // Derive unit cost per ingredient (Wastage logic removed as Wastage model was deleted)
-    const unitCostMap: Record<string, number> = {};
+    const { totalCost, breakdown } = RecipeService.computeCostBreakdown(recipe.recipeItems);
 
+    return {
+      recipeId,
+      recipeName: recipe.name,
+      yieldQty: recipe.yieldQty,
+      yieldUnit: recipe.yieldUnit,
+      totalCost,
+      costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
+      breakdown
+    };
+  }
+
+  static computeCostBreakdown(recipeItems: RecipeItemWithInventory[]) {
     const breakdown: { name: string; qty: number; unit: string; unitCost: number; lineCost: number }[] = [];
     let totalCost = 0;
 
-    for (const item of recipe.recipeItems) {
-      // costPrice/basePrice are per item.inventoryItem.unit (e.g. per KG),
-      // while quantityRequired is expressed in the recipe's own item.unit
-      // (e.g. g) — convert before pricing, or a 500 g line prices out as if
-      // it were 500 KG. Uses the canonical shared engine to guarantee
-      // identical factors to production.service.ts.
+    for (const item of recipeItems) {
       const unitCost = item.inventoryItem.costPrice || item.inventoryItem.basePrice || 0;
       let qtyInStockUnit: number;
       try {
@@ -181,9 +198,6 @@ export class RecipeService {
           item.inventoryItem.unit.toUpperCase() as ValidUnit
         ).toNumber();
       } catch {
-        // Units are from different dimensions or unrecognized — fall back to
-        // raw quantity to avoid crashing the cost report, but the data is
-        // misconfigured and should be fixed in the recipe definition.
         qtyInStockUnit = item.quantityRequired;
       }
       const lineCost = qtyInStockUnit * unitCost;
@@ -197,15 +211,7 @@ export class RecipeService {
       });
     }
 
-    return {
-      recipeId,
-      recipeName: recipe.name,
-      yieldQty: recipe.yieldQty,
-      yieldUnit: recipe.yieldUnit,
-      totalCost,
-      costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
-      breakdown
-    };
+    return { totalCost, breakdown };
   }
 
   static async getCategories() {
