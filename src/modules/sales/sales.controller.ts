@@ -9,7 +9,9 @@ export class SalesController {
       const quotations = await SalesService.getQuotations({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        fromDate: (req.query.fromDate || req.query.startDate) as string,
+        toDate: (req.query.toDate || req.query.endDate) as string,
       });
       res.json(quotations);
     } catch (error) {
@@ -131,7 +133,9 @@ export class SalesController {
       const proformas = await SalesService.getProformaInvoices({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        fromDate: (req.query.fromDate || req.query.startDate) as string,
+        toDate: (req.query.toDate || req.query.endDate) as string,
       });
       res.json(proformas);
     } catch (error) {

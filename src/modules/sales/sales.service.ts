@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
@@ -55,14 +56,36 @@ function calculateTotals<T extends { quantity: number; rate: number; taxPercent?
 export class SalesService {
   // ─── Quotations ──────────────────────────────────────────────────────────────
 
-  static async getQuotations(filters: { status?: string; customerId?: string; search?: string }) {
+  static async getQuotations(filters: {
+    status?: string;
+    customerId?: string;
+    search?: string;
+    fromDate?: string;
+    toDate?: string;
+    startDate?: string;
+    endDate?: string;
+  }) {
     const where: any = {};
-    if (filters.status) where.status = filters.status;
+    if (filters.status && filters.status !== 'ALL') where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
-    if (filters.search) {
+    if (filters.fromDate || filters.toDate || filters.startDate || filters.endDate) {
+      const startStr = (filters.fromDate || filters.startDate) as string;
+      const endStr = (filters.toDate || filters.endDate) as string;
+      const createdAtFilter: any = {};
+      if (startStr) {
+        createdAtFilter.gte = new Date(startStr.includes('T') ? startStr : `${startStr}T00:00:00.000`);
+      }
+      if (endStr) {
+        createdAtFilter.lte = new Date(endStr.includes('T') ? endStr : `${endStr}T23:59:59.999`);
+      }
+      where.createdAt = createdAtFilter;
+    }
+    if (filters.search && filters.search.trim()) {
+      const s = filters.search.trim();
       where.OR = [
-        { quotationNumber: { contains: filters.search, mode: 'insensitive' } },
-        { customerName: { contains: filters.search, mode: 'insensitive' } }
+        { quotationNumber: { contains: s, mode: 'insensitive' } },
+        { customerName: { contains: s, mode: 'insensitive' } },
+        { customer: { name: { contains: s, mode: 'insensitive' } } }
       ];
     }
     const quotations = await prisma.quotation.findMany({
@@ -114,6 +137,13 @@ export class SalesService {
     stateOfSupply?: string;
     items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
+    // Signed nearest-rupee adjustment the UI computed and displayed as the
+    // payable total (e.g. +0.25 on a ₹99.75 pre-round total to show
+    // ₹100.00) — persisted into totalAmount here rather than re-derived
+    // server-side, so the figure the user actually saw is what's stored and
+    // what propagates verbatim through Sales Order -> Proforma -> Tax
+    // Invoice (each of those already copies totalAmount unchanged).
+    roundOffAmount?: number;
     termsConditions?: string;
     notes?: string;
     createdBy?: string;
@@ -122,6 +152,7 @@ export class SalesService {
   }) {
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const roundOff = data.roundOffAmount || 0;
     const partyType = data.partyType || 'CUSTOMER';
     // The `customer` relation/customerId only ever means a real Customer
     // record — a Dealer or Franchise party has no such row, so customerId
@@ -144,7 +175,7 @@ export class SalesService {
         subTotal,
         taxAmount,
         discountAmount: discount,
-        totalAmount: totalAmount - discount,
+        totalAmount: totalAmount - discount + roundOff,
         termsConditions: data.termsConditions,
         notes: data.notes,
         createdBy: data.createdBy,
@@ -179,6 +210,7 @@ export class SalesService {
     validUntil?: string;
     items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
     discountAmount?: number;
+    roundOffAmount?: number;
     quotationNumber?: string;
     trackingNumber?: string;
     courierName?: string;
@@ -224,11 +256,12 @@ export class SalesService {
       if (data.items) {
         const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
         const discount = data.discountAmount || 0;
-        
+        const roundOff = data.roundOffAmount || 0;
+
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
         updateData.discountAmount = discount;
-        updateData.totalAmount = totalAmount - discount;
+        updateData.totalAmount = totalAmount - discount + roundOff;
 
         // Delete old items
         await tx.quotationItem.deleteMany({ where: { quotationId: id } });
@@ -557,6 +590,7 @@ export class SalesService {
             create: proforma.items.map((item) => ({
               productId: resolvedProductIds.get(item.productId!)!,
               quantity: item.quantity,
+              unit: item.unit || 'NONE',
               price: item.rate,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
@@ -691,6 +725,16 @@ export class SalesService {
     const customerId = partyType === 'CUSTOMER' ? (data.customerId || existing.customerId) : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId || undefined, data.customerName) : (data.customerName || undefined);
 
+    // deleteMany-then-create replaces the item set in two separate writes —
+    // under the default READ COMMITTED isolation, two concurrent updates to
+    // the same Proforma (e.g. a double-clicked Back/Save button with no
+    // client-side re-entrancy guard) can each pass the deleteMany before
+    // either commits its create, leaving every line item duplicated even
+    // though the submitted payload only ever had one copy each. Serializable
+    // isolation makes Postgres abort the loser with a retryable conflict
+    // instead of silently interleaving the two — the frontend's existing
+    // catch/toast surfaces that as "failed to save", which is correct: the
+    // save didn't happen, rather than happening twice.
     return prisma.$transaction(async (tx) => {
       await tx.proformaInvoiceItem.deleteMany({ where: { proformaInvoiceId: id } });
 
@@ -725,7 +769,7 @@ export class SalesService {
         },
         include: { items: true, customer: true },
       });
-    });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }
 
   static async updateProformaStatus(id: string, status: any) {
@@ -739,14 +783,36 @@ export class SalesService {
     });
   }
 
-  static async getProformaInvoices(filters: { status?: string; customerId?: string; search?: string }) {
+  static async getProformaInvoices(filters: {
+    status?: string;
+    customerId?: string;
+    search?: string;
+    fromDate?: string;
+    toDate?: string;
+    startDate?: string;
+    endDate?: string;
+  }) {
     const where: any = {};
-    if (filters.status) where.status = filters.status;
+    if (filters.status && filters.status !== 'ALL') where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
-    if (filters.search) {
+    if (filters.fromDate || filters.toDate || filters.startDate || filters.endDate) {
+      const startStr = (filters.fromDate || filters.startDate) as string;
+      const endStr = (filters.toDate || filters.endDate) as string;
+      const createdAtFilter: any = {};
+      if (startStr) {
+        createdAtFilter.gte = new Date(startStr.includes('T') ? startStr : `${startStr}T00:00:00.000`);
+      }
+      if (endStr) {
+        createdAtFilter.lte = new Date(endStr.includes('T') ? endStr : `${endStr}T23:59:59.999`);
+      }
+      where.createdAt = createdAtFilter;
+    }
+    if (filters.search && filters.search.trim()) {
+      const s = filters.search.trim();
       where.OR = [
-        { proformaNumber: { contains: filters.search, mode: 'insensitive' } },
-        { customerName: { contains: filters.search, mode: 'insensitive' } },
+        { proformaNumber: { contains: s, mode: 'insensitive' } },
+        { customerName: { contains: s, mode: 'insensitive' } },
+        { customer: { name: { contains: s, mode: 'insensitive' } } }
       ];
     }
     const results = await prisma.proformaInvoice.findMany({
