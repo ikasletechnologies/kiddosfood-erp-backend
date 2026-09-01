@@ -650,6 +650,126 @@ export class SalesService {
     }
   }
 
+  // Sales Order -> Sale Invoice (Tax Invoice).
+  static async convertSalesOrderToSale(
+    salesOrderId: string,
+    createdBy: string,
+    payload?: { franchiseId?: string; paymentType?: string; notes?: string }
+  ) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const salesOrder = await tx.salesOrder.findUnique({
+          where: { id: salesOrderId },
+          include: { items: true }
+        });
+        if (!salesOrder) throw new Error('Sales Order not found.');
+        if (salesOrder.status === 'CLOSED' || salesOrder.status === 'CONVERTED') {
+          throw new Error('This Sales Order has already been converted.');
+        }
+
+        let franchiseId = payload?.franchiseId;
+        if (!franchiseId) {
+          const hq = await FranchiseService.getHqFranchiseOrNull();
+          franchiseId = hq?.id || '';
+        }
+        if (!franchiseId) {
+          const firstFranchise = await tx.franchise.findFirst();
+          franchiseId = firstFranchise?.id || '';
+        }
+
+        const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
+        const allProducts = await tx.product.findMany();
+        const fallbackProduct = allProducts[0];
+        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
+
+        for (const item of salesOrder.items) {
+          let validProductId = item.productId || '';
+          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
+          if (productMatch) {
+            validProductId = productMatch.id;
+          }
+          if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
+            if (fallbackProduct) {
+              validProductId = fallbackProduct.id;
+            } else {
+              const newProd = await tx.product.create({
+                data: {
+                  name: item.productName || 'General Item',
+                  basePrice: item.rate,
+                  taxPercent: item.taxPercent || 0,
+                }
+              });
+              validProductId = newProd.id;
+            }
+          }
+
+          orderItemsData.push({
+            productId: validProductId,
+            quantity: item.quantity,
+            unit: item.unit || 'NONE',
+            price: item.rate,
+            discountPct: item.discountPercent || 0,
+            taxAmount: item.taxAmount,
+            totalAmount: item.totalAmount,
+          });
+        }
+
+        const order = await tx.order.create({
+          data: {
+            invoiceNum,
+            partyType: salesOrder.partyType || 'CUSTOMER',
+            partyId: salesOrder.partyId,
+            customerId: salesOrder.customerId,
+            franchiseId,
+            orderType: 'DINE_IN',
+            status: 'COMPLETED',
+            subTotal: salesOrder.subTotal,
+            taxAmount: salesOrder.taxAmount,
+            discountAmount: salesOrder.discountAmount,
+            totalAmount: salesOrder.totalAmount,
+            paymentStatus: 'UNPAID',
+            paymentType: payload?.paymentType || 'CASH',
+            stateOfSupply: salesOrder.stateOfSupply,
+            inventory_deducted: true,
+            orderItems: {
+              create: orderItemsData
+            }
+          },
+          include: { orderItems: true }
+        });
+
+        const invoice = await tx.invoice.create({
+          data: {
+            orderId: order.id,
+            totalAmount: salesOrder.subTotal - salesOrder.discountAmount,
+            taxAmount: salesOrder.taxAmount,
+            finalAmount: salesOrder.totalAmount,
+            status: 'PENDING',
+            notes: salesOrder.notes || null,
+          }
+        });
+
+        await tx.salesOrder.update({
+          where: { id: salesOrderId },
+          data: { status: 'CLOSED' },
+        });
+
+        return {
+          success: true,
+          salesOrder: {
+            id: salesOrder.id,
+            orderNo: salesOrder.orderNo,
+            status: 'CLOSED'
+          },
+          sale: order,
+          invoice
+        };
+      });
+    } catch (err: any) {
+      throw err;
+    }
+  }
+
   // Sales Order -> Proforma Invoice.
   static async convertSalesOrderToProforma(salesOrderId: string, createdBy: string) {
     try {

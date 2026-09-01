@@ -61,17 +61,117 @@ export function computeGstFromRate(
 }
 
 /**
- * Resolves our own (seller's) GST state for a given franchise: the
- * franchise's own location if known, else the company profile's state
- * (which itself falls back to the HQ franchise's location — see
- * SettingsService.getCompanyProfile).
+ * Resolves our own (seller's) GST registration state — the one canonical
+ * path every caller must use, never a franchise's own `location` directly.
+ * `SettingsService.getCompanyProfile().state` is the authoritative source
+ * (and already falls back to the HQ franchise's location internally when
+ * nobody has configured a real state yet) — checking a specific franchise's
+ * `location` *before* that, as earlier code here did, meant a properly
+ * configured company GST state could never actually take effect, since
+ * `Franchise.location` is essentially always set to a street address. The
+ * `franchiseId` fallback below only matters in the near-impossible case
+ * where no HQ franchise exists either.
  */
 export async function resolveSellerState(franchiseId?: string | null): Promise<string | null> {
+  const { SettingsService } = require('../modules/settings/settings.service');
+  const profile = await SettingsService.getCompanyProfile();
+  if (profile?.state) return profile.state;
+
   if (franchiseId) {
     const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } });
     if (franchise?.location) return franchise.location;
   }
-  const { SettingsService } = require('../modules/settings/settings.service');
-  const profile = await SettingsService.getCompanyProfile();
-  return profile?.state || null;
+  return null;
+}
+
+/**
+ * Resolves the canonical seller GST state once per distinct franchiseId in
+ * a report's result set — for use in a loop over many rows, instead of
+ * calling resolveSellerState() per row (expensive) or, worse, reading
+ * Franchise.location directly (which bypasses resolveSellerState's
+ * COMPANY_PROFILE-first precedence entirely). Every sales-side GST report
+ * must resolve seller state through this path, the same one the
+ * purchase-side already uses via resolveSellerState — one canonical
+ * seller-state source, not two.
+ */
+export async function resolveSellerStatesFor(franchiseIds: (string | null | undefined)[]): Promise<Map<string, string | null>> {
+  const distinct = Array.from(new Set(franchiseIds.filter((id): id is string => !!id)));
+  const map = new Map<string, string | null>();
+  await Promise.all(distinct.map(async (id) => {
+    map.set(id, await resolveSellerState(id));
+  }));
+  return map;
+}
+
+export interface GstLiability { cgst: number; sgst: number; igst: number }
+export interface GstUtilizationResult {
+  netCgst: number; netSgst: number; netIgst: number; netTotal: number;
+  itcUtilized: { cgst: number; sgst: number; igst: number };
+  itcUnutilized: { cgst: number; sgst: number; igst: number };
+}
+
+/**
+ * Component-wise GST ITC utilization (GSTR-3B Net GST Payable), per the
+ * statutory offset order — a flat `totalOutput - totalInput` is not legally
+ * valid on its own, since CGST and SGST credit can never offset each
+ * other's liability directly:
+ *   IGST ITC  -> IGST liability, then CGST liability, then SGST liability.
+ *   CGST ITC  -> CGST liability, then IGST liability (never SGST).
+ *   SGST ITC  -> SGST liability, then IGST liability (never CGST).
+ * For a single-component dataset (e.g. IGST-only, as in an inter-state-only
+ * period) this reduces to the same result as a flat subtraction — the
+ * distinction only matters once CGST/SGST and IGST are mixed in the same
+ * period.
+ */
+export function computeGstUtilization(output: GstLiability, input: GstLiability): GstUtilizationResult {
+  let liabCgst = Math.max(0, output.cgst || 0);
+  let liabSgst = Math.max(0, output.sgst || 0);
+  let liabIgst = Math.max(0, output.igst || 0);
+
+  let itcIgst = Math.max(0, input.igst || 0);
+  let itcCgst = Math.max(0, input.cgst || 0);
+  let itcSgst = Math.max(0, input.sgst || 0);
+
+  const round = (n: number) => Number(n.toFixed(2));
+
+  let used = Math.min(itcIgst, liabIgst);
+  liabIgst -= used; itcIgst -= used;
+  const igstToIgst = used;
+
+  used = Math.min(itcIgst, liabCgst);
+  liabCgst -= used; itcIgst -= used;
+  const igstToCgst = used;
+
+  used = Math.min(itcIgst, liabSgst);
+  liabSgst -= used; itcIgst -= used;
+  const igstToSgst = used;
+
+  used = Math.min(itcCgst, liabCgst);
+  liabCgst -= used; itcCgst -= used;
+  const cgstToCgst = used;
+
+  used = Math.min(itcCgst, liabIgst);
+  liabIgst -= used; itcCgst -= used;
+  const cgstToIgst = used;
+
+  used = Math.min(itcSgst, liabSgst);
+  liabSgst -= used; itcSgst -= used;
+  const sgstToSgst = used;
+
+  used = Math.min(itcSgst, liabIgst);
+  liabIgst -= used; itcSgst -= used;
+  const sgstToIgst = used;
+
+  return {
+    netCgst: round(liabCgst),
+    netSgst: round(liabSgst),
+    netIgst: round(liabIgst),
+    netTotal: round(liabCgst + liabSgst + liabIgst),
+    itcUtilized: {
+      cgst: round(cgstToCgst + igstToCgst),
+      sgst: round(sgstToSgst + igstToSgst),
+      igst: round(igstToIgst + cgstToIgst + sgstToIgst)
+    },
+    itcUnutilized: { cgst: round(itcCgst), sgst: round(itcSgst), igst: round(itcIgst) }
+  };
 }

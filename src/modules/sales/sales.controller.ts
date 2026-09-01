@@ -144,6 +144,17 @@ export class SalesController {
     }
   }
 
+  // Sales Order -> Sale Invoice (Tax Invoice).
+  static async convertSalesOrderToSale(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const result = await SalesService.convertSalesOrderToSale(req.params.id, createdBy, req.body);
+      res.status(201).json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
   // ─── Proforma Invoices ───────────────────────────────────────────────────────
 
   static async getProformaInvoices(req: Request, res: Response) {

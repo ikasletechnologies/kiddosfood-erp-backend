@@ -3,7 +3,7 @@ import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { ItemCategory, PaymentMode } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
-import { splitGstAmount } from '../../utils/gst-tax.util';
+import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
 
 
 function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
@@ -40,6 +40,28 @@ function buildCreatedAtFilter(startDate?: string | Date, endDate?: string | Date
   if (start) range.gte = start;
   if (end) range.lte = end;
   return { createdAt: range };
+}
+
+// VendorInvoice (Purchase Bill) date filter, for GST reporting purposes.
+// A Purchase Bill's real GST/reporting date is its own `billDate` — the
+// date the bill actually carries — not `createdAt` (when the DB row
+// happened to be inserted, which can be a different day than the bill's
+// own date, e.g. a bill entered a day late). Falls back to `createdAt`
+// only for the rare row where `billDate` was never set, mirroring the
+// same fallback already used when displaying a bill's date
+// (`inv.billDate || inv.createdAt`) — filtering must agree with display.
+function buildBillDateFilter(startDate?: string | Date, endDate?: string | Date): any {
+  if (!startDate && !endDate) return {};
+  const { start, end } = parseInclusiveDates(startDate, endDate);
+  const range: { gte?: Date; lte?: Date } = {};
+  if (start) range.gte = start;
+  if (end) range.lte = end;
+  return {
+    OR: [
+      { billDate: range },
+      { billDate: null, createdAt: range }
+    ]
+  };
 }
 
 function normalizeReportFilters(param1?: any, param2?: any, param3?: any, param4?: any): {
@@ -3452,8 +3474,10 @@ export class FinanceService {
       orderBy: { createdAt: 'desc' }
     });
 
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
+
     const toRow = (o: any) => {
-      const split = splitGstAmount(o.taxAmount || 0, o.stateOfSupply, o.franchise?.location || null);
+      const split = splitGstAmount(o.taxAmount || 0, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
       const isB2B = Boolean(o.customer?.gstNumber && o.customer.gstNumber.trim() !== '');
       const taxableValue = o.subTotal || 0;
       const taxAmount = o.taxAmount || 0;
@@ -3534,6 +3558,11 @@ export class FinanceService {
 
   static async getGSTR2Data(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
     const { franchiseId, startDate, endDate, extra } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    // The Purchase Bill's own billDate is the GST-reporting date — not
+    // createdAt (when the row was inserted, which can lag the bill's real
+    // date). PurchaseReturn has no equivalent separate date field, so debit
+    // notes below still filter on createdAt.
+    const billDateFilter = buildBillDateFilter(startDate, endDate);
     const dateFilter = buildCreatedAtFilter(startDate, endDate);
     const partyId = extra?.partyId;
     const gstRate = extra?.gstRate !== undefined && extra?.gstRate !== '' ? Number(extra.gstRate) : undefined;
@@ -3545,7 +3574,7 @@ export class FinanceService {
       where: {
         procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
         ...(partyId ? { vendorId: partyId } : {}),
-        ...dateFilter
+        ...billDateFilter
       },
       include: { vendor: true, procurementOrder: { select: { poNumber: true } } },
       orderBy: { createdAt: 'desc' }
@@ -3560,11 +3589,24 @@ export class FinanceService {
         date: (inv.billDate || inv.createdAt).toISOString().split('T')[0],
         vendorName: inv.vendor?.name || '—',
         vendorGstin: inv.vendor?.gstNumber || '—',
+        // No placeOfSupply field is persisted anywhere for purchases (unlike
+        // Order.stateOfSupply on the sales side) — the vendor's own master
+        // state is the closest real, non-fabricated stand-in.
+        placeOfSupply: inv.vendor?.state || '—',
         taxableValue,
         taxRate: taxableValue > 0 ? Number(((totalTax / taxableValue) * 100).toFixed(2)) : 0,
         igst: inv.igst || 0,
         cgst: inv.cgst || 0,
         sgst: inv.sgst || 0,
+        // No cess field exists on VendorInvoice — 0 honestly reports "not
+        // tracked," not a fabricated non-zero figure.
+        cessAmount: 0,
+        // No reverse-charge flag/config exists anywhere in this schema.
+        // Defaulting to 'N' is the correct GST default (RCM is the
+        // exception, not the rule, absent an explicit marking) — this must
+        // never default to 'Y', which would be fabricating a compliance
+        // classification with real legal weight.
+        reverseCharge: 'N',
         totalTax,
         eligibleItc: totalTax,
         totalAmount: inv.amount,
@@ -3612,16 +3654,17 @@ export class FinanceService {
   static async getGSTR3BData(franchiseIdOrFilters?: any, startDateParam?: string | Date, endDateParam?: string | Date) {
     const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
     const dateFilter = buildCreatedAtFilter(startDate, endDate);
+    const billDateFilter = buildBillDateFilter(startDate, endDate);
 
     const [orders, purchasesAgg, creditNoteAgg, debitNoteAgg] = await Promise.all([
       prisma.order.findMany({
         where: finalSaleWhere({ ...(franchiseId ? { franchiseId } : {}), ...dateFilter }),
-        select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
+        select: { subTotal: true, taxAmount: true, totalAmount: true, stateOfSupply: true, franchiseId: true }
       }),
       prisma.vendorInvoice.aggregate({
         where: {
           procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
-          ...dateFilter
+          ...billDateFilter
         },
         _sum: { subtotal: true, cgst: true, sgst: true, igst: true }
       }),
@@ -3635,6 +3678,8 @@ export class FinanceService {
       })
     ]);
 
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
+
     let outputTaxable = 0;
     let outputTax = 0;
     let outputIgst = 0;
@@ -3645,7 +3690,7 @@ export class FinanceService {
       outputTaxable += o.subTotal || 0;
       const t = o.taxAmount || 0;
       outputTax += t;
-      const split = splitGstAmount(t, o.stateOfSupply, o.franchise?.location || null);
+      const split = splitGstAmount(t, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
       outputIgst += split.igst;
       outputCgst += split.cgst;
       outputSgst += split.sgst;
@@ -3659,11 +3704,24 @@ export class FinanceService {
     outputSgst -= creditNoteAgg._sum.sgst || 0;
 
     // Net approved Purchase Debit Notes against input tax (ITC reversal).
+    // "Eligible ITC" has only one modeled bucket here — every Purchase
+    // Bill's persisted CGST/SGST/IGST, under "All other ITC" — because
+    // nothing in the schema classifies ITC into import-of-goods/services,
+    // reverse-charge, ISD, or ineligible/blocked credit. Do not split this
+    // into those categories without a real field to back them.
     const inputCgst = (purchasesAgg._sum.cgst || 0) - (debitNoteAgg._sum.cgst || 0);
     const inputSgst = (purchasesAgg._sum.sgst || 0) - (debitNoteAgg._sum.sgst || 0);
     const inputIgst = (purchasesAgg._sum.igst || 0) - (debitNoteAgg._sum.igst || 0);
     const totalInputTax = inputCgst + inputSgst + inputIgst;
-    const netGstPayable = Math.max(0, outputTax - totalInputTax);
+
+    // Net GST Payable per statutory component-wise ITC utilization (IGST
+    // ITC -> IGST -> CGST -> SGST liability; CGST ITC -> CGST -> IGST only;
+    // SGST ITC -> SGST -> IGST only) — never a flat total-minus-total, which
+    // would implicitly allow invalid CGST<->SGST cross-utilization.
+    const utilization = computeGstUtilization(
+      { cgst: outputCgst, sgst: outputSgst, igst: outputIgst },
+      { cgst: inputCgst, sgst: inputSgst, igst: inputIgst }
+    );
 
     return {
       outwardSupplies: [
@@ -3690,10 +3748,15 @@ export class FinanceService {
         ineligible: []
       },
       exemptSupplies: [],
+      netGstLiability: {
+        cgst: utilization.netCgst,
+        sgst: utilization.netSgst,
+        igst: utilization.netIgst
+      },
       summary: {
         totalOutputTax: Number(outputTax.toFixed(2)),
         totalInputTax: Number(totalInputTax.toFixed(2)),
-        netGstPayable: Number(netGstPayable.toFixed(2))
+        netGstPayable: utilization.netTotal
       }
     };
   }
@@ -3714,19 +3777,15 @@ export class FinanceService {
     const fyStart = new Date(startYear, 3, 1);
     const fyEnd = new Date(startYear + 1, 2, 31, 23, 59, 59);
 
-    const franchise = franchiseId
-      ? await prisma.franchise.findUnique({ where: { id: franchiseId } })
-      : null;
-
     const [orders, purchasesAgg, creditNoteAgg, debitNoteAgg] = await Promise.all([
       prisma.order.findMany({
         where: finalSaleWhere({ ...(franchiseId ? { franchiseId } : {}), createdAt: { gte: fyStart, lte: fyEnd } }),
-        select: { subTotal: true, taxAmount: true, stateOfSupply: true, franchise: { select: { location: true } } }
+        select: { subTotal: true, taxAmount: true, stateOfSupply: true, franchiseId: true, customer: { select: { gstNumber: true } } }
       }),
       prisma.vendorInvoice.aggregate({
         where: {
           procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any } },
-          createdAt: { gte: fyStart, lte: fyEnd }
+          ...buildBillDateFilter(fyStart, fyEnd)
         },
         _sum: { subtotal: true, cgst: true, sgst: true, igst: true }
       }),
@@ -3740,64 +3799,81 @@ export class FinanceService {
       })
     ]);
 
-    let outputTaxable = 0;
-    let outputTax = 0;
-    let outputIgst = 0;
-    let outputCgst = 0;
-    let outputSgst = 0;
-    orders.forEach(o => {
-      outputTaxable += o.subTotal || 0;
-      const t = o.taxAmount || 0;
-      outputTax += t;
-      const split = splitGstAmount(t, o.stateOfSupply, o.franchise?.location || null);
-      outputIgst += split.igst;
-      outputCgst += split.cgst;
-      outputSgst += split.sgst;
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
+
+    // B2B (customer has a real GSTIN on file) vs B2C (unregistered) — same
+    // classification GSTR-1 already uses, not re-derived differently here.
+    const b2b = { taxableValue: 0, cgst: 0, sgst: 0, igst: 0 };
+    const b2c = { taxableValue: 0, cgst: 0, sgst: 0, igst: 0 };
+    orders.forEach((o) => {
+      const isB2B = Boolean(o.customer?.gstNumber && o.customer.gstNumber.trim() !== '');
+      const bucket = isB2B ? b2b : b2c;
+      bucket.taxableValue += o.subTotal || 0;
+      const split = splitGstAmount(o.taxAmount || 0, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
+      bucket.cgst += split.cgst;
+      bucket.sgst += split.sgst;
+      bucket.igst += split.igst;
     });
 
-    // Net approved credit/debit notes into the same annual totals GSTR-1/2/3B use.
-    outputTaxable -= creditNoteAgg._sum.taxableValue || 0;
-    outputTax -= creditNoteAgg._sum.taxAmount || 0;
-    outputIgst -= creditNoteAgg._sum.igst || 0;
-    outputCgst -= creditNoteAgg._sum.cgst || 0;
-    outputSgst -= creditNoteAgg._sum.sgst || 0;
+    const creditDebitAdj = {
+      taxableValue: -(creditNoteAgg._sum.taxableValue || 0),
+      cgst: -(creditNoteAgg._sum.cgst || 0),
+      sgst: -(creditNoteAgg._sum.sgst || 0),
+      igst: -(creditNoteAgg._sum.igst || 0),
+    };
 
-    const inputCgstNet = (purchasesAgg._sum.cgst || 0) - (debitNoteAgg._sum.cgst || 0);
-    const inputSgstNet = (purchasesAgg._sum.sgst || 0) - (debitNoteAgg._sum.sgst || 0);
-    const inputIgstNet = (purchasesAgg._sum.igst || 0) - (debitNoteAgg._sum.igst || 0);
-    const inputTax = inputCgstNet + inputSgstNet + inputIgstNet;
+    const totalOutward = {
+      taxableValue: b2b.taxableValue + b2c.taxableValue + creditDebitAdj.taxableValue,
+      cgst: b2b.cgst + b2c.cgst + creditDebitAdj.cgst,
+      sgst: b2b.sgst + b2c.sgst + creditDebitAdj.sgst,
+      igst: b2b.igst + b2c.igst + creditDebitAdj.igst,
+    };
+    const outputTax = totalOutward.cgst + totalOutward.sgst + totalOutward.igst;
+
+    // Eligible ITC — one modeled bucket (no eligibility/RCM classification
+    // exists anywhere in the schema, so nothing here is split into
+    // "reverse charge" vs "normal" ITC; the previous version of this report
+    // mislabeled every ordinary Purchase Bill as reverse-charge inward
+    // supply, which was simply wrong, not a real RCM classification).
+    const itc = {
+      taxableValue: (purchasesAgg._sum.subtotal || 0) - (debitNoteAgg._sum.taxableValue || 0),
+      cgst: (purchasesAgg._sum.cgst || 0) - (debitNoteAgg._sum.cgst || 0),
+      sgst: (purchasesAgg._sum.sgst || 0) - (debitNoteAgg._sum.sgst || 0),
+      igst: (purchasesAgg._sum.igst || 0) - (debitNoteAgg._sum.igst || 0),
+    };
+    const inputTax = itc.cgst + itc.sgst + itc.igst;
+
+    const utilization = computeGstUtilization(
+      { cgst: totalOutward.cgst, sgst: totalOutward.sgst, igst: totalOutward.igst },
+      { cgst: itc.cgst, sgst: itc.sgst, igst: itc.igst }
+    );
+
+    const round = (n: number) => Number((n || 0).toFixed(2));
+    const round4 = (r: { taxableValue: number; cgst: number; sgst: number; igst: number }) => ({
+      taxableValue: round(r.taxableValue), cgst: round(r.cgst), sgst: round(r.sgst), igst: round(r.igst), cess: 0
+    });
 
     return {
-      basicDetails: {
-        financialYear: fy,
-        gstin: '',
-        legalName: franchise?.name || '',
-        tradeName: franchise?.name || ''
-      },
-      outwardAndInwardSupplies: [
-        {
-          section: '4A',
-          description: 'Supplies made to registered/unregistered persons',
-          taxableValue: Number(outputTaxable.toFixed(2)),
-          centralTax: Number(outputCgst.toFixed(2)),
-          stateTax: Number(outputSgst.toFixed(2)),
-          integratedTax: Number(outputIgst.toFixed(2)),
-          cess: 0
-        },
-        {
-          section: '4C',
-          description: 'Inward supplies liable to reverse charge',
-          taxableValue: (purchasesAgg._sum.subtotal || 0) - (debitNoteAgg._sum.taxableValue || 0),
-          centralTax: Number(inputCgstNet.toFixed(2)),
-          stateTax: Number(inputSgstNet.toFixed(2)),
-          integratedTax: Number(inputIgstNet.toFixed(2)),
-          cess: 0
-        }
+      financialYear: fy,
+      outwardSupplies: [
+        { category: 'B2B Sales', ...round4(b2b) },
+        { category: 'B2C Sales', ...round4(b2c) },
+        { category: 'Credit/Debit Note Adjustments', ...round4(creditDebitAdj) },
+        { category: 'Total Outward Supplies', ...round4(totalOutward) }
       ],
+      itcSummary: {
+        ...round4(itc),
+        total: round(inputTax)
+      },
+      reconciliation: {
+        totalOutputGst: round(outputTax),
+        eligibleItc: round(inputTax),
+        netGstPayable: utilization.netTotal
+      },
       summary: {
-        totalOutputTax: Number(outputTax.toFixed(2)),
-        totalInputTax: Number(inputTax.toFixed(2)),
-        netTaxPayable: Number(Math.max(0, outputTax - inputTax).toFixed(2))
+        totalOutputTax: round(outputTax),
+        totalInputTax: round(inputTax),
+        netTaxPayable: utilization.netTotal
       }
     };
   }
@@ -3823,10 +3899,11 @@ export class FinanceService {
         ...dateFilter
       }),
       include: {
-        orderItems: { include: { product: true } },
-        franchise: { select: { location: true } }
+        orderItems: { include: { product: true } }
       }
     });
+
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
 
     const hsnMap: Record<string, {
       hsn: string; productName: string; unit: string; gstRate: number; quantity: number;
@@ -3837,7 +3914,7 @@ export class FinanceService {
     orders.forEach(o => {
       const orderSubTotal = o.subTotal || 0;
       const orderTax = o.taxAmount || 0;
-      const franchiseLocation = o.franchise?.location || null;
+      const franchiseLocation = sellerStates.get(o.franchiseId) ?? null;
 
       o.orderItems.forEach(item => {
         // Service lines never appear in the goods (HSN) summary, even on an
@@ -3926,9 +4003,11 @@ export class FinanceService {
         orderItems: { some: { product: { productType: 'SERVICE' } } },
         ...dateFilter
       }),
-      include: { orderItems: { include: { product: true } }, franchise: { select: { location: true } } },
+      include: { orderItems: { include: { product: true } } },
       orderBy: { createdAt: 'desc' }
     });
+
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
 
     const sacMap: Record<string, {
       sacCode: string; serviceName: string; taxableValue: number; gstRate: number;
@@ -3952,7 +4031,7 @@ export class FinanceService {
         const lineTax = typeof item.taxAmount === 'number' && item.taxAmount > 0
           ? item.taxAmount
           : (orderSubTotal > 0 ? (lineSubtotal / orderSubTotal) * orderTax : 0);
-        const split = splitGstAmount(lineTax, o.stateOfSupply, o.franchise?.location || null);
+        const split = splitGstAmount(lineTax, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
 
         sacMap[key].taxableValue += lineSubtotal;
         sacMap[key].cgst += split.cgst;
@@ -4652,11 +4731,6 @@ export class FinanceService {
       };
     }
 
-    const franchise = filters.franchiseId
-      ? await prisma.franchise.findUnique({ where: { id: filters.franchiseId }, select: { location: true } })
-      : null;
-    const franchiseLocation = franchise?.location || null;
-
     const orders = await prisma.order.findMany({
       where,
       include: {
@@ -4666,6 +4740,8 @@ export class FinanceService {
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
 
     let totalSubTotal = 0;
     let totalDiscount = 0;
@@ -4682,7 +4758,7 @@ export class FinanceService {
       const discountAmount = o.discountAmount || 0;
       const taxableValue = Math.max(0, subTotal - discountAmount);
       const taxAmount = o.taxAmount || 0;
-      const split = splitGstAmount(taxAmount, o.stateOfSupply, franchiseLocation);
+      const split = splitGstAmount(taxAmount, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
       const grandTotal = o.totalAmount || (taxableValue + taxAmount);
       const paid = o.paymentStatus === 'PAID'
         ? grandTotal
