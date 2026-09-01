@@ -7,8 +7,8 @@ import { SalesService } from '../../modules/sales/sales.service';
 // own delete flow — leaving the database exactly as it was found.
 
 async function main() {
-  const customer = await prisma.customer.findFirst({ where: { name: 'Hari' } });
-  const product = await prisma.product.findFirst({ where: { name: 'APPAM' } });
+  const customer = await prisma.customer.findFirst();
+  const product = await prisma.product.findFirst();
   if (!customer || !product) throw new Error('Reference customer/product not found for test setup');
 
   console.log('=== Reproducing the reported bug scenario: Price ₹95, GST 5%, round-off enabled ===');

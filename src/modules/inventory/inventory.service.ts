@@ -167,9 +167,11 @@ export class InventoryService {
   // so omitting it here correctly means "every franchise" (SUPER_ADMIN's
   // global view), not "no results" — do not substitute a default franchise.
   static async getInventory(franchiseId: string | undefined, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory, asOfDate?: string) {
+    const scopeFilter = franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {};
+
     const items = await prisma.inventoryItem.findMany({
       where: {
-        franchiseId,
+        ...scopeFilter,
         ...(includeInactive ? {} : { isActive: true }),
         ...(excludeCategories && excludeCategories.length > 0 ? { category: { notIn: excludeCategories } } : {}),
         ...(category ? { category } : {})
@@ -194,14 +196,16 @@ export class InventoryService {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
+    const itemWhere = franchiseId ? { item: scopeFilter } : {};
+
     const movementsToday = await prisma.stockMovement.findMany({
-      where: { item: { franchiseId }, createdAt: { gte: today } },
+      where: { ...itemWhere, createdAt: { gte: today } },
     });
 
     // Recompute stock from movements for accuracy (scoped to asOfBoundary when provided)
     const allMovements = await prisma.stockMovement.findMany({
       where: {
-        item: { franchiseId },
+        ...itemWhere,
         ...(asOfBoundary ? { createdAt: { lte: asOfBoundary } } : {})
       },
       select: { itemId: true, quantity: true, baseQty: true },
@@ -215,7 +219,7 @@ export class InventoryService {
     // Identify which items have EVER been purchased (from movements or linked vendor)
     const itemsWithPurchaseMovements = await prisma.stockMovement.findMany({
       where: {
-        item: { franchiseId },
+        ...itemWhere,
         movementType: StockMovementType.PURCHASE_IN
       },
       select: { itemId: true },
@@ -227,7 +231,7 @@ export class InventoryService {
     const pendingOrders = await prisma.procurementOrderItem.findMany({
       where: {
         procurementOrder: { status: { in: ['PENDING_APPROVAL', 'APPROVED', 'SENT', 'PARTIALLY_RECEIVED'] } },
-        inventoryItem: { franchiseId }
+        ...(franchiseId ? { inventoryItem: scopeFilter } : {})
       },
       select: { inventoryItemId: true, quantity: true }
     });

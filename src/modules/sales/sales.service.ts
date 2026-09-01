@@ -40,17 +40,71 @@ async function resolveCustomerName(customerId?: string, customerName?: string): 
   return customer?.name;
 }
 
-function calculateTotals<T extends { quantity: number; rate: number; taxPercent?: number }>(items: T[]) {
+function calculateTotals<T extends {
+  quantity: number;
+  rate: number;
+  taxPercent?: number;
+  discountPercent?: number;
+  discountPct?: number;
+  discountAmount?: number;
+  discount?: number;
+}>(items: T[], documentDiscountAmount: number = 0) {
   let subTotal = 0;
   let taxAmount = 0;
-  const computed = items.map((item) => {
-    const lineTotal = item.quantity * item.rate;
-    const lineTax = (lineTotal * (item.taxPercent || 0)) / 100;
-    subTotal += lineTotal;
+  let totalDiscount = 0;
+
+  const validItems = items || [];
+  const totalGross = validItems.reduce((sum, item) => sum + (item.quantity || 0) * (item.rate || 0), 0);
+  const hasExplicitItemDiscounts = validItems.some((item) =>
+    (item.discountAmount !== undefined && item.discountAmount > 0) ||
+    (item.discount !== undefined && item.discount > 0) ||
+    (item.discountPercent !== undefined && item.discountPercent > 0) ||
+    (item.discountPct !== undefined && item.discountPct > 0)
+  );
+
+  const computed = validItems.map((item) => {
+    const gross = (item.quantity || 0) * (item.rate || 0);
+    let discAmt = (item.discountAmount !== undefined && item.discountAmount > 0)
+      ? item.discountAmount
+      : ((item.discount !== undefined && item.discount > 0) ? item.discount : 0);
+
+    let discPct = (item.discountPercent !== undefined && item.discountPercent > 0)
+      ? item.discountPercent
+      : ((item.discountPct !== undefined && item.discountPct > 0) ? item.discountPct : 0);
+
+    if (!hasExplicitItemDiscounts && documentDiscountAmount > 0 && totalGross > 0) {
+      discAmt = Math.round((documentDiscountAmount * (gross / totalGross)) * 100) / 100;
+      discPct = gross > 0 ? Math.round(((discAmt / gross) * 100) * 100) / 100 : 0;
+    } else if (!discAmt && discPct > 0) {
+      discAmt = Math.round((gross * discPct / 100) * 100) / 100;
+    } else if (!discPct && gross > 0 && discAmt > 0) {
+      discPct = Math.round(((discAmt / gross) * 100) * 100) / 100;
+    }
+
+    const taxable = Math.max(0, Math.round((gross - discAmt) * 100) / 100);
+    const lineTax = Math.round((taxable * (item.taxPercent || 0) / 100) * 100) / 100;
+
+    subTotal += taxable;
     taxAmount += lineTax;
-    return { ...item, taxAmount: lineTax, totalAmount: lineTotal + lineTax };
+    totalDiscount += discAmt;
+
+    return {
+      ...item,
+      discountPercent: discPct,
+      discountPct: discPct,
+      discountAmount: discAmt,
+      taxableAmount: taxable,
+      taxAmount: lineTax,
+      totalAmount: Math.round((taxable + lineTax) * 100) / 100
+    };
   });
-  return { computed, subTotal, taxAmount, totalAmount: subTotal + taxAmount };
+
+  subTotal = Math.round(subTotal * 100) / 100;
+  taxAmount = Math.round(taxAmount * 100) / 100;
+  totalDiscount = Math.round(totalDiscount * 100) / 100;
+  const grandTotal = Math.round((subTotal + taxAmount) * 100) / 100;
+
+  return { computed, subTotal, taxAmount, totalDiscount, totalAmount: grandTotal };
 }
 
 export class SalesService {
@@ -144,8 +198,9 @@ export class SalesService {
     customerEmail?: string;
     validUntil?: string;
     stateOfSupply?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; discountPercent?: number; discountPct?: number; discountAmount?: number; discount?: number }>;
     discountAmount?: number;
+    totalAmount?: number;
     // Signed nearest-rupee adjustment the UI computed and displayed as the
     // payable total (e.g. +0.25 on a ₹99.75 pre-round total to show
     // ₹100.00) — persisted into totalAmount here rather than re-derived
@@ -159,8 +214,8 @@ export class SalesService {
     quotationNumber?: string;
     status?: string;
   }) {
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discount);
     const roundOff = data.roundOffAmount || 0;
     const partyType = data.partyType || 'CUSTOMER';
     // The `customer` relation/customerId only ever means a real Customer
@@ -183,8 +238,8 @@ export class SalesService {
         status: (data.status as any) || undefined,
         subTotal,
         taxAmount,
-        discountAmount: discount,
-        totalAmount: totalAmount - discount + roundOff,
+        discountAmount: discount || totalDiscount,
+        totalAmount: data.totalAmount !== undefined ? data.totalAmount : (totalAmount + roundOff),
         termsConditions: data.termsConditions,
         notes: data.notes,
         createdBy: data.createdBy,
@@ -195,6 +250,8 @@ export class SalesService {
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
+            discountPercent: item.discountPercent || item.discountPct || 0,
+            discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount
@@ -217,8 +274,9 @@ export class SalesService {
     notes?: string;
     termsConditions?: string;
     validUntil?: string;
-    items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    items?: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; discountPercent?: number; discountPct?: number; discountAmount?: number; discount?: number }>;
     discountAmount?: number;
+    totalAmount?: number;
     roundOffAmount?: number;
     quotationNumber?: string;
     trackingNumber?: string;
@@ -263,14 +321,15 @@ export class SalesService {
 
     return prisma.$transaction(async (tx) => {
       if (data.items) {
-        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
-        const discount = data.discountAmount || 0;
+        const discountInput = data.discountAmount !== undefined ? data.discountAmount : 0;
+        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discountInput);
+        const discount = data.discountAmount !== undefined ? data.discountAmount : totalDiscount;
         const roundOff = data.roundOffAmount || 0;
 
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
         updateData.discountAmount = discount;
-        updateData.totalAmount = totalAmount - discount + roundOff;
+        updateData.totalAmount = (data as any).totalAmount !== undefined ? (data as any).totalAmount : (totalAmount + roundOff);
 
         // Delete old items
         await tx.quotationItem.deleteMany({ where: { quotationId: id } });
@@ -283,6 +342,8 @@ export class SalesService {
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
+            discountPercent: item.discountPercent || item.discountPct || 0,
+            discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount
@@ -396,6 +457,8 @@ export class SalesService {
               quantity: item.quantity,
               unit: item.unit,
               rate: item.rate,
+              discountPercent: item.discountPercent || 0,
+              discountAmount: item.discountAmount || 0,
               taxPercent: item.taxPercent,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
@@ -465,6 +528,8 @@ export class SalesService {
               quantity: item.quantity,
               unit: item.unit,
               rate: item.rate,
+              discountPercent: item.discountPercent || 0,
+              discountAmount: item.discountAmount || 0,
               taxPercent: item.taxPercent,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
@@ -670,8 +735,8 @@ export class SalesService {
     proformaNumber?: string;
     status?: any;
   }) {
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
     const partyType = data.partyType || 'CUSTOMER';
     const customerId = partyType === 'CUSTOMER' ? data.customerId : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId, data.customerName) : (data.customerName || undefined);
@@ -700,7 +765,9 @@ export class SalesService {
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
-            taxPercent: item.taxPercent,
+            discountPercent: item.discountPercent || item.discountPct || 0,
+            discountAmount: item.discountAmount || 0,
+            taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
           })),
@@ -728,8 +795,8 @@ export class SalesService {
     if (!existing) throw new Error('Proforma Invoice not found');
     if (existing.status !== 'DRAFT') throw new Error(`Cannot update Proforma Invoice in ${existing.status} status`);
 
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
     const partyType = data.partyType || existing.partyType || 'CUSTOMER';
     const customerId = partyType === 'CUSTOMER' ? (data.customerId || existing.customerId) : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId || undefined, data.customerName) : (data.customerName || undefined);
@@ -770,7 +837,9 @@ export class SalesService {
               quantity: item.quantity,
               unit: item.unit,
               rate: item.rate,
-              taxPercent: item.taxPercent,
+              discountPercent: item.discountPercent || item.discountPct || 0,
+              discountAmount: item.discountAmount || 0,
+              taxPercent: item.taxPercent || 0,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
             })),
@@ -935,8 +1004,8 @@ export class SalesService {
       if (existing) return existing;
     }
 
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items);
     const discount = data.discountAmount || 0;
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
 
     try {
       return await prisma.$transaction(async (tx) => tx.salesOrder.create({
@@ -964,6 +1033,8 @@ export class SalesService {
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
+            discountPercent: item.discountPercent || item.discountPct || 0,
+            discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount
@@ -1006,13 +1077,13 @@ export class SalesService {
 
     return prisma.$transaction(async (tx) => {
       if (items) {
-        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(items as any[]);
         const discount = data.discountAmount || 0;
+        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(items as any[], discount);
 
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
         updateData.discountAmount = discount;
-        updateData.totalAmount = totalAmount - discount;
+        updateData.totalAmount = totalAmount;
 
         // Same replace-all-items pattern as updateQuotation/updateProformaInvoice:
         // the frontend never sends SalesOrderItem.id, so there's nothing to
@@ -1026,6 +1097,8 @@ export class SalesService {
             quantity: item.quantity,
             unit: item.unit,
             rate: item.rate,
+            discountPercent: item.discountPercent || item.discountPct || 0,
+            discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount

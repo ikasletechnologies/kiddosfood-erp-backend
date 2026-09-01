@@ -1394,17 +1394,19 @@ model Quotation {
 }
 
 model QuotationItem {
-  id          String    @id @default(uuid())
-  quotationId String
-  productId   String?
-  productName String
-  quantity    Float
-  unit        String?
-  rate        Float
-  taxPercent  Float     @default(0)
-  taxAmount   Float     @default(0)
-  totalAmount Float
-  quotation   Quotation @relation(fields: [quotationId], references: [id])
+  id              String    @id @default(uuid())
+  quotationId     String
+  productId       String?
+  productName     String
+  quantity        Float
+  unit            String?
+  rate            Float
+  discountPercent Float     @default(0)
+  discountAmount  Float     @default(0)
+  taxPercent      Float     @default(0)
+  taxAmount       Float     @default(0)
+  totalAmount     Float
+  quotation       Quotation @relation(fields: [quotationId], references: [id])
 }
 
 model SalesOrder {
@@ -1466,17 +1468,19 @@ model SalesOrder {
 }
 
 model SalesOrderItem {
-  id           String     @id @default(uuid())
-  salesOrderId String
-  productId    String?
-  productName  String
-  quantity     Float
-  unit         String?
-  rate         Float
-  taxPercent   Float      @default(0)
-  taxAmount    Float      @default(0)
-  totalAmount  Float
-  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id])
+  id              String     @id @default(uuid())
+  salesOrderId    String
+  productId       String?
+  productName     String
+  quantity        Float
+  unit            String?
+  rate            Float
+  discountPercent Float      @default(0)
+  discountAmount  Float      @default(0)
+  taxPercent      Float      @default(0)
+  taxAmount       Float      @default(0)
+  totalAmount     Float
+  salesOrder      SalesOrder @relation(fields: [salesOrderId], references: [id])
 }
 
 // A formal pre-invoice used for advance/payment requests or commercial
@@ -1519,6 +1523,8 @@ model ProformaInvoiceItem {
   quantity          Float
   unit              String?
   rate              Float
+  discountPercent   Float           @default(0)
+  discountAmount    Float           @default(0)
   taxPercent        Float           @default(0)
   taxAmount         Float           @default(0)
   totalAmount       Float
