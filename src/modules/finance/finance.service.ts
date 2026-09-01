@@ -14,8 +14,18 @@ function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date)
   }
   if (endDate) {
     end = new Date(endDate);
-    if (end.getHours() === 0 && end.getMinutes() === 0 && end.getSeconds() === 0 && end.getMilliseconds() === 0) {
-      end.setHours(23, 59, 59, 999);
+    // A bare "YYYY-MM-DD" (what every <input type="date"> sends) always
+    // parses as UTC midnight, per spec, regardless of server timezone.
+    // This must use the UTC accessors, not the local ones: on a server
+    // whose local timezone isn't UTC (this one runs in Asia/Calcutta,
+    // UTC+5:30), end.getHours() reads back 5, never 0, so the bump below
+    // silently never fired — `end` stayed pinned at UTC midnight (5:30 AM
+    // IST) instead of end-of-day, cutting every report's "today" filter
+    // off a few hours after it started and hiding the rest of the day's
+    // real transactions (confirmed against INV-2026-00001..00008, all
+    // created well after UTC midnight on their own calendar day).
+    if (end.getUTCHours() === 0 && end.getUTCMinutes() === 0 && end.getUTCSeconds() === 0 && end.getUTCMilliseconds() === 0) {
+      end.setUTCHours(23, 59, 59, 999);
     }
   }
   return { start, end };

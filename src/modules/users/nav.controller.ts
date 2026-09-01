@@ -73,41 +73,6 @@ export class NavController {
         icon: 'BarChart3',
         children: [
           {
-            title: 'Production',
-            path: '/reports/production',
-            children: [
-              { title: 'Production Batches', path: '/reports/production/batches' },
-              { title: 'Production History', path: '/reports/production/history' },
-              { title: 'Yield & Summary', path: '/reports/production' }
-            ]
-          },
-          {
-            title: 'Inventory',
-            path: '/reports/inventory',
-            children: [
-              { title: 'Stock Summary', path: '/reports/stock-summary' },
-              { title: 'Item Report By Party', path: '/reports/item-by-party' },
-              { title: 'Item Wise Profit & Loss', path: '/reports/item-profit-loss' },
-              { title: 'Item Category Wise Profit', path: '/reports/item-category-profit-loss' },
-              { title: 'Low Stock Summary', path: '/reports/low-stock-summary' },
-              { title: 'Stock Detail', path: '/reports/stock-detail' },
-              { title: 'Item Detail', path: '/reports/item-detail' },
-              { title: 'Sale / Purchase Report By Item', path: '/reports/sale-purchase-by-item' },
-              { title: 'Stock Summary Report By Item', path: '/reports/stock-summary-by-item' },
-              { title: 'Item Wise Discount', path: '/reports/item-discount' },
-              { title: 'Inventory Valuation', path: '/reports/inventory-value' }
-            ]
-          },
-          {
-            title: 'Inventory Ledger',
-            path: '/reports/inventory-ledger',
-            children: [
-              { title: 'Stock Movement Ledger', path: '/reports/inventory-ledger' },
-              { title: 'Raw Material Summary', path: '/inventory/materials' },
-              { title: 'Stock Movement History', path: '/inventory/history' }
-            ]
-          },
-          {
             title: 'Financial',
             children: [
               {
@@ -188,11 +153,11 @@ export class NavController {
             ]
           },
           {
-            title: 'Franchise',
-            path: '/reports/franchise',
+            title: 'Franchise Reports',
+            path: '/reports?parent=franchise',
             children: [
-              { title: 'Franchise Overview', path: '/reports/franchise' },
-              { title: 'Branch Performance', path: '/reports/franchise/performance' }
+              { title: 'Franchise Performance', path: '/reports?parent=franchise&report=Franchise+Performance+Summary' },
+              { title: 'Franchise Outstanding', path: '/reports?parent=franchise&report=Franchise+Dues+%26+Balances' }
             ]
           }
         ]
