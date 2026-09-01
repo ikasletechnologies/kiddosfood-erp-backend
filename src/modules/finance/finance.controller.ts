@@ -386,13 +386,20 @@ export class FinanceController {
       });
       res.status(201).json(payment);
     } catch (error: any) {
-      const isBusinessError = error.message && (
+      if (error.statusCode === 400 || error.code || (error.message && (
         error.message.startsWith('Insufficient') ||
         error.message.startsWith('Invalid payment') ||
         error.message.startsWith('No ') ||
-        error.message.includes('account found')
-      );
-      res.status(isBusinessError ? 400 : 500).json({ error: error.message });
+        error.message.startsWith('Please ') ||
+        error.message.includes('account')
+      ))) {
+        return res.status(400).json({
+          statusCode: 400,
+          code: error.code || 'BAD_REQUEST',
+          message: error.message
+        });
+      }
+      res.status(500).json({ statusCode: 500, message: error.message });
     }
   }
 

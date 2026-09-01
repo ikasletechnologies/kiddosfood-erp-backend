@@ -1534,11 +1534,15 @@ export class SalesService {
   // came from trusting DeliveryChallanItem.unit's schema default blindly.
   private static async resolveDisplayUnit(item: { unit: string; productId: string | null }, sourceFranchiseId: string | null): Promise<string> {
     if (item.unit && item.unit !== 'NONE') return item.unit;
-    if (!item.productId || !sourceFranchiseId) return item.unit || 'NONE';
+    if (!item.productId) return (item.unit && item.unit !== 'NONE') ? item.unit : 'PCS';
     const product = await prisma.product.findUnique({ where: { id: item.productId }, select: { sku: true } });
-    if (!product?.sku) return item.unit || 'NONE';
-    const invItem = await prisma.inventoryItem.findFirst({ where: { franchiseId: sourceFranchiseId, sku: product.sku }, select: { unit: true } });
-    return invItem?.unit || item.unit || 'NONE';
+    if (sourceFranchiseId && product?.sku) {
+      const invItem = await prisma.inventoryItem.findFirst({ where: { franchiseId: sourceFranchiseId, sku: product.sku }, select: { unit: true } });
+      if (invItem?.unit && invItem.unit !== 'NONE') return invItem.unit;
+    }
+    const recipe = await prisma.recipe.findFirst({ where: { productId: item.productId }, select: { yieldUnit: true } });
+    if (recipe?.yieldUnit && recipe.yieldUnit !== 'NONE') return recipe.yieldUnit;
+    return 'PCS';
   }
 
   private static resolvePartyType(dc: { customerId: string | null; dealerId: string | null; franchiseId: string | null }): string {
@@ -1547,7 +1551,7 @@ export class SalesService {
 
   static async getTransitStock() {
     const challans = await prisma.deliveryChallan.findMany({
-      where: { status: 'IN_TRANSIT' },
+      where: { status: { in: ['IN_TRANSIT', 'OPEN'] } },
       include: { customer: true, dealer: true, items: true },
       orderBy: { challanDate: 'desc' }
     });
@@ -1584,6 +1588,7 @@ export class SalesService {
           quantity: item.quantity,
           unit: await SalesService.resolveDisplayUnit(item, dc.sourceFranchiseId),
           dispatchDate: dc.challanDate,
+          expectedDeliveryDate: dc.dueDate,
           vehicleNo: dc.vehicleNo,
           driverName: dc.driverName,
           status: 'IN_TRANSIT',

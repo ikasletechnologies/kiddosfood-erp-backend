@@ -2,6 +2,8 @@ import prisma from '../../lib/prisma';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { ItemCategory, PaymentMode } from '@prisma/client';
+import { PaymentValidationError } from '../../utils/errors';
+
 
 function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
   let start: Date | undefined = undefined;
@@ -1024,27 +1026,25 @@ export class FinanceService {
         if (existing) return existing;
       }
 
-      // 1. Resolve account (Prefer ID, fallback to Type mapping)
-      let account;
-      if (sourceId && sourceId.length > 20) { // Likely a UUID
-         account = await tx.account.findUnique({ where: { id: sourceId } });
-      } 
-      
-      // Fallback if no account found by ID or if sourceId is a Type string
-      if (!account) {
-         account = await tx.account.findFirst({
-           where: { 
-             type: accountType as any,
-             franchiseId: data.franchiseId || null
-           }
-         });
-      }
+      // 1. Resolve & Validate Account using AccountService rules
+      const chequeDetails = {
+        chequeNumber: data.chequeNumber,
+        chequeDate: data.chequeDate,
+        bankName: data.bankName
+      };
+      const account = await AccountService.validateAccountForPayment(
+        data.method || resolvedPaymentMode,
+        sourceId,
+        data.franchiseId || null,
+        chequeDetails,
+        tx
+      );
 
       // 2. Balance check for OUTFLOW + PAID
       if (flow === 'OUT' && status === 'PAID') {
-        if (!account) throw new Error(`Source account not found. Please create a ${accountType} account first.`);
+        if (!account) throw new PaymentValidationError('INVALID_ACCOUNT_FOR_PAYMENT_MODE', `Source account not found.`);
         if (account.balance < amount) {
-          throw new Error(`Insufficient balance in ${account.name}. Available: ₹${account.balance}`);
+          throw new PaymentValidationError('INSUFFICIENT_FUNDS', `Insufficient balance in ${account.name}. Available: ₹${account.balance}`);
         }
       }
 
