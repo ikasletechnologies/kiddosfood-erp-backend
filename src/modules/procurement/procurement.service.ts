@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
+import { computeGstFromRate, resolveSellerState } from '../../utils/gst-tax.util';
 
 export class ProcurementService {
   /**
@@ -644,6 +645,11 @@ export class ProcurementService {
     items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
+    const [vendor, sellerState] = await Promise.all([
+      prisma.vendor.findUnique({ where: { id: data.vendorId }, select: { state: true } }),
+      resolveSellerState(data.franchiseId)
+    ]);
+
     const poItemsData = await Promise.all(data.items.map(async (item) => {
       const inventoryItem = await prisma.inventoryItem.findUnique({
         where: { id: item.inventoryItemId }
@@ -675,9 +681,7 @@ export class ProcurementService {
       // silently turn a genuine 0%-GST item into 5%, since 0 is falsy.
       const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
       const subtotal = item.quantity * item.price;
-      const gstAmount = (subtotal * gstRate) / 100;
-      const cgst = gstAmount / 2;
-      const sgst = gstAmount / 2;
+      const split = computeGstFromRate(subtotal, gstRate, vendor?.state, sellerState);
 
       return {
         ...item,
@@ -687,10 +691,10 @@ export class ProcurementService {
         price: item.price,
         unit: item.unit || 'UNIT',
         subtotal,
-        cgst,
-        sgst,
-        igst: 0,
-        total: subtotal + gstAmount
+        cgst: split.cgst,
+        sgst: split.sgst,
+        igst: split.igst,
+        total: subtotal + split.taxAmount
       };
     }));
 
@@ -879,6 +883,11 @@ export class ProcurementService {
       if (data.paymentTerms !== undefined) updateData.paymentTerms = data.paymentTerms;
 
       if (data.items && data.items.length > 0) {
+        const [vendorForTax, sellerState] = await Promise.all([
+          tx.vendor.findUnique({ where: { id: data.vendorId || po.vendorId }, select: { state: true } }),
+          resolveSellerState(data.franchiseId !== undefined ? data.franchiseId : po.franchiseId)
+        ]);
+
         const poItemsData = await Promise.all(data.items.map(async (item) => {
           const inventoryItem = await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } });
           // Same guard as createPurchaseOrder — a Finished Good must never
@@ -900,7 +909,7 @@ export class ProcurementService {
           // not get silently bumped to 5% by a falsy-zero fallback.
           const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
           const subtotal = item.quantity * item.price;
-          const gstAmount = (subtotal * gstRate) / 100;
+          const split = computeGstFromRate(subtotal, gstRate, vendorForTax?.state, sellerState);
           return {
             inventoryItemId: item.inventoryItemId,
             itemName: inventoryItem?.name || 'Unknown Material',
@@ -909,10 +918,10 @@ export class ProcurementService {
             price: item.price,
             unit: item.unit || 'UNIT',
             subtotal,
-            cgst: gstAmount / 2,
-            sgst: gstAmount / 2,
-            igst: 0,
-            total: subtotal + gstAmount
+            cgst: split.cgst,
+            sgst: split.sgst,
+            igst: split.igst,
+            total: subtotal + split.taxAmount
           };
         }));
 

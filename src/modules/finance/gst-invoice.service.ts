@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { isInterState as computeIsInterState, resolveSellerState } from '../../utils/gst-tax.util';
 
 interface GSTBreakdown {
   subtotal: number;
@@ -10,6 +11,11 @@ interface GSTBreakdown {
   isInterState: boolean;
 }
 
+// Still takes an explicit isInterState boolean (this file's call sites deal
+// in franchise-to-franchise internal invoices, not a buyer/seller pair) —
+// generateFranchiseInvoice below now derives that boolean from real
+// franchise locations via the canonical util's isInterState() rather than
+// trusting the caller's query-param boolean blindly.
 export function calculateGST(subtotal: number, gstRate: number, isInterState = false): GSTBreakdown {
   const gstAmount = Number(((subtotal * gstRate) / 100).toFixed(2));
   const half = Number((gstAmount / 2).toFixed(2));
@@ -39,8 +45,17 @@ export class GSTInvoiceService {
     if (!order) throw new Error('Franchise order not found');
     if (order.status === 'CANCELLED') throw new Error('Cannot generate invoice for a cancelled franchise order');
 
+    // HQ is the seller on every franchise-order invoice; the destination
+    // franchise is the buyer. Derive inter-state from their real locations
+    // when both are known, falling back to the caller-supplied query param
+    // only when HQ's own location isn't configured yet.
+    const hqLocation = await resolveSellerState(null);
+    const resolvedInterState = (hqLocation && order.franchise.location)
+      ? computeIsInterState(order.franchise.location, hqLocation)
+      : isInterState;
+
     const lineItems = order.items.map(item => {
-      const gst = calculateGST(item.totalAmount, item.product.taxPercent ?? 5, isInterState);
+      const gst = calculateGST(item.totalAmount, item.product.taxPercent ?? 5, resolvedInterState);
       return {
         productName: item.product.name,
         hsnCode: item.product.hsnCode ?? 'N/A',

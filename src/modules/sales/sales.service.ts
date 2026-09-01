@@ -157,17 +157,19 @@ export class SalesService {
       orderBy: { createdAt: 'desc' }
     });
 
-    // Estimate converts to a Sales Order now (convertedOrderId), not
-    // straight to a Tax Invoice — convertedInvoiceId only gets set on a
-    // Quotation via the old (now-unused) direct path and stays null for
-    // every new conversion, so this resolves the Sales Order's number.
     const salesOrderIds = quotations.map(q => q.convertedOrderId).filter(Boolean) as string[];
+    const invoiceIds = quotations.map(q => q.convertedInvoiceId).filter(Boolean) as string[];
     const salesOrderMap = salesOrderIds.length
       ? new Map((await prisma.salesOrder.findMany({ where: { id: { in: salesOrderIds } }, select: { id: true, orderNumber: true } })).map(o => [o.id, o.orderNumber]))
       : new Map<string, string>();
+    const invoiceMap = invoiceIds.length
+      ? new Map((await prisma.order.findMany({ where: { id: { in: invoiceIds } }, select: { id: true, invoiceNum: true } })).map(i => [i.id, i.invoiceNum]))
+      : new Map<string, string>();
+
     return quotations.map(q => ({
       ...q,
-      convertedOrderNumber: q.convertedOrderId ? salesOrderMap.get(q.convertedOrderId) || null : null
+      convertedOrderNumber: q.convertedOrderId ? salesOrderMap.get(q.convertedOrderId) || null : null,
+      convertedInvoiceNumber: q.convertedInvoiceId ? invoiceMap.get(q.convertedInvoiceId) || null : null
     }));
   }
 
@@ -176,17 +178,32 @@ export class SalesService {
       where: { id },
       include: { customer: true, items: true }
     });
-    if (quotation && quotation.convertedOrderId) {
+    if (!quotation) return null;
+
+    let convertedOrderNumber: string | null = null;
+    let convertedInvoiceNumber: string | null = null;
+
+    if (quotation.convertedOrderId) {
       const salesOrder = await prisma.salesOrder.findUnique({
         where: { id: quotation.convertedOrderId },
         select: { orderNumber: true }
       });
-      return {
-        ...quotation,
-        convertedOrderNumber: salesOrder?.orderNumber || null
-      };
+      convertedOrderNumber = salesOrder?.orderNumber || null;
     }
-    return quotation ? { ...quotation, convertedOrderNumber: null } : null;
+
+    if (quotation.convertedInvoiceId) {
+      const invoiceOrder = await prisma.order.findUnique({
+        where: { id: quotation.convertedInvoiceId },
+        select: { invoiceNum: true }
+      });
+      convertedInvoiceNumber = invoiceOrder?.invoiceNum || null;
+    }
+
+    return {
+      ...quotation,
+      convertedOrderNumber,
+      convertedInvoiceNumber
+    };
   }
 
   static async createQuotation(data: {
@@ -396,94 +413,237 @@ export class SalesService {
   ) {
     try {
       return await prisma.$transaction(async (tx) => {
-      const quotation = await tx.quotation.findUnique({ where: { id: quotationId }, include: { items: true } });
-      if (!quotation) throw new Error('Estimate not found.');
+        const quotation = await tx.quotation.findUnique({ where: { id: quotationId }, include: { items: true } });
+        if (!quotation) throw new Error('Estimate not found.');
 
-      // Dedup check FIRST, unconditionally — checking it only inside the
-      // `status !== 'SENT'` branch (as this used to) meant that while the
-      // status was still 'SENT' (i.e. two rapid clicks/tabs both read it
-      // before either transaction committed), the existing-order check was
-      // skipped entirely and both could attempt to create a Sales Order.
-      if (quotation.convertedOrderId) {
-        const existing = await tx.salesOrder.findUnique({ where: { id: quotation.convertedOrderId }, include: { items: true } });
-        if (existing) return existing;
-      }
-      if (quotation.status !== 'SENT') {
-        throw new Error(`Only an Estimate with status SENT can be converted to a Sales Order (current status: ${quotation.status}).`);
-      }
+        if (quotation.status === 'CONVERTED' || quotation.convertedOrderId || quotation.convertedInvoiceId) {
+          throw new Error('This estimate has already been converted.');
+        }
 
-      // Order Date is the conversion moment itself — never the quotation's
-      // own date or its validUntil. Due Date is a separate sales-order
-      // fulfilment/payment commitment: honor an explicit override from the
-      // convert modal, otherwise default to a week out — deliberately not
-      // Quotation.validUntil, which means "this price offer expires on...",
-      // a different business concept (see conversation/spec this followed).
-      const orderDate = new Date();
-      const DEFAULT_DUE_DAYS = 7;
-      const dueDate = trackingData?.dueDate
-        ? new Date(trackingData.dueDate)
-        : new Date(orderDate.getTime() + DEFAULT_DUE_DAYS * 24 * 60 * 60 * 1000);
+        const orderDate = new Date();
+        const DEFAULT_DUE_DAYS = 7;
+        const dueDate = trackingData?.dueDate
+          ? new Date(trackingData.dueDate)
+          : new Date(orderDate.getTime() + DEFAULT_DUE_DAYS * 24 * 60 * 60 * 1000);
 
-      const salesOrder = await tx.salesOrder.create({
-        data: {
-          orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
-          quotationId: quotation.id,
-          partyType: quotation.partyType,
-          partyId: quotation.partyId,
-          customerId: quotation.customerId,
-          customerName: quotation.customerName,
-          customerPhone: quotation.customerPhone,
-          status: 'DRAFT',
-          subTotal: quotation.subTotal,
-          taxAmount: quotation.taxAmount,
-          discountAmount: quotation.discountAmount,
-          totalAmount: quotation.totalAmount,
-          orderDate,
-          dueDate,
-          // Carried forward, not re-asked — see the schema comment on
-          // SalesOrder.stateOfSupply for why this must match the quotation
-          // the customer already accepted rather than being editable here.
-          stateOfSupply: quotation.stateOfSupply,
-          deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
-          deliveryAddress: trackingData?.deliveryAddress || undefined,
-          trackingNumber: trackingData?.trackingNumber || undefined,
-          courierName: trackingData?.courierName || undefined,
-          notes: quotation.notes,
-          createdBy,
-          items: {
-            create: quotation.items.map((item) => ({
-              productId: item.productId,
-              productName: item.productName,
-              quantity: item.quantity,
-              unit: item.unit,
-              rate: item.rate,
-              discountPercent: item.discountPercent || 0,
-              discountAmount: item.discountAmount || 0,
-              taxPercent: item.taxPercent,
-              taxAmount: item.taxAmount,
-              totalAmount: item.totalAmount,
-            })),
+        const salesOrder = await tx.salesOrder.create({
+          data: {
+            orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
+            quotationId: quotation.id,
+            partyType: quotation.partyType,
+            partyId: quotation.partyId,
+            customerId: quotation.customerId,
+            customerName: quotation.customerName,
+            customerPhone: quotation.customerPhone,
+            status: 'DRAFT',
+            subTotal: quotation.subTotal,
+            taxAmount: quotation.taxAmount,
+            discountAmount: quotation.discountAmount,
+            totalAmount: quotation.totalAmount,
+            orderDate,
+            dueDate,
+            stateOfSupply: quotation.stateOfSupply,
+            deliveryDate: trackingData?.deliveryDate ? new Date(trackingData.deliveryDate) : undefined,
+            deliveryAddress: trackingData?.deliveryAddress || undefined,
+            trackingNumber: trackingData?.trackingNumber || undefined,
+            courierName: trackingData?.courierName || undefined,
+            notes: quotation.notes,
+            createdBy,
+            items: {
+              create: quotation.items.map((item) => ({
+                productId: item.productId,
+                productName: item.productName,
+                quantity: item.quantity,
+                unit: item.unit,
+                rate: item.rate,
+                discountPercent: item.discountPercent || 0,
+                discountAmount: item.discountAmount || 0,
+                taxPercent: item.taxPercent,
+                taxAmount: item.taxAmount,
+                totalAmount: item.totalAmount,
+              })),
+            },
           },
-        },
-        include: { items: true },
-      });
+          include: { items: true },
+        });
 
-      await tx.quotation.update({
-        where: { id: quotationId },
-        data: { status: 'CONVERTED', convertedOrderId: salesOrder.id },
-      });
+        await tx.quotation.update({
+          where: { id: quotationId },
+          data: { status: 'CONVERTED', convertedOrderId: salesOrder.id },
+        });
 
-      return salesOrder;
+        return {
+          success: true,
+          estimate: {
+            id: quotation.id,
+            estimateNo: quotation.quotationNumber,
+            status: 'CONVERTED'
+          },
+          salesOrder
+        };
       });
     } catch (err: any) {
-      // True concurrent double-click/multi-tab race backstop — the DB-level
-      // @unique on SalesOrder.quotationId is what actually stops a second
-      // row from persisting; return the winner's row instead of erroring.
       if (err?.code === 'P2002') {
         const quotationNow = await prisma.quotation.findUnique({ where: { id: quotationId } });
         if (quotationNow?.convertedOrderId) {
           const existing = await prisma.salesOrder.findUnique({ where: { id: quotationNow.convertedOrderId }, include: { items: true } });
-          if (existing) return existing;
+          if (existing) {
+            return {
+              success: true,
+              estimate: { id: quotationNow.id, estimateNo: quotationNow.quotationNumber, status: 'CONVERTED' },
+              salesOrder: existing
+            };
+          }
+        }
+      }
+      throw err;
+    }
+  }
+
+  static async convertQuotationToSale(
+    quotationId: string,
+    createdBy: string,
+    payload?: { franchiseId?: string; paymentType?: string; notes?: string }
+  ) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const quotation = await tx.quotation.findUnique({
+          where: { id: quotationId },
+          include: { items: true }
+        });
+        if (!quotation) throw new Error('Estimate not found.');
+
+        if (quotation.status === 'CONVERTED' || quotation.convertedInvoiceId || quotation.convertedOrderId) {
+          throw new Error('This estimate has already been converted.');
+        }
+
+        let franchiseId = payload?.franchiseId;
+        if (!franchiseId) {
+          const hq = await FranchiseService.getHqFranchiseOrNull();
+          franchiseId = hq?.id || '';
+        }
+        if (!franchiseId) {
+          const firstFranchise = await tx.franchise.findFirst();
+          franchiseId = firstFranchise?.id || '';
+        }
+        if (!franchiseId) {
+          throw new Error('A branch/franchise must be configured to convert an estimate to a Sale/Invoice.');
+        }
+
+        const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
+
+        // Resolve a valid Product.id for each OrderItem (FK constraint on OrderItem.productId)
+        const allProducts = await tx.product.findMany();
+        const fallbackProduct = allProducts[0];
+        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
+
+        for (const item of quotation.items) {
+          let validProductId = item.productId || '';
+          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
+          
+          if (productMatch) {
+            validProductId = productMatch.id;
+          } else if (item.productId) {
+            const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
+            if (invItem) {
+              const matchedBySkuOrName = allProducts.find(p => (invItem.sku && p.sku === invItem.sku) || p.name.toLowerCase() === invItem.name.toLowerCase());
+              if (matchedBySkuOrName) {
+                validProductId = matchedBySkuOrName.id;
+              }
+            }
+          }
+
+          if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
+            if (fallbackProduct) {
+              validProductId = fallbackProduct.id;
+            } else {
+              const newProd = await tx.product.create({
+                data: {
+                  name: item.productName || 'General Item',
+                  basePrice: item.rate,
+                  taxPercent: item.taxPercent || 0,
+                }
+              });
+              validProductId = newProd.id;
+            }
+          }
+
+          orderItemsData.push({
+            productId: validProductId,
+            quantity: item.quantity,
+            unit: item.unit || 'NONE',
+            price: item.rate,
+            discountPct: item.discountPercent || 0,
+            taxAmount: item.taxAmount,
+            totalAmount: item.totalAmount,
+          });
+        }
+
+        const order = await tx.order.create({
+          data: {
+            invoiceNum,
+            partyType: quotation.partyType,
+            partyId: quotation.partyId,
+            customerId: quotation.customerId,
+            franchiseId,
+            orderType: 'DINE_IN',
+            status: 'COMPLETED',
+            subTotal: quotation.subTotal,
+            taxAmount: quotation.taxAmount,
+            discountAmount: quotation.discountAmount,
+            totalAmount: quotation.totalAmount,
+            paymentStatus: 'UNPAID',
+            paymentType: payload?.paymentType || 'CASH',
+            stateOfSupply: quotation.stateOfSupply,
+            inventory_deducted: true,
+            sourceQuotationId: quotation.id,
+            orderItems: {
+              create: orderItemsData
+            }
+          },
+          include: { orderItems: true }
+        });
+
+        const invoice = await tx.invoice.create({
+          data: {
+            orderId: order.id,
+            totalAmount: quotation.subTotal - quotation.discountAmount,
+            taxAmount: quotation.taxAmount,
+            finalAmount: quotation.totalAmount,
+            status: 'PENDING',
+            termsAndConditions: quotation.termsConditions || null,
+            notes: quotation.notes || null,
+          }
+        });
+
+        await tx.quotation.update({
+          where: { id: quotationId },
+          data: { status: 'CONVERTED', convertedInvoiceId: order.id },
+        });
+
+        return {
+          success: true,
+          estimate: {
+            id: quotation.id,
+            estimateNo: quotation.quotationNumber,
+            status: 'CONVERTED'
+          },
+          sale: order,
+          invoice
+        };
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        const quotationNow = await prisma.quotation.findUnique({ where: { id: quotationId } });
+        if (quotationNow?.convertedInvoiceId) {
+          const existing = await prisma.order.findUnique({ where: { id: quotationNow.convertedInvoiceId }, include: { orderItems: true } });
+          if (existing) {
+            return {
+              success: true,
+              estimate: { id: quotationNow.id, estimateNo: quotationNow.quotationNumber, status: 'CONVERTED' },
+              sale: existing
+            };
+          }
         }
       }
       throw err;
@@ -1240,14 +1400,64 @@ export class SalesService {
   }
 
   static async updateReturnOrder(id: string, data: { status?: string; approvedBy?: string }) {
-    return prisma.returnOrder.update({
-      where: { id },
-      data: {
-        status: data.status as any,
-        approvedBy: data.approvedBy,
-        approvedAt: data.status === 'APPROVED' ? new Date() : undefined
+    const updateData: any = {
+      status: data.status as any,
+      approvedBy: data.approvedBy,
+      approvedAt: data.status === 'APPROVED' ? new Date() : undefined
+    };
+
+    // Backfill the GST breakdown only on approval — a PENDING return isn't
+    // yet an "applicable" credit note and must not feed any GST report
+    // (see the ReturnOrder schema comment). Approximated (not ledger-grade)
+    // since ReturnItem carries no per-line tax of its own: taxableValue is
+    // the refund total, gstRate is a quantity-weighted average of the
+    // returned products' own rates, and the CGST/SGST vs IGST split reuses
+    // the same canonical util and buyer/seller states as every other report.
+    if (data.status === 'APPROVED') {
+      const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
+      const ret = await prisma.returnOrder.findUnique({
+        where: { id },
+        include: {
+          items: true,
+          posOrder: { select: { stateOfSupply: true, franchiseId: true } },
+          salesOrder: { select: { stateOfSupply: true } }
+        }
+      });
+
+      if (ret) {
+        const buyerState = ret.posOrder?.stateOfSupply || ret.salesOrder?.stateOfSupply || null;
+        const franchiseId = ret.franchiseId || ret.posOrder?.franchiseId || null;
+        const sellerState = await resolveSellerState(franchiseId);
+
+        const productIds = ret.items.map((i) => i.productId).filter(Boolean) as string[];
+        const products = productIds.length
+          ? await prisma.product.findMany({ where: { id: { in: productIds } }, select: { id: true, taxPercent: true } })
+          : [];
+        const rateMap = new Map(products.map((p) => [p.id, p.taxPercent]));
+
+        const taxableValue = ret.refundAmount || 0;
+        let weightedRateSum = 0;
+        let weightTotal = 0;
+        for (const item of ret.items) {
+          const rate = item.productId && rateMap.has(item.productId) ? (rateMap.get(item.productId) as number) : 5;
+          const lineValue = item.totalAmount || item.quantity * item.rate;
+          weightedRateSum += rate * lineValue;
+          weightTotal += lineValue;
+        }
+        const gstRate = weightTotal > 0 ? Number((weightedRateSum / weightTotal).toFixed(2)) : 0;
+        const taxAmount = Number(((taxableValue * gstRate) / 100).toFixed(2));
+        const split = splitGstAmount(taxAmount, buyerState, sellerState);
+
+        updateData.taxableValue = taxableValue;
+        updateData.gstRate = gstRate;
+        updateData.cgst = split.cgst;
+        updateData.sgst = split.sgst;
+        updateData.igst = split.igst;
+        updateData.taxAmount = taxAmount;
       }
-    });
+    }
+
+    return prisma.returnOrder.update({ where: { id }, data: updateData });
   }
 
   static async recordRefund(returnId: string, data: { accountId: string; method: string; createdBy?: string }) {

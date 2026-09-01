@@ -617,8 +617,11 @@ app.post('/api/sales/quotations', authenticate, authorizeRole(['FRANCHISE_ADMIN'
 app.get('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getQuotation);
 app.patch('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateQuotation);
 app.put('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateQuotation);
-app.delete('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.deleteQuotation);
 app.post('/api/sales/quotations/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotation);
+app.post('/api/sales/quotations/:id/convert-to-sale', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
+app.post('/api/sales/quotations/:id/convert-to-sales-order', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
+app.post('/api/estimates/:id/convert-to-sale', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
+app.post('/api/estimates/:id/convert-to-sales-order', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
 
 app.get('/api/sales/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getSalesOrders);
 app.post('/api/sales/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createSalesOrder);

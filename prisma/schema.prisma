@@ -579,6 +579,7 @@ model Product {
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @updatedAt
   hsnCode         String?
+  sacCode         String?
   productType     ProductType          @default(FINISHED_GOOD)
   shelfLifeDays   Int?
   franchiseOrders FranchiseOrderItem[]
@@ -1539,6 +1540,16 @@ model ReturnOrder {
   reason           String
   status           ReturnStatus    @default(PENDING)
   refundAmount     Float
+  // GST breakdown of refundAmount, backfilled from the original sale's tax
+  // split at approval time (see SalesService.updateReturnOrder). Null while
+  // PENDING — an unapproved return is not yet an "applicable" credit note
+  // and must not feed any GST report.
+  taxableValue     Float?
+  gstRate          Float?
+  cgst             Float?
+  sgst             Float?
+  igst             Float?
+  taxAmount        Float?
   refundMethod     String?
   approvedBy       String?
   approvedAt       DateTime?
@@ -1681,6 +1692,14 @@ model PurchaseReturn {
   returnSource       String               @default("MANUAL")
   status             String               @default("PENDING")
   refundAmount       Float
+  // GST breakdown of refundAmount, backfilled at approval time. See
+  // ReturnOrder's matching fields for the same rationale.
+  taxableValue       Float?
+  gstRate            Float?
+  cgst               Float?
+  sgst               Float?
+  igst               Float?
+  taxAmount          Float?
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
   procurementOrder   ProcurementOrder?    @relation(fields: [procurementOrderId], references: [id])
@@ -2086,6 +2105,7 @@ enum QCStatus {
 enum ProductType {
   FINISHED_GOOD
   MADE_TO_ORDER
+  SERVICE
 }
 
 enum FranchiseOrderStatus {

@@ -194,6 +194,52 @@ export class PurchaseService {
   }
 
   /**
+   * Backfill a Purchase Return's GST breakdown once it's APPROVED/COMPLETED
+   * — the point it becomes an "applicable" debit note (see PurchaseReturn's
+   * schema comment). Approximated (matches PurchaseReturnItem to the
+   * originating PO's line by item name, since neither carries per-line tax
+   * of its own): taxableValue is the refund total, gstRate is a
+   * quantity-weighted average of the matched PO lines' own rates, and the
+   * CGST/SGST vs IGST split reuses the same canonical util as every other
+   * GST report/write path.
+   */
+  static async backfillPurchaseReturnTax(tx: any, returnId: string) {
+    const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
+    const pr = await tx.purchaseReturn.findUnique({
+      where: { id: returnId },
+      include: {
+        items: true,
+        vendor: { select: { state: true } },
+        procurementOrder: { include: { poItems: true } }
+      }
+    });
+    if (!pr) return;
+
+    const sellerState = await resolveSellerState(pr.procurementOrder?.franchiseId || null);
+    const poItems = pr.procurementOrder?.poItems || [];
+    const rateMap = new Map(poItems.map((pi: any) => [(pi.itemName || '').toLowerCase(), pi.gstRate]));
+
+    const taxableValue = Number(pr.refundAmount) || 0;
+    let weightedRateSum = 0;
+    let weightTotal = 0;
+    for (const item of pr.items) {
+      const key = (item.itemName || '').toLowerCase();
+      const rate = rateMap.has(key) ? (rateMap.get(key) as number) : 5;
+      const lineValue = item.totalAmount || item.quantity * item.rate;
+      weightedRateSum += rate * lineValue;
+      weightTotal += lineValue;
+    }
+    const gstRate = weightTotal > 0 ? Number((weightedRateSum / weightTotal).toFixed(2)) : 0;
+    const taxAmount = Number(((taxableValue * gstRate) / 100).toFixed(2));
+    const split = splitGstAmount(taxAmount, pr.vendor?.state, sellerState);
+
+    await tx.purchaseReturn.update({
+      where: { id: returnId },
+      data: { taxableValue, gstRate, cgst: split.cgst, sgst: split.sgst, igst: split.igst, taxAmount }
+    });
+  }
+
+  /**
    * Recognize a Purchase Return in the Vendor Ledger (DEBIT) and update running balance.
    * Idempotent: Skips if a RETURN ledger entry for this return already exists.
    */
@@ -352,6 +398,7 @@ export class PurchaseService {
           }
         }
 
+        await this.backfillPurchaseReturnTax(tx, created.id);
         await this.recognizeReturn(tx, created.id);
       }
 
@@ -399,6 +446,7 @@ export class PurchaseService {
         }
 
         // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor)
+        await this.backfillPurchaseReturnTax(tx, id);
         await this.recognizeReturn(tx, id);
       }
 

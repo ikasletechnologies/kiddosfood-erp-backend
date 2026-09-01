@@ -21,6 +21,8 @@ async function main() {
       itemTotalAmount: existing.items[0]?.totalAmount,
     });
 
+    await prisma.quotation.update({ where: { id: existing.id }, data: { status: 'SENT', convertedOrderId: null, convertedInvoiceId: null } });
+
     const updated = await SalesService.updateQuotation(existing.id, {
       items: existing.items.map(i => ({
         productId: i.productId || undefined,

@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { ProcurementService } from '../procurement/procurement.service';
 import { VendorInvoiceService } from '../vendor-invoices/vendor-invoices.service';
+import { resolveSellerState } from '../../utils/gst-tax.util';
 
 export class GRNService {
   /**
@@ -158,7 +159,7 @@ export class GRNService {
     return prisma.$transaction(async (tx) => {
       const grn = await tx.goodsReceipt.findUnique({
         where: { id: grnId },
-        include: { items: true, procurementOrder: { include: { poItems: true } } }
+        include: { items: true, procurementOrder: { include: { poItems: true, vendor: { select: { state: true } } } } }
       });
       if (!grn) throw new Error('GRN not found');
       if (grn.status === 'COMPLETED') throw new Error('GRN already approved');
@@ -264,7 +265,8 @@ export class GRNService {
       // paths can no longer disagree the way they used to (this path had
       // tax right via a flat taxFactor; the manual path hardcoded 0% and
       // could overwrite this correct bill with a tax-free one).
-      const commercials = VendorInvoiceService.computeCommercialsFromPO(grn.procurementOrder, grn.items);
+      const sellerState = await resolveSellerState(grn.procurementOrder.franchiseId);
+      const commercials = VendorInvoiceService.computeCommercialsFromPO(grn.procurementOrder, grn.items, grn.procurementOrder.vendor?.state, sellerState);
 
       if (commercials.amount > 0) {
         // Automatically generate a Purchase Bill (Vendor Invoice) only if one doesn't exist yet.

@@ -57,13 +57,31 @@ export class SalesController {
     }
   }
 
-  // Estimate -> Sales Order (not a Tax Invoice — see SalesService's chain
-  // comment for why this used to skip straight there).
   static async convertQuotation(req: Request, res: Response) {
     try {
       const createdBy = (req as any).user?.userId;
-      const salesOrder = await SalesService.convertQuotationToSalesOrder(req.params.id, createdBy, req.body);
-      res.status(201).json(salesOrder);
+      const result = await SalesService.convertQuotationToSalesOrder(req.params.id, createdBy, req.body);
+      res.status(201).json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async convertQuotationToSalesOrder(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const result = await SalesService.convertQuotationToSalesOrder(req.params.id, createdBy, req.body);
+      res.status(201).json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async convertQuotationToSale(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const result = await SalesService.convertQuotationToSale(req.params.id, createdBy, req.body);
+      res.status(201).json(result);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }

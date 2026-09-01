@@ -895,8 +895,8 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
-      const report = await FinanceService.getGSTR1Data(franchiseId, startDate as string, endDate as string);
+      const { startDate, endDate, partyId, gstRate } = req.query;
+      const report = await FinanceService.getGSTR1Data({ franchiseId, startDate, endDate, partyId, gstRate });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -908,8 +908,8 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
-      const report = await FinanceService.getGSTR2Data(franchiseId, startDate as string, endDate as string);
+      const { startDate, endDate, partyId, gstRate } = req.query;
+      const report = await FinanceService.getGSTR2Data({ franchiseId, startDate, endDate, partyId, gstRate });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -947,8 +947,8 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
-      const report = await FinanceService.getHsnSummaryData(franchiseId, startDate as string, endDate as string);
+      const { startDate, endDate, partyId, gstRate } = req.query;
+      const report = await FinanceService.getHsnSummaryData({ franchiseId, startDate, endDate, partyId, gstRate });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -960,8 +960,8 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
-      const report = await FinanceService.getSacReportData(franchiseId, startDate as string, endDate as string);
+      const { startDate, endDate, partyId, gstRate } = req.query;
+      const report = await FinanceService.getSacReportData({ franchiseId, startDate, endDate, partyId, gstRate });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

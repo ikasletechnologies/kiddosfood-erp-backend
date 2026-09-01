@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
+import { splitGstAmount, resolveSellerState } from '../../utils/gst-tax.util';
 
 
 export class VendorInvoiceService {
@@ -18,7 +19,9 @@ export class VendorInvoiceService {
    */
   static computeCommercialsFromPO(
     po: { poItems: { inventoryItemId: string | null; gstRate: number; quantity: number; price: number }[]; subtotal: number; cgst: number; sgst: number; igst: number; totalAmount: number; discountAmount?: number | null; freightCost?: number | null; warehouseId?: string | null },
-    grnItems?: { materialId: string | null; acceptedQty: number; price: number; warehouseId?: string | null }[]
+    grnItems?: { materialId: string | null; acceptedQty: number; price: number; warehouseId?: string | null }[],
+    buyerState?: string | null,
+    sellerState?: string | null
   ) {
     if (!grnItems || grnItems.length === 0) {
       // No GRN context (direct/full-PO bill) — bill the PO's own totals as-is.
@@ -50,11 +53,13 @@ export class VendorInvoiceService {
       
       const lineSubtotal = new Decimal(gi.acceptedQty).times(gi.price);
       const lineTax = lineSubtotal.times(gstRate).dividedBy(100);
-      
+      const lineSplit = splitGstAmount(lineTax.toNumber(), buyerState, sellerState);
+
       acceptedSubtotal = acceptedSubtotal.plus(lineSubtotal);
-      cgst = cgst.plus(lineTax.dividedBy(2));
-      sgst = sgst.plus(lineTax.dividedBy(2));
-      
+      cgst = cgst.plus(lineSplit.cgst);
+      sgst = sgst.plus(lineSplit.sgst);
+      igst = igst.plus(lineSplit.igst);
+
       if (!warehouseId && gi.warehouseId) warehouseId = gi.warehouseId;
     }
 
@@ -141,6 +146,9 @@ export class VendorInvoiceService {
     amount: number;
     subtotal?: number;
     taxAmount?: number;
+    cgst?: number;
+    sgst?: number;
+    igst?: number;
     discountAmount?: number;
     freightCost?: number;
     items?: any[];
@@ -167,8 +175,43 @@ export class VendorInvoiceService {
           }
         });
         actualPoId = directPo.id;
+
+        // No PO/GRN to derive tax from — use whatever breakdown the caller
+        // supplied, or auto-split a blended taxAmount by vendor-vs-seller
+        // state (this used to leave cgst/sgst/igst NULL forever, silently
+        // dropping every Direct Purchase bill's GST from GSTR-2).
+        if (data.cgst != null || data.sgst != null || data.igst != null) {
+          commercials = {
+            subtotal: data.subtotal ?? data.amount,
+            cgst: data.cgst || 0,
+            sgst: data.sgst || 0,
+            igst: data.igst || 0,
+            taxAmount: data.taxAmount ?? ((data.cgst || 0) + (data.sgst || 0) + (data.igst || 0)),
+            discountAmount: data.discountAmount || 0,
+            freightCost: data.freightCost || 0,
+            amount: data.amount,
+            warehouseId: null,
+          };
+        } else if (data.taxAmount) {
+          const [vendor, sellerState] = await Promise.all([
+            tx.vendor.findUnique({ where: { id: data.vendorId }, select: { state: true } }),
+            resolveSellerState(null)
+          ]);
+          const split = splitGstAmount(data.taxAmount, vendor?.state, sellerState);
+          commercials = {
+            subtotal: data.subtotal ?? data.amount,
+            cgst: split.cgst,
+            sgst: split.sgst,
+            igst: split.igst,
+            taxAmount: data.taxAmount,
+            discountAmount: data.discountAmount || 0,
+            freightCost: data.freightCost || 0,
+            amount: data.amount,
+            warehouseId: null,
+          };
+        }
       } else {
-        const po = await tx.procurementOrder.findUnique({ where: { id: actualPoId }, include: { poItems: true } });
+        const po = await tx.procurementOrder.findUnique({ where: { id: actualPoId }, include: { poItems: true, vendor: { select: { state: true } } } });
         if (!po) throw new Error('Purchase Order not found');
 
         // Bill tied to a real PO — derive subtotal/tax/gross SERVER-SIDE from
@@ -179,7 +222,8 @@ export class VendorInvoiceService {
         const grn = data.grnId
           ? await tx.goodsReceipt.findUnique({ where: { id: data.grnId }, include: { items: true } })
           : null;
-        commercials = this.computeCommercialsFromPO(po, grn?.items);
+        const sellerState = await resolveSellerState(po.franchiseId);
+        commercials = this.computeCommercialsFromPO(po, grn?.items, po.vendor?.state, sellerState);
       }
 
       let invoiceId: string;
