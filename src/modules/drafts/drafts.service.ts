@@ -10,10 +10,13 @@ export class DraftsService {
 
   static async saveDraft(userId: string, draft: { id?: string; type: string; data: any }) {
     if (draft.id) {
-      return prisma.draft.update({
-        where: { id: draft.id },
-        data: { data: draft.data, updatedAt: new Date() },
-      });
+      const existing = await prisma.draft.findUnique({ where: { id: draft.id } });
+      if (existing) {
+        return prisma.draft.update({
+          where: { id: draft.id },
+          data: { data: draft.data, updatedAt: new Date() },
+        });
+      }
     }
     return prisma.draft.create({
       data: { type: draft.type, userId, data: draft.data },
@@ -21,6 +24,6 @@ export class DraftsService {
   }
 
   static async deleteDraft(id: string) {
-    return prisma.draft.delete({ where: { id } });
+    return prisma.draft.deleteMany({ where: { id } });
   }
 }
