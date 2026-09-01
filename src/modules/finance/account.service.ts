@@ -1,5 +1,7 @@
 import prisma from '../../lib/prisma';
 import { FranchiseService } from '../franchise/franchise.service';
+import { PaymentValidationError } from '../../utils/errors';
+
 
 /**
  * AccountService
@@ -211,4 +213,226 @@ export class AccountService {
       })
     };
   }
+
+  /**
+   * Validate account eligibility for a payment mode.
+   * Throws PaymentValidationError with machine-readable codes on any failure.
+   */
+  static async validateAccountForPayment(
+    paymentMode: string,
+    sourceAccount?: string,
+    franchiseId?: string | null,
+    chequeDetails?: { chequeNumber?: string; chequeDate?: any; bankName?: string },
+    tx?: any
+  ) {
+    const db = tx || prisma;
+    const modeUpper = (paymentMode || '').toUpperCase();
+
+    // 1. CASH Mode
+    if (modeUpper === 'CASH') {
+      let account: any = null;
+      if (sourceAccount && sourceAccount.length > 20) {
+        account = await db.account.findUnique({ where: { id: sourceAccount } });
+        if (!account) {
+          throw new PaymentValidationError(
+            'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+            'The selected cash account was not found.'
+          );
+        }
+      } else {
+        account = await db.account.findFirst({
+          where: {
+            type: 'CASH',
+            status: 'ACTIVE',
+            ...(franchiseId ? { franchiseId } : {})
+          }
+        });
+      }
+
+      if (!account) {
+        throw new PaymentValidationError(
+          'CASH_ACCOUNT_NOT_CONFIGURED',
+          'No active cash account is configured. Please create or activate a cash account before receiving a cash payment.'
+        );
+      }
+      if (account.status !== 'ACTIVE') {
+        throw new PaymentValidationError(
+          'ACCOUNT_INACTIVE',
+          'The selected cash account is inactive. Please select an active account.'
+        );
+      }
+      if (account.type !== 'CASH') {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected account is not a Cash account.'
+        );
+      }
+      return account;
+    }
+
+    // 2. BANK Mode (BANK, BANK_TRANSFER, NEFT, RTGS, IMPS)
+    if (
+      modeUpper === 'BANK' ||
+      modeUpper === 'BANK_TRANSFER' ||
+      modeUpper === 'NEFT' ||
+      modeUpper === 'RTGS' ||
+      modeUpper === 'IMPS'
+    ) {
+      const activeBankCount = await db.account.count({
+        where: {
+          type: 'BANK',
+          status: 'ACTIVE',
+          ...(franchiseId ? { franchiseId } : {})
+        }
+      });
+      if (activeBankCount === 0) {
+        throw new PaymentValidationError(
+          'BANK_ACCOUNT_NOT_CONFIGURED',
+          'No bank account is configured. Please add a bank account before receiving this payment.'
+        );
+      }
+
+      if (!sourceAccount || sourceAccount.length <= 20) {
+        throw new PaymentValidationError(
+          'BANK_ACCOUNT_REQUIRED',
+          'Please select the bank account where this payment was received.'
+        );
+      }
+
+      const account = await db.account.findUnique({ where: { id: sourceAccount } });
+      if (!account) {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected bank account was not found.'
+        );
+      }
+      if (account.status !== 'ACTIVE') {
+        throw new PaymentValidationError(
+          'ACCOUNT_INACTIVE',
+          'The selected bank account is inactive. Please select an active account.'
+        );
+      }
+      if (account.type !== 'BANK') {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected account is not a Bank account.'
+        );
+      }
+      return account;
+    }
+
+    // 3. UPI / ONLINE Mode (UPI, CARD, WALLET, ONLINE)
+    if (
+      modeUpper === 'UPI' ||
+      modeUpper === 'CARD' ||
+      modeUpper === 'WALLET' ||
+      modeUpper === 'ONLINE'
+    ) {
+      const eligibleAccountsCount = await db.account.count({
+        where: {
+          type: { in: ['UPI', 'BANK'] },
+          status: 'ACTIVE',
+          ...(franchiseId ? { franchiseId } : {})
+        }
+      });
+      if (eligibleAccountsCount === 0) {
+        throw new PaymentValidationError(
+          'UPI_ACCOUNT_NOT_CONFIGURED',
+          'No Bank/UPI account is configured. Please configure an account before receiving an online payment.'
+        );
+      }
+
+      if (!sourceAccount || sourceAccount.length <= 20) {
+        throw new PaymentValidationError(
+          'UPI_ACCOUNT_REQUIRED',
+          'Please select the Bank or UPI account for this online payment.'
+        );
+      }
+
+      const account = await db.account.findUnique({ where: { id: sourceAccount } });
+      if (!account) {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected UPI/Bank account was not found.'
+        );
+      }
+      if (account.status !== 'ACTIVE') {
+        throw new PaymentValidationError(
+          'ACCOUNT_INACTIVE',
+          'The selected account is inactive. Please select an active account.'
+        );
+      }
+      if (account.type !== 'UPI' && account.type !== 'BANK') {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected account is not valid for UPI/Online payments.'
+        );
+      }
+      return account;
+    }
+
+    // 4. CHEQUE Mode
+    if (modeUpper === 'CHEQUE') {
+      const chequeNum = chequeDetails?.chequeNumber;
+      const chequeDt = chequeDetails?.chequeDate;
+      if (!chequeNum || !chequeDt) {
+        throw new PaymentValidationError(
+          'CHEQUE_DETAILS_REQUIRED',
+          'Cheque details (bank name, cheque number, cheque date) are required for cheque payments.'
+        );
+      }
+
+      if (!sourceAccount || sourceAccount.length <= 20) {
+        throw new PaymentValidationError(
+          'BANK_ACCOUNT_REQUIRED',
+          'Please select the bank account for this cheque payment.'
+        );
+      }
+
+      const account = await db.account.findUnique({ where: { id: sourceAccount } });
+      if (!account) {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected bank account for cheque was not found.'
+        );
+      }
+      if (account.status !== 'ACTIVE') {
+        throw new PaymentValidationError(
+          'ACCOUNT_INACTIVE',
+          'The selected bank account is inactive. Please select an active account.'
+        );
+      }
+      if (account.type !== 'BANK') {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected account is not a Bank account.'
+        );
+      }
+      return account;
+    }
+
+    // 5. Fallback for any other mode
+    if (sourceAccount && sourceAccount.length > 20) {
+      const account = await db.account.findUnique({ where: { id: sourceAccount } });
+      if (!account) {
+        throw new PaymentValidationError(
+          'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+          'The selected target account was not found.'
+        );
+      }
+      if (account.status !== 'ACTIVE') {
+        throw new PaymentValidationError(
+          'ACCOUNT_INACTIVE',
+          'The selected account is inactive. Please select an active account.'
+        );
+      }
+      return account;
+    }
+
+    throw new PaymentValidationError(
+      'INVALID_ACCOUNT_FOR_PAYMENT_MODE',
+      'Valid destination account is required for this payment.'
+    );
+  }
 }
+
