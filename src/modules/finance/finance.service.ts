@@ -517,17 +517,19 @@ export class FinanceService {
   // exists at all.
   private static mergeAllocationsIntoPayments(invoice: any): any {
     if (!invoice) return invoice;
-    const allocationPayments = (invoice.allocations || []).map((a: any) => ({
-      id: a.payment?.id,
-      paidAmount: a.amount,
-      status: a.payment?.status,
-      isCancelled: a.payment?.isCancelled,
-      createdAt: a.payment?.createdAt,
-      paymentMode: a.payment?.paymentMode,
-      paymentNumber: a.payment?.paymentNumber,
-      accountId: a.payment?.accountId,
-      isAllocation: true,
-    }));
+    const allocationPayments = (invoice.allocations || [])
+      .filter((a: any) => a.payment?.invoiceId !== invoice.id)
+      .map((a: any) => ({
+        id: a.payment?.id,
+        paidAmount: a.amount,
+        status: a.payment?.status,
+        isCancelled: a.payment?.isCancelled,
+        createdAt: a.payment?.createdAt,
+        paymentMode: a.payment?.paymentMode,
+        paymentNumber: a.payment?.paymentNumber,
+        accountId: a.payment?.accountId,
+        isAllocation: true,
+      }));
     return { ...invoice, payments: [...(invoice.payments || []), ...allocationPayments] };
   }
 
@@ -1157,7 +1159,17 @@ export class FinanceService {
         _sum: { paidAmount: true },
       }),
       tx.paymentAllocation.aggregate({
-        where: { invoiceId, payment: { status: 'PAID', isCancelled: false } },
+        where: { 
+          invoiceId, 
+          payment: { 
+            status: 'PAID', 
+            isCancelled: false,
+            OR: [
+              { invoiceId: null },
+              { invoiceId: { not: invoiceId } }
+            ]
+          } 
+        },
         _sum: { amount: true },
       }),
     ]);
@@ -1176,15 +1188,24 @@ export class FinanceService {
   // `payments`, so this only adds the missing term and changes no other
   // behavior at any call site.
   private static sumOrderPaidWithAllocations(
-    payments: { paidAmount: number; isCancelled: boolean; status: string }[] | null | undefined,
-    allocations: { amount: number; payment: { status: string; isCancelled: boolean } }[] | null | undefined,
+    payments: { id?: string; paidAmount: number; isCancelled: boolean; status: string }[] | null | undefined,
+    allocations: { amount: number; payment: { id?: string; invoiceId?: string | null; status: string; isCancelled: boolean } }[] | null | undefined,
     isValid: (p: { status: string; isCancelled: boolean }) => boolean
   ): number {
+    const directIds = new Set((payments || []).map((p: any) => p.id).filter(Boolean));
     const direct = (payments || [])
       .filter((p) => isValid(p))
       .reduce((s, p) => s + (p.paidAmount || 0), 0);
     const allocated = (allocations || [])
-      .filter((a) => isValid(a.payment))
+      .filter((a) => {
+        if (!isValid(a.payment)) return false;
+        // If payment id is available, ensure we don't double count a payment already in the direct list
+        if ((a.payment as any).id && directIds.has((a.payment as any).id)) return false;
+        // If the payment was created with an explicit invoiceId (legacy single invoice path),
+        // its paidAmount is already fully counted in the direct `payments` list.
+        if ((a.payment as any).invoiceId) return false;
+        return true;
+      })
       .reduce((s, a) => s + (a.amount || 0), 0);
     return direct + allocated;
   }
@@ -2274,7 +2295,11 @@ export class FinanceService {
           order: {
             include: { customer: true }
           },
-          account: true
+          invoice: true,
+          account: true,
+          vendorInvoice: {
+            include: { vendor: true }
+          }
         },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -2284,26 +2309,81 @@ export class FinanceService {
       prisma.payment.aggregate({ where: { AND: [whereClause, this.PAYMENT_OUTFLOW_FILTER] }, _sum: { paidAmount: true } })
     ]);
 
-    const data = payments.map(p => {
+    const expenseIds = Array.from(new Set(
+      payments.filter(p => p.sourceModule === 'EXPENSE' && p.linkedDocId).map(p => p.linkedDocId as string)
+    ));
+    const linkedExpenses = expenseIds.length
+      ? await prisma.expense.findMany({ where: { id: { in: expenseIds } }, select: { id: true, payee: true, category: true } })
+      : [];
+    const expenseById = new Map(linkedExpenses.map(e => [e.id, e]));
+
+    const data = await Promise.all(payments.map(async p => {
       const flow = p.entityType === 'VENDOR' || p.sourceModule === 'EXPENSE' || p.type === 'INTERNAL_TRANSFER' ? 'OUT' : 'IN';
+      let partyName = await this.resolvePartyName(p.entityType, p.entityId);
+
+      if (!partyName) {
+        if (p.order?.customerName) {
+          partyName = p.order.customerName;
+        } else if (p.order?.customer?.name) {
+          partyName = p.order.customer.name;
+        } else if (p.vendorInvoice?.vendor?.name) {
+          partyName = p.vendorInvoice.vendor.name;
+        } else if (p.sourceModule === 'EXPENSE') {
+          const linkedExpense = p.linkedDocId ? expenseById.get(p.linkedDocId) : undefined;
+          partyName = linkedExpense?.payee || (p.entityId ? p.entityId : linkedExpense?.category ? linkedExpense.category : null);
+        }
+      }
+
+      let transactionType = 'Payment';
+      if (p.vendorInvoice || p.entityType === 'VENDOR') {
+        transactionType = 'Purchase';
+      } else if (p.sourceModule === 'POS' || p.order || p.invoice) {
+        transactionType = 'Sale';
+      } else if (p.sourceModule === 'EXPENSE') {
+        transactionType = 'Expense';
+      } else if (p.type === 'INTERNAL_TRANSFER') {
+        transactionType = 'Transfer';
+      } else if (p.entityType === 'CUSTOMER') {
+        transactionType = flow === 'IN' ? 'Receipt' : 'Payment';
+      }
+
+      const total = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
+      const moneyIn = flow === 'IN' ? Number(p.paidAmount) : null;
+      const moneyOut = flow === 'OUT' ? Number(p.paidAmount) : null;
+      const refNo = p.paymentNumber || p.transactionRef || (p.order?.invoiceNum ? `INV-${p.order.invoiceNum}` : p.id?.slice(-8) || p.id);
+
       return {
         id: p.id,
         createdAt: p.createdAt,
+        date: p.createdAt,
         time: p.createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-        particulars: p.transactionRef || (p.entityType === 'VENDOR' ? 'Vendor Payment' : p.entityType === 'CUSTOMER' ? 'Customer Payment' : p.sourceModule || 'Direct Payment'),
-        type: flow === 'IN' ? 'DEBIT' : 'CREDIT',
-        voucherType: p.sourceModule || p.linkedDocType || 'Payment',
-        voucherNo: p.paymentNumber || p.id,
+        name: partyName || null,
+        partyName: partyName || null,
+        refNo,
+        paymentNumber: p.paymentNumber,
+        type: transactionType,
+        transactionType,
+        paymentType: p.paymentMode,
+        paymentMode: p.paymentMode,
+        total,
+        moneyIn,
+        moneyOut,
         amount: p.paidAmount,
+        paidAmount: p.paidAmount,
+        accountingType: flow === 'IN' ? 'DEBIT' : 'CREDIT',
+        flow,
+        particulars: p.transactionRef || (transactionType === 'Purchase' ? 'Vendor Purchase Payment' : transactionType === 'Sale' ? 'Sales Payment Receipt' : transactionType === 'Expense' ? 'Expense Payment' : `${transactionType} Voucher`),
+        status: p.status,
         isCancelled: p.isCancelled,
         createdBy: p.createdBy || 'System',
-        approvedBy: p.approvedBy || 'System'
+        approvedBy: p.approvedBy || 'System',
+        accountName: p.account?.name || null,
+        orderId: p.orderId,
+        invoiceId: p.invoiceId,
+        vendorInvoiceId: p.vendorInvoiceId
       };
-    });
+    }));
 
-    // Sourced from full-range aggregates (not the paginated `data` slice above)
-    // so the totals/closing balance stay correct once a period has more rows
-    // than one page.
     const rangeInflows = rangeInAgg._sum.paidAmount || 0;
     const rangeOutflows = rangeOutAgg._sum.paidAmount || 0;
 
@@ -2313,6 +2393,8 @@ export class FinanceService {
       closingBalance: openingBalance + rangeInflows - rangeOutflows,
       totalDebit: rangeInflows,
       totalCredit: rangeOutflows,
+      totalMoneyIn: rangeInflows,
+      totalMoneyOut: rangeOutflows,
       pagination: {
         page,
         limit,
