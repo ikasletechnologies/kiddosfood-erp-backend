@@ -459,11 +459,11 @@ export class FinanceService {
       ];
     }
 
-    return prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
       where: Object.keys(where).length > 0 ? where : undefined,
-      include: { 
-        order: { 
-          include: { 
+      include: {
+        order: {
+          include: {
             customer: true,
             franchise: true,
             orderItems: {
@@ -471,16 +471,18 @@ export class FinanceService {
                 product: true
               }
             }
-          } 
-        }, 
-        payments: true 
+          }
+        },
+        payments: true,
+        allocations: { include: { payment: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
+    return invoices.map((inv) => this.mergeAllocationsIntoPayments(inv));
   }
 
   static async getInvoiceById(id: string) {
-    return prisma.invoice.findFirst({
+    const invoice = await prisma.invoice.findFirst({
       where: {
         OR: [
           { id },
@@ -499,9 +501,34 @@ export class FinanceService {
             }
           }
         },
-        payments: true
+        payments: true,
+        allocations: { include: { payment: true } }
       }
     });
+    return this.mergeAllocationsIntoPayments(invoice);
+  }
+
+  // A multi-invoice receipt attributes its per-invoice share via
+  // PaymentAllocation rather than Payment.invoiceId (see
+  // FinanceService.createPayment), so `Invoice.payments` alone misses that
+  // money. Every consumer of an Invoice's payment history (Payment-In's own
+  // outstanding calc, the Tax Invoice detail view) reads `invoice.payments`
+  // — normalizing here means none of them need to know PaymentAllocation
+  // exists at all.
+  private static mergeAllocationsIntoPayments(invoice: any): any {
+    if (!invoice) return invoice;
+    const allocationPayments = (invoice.allocations || []).map((a: any) => ({
+      id: a.payment?.id,
+      paidAmount: a.amount,
+      status: a.payment?.status,
+      isCancelled: a.payment?.isCancelled,
+      createdAt: a.payment?.createdAt,
+      paymentMode: a.payment?.paymentMode,
+      paymentNumber: a.payment?.paymentNumber,
+      accountId: a.payment?.accountId,
+      isAllocation: true,
+    }));
+    return { ...invoice, payments: [...(invoice.payments || []), ...allocationPayments] };
   }
 
   static async addExpense(data: any) {
@@ -634,7 +661,13 @@ export class FinanceService {
       const activePayments = await tx.payment.findMany({
         where: { invoiceId, status: "PAID", isCancelled: false }
       });
-      if (activePayments.length > 0) {
+      // Also block if this invoice received money as part of a multi-invoice
+      // receipt (PaymentAllocation) — that money is real and allocated here
+      // even though the parent Payment.invoiceId points at no single invoice.
+      const activeAllocations = await tx.paymentAllocation.findMany({
+        where: { invoiceId, payment: { status: "PAID", isCancelled: false } }
+      });
+      if (activePayments.length > 0 || activeAllocations.length > 0) {
         throw new Error("Cannot cancel an invoice with active payments. Please cancel payments first.");
       }
 
@@ -713,7 +746,16 @@ export class FinanceService {
   static async getPayments(franchiseId?: string) {
     const payments = await prisma.payment.findMany({
       where: {
-        ...(franchiseId ? { order: { franchiseId } } : {}),
+        // A multi-invoice receipt has orderId=null (it doesn't belong to
+        // one order), so the plain `order: { franchiseId }` filter below
+        // would silently exclude it from every franchise-scoped query —
+        // match via its allocated invoices' orders too.
+        ...(franchiseId ? {
+          OR: [
+            { order: { franchiseId } },
+            { allocations: { some: { invoice: { order: { franchiseId } } } } },
+          ],
+        } : {}),
       },
       include: { order: true, invoice: true, account: true },
       orderBy: { createdAt: 'desc' }
@@ -1078,6 +1120,27 @@ export class FinanceService {
   /**
    * Central Ledger Entry Creation
    */
+  // Total actually paid toward one Invoice, from BOTH sources of truth:
+  // a direct single-invoice Payment (Payment.invoiceId) and any
+  // PaymentAllocation rows from a multi-invoice receipt that included this
+  // invoice. Used everywhere "how much has this invoice collected" is
+  // decided (overpayment guard, status recompute, cancel-invoice guard) so
+  // an invoice's history is correct regardless of which path it was paid
+  // through.
+  private static async getInvoicePaidAmount(tx: any, invoiceId: string): Promise<number> {
+    const [direct, allocated] = await Promise.all([
+      tx.payment.aggregate({
+        where: { invoiceId, status: 'PAID', isCancelled: false },
+        _sum: { paidAmount: true },
+      }),
+      tx.paymentAllocation.aggregate({
+        where: { invoiceId, payment: { status: 'PAID', isCancelled: false } },
+        _sum: { amount: true },
+      }),
+    ]);
+    return (direct._sum.paidAmount || 0) + (allocated._sum.amount || 0);
+  }
+
   static async createPayment(data: any) {
     const amount    = parseFloat(data.amount);
     // Server-side backstop for the ₹0/negative payment guard — the frontend
@@ -1131,6 +1194,20 @@ export class FinanceService {
     };
     const resolvedPaymentMode = paymentModeMap[data.method] || paymentModeMap[sourceId] || 'CASH';
 
+    // Multi-invoice receipt support: `data.allocations` is an optional
+    // [{invoiceId, amount}] list. A single-entry list behaves EXACTLY like
+    // the legacy `data.invoiceId` field (normalized into `singleInvoiceId`
+    // below, so every pre-existing single-invoice code path — Payment.
+    // invoiceId/orderId, the overpayment guard, the status recompute — is
+    // untouched and unaware anything changed). Only 2+ entries take the new
+    // PaymentAllocation path, where Payment.invoiceId/orderId are left null
+    // because the receipt doesn't belong to one invoice/order.
+    const rawAllocations: { invoiceId: string; amount: number }[] | undefined =
+      Array.isArray(data.allocations) && data.allocations.length > 0 ? data.allocations : undefined;
+    const isMultiInvoice = !!rawAllocations && rawAllocations.length >= 2;
+    const singleInvoiceId: string | undefined =
+      data.invoiceId || (rawAllocations && rawAllocations.length === 1 ? rawAllocations[0].invoiceId : undefined);
+
     const operation = async (tx: any) => {
       // 0. Idempotency: a retry/double-click/API re-entry carrying the same
       // key must return the ALREADY-created payment instead of posting a
@@ -1165,16 +1242,17 @@ export class FinanceService {
         }
       }
 
-      // 2b. Overpayment guard for a Tax Invoice receipt — the invoice's
-      // paid/outstanding split is computed by summing Payment rows (see
-      // step 6 below), so a payment that pushes the total past what's owed
-      // would silently produce a negative outstanding balance downstream.
-      // Also resolves the Order this Invoice belongs to — Payment.orderId
-      // is what franchise-scoped queries (FinanceService.getPayments) key
-      // off, so a Payment with invoiceId set but orderId left null would
-      // silently vanish from any franchise-filtered Payments list.
+      // 2b. Overpayment guard for a TRUE legacy single-invoice call — only
+      // when the caller sent `data.invoiceId` directly and no `allocations`
+      // field at all. Untouched from before this feature existed: `amount`
+      // IS the invoice's paid amount here, there's no separate figure to
+      // reconcile it against. Also resolves the Order this Invoice belongs
+      // to — Payment.orderId is what franchise-scoped queries
+      // (FinanceService.getPayments) key off, so a Payment with invoiceId
+      // set but orderId left null would silently vanish from any
+      // franchise-filtered Payments list.
       let orderIdForInvoice: string | undefined;
-      if (data.invoiceId) {
+      if (data.invoiceId && !rawAllocations) {
         const invoiceForGuard = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
         if (!invoiceForGuard) throw new Error('Invoice not found.');
         // A cancelled invoice's balance can still read as > 0 (cancelInvoice
@@ -1192,15 +1270,85 @@ export class FinanceService {
         }
         orderIdForInvoice = invoiceForGuard.orderId;
         if (flow === 'IN' && status === 'PAID') {
-          const paidSoFar = await tx.payment.aggregate({
-            where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
-            _sum: { paidAmount: true },
-          });
-          const alreadyPaid = paidSoFar._sum.paidAmount || 0;
+          const alreadyPaid = await this.getInvoicePaidAmount(tx, data.invoiceId);
           const outstanding = invoiceForGuard.finalAmount - alreadyPaid;
           if (amount > outstanding + 0.01) {
             throw new Error(`Invalid payment amount: ₹${amount} exceeds the outstanding balance (₹${outstanding.toFixed(2)}) on this invoice.`);
           }
+        }
+      }
+
+      // 2c. Allocation-based receipt validation — runs for ANY caller using
+      // `allocations`, whether it's a single entry (the new UI's one-invoice
+      // case, still normalized into Payment.invoiceId below via
+      // singleInvoiceId) or a true multi-invoice (2+) list. Unlike the bare
+      // `invoiceId` path above, a caller stating `allocations` is asserting
+      // a distinct per-invoice figure that must actually reconcile with the
+      // payment amount — never trust it. Every invoice is re-fetched here
+      // (inside the transaction) and re-validated: belongs to the same
+      // party as this payment's entityId, not cancelled, allocation within
+      // [0, outstanding], and the allocations must sum to exactly the
+      // payment amount. All of this runs BEFORE the Payment row (and
+      // therefore any PaymentAllocation row) is created, so a rejected
+      // request writes nothing at all.
+      if (rawAllocations && flow === 'IN' && status === 'PAID') {
+        const seen = new Set<string>();
+        let allocatedTotal = 0;
+        for (const alloc of rawAllocations!) {
+          const allocAmount = parseFloat(alloc.amount as any);
+          if (!alloc.invoiceId || seen.has(alloc.invoiceId)) {
+            throw new PaymentValidationError('DUPLICATE_ALLOCATION', 'Each invoice may only be allocated once in a single receipt.');
+          }
+          seen.add(alloc.invoiceId);
+          if (!(allocAmount > 0)) {
+            throw new PaymentValidationError('INVALID_ALLOCATION_AMOUNT', 'Each invoice allocation must be a positive amount.');
+          }
+
+          const invoiceForGuard = await tx.invoice.findUnique({
+            where: { id: alloc.invoiceId },
+            include: { order: { select: { customerId: true, partyId: true, partyType: true } } },
+          });
+          if (!invoiceForGuard) {
+            throw new PaymentValidationError('INVOICE_NOT_FOUND', `Invoice ${alloc.invoiceId} not found.`);
+          }
+          if (invoiceForGuard.status === 'CANCELLED') {
+            throw new PaymentValidationError(
+              'INVOICE_CANCELLED',
+              'Cannot receive payment for a cancelled invoice.'
+            );
+          }
+          // Cross-customer guard: an invoice's owner is its Order's
+          // partyId (or customerId, for the CUSTOMER party type — the same
+          // fallback the Payment-In page's own invoice filter already
+          // uses), and it must match this payment's entityId exactly.
+          const order = invoiceForGuard.order as any;
+          const ownerId = order?.partyType === 'CUSTOMER' ? (order?.partyId || order?.customerId) : order?.partyId;
+          if (!entityId || ownerId !== entityId) {
+            throw new PaymentValidationError(
+              'INVOICE_PARTY_MISMATCH',
+              `Invoice ${alloc.invoiceId} does not belong to the selected party.`
+            );
+          }
+
+          const alreadyPaid = await this.getInvoicePaidAmount(tx, alloc.invoiceId);
+          const outstanding = invoiceForGuard.finalAmount - alreadyPaid;
+          if (allocAmount > outstanding + 0.01) {
+            throw new PaymentValidationError(
+              'ALLOCATION_EXCEEDS_OUTSTANDING',
+              `Invalid allocation: ₹${allocAmount} exceeds the outstanding balance (₹${outstanding.toFixed(2)}) on invoice ${alloc.invoiceId}.`
+            );
+          }
+          allocatedTotal += allocAmount;
+          // A single-entry allocations list still populates Payment.orderId
+          // directly (see singleInvoiceId/Payment.create below) — capture it
+          // here since this loop already fetched the invoice.
+          if (!isMultiInvoice) orderIdForInvoice = invoiceForGuard.orderId;
+        }
+        if (Math.abs(allocatedTotal - amount) > 0.01) {
+          throw new PaymentValidationError(
+            'ALLOCATION_TOTAL_MISMATCH',
+            `Total allocation (₹${allocatedTotal.toFixed(2)}) must equal the payment amount (₹${amount.toFixed(2)}).`
+          );
         }
       }
 
@@ -1221,8 +1369,11 @@ export class FinanceService {
           linkedDocType:  linkedDocType as any,
           linkedDocId:    linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
-          invoiceId:      data.invoiceId || undefined,
-          orderId:        data.orderId || orderIdForInvoice || undefined,
+          // A multi-invoice receipt (isMultiInvoice) doesn't belong to one
+          // Invoice/Order, so both stay null here — its per-invoice
+          // attribution lives in the PaymentAllocation rows created below.
+          invoiceId:      !isMultiInvoice ? (singleInvoiceId || undefined) : undefined,
+          orderId:        !isMultiInvoice ? (data.orderId || orderIdForInvoice || undefined) : undefined,
           entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
           entityId:       entityId,
           paymentMode:    resolvedPaymentMode as any,
@@ -1234,6 +1385,20 @@ export class FinanceService {
           createdAt:      data.createdAt ? new Date(data.createdAt) : undefined,
         },
       });
+
+      // 4b. Multi-invoice receipt: persist the per-invoice split validated
+      // in step 2c. Each invoice's own status is recomputed in step 5b
+      // below using FinanceService.getInvoicePaidAmount, which already
+      // includes these rows.
+      if (isMultiInvoice) {
+        await tx.paymentAllocation.createMany({
+          data: rawAllocations!.map((alloc) => ({
+            paymentId: payment.id,
+            invoiceId: alloc.invoiceId,
+            amount: parseFloat(alloc.amount as any),
+          })),
+        });
+      }
 
       // 5. If this is a Vendor Payment, record in VendorLedger (CREDIT)
       // NOTE: was previously `data.entityType === 'VENDOR' || flow === 'OUT'`, which
@@ -1321,19 +1486,21 @@ export class FinanceService {
       }
 
       // 5b. Customer payment against a Tax Invoice — recompute paid/
-      // outstanding/status from the actual sum of Payment rows every time
-      // (never trust a client-supplied status), and mirror it onto the
-      // Order the Invoice belongs to so both records agree. This is the
-      // ONLY place a Tax Invoice's payment status is allowed to change —
-      // it is never settable directly by the frontend.
-      if (data.invoiceId && status === 'PAID') {
-        const invoiceRow = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
-        if (invoiceRow) {
-          const totalPaid = await tx.payment.aggregate({
-            where: { invoiceId: data.invoiceId, status: 'PAID', isCancelled: false },
-            _sum: { paidAmount: true },
-          });
-          const paidSoFar = totalPaid._sum.paidAmount || 0;
+      // outstanding/status from the actual sum of Payment (+ PaymentAllocation
+      // for a multi-invoice receipt) rows every time (never trust a client-
+      // supplied status), and mirror it onto the Order the Invoice belongs
+      // to so both records agree. This is the ONLY place a Tax Invoice's
+      // payment status is allowed to change — it is never settable directly
+      // by the frontend. Multi-invoice receipts recompute EVERY allocated
+      // invoice, not just one.
+      const invoiceIdsToRecompute = isMultiInvoice
+        ? rawAllocations!.map((a) => a.invoiceId)
+        : (singleInvoiceId ? [singleInvoiceId] : []);
+      if (invoiceIdsToRecompute.length > 0 && status === 'PAID') {
+        for (const invId of invoiceIdsToRecompute) {
+          const invoiceRow = await tx.invoice.findUnique({ where: { id: invId } });
+          if (!invoiceRow) continue;
+          const paidSoFar = await this.getInvoicePaidAmount(tx, invId);
           // 'PARTIAL' (not 'PARTIALLY_PAID') to match the existing status
           // vocabulary already used by /sales/invoices' status badge map.
           const newStatus = paidSoFar >= invoiceRow.finalAmount - 0.01
@@ -1341,7 +1508,7 @@ export class FinanceService {
             : paidSoFar > 0
             ? 'PARTIAL'
             : 'UNPAID';
-          await tx.invoice.update({ where: { id: data.invoiceId }, data: { status: newStatus } });
+          await tx.invoice.update({ where: { id: invId }, data: { status: newStatus } });
           await tx.order.update({ where: { id: invoiceRow.orderId }, data: { paymentStatus: newStatus } });
         }
       }
