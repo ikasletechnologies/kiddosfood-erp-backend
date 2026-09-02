@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "VendorInvoice" ADD COLUMN     "discountAmount" DOUBLE PRECISION DEFAULT 0,
+ADD COLUMN     "freightCost" DOUBLE PRECISION DEFAULT 0;
