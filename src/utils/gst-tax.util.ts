@@ -13,15 +13,93 @@ export interface GstSplit {
   isInterState: boolean;
 }
 
-function normalizeState(s?: string | null): string {
-  return (s || '').trim().toLowerCase();
+export const INDIAN_GST_STATE_MAP: Record<string, string> = {
+  '01': 'Jammu and Kashmir',
+  '02': 'Himachal Pradesh',
+  '03': 'Punjab',
+  '04': 'Chandigarh',
+  '05': 'Uttarakhand',
+  '06': 'Haryana',
+  '07': 'Delhi',
+  '08': 'Rajasthan',
+  '09': 'Uttar Pradesh',
+  '10': 'Bihar',
+  '11': 'Sikkim',
+  '12': 'Arunachal Pradesh',
+  '13': 'Nagaland',
+  '14': 'Manipur',
+  '15': 'Mizoram',
+  '16': 'Tripura',
+  '17': 'Meghalaya',
+  '18': 'Assam',
+  '19': 'West Bengal',
+  '20': 'Jharkhand',
+  '21': 'Odisha',
+  '22': 'Chhattisgarh',
+  '23': 'Madhya Pradesh',
+  '24': 'Gujarat',
+  '25': 'Daman and Diu',
+  '26': 'Dadra and Nagar Haveli and Daman and Diu',
+  '27': 'Maharashtra',
+  '28': 'Andhra Pradesh',
+  '29': 'Karnataka',
+  '30': 'Goa',
+  '31': 'Lakshadweep',
+  '32': 'Kerala',
+  '33': 'Tamil Nadu',
+  '34': 'Puducherry',
+  '35': 'Andaman and Nicobar Islands',
+  '36': 'Telangana',
+  '37': 'Andhra Pradesh',
+  '38': 'Ladakh',
+  '97': 'Other Territory'
+};
+
+/**
+ * Extracts standard state name from a 15-digit GSTIN if available
+ */
+export function getStateFromGstin(gstin?: string | null): string | null {
+  if (!gstin || typeof gstin !== 'string') return null;
+  const trimmed = gstin.trim();
+  if (trimmed.length < 2) return null;
+  const stateCode = trimmed.slice(0, 2);
+  return INDIAN_GST_STATE_MAP[stateCode] || null;
 }
 
 /**
- * True when buyer/seller states differ and both are known. An unknown state
- * on either side is treated as intra-state (CGST+SGST) rather than silently
- * reclassified to IGST — the conservative default this codebase already
- * relied on.
+ * Normalizes state name / code for comparison (e.g., '33 - Tamil Nadu', 'tamil nadu' -> 'tamil nadu')
+ */
+export function normalizeState(s?: string | null): string {
+  if (!s || typeof s !== 'string') return '';
+  let cleaned = s.trim().toLowerCase();
+  
+  // Handle formats like "33 - Tamil Nadu" or "33-Tamil Nadu" or "33: Tamil Nadu"
+  const prefixMatch = cleaned.match(/^(\d{2})\s*[-:]\s*(.+)$/);
+  if (prefixMatch) {
+    cleaned = prefixMatch[2].trim();
+  } else if (/^\d{2}$/.test(cleaned)) {
+    const mapped = INDIAN_GST_STATE_MAP[cleaned];
+    if (mapped) cleaned = mapped.toLowerCase();
+  }
+
+  return cleaned;
+}
+
+/**
+ * Validates that seller GST state is configured before processing tax calculations.
+ * Throws a clear configuration error rather than silently defaulting to IGST.
+ */
+export function assertValidSellerState(sellerState?: string | null): string {
+  if (!sellerState || !sellerState.trim()) {
+    throw new Error('Company GST seller state is not configured. Please configure the State in Company Profile Settings.');
+  }
+  return sellerState.trim();
+}
+
+/**
+ * True when buyer/seller states differ and both are known valid states.
+ * An unknown/missing state on either side is treated as intra-state (CGST+SGST)
+ * rather than silently reclassified to IGST.
  */
 export function isInterState(buyerState?: string | null, sellerState?: string | null): boolean {
   const b = normalizeState(buyerState);
@@ -62,37 +140,30 @@ export function computeGstFromRate(
 
 /**
  * Resolves our own (seller's) GST registration state — the one canonical
- * path every caller must use, never a franchise's own `location` directly.
- * `SettingsService.getCompanyProfile().state` is the authoritative source
- * (and already falls back to the HQ franchise's location internally when
- * nobody has configured a real state yet) — checking a specific franchise's
- * `location` *before* that, as earlier code here did, meant a properly
- * configured company GST state could never actually take effect, since
- * `Franchise.location` is essentially always set to a street address. The
- * `franchiseId` fallback below only matters in the near-impossible case
- * where no HQ franchise exists either.
+ * path every caller must use.
+ * SettingsService.getCompanyProfile().state is the authoritative source.
+ * Never fall back to Franchise.location for GST state classification.
  */
 export async function resolveSellerState(franchiseId?: string | null): Promise<string | null> {
   const { SettingsService } = require('../modules/settings/settings.service');
   const profile = await SettingsService.getCompanyProfile();
-  if (profile?.state) return profile.state;
-
-  if (franchiseId) {
-    const franchise = await prisma.franchise.findUnique({ where: { id: franchiseId }, select: { location: true } });
-    if (franchise?.location) return franchise.location;
+  if (profile?.state && typeof profile.state === 'string' && profile.state.trim()) {
+    return profile.state.trim();
   }
+
+  // Fallback to structured state derived from profile GSTIN
+  const gstin = profile?.gstNumber || profile?.gstin;
+  if (gstin && typeof gstin === 'string') {
+    const derived = getStateFromGstin(gstin);
+    if (derived) return derived;
+  }
+
   return null;
 }
 
 /**
  * Resolves the canonical seller GST state once per distinct franchiseId in
- * a report's result set — for use in a loop over many rows, instead of
- * calling resolveSellerState() per row (expensive) or, worse, reading
- * Franchise.location directly (which bypasses resolveSellerState's
- * COMPANY_PROFILE-first precedence entirely). Every sales-side GST report
- * must resolve seller state through this path, the same one the
- * purchase-side already uses via resolveSellerState — one canonical
- * seller-state source, not two.
+ * a report's result set.
  */
 export async function resolveSellerStatesFor(franchiseIds: (string | null | undefined)[]): Promise<Map<string, string | null>> {
   const distinct = Array.from(new Set(franchiseIds.filter((id): id is string => !!id)));

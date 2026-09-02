@@ -1026,6 +1026,7 @@ model Payment {
   invoice             Invoice?              @relation(fields: [invoiceId], references: [id])
   order               Order?                @relation(fields: [orderId], references: [id])
   vendorInvoice       VendorInvoice?        @relation(fields: [vendorInvoiceId], references: [id])
+  allocations         PaymentAllocation[]
 
   @@index([orderId])
   @@index([status, createdAt])
@@ -1045,6 +1046,28 @@ model Invoice {
   createdAt          DateTime  @default(now())
   order              Order     @relation(fields: [orderId], references: [id])
   payments           Payment[]
+  allocations        PaymentAllocation[]
+}
+
+// One receipt (Payment) can be split across several Tax Invoices for the
+// same customer — e.g. a ₹350 receipt paying ₹100 on Invoice A, ₹200 on
+// Invoice B, ₹50 on Invoice C. Payment.invoiceId stays single-valued and is
+// left null for a payment spanning 2+ invoices (a single-invoice payment,
+// whether entered via the legacy one-invoice flow or as a one-row
+// allocation, keeps using Payment.invoiceId directly and never gets a row
+// here — see FinanceService.createPayment). This table is additive only:
+// no existing Payment/Invoice data is migrated into it.
+model PaymentAllocation {
+  id        String   @id @default(uuid())
+  paymentId String
+  invoiceId String
+  amount    Float
+  createdAt DateTime @default(now())
+  payment   Payment  @relation(fields: [paymentId], references: [id])
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id])
+
+  @@index([paymentId])
+  @@index([invoiceId])
 }
 
 model Account {

@@ -68,7 +68,13 @@ export class DealerService {
     const [orders, challans] = await Promise.all([
       prisma.order.findMany({
         where: { partyType: 'DEALER', partyId: id },
-        include: { payments: { where: { isCancelled: false } } },
+        include: {
+          payments: { where: { isCancelled: false } },
+          // A multi-invoice receipt's share of this order isn't in
+          // `payments` (that Payment's orderId is null) — it's here, on the
+          // Invoice this order owns.
+          invoice: { select: { allocations: { where: { payment: { isCancelled: false } }, select: { amount: true } } } }
+        },
         orderBy: { createdAt: 'desc' }
       }),
       prisma.deliveryChallan.findMany({
@@ -78,7 +84,9 @@ export class DealerService {
     ]);
 
     const orderTxns = orders.map((o) => {
-      const paid = o.payments.reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const direct = o.payments.reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const allocated = (o.invoice?.allocations || []).reduce((sum, a) => sum + (a.amount || 0), 0);
+      const paid = direct + allocated;
       const balance = Math.max(0, Number((o.totalAmount - paid).toFixed(2)));
       return {
         id: o.id,

@@ -20,8 +20,8 @@ function check(label: string, ok: boolean, detail?: any) {
   else { fail++; console.log(`  FAIL - ${label}`, detail !== undefined ? JSON.stringify(detail) : ''); }
 }
 
-const TODAY = '2026-09-01';
-const YESTERDAY = '2026-08-31';
+const TODAY = new Date().toISOString().split('T')[0];
+const YESTERDAY = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 const COMPANY_STATE = 'Tamil Nadu'; // matches the intra-state customer below
 const INTERSTATE_CUSTOMER_STATE = 'Karnataka';
 

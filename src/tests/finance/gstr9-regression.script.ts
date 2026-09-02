@@ -19,7 +19,7 @@ function check(label: string, ok: boolean, detail?: any) {
 }
 
 const COMPANY_STATE = 'Tamil Nadu';
-const TODAY = new Date('2026-09-01T10:00:00.000Z');
+const TODAY = new Date();
 const FY = TODAY.getUTCMonth() >= 3 ? `${TODAY.getUTCFullYear()}-${TODAY.getUTCFullYear() + 1}` : `${TODAY.getUTCFullYear() - 1}-${TODAY.getUTCFullYear()}`;
 
 async function createTaxInvoice(opts: { customerId: string; customerName: string; stateOfSupply: string; productId: string; qty: number; rate: number; taxPercent: number }) {
