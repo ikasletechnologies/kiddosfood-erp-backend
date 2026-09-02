@@ -98,12 +98,12 @@ async function main() {
     const b2cRow = after.outwardSupplies.find((r: any) => r.category === 'B2C Sales');
     const totalRow = after.outwardSupplies.find((r: any) => r.category === 'Total Outward Supplies');
 
-    check('B2B taxable value increased by the B2B invoice amount', b2bRow.taxableValue - before.outwardSupplies.find((r: any) => r.category === 'B2B Sales').taxableValue >= 199.99);
-    check('B2C taxable value increased by the B2C invoice amount', b2cRow.taxableValue - before.outwardSupplies.find((r: any) => r.category === 'B2C Sales').taxableValue >= 99.99);
-    check('B2B row is intra-state (CGST+SGST, no IGST) given matching company/customer state', b2bRow.igst === 0 && b2bRow.cgst > 0 && b2bRow.sgst > 0, b2bRow);
+    check('B2B taxable value increased by the B2B invoice amount', (b2bRow?.taxableValue || 0) - (before.outwardSupplies.find((r: any) => r.category === 'B2B Sales')?.taxableValue || 0) >= 199.99);
+    check('B2C taxable value increased by the B2C invoice amount', (b2cRow?.taxableValue || 0) - (before.outwardSupplies.find((r: any) => r.category === 'B2C Sales')?.taxableValue || 0) >= 99.99);
+    check('B2B row is intra-state (CGST+SGST, no IGST) given matching company/customer state', b2bRow?.igst === 0 && (b2bRow?.cgst || 0) > 0 && (b2bRow?.sgst || 0) > 0, b2bRow);
     check(
       'Total Outward Supplies = B2B + B2C + Credit/Debit adjustments',
-      Math.abs(totalRow.taxableValue - (b2bRow.taxableValue + b2cRow.taxableValue + after.outwardSupplies.find((r: any) => r.category === 'Credit/Debit Note Adjustments').taxableValue)) < 0.01
+      Math.abs((totalRow?.taxableValue || 0) - ((b2bRow?.taxableValue || 0) + (b2cRow?.taxableValue || 0) + (after.outwardSupplies.find((r: any) => r.category === 'Credit/Debit Note Adjustments')?.taxableValue || 0))) < 0.01
     );
 
     console.log('\n=== Purchase side: PO/GRN alone must not affect ITC; approved bill must (and must not be labeled RCM) ===');
@@ -150,7 +150,7 @@ async function main() {
     const priorFy = `${Number(FY.split('-')[0]) - 1}-${Number(FY.split('-')[1]) - 1}`;
     const priorFyReport = await FinanceService.getGSTR9Data(undefined, priorFy);
     const priorTotal = priorFyReport.outwardSupplies.find((r: any) => r.category === 'Total Outward Supplies');
-    check('Prior FY total taxable value did not pick up today\'s new invoices', priorTotal.taxableValue < totalRow.taxableValue);
+    check('Prior FY total taxable value did not pick up today\'s new invoices', (priorTotal?.taxableValue || 0) < (totalRow?.taxableValue || 0));
 
   } finally {
     console.log('\n=== Cleanup ===');

@@ -663,7 +663,7 @@ export class SalesService {
           include: { items: true }
         });
         if (!salesOrder) throw new Error('Sales Order not found.');
-        if (salesOrder.status === 'CLOSED' || salesOrder.status === 'CONVERTED') {
+        if (salesOrder.status === 'DELIVERED' || (salesOrder.status as string) === 'CLOSED' || (salesOrder.status as string) === 'CONVERTED') {
           throw new Error('This Sales Order has already been converted.');
         }
 
@@ -751,15 +751,15 @@ export class SalesService {
 
         await tx.salesOrder.update({
           where: { id: salesOrderId },
-          data: { status: 'CLOSED' },
+          data: { status: 'DELIVERED' },
         });
 
         return {
           success: true,
           salesOrder: {
             id: salesOrder.id,
-            orderNo: salesOrder.orderNo,
-            status: 'CLOSED'
+            orderNo: salesOrder.orderNumber,
+            status: 'DELIVERED'
           },
           sale: order,
           invoice
@@ -1342,17 +1342,66 @@ export class SalesService {
     // exists" (or clear a real one) directly. items is handled separately
     // below (nested create, not a raw array), so it must not be spread
     // as-is into Prisma's `data` — that's what used to crash this call.
-    const { proformaInvoiceId, items, ...safeData } = data;
+    const {
+      proformaInvoiceId,
+      items,
+      _rawState,
+      rawState,
+      selectedCustomer,
+      customerSearch,
+      customerPhone,
+      termsText,
+      description,
+      roundOffEnabled,
+      paymentType,
+      priceMode,
+      taxLabel,
+      customer,
+      id: _id,
+      createdAt,
+      updatedAt,
+      ...safeData
+    } = data;
+
+    const validKeys = [
+      'orderNumber',
+      'quotationId',
+      'idempotencyKey',
+      'partyType',
+      'partyId',
+      'customerId',
+      'customerName',
+      'customerPhone',
+      'status',
+      'subTotal',
+      'taxAmount',
+      'discountAmount',
+      'totalAmount',
+      'orderDate',
+      'dueDate',
+      'stateOfSupply',
+      'deliveryDate',
+      'deliveryAddress',
+      'trackingNumber',
+      'courierName',
+      'notes',
+      'createdBy',
+      'paymentStatus',
+    ];
+
+    const cleanSafeData: any = {};
+    for (const key of validKeys) {
+      if (key in safeData && safeData[key] !== undefined) {
+        cleanSafeData[key] = safeData[key];
+      }
+    }
 
     const updateData: any = {
-      ...safeData,
-      status: data.status as any,
-      deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
-      // orderDate is set once at creation (direct-create or conversion)
-      // and isn't meant to move afterward — only convert it through if a
-      // caller explicitly sends one; dueDate stays freely editable.
-      orderDate: data.orderDate ? new Date(data.orderDate) : undefined,
-      dueDate: data.dueDate ? new Date(data.dueDate) : undefined
+      ...cleanSafeData,
+      status: cleanSafeData.status ? (cleanSafeData.status === 'CLOSED' ? 'DELIVERED' : cleanSafeData.status) : undefined,
+      deliveryDate: cleanSafeData.deliveryDate ? new Date(cleanSafeData.deliveryDate) : undefined,
+      orderDate: cleanSafeData.orderDate ? new Date(cleanSafeData.orderDate) : undefined,
+      dueDate: cleanSafeData.dueDate ? new Date(cleanSafeData.dueDate) : undefined
     };
 
     return prisma.$transaction(async (tx) => {
