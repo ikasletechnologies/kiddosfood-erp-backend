@@ -2302,7 +2302,7 @@ export class FinanceService {
       prisma.payment.findMany({
         where: whereClause,
         include: {
-          order: { include: { customer: true } },
+          order: { include: { customer: true, payments: true } },
           invoice: true,
           account: true,
           vendorInvoice: { include: { vendor: true } }
@@ -2347,6 +2347,13 @@ export class FinanceService {
         (p.sourceModule === 'POS' ? 'Counter Billing Payment' : null) ||
         (p.entityType === 'VENDOR' ? 'Vendor Payment' : p.entityType === 'CUSTOMER' ? 'Customer Payment' : p.sourceModule ? `${p.sourceModule} Payment` : 'Payment Voucher');
 
+      const orderTotal = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
+      const paidForOrder = p.order?.payments?.length
+        ? p.order.payments.filter((x: any) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')).reduce((s: number, x: any) => s + Number(x.paidAmount), 0)
+        : Number(p.paidAmount);
+      const receivableAmount = Number(p.paidAmount);
+      const balanceAmount = Math.max(0, orderTotal - paidForOrder);
+
       return {
         id: p.id,
         createdAt: p.createdAt,
@@ -2365,8 +2372,12 @@ export class FinanceService {
         type: p.paymentMode,
         accountingType: flow === 'IN' ? 'DEBIT' : 'CREDIT',
         flow,
-        amount: p.paidAmount,
-        paidAmount: p.paidAmount,
+        amount: receivableAmount,
+        paidAmount: receivableAmount,
+        orderTotal,
+        totalAmount: orderTotal,
+        receivableAmount,
+        balanceAmount,
         status: p.status,
         isCancelled: p.isCancelled,
         createdBy: p.createdBy || 'System',
@@ -2375,8 +2386,15 @@ export class FinanceService {
       };
     }));
 
+    const totalTransactionAmount = payments.reduce((s, p) => s + Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount), 0);
+    const totalReceivedAmount = Number(inAgg._sum.paidAmount || 0);
+    const totalRemainingBalance = Math.max(0, totalTransactionAmount - totalReceivedAmount);
+
     return {
       data,
+      totalAmount: totalTransactionAmount,
+      receivableAmount: totalReceivedAmount,
+      balanceAmount: totalRemainingBalance,
       totalDebit: inAgg._sum.paidAmount || 0,
       totalCredit: outAgg._sum.paidAmount || 0,
       pagination: {
