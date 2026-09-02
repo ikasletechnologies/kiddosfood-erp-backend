@@ -116,10 +116,11 @@ export class FinanceService {
 
       if (!order) throw new Error('Order not found');
 
-      // 1. Calculate Tax (5% GST as per Phase 5 instructions)
+      // 1. Calculate Tax & Final Amount directly from authoritative order record
       const subTotal = order.subTotal;
-      const taxAmount = Number((subTotal * 0.05).toFixed(2));
-      const finalAmount = subTotal + taxAmount;
+      const taxAmount = order.taxAmount ?? Number((subTotal * 0.05).toFixed(2));
+      const finalAmount = order.totalAmount ?? (subTotal + taxAmount);
+      const invoiceStatus = order.paymentStatus === 'PAID' ? 'PAID' : (order.status === 'COMPLETED' ? 'PAID' : 'UNPAID');
 
       // 2. Create Invoice
       const invoice = await tx.invoice.upsert({
@@ -128,14 +129,14 @@ export class FinanceService {
           totalAmount: subTotal,
           taxAmount: taxAmount,
           finalAmount: finalAmount,
-          status: 'PAID' // Default since POS orders are usually paid at completion
+          status: invoiceStatus
         },
         create: {
           orderId,
           totalAmount: subTotal,
           taxAmount: taxAmount,
           finalAmount: finalAmount,
-          status: 'PAID'
+          status: invoiceStatus
         }
       });
 
