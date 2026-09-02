@@ -885,65 +885,88 @@ export class FinanceService {
 
   static async getGstRateReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
     const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
-    const { start, end } = parseInclusiveDates(startDate, endDate);
-    const dateFilter = (start || end) ? {
-      createdAt: {
-        ...(start ? { gte: start } : {}),
-        ...(end ? { lte: end } : {})
-      }
-    } : {};
+    const dateFilter = buildCreatedAtFilter(startDate, endDate);
+    const billDateFilter = buildBillDateFilter(startDate, endDate);
 
-    const [orders, purchases] = await Promise.all([
-      prisma.order.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: 'COMPLETED' },
-        include: { orderItems: { include: { product: true } } }
+    // Sales: use the same canonical source as GSTR-1 — finalSaleWhere covers
+    // both TAX_INVOICE (any non-CANCELLED status) and POS (COMPLETED/REFUNDED).
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({
+        ...(franchiseId ? { franchiseId } : {}),
+        ...dateFilter
       }),
-      prisma.procurementOrder.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), ...dateFilter, status: { not: 'CANCELLED' as any } },
-        include: { poItems: true }
-      })
-    ]);
+      select: { subTotal: true, taxAmount: true }
+    });
+
+    // Purchases: use VendorInvoice (Purchase Bill) — the canonical source for
+    // GSTR-2. A PO/GRN alone never has real GST tax amounts until a bill is
+    // raised against it; querying procurementOrder.poItems yields zeros.
+    const invoices = await prisma.vendorInvoice.findMany({
+      where: {
+        procurementOrder: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { not: 'CANCELLED' as any }
+        },
+        ...billDateFilter
+      },
+      select: { subtotal: true, cgst: true, sgst: true, igst: true }
+    });
 
     const knownBrackets = [5, 12, 18, 28];
-    const rateMap: Record<number, { taxName: string; taxPercent: number; taxableSaleAmount: number; taxIn: number; taxablePurchaseAmount: number; taxOut: number }> = {};
-
+    type RateRow = {
+      taxName: string;
+      taxPercent: number;
+      taxableSaleAmount: number;
+      taxIn: number;
+      taxablePurchaseAmount: number;
+      taxOut: number;
+    };
+    const rateMap: Record<number, RateRow> = {};
     knownBrackets.forEach(b => {
       rateMap[b] = { taxName: `GST ${b}%`, taxPercent: b, taxableSaleAmount: 0, taxIn: 0, taxablePurchaseAmount: 0, taxOut: 0 };
     });
 
     const nearestBracket = (rate: number) =>
-      knownBrackets.reduce((prev, curr) => Math.abs(curr - rate) < Math.abs(prev - rate) ? curr : prev, 5);
+      knownBrackets.reduce((prev, curr) => (Math.abs(curr - rate) < Math.abs(prev - rate) ? curr : prev), 5);
 
+    // Aggregate sales: derive effective rate from order-level subTotal / taxAmount
+    // (the same fields GSTR-1 uses), bucket to nearest standard GST bracket.
     orders.forEach(o => {
-      o.orderItems.forEach(item => {
-        const rate = item.product?.taxPercent ?? 5;
-        const bracket = nearestBracket(rate);
-        if (rateMap[bracket]) {
-          const itemSubtotal = (item.quantity || 0) * (item.price || 0);
-          rateMap[bracket].taxableSaleAmount += itemSubtotal;
-          rateMap[bracket].taxIn += item.taxAmount || 0;
-        }
-      });
+      const taxableValue = o.subTotal || 0;
+      const taxAmount = o.taxAmount || 0;
+      if (taxableValue <= 0) return;
+      const effectiveRate = Number(((taxAmount / taxableValue) * 100).toFixed(2));
+      const bracket = nearestBracket(effectiveRate);
+      if (rateMap[bracket]) {
+        rateMap[bracket].taxableSaleAmount += taxableValue;
+        rateMap[bracket].taxIn += taxAmount;
+      }
     });
 
-    purchases.forEach(p => {
-      (p.poItems || []).forEach(item => {
-        const rate = item.gstRate ?? 5;
-        const bracket = nearestBracket(rate);
-        if (rateMap[bracket]) {
-          rateMap[bracket].taxablePurchaseAmount += item.subtotal || 0;
-          rateMap[bracket].taxOut += (item.cgst || 0) + (item.sgst || 0) + (item.igst || 0);
-        }
-      });
+    // Aggregate purchases: derive effective rate from VendorInvoice totals
+    // (the same fields GSTR-2 uses).
+    invoices.forEach(inv => {
+      const taxableValue = inv.subtotal || 0;
+      const totalTax = (inv.cgst || 0) + (inv.sgst || 0) + (inv.igst || 0);
+      if (taxableValue <= 0) return;
+      const effectiveRate = Number(((totalTax / taxableValue) * 100).toFixed(2));
+      const bracket = nearestBracket(effectiveRate);
+      if (rateMap[bracket]) {
+        rateMap[bracket].taxablePurchaseAmount += taxableValue;
+        rateMap[bracket].taxOut += totalTax;
+      }
     });
 
-    const data = Object.values(rateMap).map(r => ({
-      ...r,
-      taxableSaleAmount: Number(r.taxableSaleAmount.toFixed(2)),
-      taxIn: Number(r.taxIn.toFixed(2)),
-      taxablePurchaseAmount: Number(r.taxablePurchaseAmount.toFixed(2)),
-      taxOut: Number(r.taxOut.toFixed(2))
-    }));
+    // Only return rows that have actual data; suppress empty bracket placeholders.
+    const data = Object.values(rateMap)
+      .filter(r => r.taxableSaleAmount > 0 || r.taxablePurchaseAmount > 0 || r.taxIn > 0 || r.taxOut > 0)
+      .map(r => ({
+        ...r,
+        taxableSaleAmount: Number(r.taxableSaleAmount.toFixed(2)),
+        taxIn: Number(r.taxIn.toFixed(2)),
+        taxablePurchaseAmount: Number(r.taxablePurchaseAmount.toFixed(2)),
+        taxOut: Number(r.taxOut.toFixed(2))
+      }));
 
     return {
       data,
