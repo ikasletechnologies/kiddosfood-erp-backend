@@ -62,7 +62,7 @@ CREATE TYPE "FranchiseLedgerRefType" AS ENUM ('ORDER', 'PAYMENT', 'RETURN', 'ADJ
 CREATE TYPE "ItemCategory" AS ENUM ('RAW_MATERIAL', 'SEMI_FINISHED', 'FINISHED_GOOD', 'PACKAGING');
 
 -- CreateEnum
-CREATE TYPE "StockMovementType" AS ENUM ('PURCHASE_IN', 'PRODUCTION_OUT', 'PRODUCTION_IN', 'SALES_OUT', 'WASTE_OUT', 'TRANSFER_IN', 'TRANSFER_OUT', 'ADJUSTMENT', 'RETURN_OUT', 'RECALL_RETURN_IN');
+CREATE TYPE "StockMovementType" AS ENUM ('PURCHASE_IN', 'PRODUCTION_OUT', 'PRODUCTION_IN', 'SALES_OUT', 'WASTE_OUT', 'TRANSFER_IN', 'TRANSFER_OUT', 'ADJUSTMENT', 'RETURN_OUT', 'RECALL_RETURN_IN', 'RETURN_QUARANTINE_IN');
 
 -- CreateEnum
 CREATE TYPE "GRNStatus" AS ENUM ('PENDING', 'COMPLETED', 'CANCELLED');
@@ -83,7 +83,7 @@ CREATE TYPE "POPaymentStatus" AS ENUM ('UNPAID', 'PARTIAL', 'PAID', 'OVERDUE');
 CREATE TYPE "QCStatus" AS ENUM ('PENDING', 'APPROVED', 'HOLD', 'REJECTED');
 
 -- CreateEnum
-CREATE TYPE "ProductType" AS ENUM ('FINISHED_GOOD', 'MADE_TO_ORDER');
+CREATE TYPE "ProductType" AS ENUM ('FINISHED_GOOD', 'MADE_TO_ORDER', 'SERVICE');
 
 -- CreateEnum
 CREATE TYPE "FranchiseOrderStatus" AS ENUM ('PENDING', 'APPROVED', 'IN_PRODUCTION', 'DISPATCHED', 'DELIVERED', 'CANCELLED');
@@ -128,7 +128,13 @@ CREATE TYPE "ComponentType" AS ENUM ('EARNING', 'DEDUCTION');
 CREATE TYPE "QuotationStatus" AS ENUM ('DRAFT', 'SENT', 'ACCEPTED', 'REJECTED', 'EXPIRED', 'CONVERTED');
 
 -- CreateEnum
-CREATE TYPE "SalesOrderStatus" AS ENUM ('PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED');
+CREATE TYPE "PartyType" AS ENUM ('CUSTOMER', 'DEALER', 'FRANCHISE');
+
+-- CreateEnum
+CREATE TYPE "SalesOrderStatus" AS ENUM ('DRAFT', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED');
+
+-- CreateEnum
+CREATE TYPE "ProformaInvoiceStatus" AS ENUM ('DRAFT', 'SENT', 'CONVERTED', 'CANCELLED');
 
 -- CreateEnum
 CREATE TYPE "ReturnStatus" AS ENUM ('PENDING', 'APPROVED', 'REJECTED', 'COMPLETED');
@@ -298,7 +304,10 @@ CREATE TABLE "DailySettlement" (
     "cashTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "upiTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "cardTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "otherTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "grandTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "refundTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "netTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "orderCount" INTEGER NOT NULL DEFAULT 0,
     "closedBy" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -378,6 +387,7 @@ CREATE TABLE "StockMovement" (
     "movementType" "StockMovementType" NOT NULL,
     "quantity" DOUBLE PRECISION NOT NULL,
     "baseQty" DOUBLE PRECISION,
+    "transactionUnit" TEXT,
     "unitId" TEXT,
     "referenceType" TEXT,
     "referenceId" TEXT,
@@ -484,6 +494,7 @@ CREATE TABLE "ProcurementOrder" (
     "deliveryInstructions" TEXT,
     "internalNotes" TEXT,
     "vendorNotes" TEXT,
+    "paymentTerms" TEXT,
     "approvedAt" TIMESTAMP(3),
     "approvedBy" TEXT,
     "warehouseId" TEXT,
@@ -501,6 +512,7 @@ CREATE TABLE "ProcurementOrderItem" (
     "inventoryItemId" TEXT,
     "quantity" DOUBLE PRECISION NOT NULL,
     "price" DOUBLE PRECISION NOT NULL,
+    "unit" TEXT NOT NULL DEFAULT 'UNIT',
     "cgst" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "gstRate" DOUBLE PRECISION NOT NULL DEFAULT 5,
     "hsnCode" TEXT,
@@ -537,6 +549,12 @@ CREATE TABLE "GoodsReceiptItem" (
     "acceptedQty" DOUBLE PRECISION NOT NULL,
     "rejectedQty" DOUBLE PRECISION NOT NULL,
     "price" DOUBLE PRECISION NOT NULL,
+    "poPrice" DOUBLE PRECISION,
+    "priceOverridden" BOOLEAN NOT NULL DEFAULT false,
+    "priceOverrideReason" TEXT,
+    "priceOverrideBy" TEXT,
+    "priceOverrideAt" TIMESTAMP(3),
+    "unit" TEXT NOT NULL DEFAULT 'UNIT',
     "binId" TEXT,
     "expDate" TIMESTAMP(3),
     "lotNumber" TEXT,
@@ -565,6 +583,8 @@ CREATE TABLE "VendorInvoice" (
     "cgst" DOUBLE PRECISION,
     "sgst" DOUBLE PRECISION,
     "igst" DOUBLE PRECISION,
+    "discountAmount" DOUBLE PRECISION DEFAULT 0,
+    "freightCost" DOUBLE PRECISION DEFAULT 0,
     "advanceApplied" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "warehouseId" TEXT,
 
@@ -587,6 +607,7 @@ CREATE TABLE "Product" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "hsnCode" TEXT,
+    "sacCode" TEXT,
     "productType" "ProductType" NOT NULL DEFAULT 'FINISHED_GOOD',
     "shelfLifeDays" INTEGER,
 
@@ -634,6 +655,7 @@ CREATE TABLE "RecipeItem" (
 -- CreateTable
 CREATE TABLE "Production" (
     "id" TEXT NOT NULL,
+    "productionBatchCode" TEXT,
     "productionType" TEXT NOT NULL,
     "recipeId" TEXT NOT NULL,
     "quantity" DOUBLE PRECISION NOT NULL,
@@ -874,7 +896,10 @@ CREATE TABLE "StockTransferItem" (
 CREATE TABLE "Order" (
     "id" TEXT NOT NULL,
     "invoiceNum" TEXT NOT NULL,
+    "partyType" "PartyType",
+    "partyId" TEXT,
     "customerId" TEXT,
+    "customerName" TEXT,
     "branchId" TEXT,
     "franchiseId" TEXT NOT NULL,
     "orderType" TEXT NOT NULL DEFAULT 'DINE_IN',
@@ -887,6 +912,8 @@ CREATE TABLE "Order" (
     "paymentType" TEXT NOT NULL DEFAULT 'CASH',
     "stateOfSupply" TEXT,
     "inventory_deducted" BOOLEAN NOT NULL DEFAULT false,
+    "sourceQuotationId" TEXT,
+    "sourceProformaInvoiceId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "Order_pkey" PRIMARY KEY ("id")
@@ -954,6 +981,17 @@ CREATE TABLE "Invoice" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "Invoice_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "PaymentAllocation" (
+    "id" TEXT NOT NULL,
+    "paymentId" TEXT NOT NULL,
+    "invoiceId" TEXT NOT NULL,
+    "amount" DOUBLE PRECISION NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "PaymentAllocation_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -1279,11 +1317,14 @@ CREATE TABLE "Payslip" (
 CREATE TABLE "Quotation" (
     "id" TEXT NOT NULL,
     "quotationNumber" TEXT NOT NULL,
+    "partyType" "PartyType" NOT NULL DEFAULT 'CUSTOMER',
+    "partyId" TEXT,
     "customerId" TEXT,
     "customerName" TEXT,
     "customerPhone" TEXT,
     "customerEmail" TEXT,
     "validUntil" TIMESTAMP(3),
+    "stateOfSupply" TEXT,
     "status" "QuotationStatus" NOT NULL DEFAULT 'DRAFT',
     "subTotal" DOUBLE PRECISION NOT NULL,
     "taxAmount" DOUBLE PRECISION NOT NULL,
@@ -1293,6 +1334,7 @@ CREATE TABLE "Quotation" (
     "notes" TEXT,
     "createdBy" TEXT,
     "convertedOrderId" TEXT,
+    "convertedInvoiceId" TEXT,
     "trackingNumber" TEXT,
     "courierName" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1310,6 +1352,8 @@ CREATE TABLE "QuotationItem" (
     "quantity" DOUBLE PRECISION NOT NULL,
     "unit" TEXT,
     "rate" DOUBLE PRECISION NOT NULL,
+    "discountPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "discountAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
@@ -1322,13 +1366,21 @@ CREATE TABLE "SalesOrder" (
     "id" TEXT NOT NULL,
     "orderNumber" TEXT NOT NULL,
     "quotationId" TEXT,
+    "proformaInvoiceId" TEXT,
+    "idempotencyKey" TEXT,
+    "partyType" "PartyType" NOT NULL DEFAULT 'CUSTOMER',
+    "partyId" TEXT,
     "customerId" TEXT,
     "customerName" TEXT,
-    "status" "SalesOrderStatus" NOT NULL DEFAULT 'PENDING',
+    "customerPhone" TEXT,
+    "status" "SalesOrderStatus" NOT NULL DEFAULT 'DRAFT',
     "subTotal" DOUBLE PRECISION NOT NULL,
     "taxAmount" DOUBLE PRECISION NOT NULL,
     "discountAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "orderDate" TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    "dueDate" TIMESTAMP(3),
+    "stateOfSupply" TEXT,
     "deliveryDate" TIMESTAMP(3),
     "deliveryAddress" TEXT,
     "trackingNumber" TEXT,
@@ -1351,11 +1403,57 @@ CREATE TABLE "SalesOrderItem" (
     "quantity" DOUBLE PRECISION NOT NULL,
     "unit" TEXT,
     "rate" DOUBLE PRECISION NOT NULL,
+    "discountPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "discountAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
 
     CONSTRAINT "SalesOrderItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProformaInvoice" (
+    "id" TEXT NOT NULL,
+    "proformaNumber" TEXT NOT NULL,
+    "sourceSalesOrderId" TEXT,
+    "partyType" "PartyType",
+    "partyId" TEXT,
+    "customerId" TEXT,
+    "customerName" TEXT,
+    "customerPhone" TEXT,
+    "stateOfSupply" TEXT,
+    "status" "ProformaInvoiceStatus" NOT NULL DEFAULT 'DRAFT',
+    "subTotal" DOUBLE PRECISION NOT NULL,
+    "taxAmount" DOUBLE PRECISION NOT NULL,
+    "discountAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "totalAmount" DOUBLE PRECISION NOT NULL,
+    "paymentTerms" TEXT,
+    "notes" TEXT,
+    "createdBy" TEXT,
+    "convertedInvoiceId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "ProformaInvoice_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProformaInvoiceItem" (
+    "id" TEXT NOT NULL,
+    "proformaInvoiceId" TEXT NOT NULL,
+    "productId" TEXT,
+    "productName" TEXT NOT NULL,
+    "quantity" DOUBLE PRECISION NOT NULL,
+    "unit" TEXT,
+    "rate" DOUBLE PRECISION NOT NULL,
+    "discountPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "discountAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "totalAmount" DOUBLE PRECISION NOT NULL,
+
+    CONSTRAINT "ProformaInvoiceItem_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -1367,6 +1465,12 @@ CREATE TABLE "ReturnOrder" (
     "reason" TEXT NOT NULL,
     "status" "ReturnStatus" NOT NULL DEFAULT 'PENDING',
     "refundAmount" DOUBLE PRECISION NOT NULL,
+    "taxableValue" DOUBLE PRECISION,
+    "gstRate" DOUBLE PRECISION,
+    "cgst" DOUBLE PRECISION,
+    "sgst" DOUBLE PRECISION,
+    "igst" DOUBLE PRECISION,
+    "taxAmount" DOUBLE PRECISION,
     "refundMethod" TEXT,
     "approvedBy" TEXT,
     "approvedAt" TIMESTAMP(3),
@@ -1375,6 +1479,7 @@ CREATE TABLE "ReturnOrder" (
     "franchiseId" TEXT,
     "franchiseOrderId" TEXT,
     "posOrderId" TEXT,
+    "idempotencyKey" TEXT,
 
     CONSTRAINT "ReturnOrder_pkey" PRIMARY KEY ("id")
 );
@@ -1398,9 +1503,11 @@ CREATE TABLE "DeliveryChallan" (
     "id" TEXT NOT NULL,
     "challanNumber" TEXT NOT NULL,
     "customerId" TEXT,
+    "dealerId" TEXT,
     "salesOrderId" TEXT,
     "franchiseId" TEXT,
     "sourceFranchiseId" TEXT,
+    "sourceInvoiceId" TEXT,
     "status" TEXT NOT NULL DEFAULT 'DRAFT',
     "challanDate" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "dueDate" TIMESTAMP(3),
@@ -1412,6 +1519,10 @@ CREATE TABLE "DeliveryChallan" (
     "subTotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "idempotencyKey" TEXT,
+    "receivedBy" TEXT,
+    "deliveredAt" TIMESTAMP(3),
+    "podReference" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -1436,14 +1547,51 @@ CREATE TABLE "DeliveryChallanItem" (
 );
 
 -- CreateTable
+CREATE TABLE "DeliveryChallanReturn" (
+    "id" TEXT NOT NULL,
+    "returnNumber" TEXT NOT NULL,
+    "challanId" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "otherReason" TEXT,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "createdBy" TEXT,
+    "idempotencyKey" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "DeliveryChallanReturn_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "DeliveryChallanReturnItem" (
+    "id" TEXT NOT NULL,
+    "returnId" TEXT NOT NULL,
+    "challanItemId" TEXT NOT NULL,
+    "productId" TEXT,
+    "productName" TEXT NOT NULL,
+    "quantity" DOUBLE PRECISION NOT NULL,
+    "unit" TEXT NOT NULL DEFAULT 'NONE',
+    "condition" TEXT,
+
+    CONSTRAINT "DeliveryChallanReturnItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "PurchaseReturn" (
     "id" TEXT NOT NULL,
     "returnNumber" TEXT NOT NULL,
     "procurementOrderId" TEXT,
     "vendorId" TEXT NOT NULL,
     "reason" TEXT NOT NULL,
+    "returnSource" TEXT NOT NULL DEFAULT 'MANUAL',
     "status" TEXT NOT NULL DEFAULT 'PENDING',
     "refundAmount" DOUBLE PRECISION NOT NULL,
+    "taxableValue" DOUBLE PRECISION,
+    "gstRate" DOUBLE PRECISION,
+    "cgst" DOUBLE PRECISION,
+    "sgst" DOUBLE PRECISION,
+    "igst" DOUBLE PRECISION,
+    "taxAmount" DOUBLE PRECISION,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -1582,6 +1730,8 @@ CREATE TABLE "Warehouse" (
     "id" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "nameKey" TEXT NOT NULL,
+    "code" TEXT,
+    "status" TEXT NOT NULL DEFAULT 'ACTIVE',
     "location" TEXT,
     "type" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1755,10 +1905,16 @@ CREATE UNIQUE INDEX "Customer_phone_key" ON "Customer"("phone");
 CREATE UNIQUE INDEX "Customer_email_key" ON "Customer"("email");
 
 -- CreateIndex
+CREATE INDEX "Customer_franchiseId_idx" ON "Customer"("franchiseId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Dealer_phone_key" ON "Dealer"("phone");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Dealer_email_key" ON "Dealer"("email");
+
+-- CreateIndex
+CREATE INDEX "Dealer_franchiseId_idx" ON "Dealer"("franchiseId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "BusinessPartner_phone_key" ON "BusinessPartner"("phone");
@@ -1773,13 +1929,25 @@ CREATE UNIQUE INDEX "DailySettlement_franchiseId_businessDate_key" ON "DailySett
 CREATE UNIQUE INDEX "Cheque_chequeNumber_key" ON "Cheque"("chequeNumber");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "InventoryItem_sku_key" ON "InventoryItem"("sku");
+CREATE UNIQUE INDEX "InventoryItem_sku_franchiseId_key" ON "InventoryItem"("sku", "franchiseId");
+
+-- CreateIndex
+CREATE INDEX "StockMovement_movementType_createdAt_idx" ON "StockMovement"("movementType", "createdAt");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Vendor_vendorCode_key" ON "Vendor"("vendorCode");
 
 -- CreateIndex
+CREATE INDEX "VendorLedger_vendorId_idx" ON "VendorLedger"("vendorId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "ProcurementOrder_poNumber_key" ON "ProcurementOrder"("poNumber");
+
+-- CreateIndex
+CREATE INDEX "ProcurementOrder_franchiseId_createdAt_idx" ON "ProcurementOrder"("franchiseId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "ProcurementOrder_createdAt_idx" ON "ProcurementOrder"("createdAt");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "VendorInvoice_invoiceNumber_key" ON "VendorInvoice"("invoiceNumber");
@@ -1797,6 +1965,18 @@ CREATE UNIQUE INDEX "Recipe_recipeCode_key" ON "Recipe"("recipeCode");
 CREATE UNIQUE INDEX "RecipeCategory_name_key" ON "RecipeCategory"("name");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "Production_productionBatchCode_key" ON "Production"("productionBatchCode");
+
+-- CreateIndex
+CREATE INDEX "Production_franchiseId_status_producedAt_idx" ON "Production"("franchiseId", "status", "producedAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProductBatch_productionId_key" ON "ProductBatch"("productionId");
+
+-- CreateIndex
+CREATE INDEX "ProductBatch_franchiseId_expiryDate_idx" ON "ProductBatch"("franchiseId", "expiryDate");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "BatchRecall_productBatchId_key" ON "BatchRecall"("productBatchId");
 
 -- CreateIndex
@@ -1809,7 +1989,34 @@ CREATE UNIQUE INDEX "ProductPackaging_barcode_key" ON "ProductPackaging"("barcod
 CREATE UNIQUE INDEX "FranchiseOrder_orderNumber_key" ON "FranchiseOrder"("orderNumber");
 
 -- CreateIndex
+CREATE INDEX "FranchiseOrder_franchiseId_createdAt_idx" ON "FranchiseOrder"("franchiseId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "FranchiseOrder_createdAt_idx" ON "FranchiseOrder"("createdAt");
+
+-- CreateIndex
+CREATE INDEX "FranchiseOrder_franchiseId_status_idx" ON "FranchiseOrder"("franchiseId", "status");
+
+-- CreateIndex
+CREATE INDEX "FranchiseOrder_status_idx" ON "FranchiseOrder"("status");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Order_invoiceNum_key" ON "Order"("invoiceNum");
+
+-- CreateIndex
+CREATE INDEX "Order_franchiseId_createdAt_idx" ON "Order"("franchiseId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Order_createdAt_idx" ON "Order"("createdAt");
+
+-- CreateIndex
+CREATE INDEX "Order_franchiseId_status_idx" ON "Order"("franchiseId", "status");
+
+-- CreateIndex
+CREATE INDEX "Order_customerId_paymentStatus_idx" ON "Order"("customerId", "paymentStatus");
+
+-- CreateIndex
+CREATE INDEX "Order_franchiseId_paymentStatus_idx" ON "Order"("franchiseId", "paymentStatus");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Payment_paymentNumber_key" ON "Payment"("paymentNumber");
@@ -1818,13 +2025,31 @@ CREATE UNIQUE INDEX "Payment_paymentNumber_key" ON "Payment"("paymentNumber");
 CREATE UNIQUE INDEX "Payment_idempotencyKey_key" ON "Payment"("idempotencyKey");
 
 -- CreateIndex
+CREATE INDEX "Payment_orderId_idx" ON "Payment"("orderId");
+
+-- CreateIndex
+CREATE INDEX "Payment_status_createdAt_idx" ON "Payment"("status", "createdAt");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Invoice_orderId_key" ON "Invoice"("orderId");
+
+-- CreateIndex
+CREATE INDEX "PaymentAllocation_paymentId_idx" ON "PaymentAllocation"("paymentId");
+
+-- CreateIndex
+CREATE INDEX "PaymentAllocation_invoiceId_idx" ON "PaymentAllocation"("invoiceId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Account_accountCode_key" ON "Account"("accountCode");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Expense_expenseNumber_key" ON "Expense"("expenseNumber");
+
+-- CreateIndex
+CREATE INDEX "Expense_franchiseId_date_idx" ON "Expense"("franchiseId", "date");
+
+-- CreateIndex
+CREATE INDEX "Expense_date_idx" ON "Expense"("date");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Delivery_orderId_key" ON "Delivery"("orderId");
@@ -1851,10 +2076,46 @@ CREATE UNIQUE INDEX "Quotation_quotationNumber_key" ON "Quotation"("quotationNum
 CREATE UNIQUE INDEX "SalesOrder_orderNumber_key" ON "SalesOrder"("orderNumber");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "SalesOrder_quotationId_key" ON "SalesOrder"("quotationId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SalesOrder_proformaInvoiceId_key" ON "SalesOrder"("proformaInvoiceId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SalesOrder_idempotencyKey_key" ON "SalesOrder"("idempotencyKey");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProformaInvoice_proformaNumber_key" ON "ProformaInvoice"("proformaNumber");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProformaInvoice_sourceSalesOrderId_key" ON "ProformaInvoice"("sourceSalesOrderId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProformaInvoice_convertedInvoiceId_key" ON "ProformaInvoice"("convertedInvoiceId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "ReturnOrder_returnNumber_key" ON "ReturnOrder"("returnNumber");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "ReturnOrder_idempotencyKey_key" ON "ReturnOrder"("idempotencyKey");
+
+-- CreateIndex
+CREATE INDEX "ReturnOrder_franchiseId_createdAt_idx" ON "ReturnOrder"("franchiseId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "ReturnOrder_createdAt_idx" ON "ReturnOrder"("createdAt");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "DeliveryChallan_challanNumber_key" ON "DeliveryChallan"("challanNumber");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DeliveryChallan_idempotencyKey_key" ON "DeliveryChallan"("idempotencyKey");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DeliveryChallanReturn_returnNumber_key" ON "DeliveryChallanReturn"("returnNumber");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DeliveryChallanReturn_idempotencyKey_key" ON "DeliveryChallanReturn"("idempotencyKey");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "PurchaseReturn_returnNumber_key" ON "PurchaseReturn"("returnNumber");
@@ -2121,6 +2382,12 @@ ALTER TABLE "Payment" ADD CONSTRAINT "Payment_vendorInvoiceId_fkey" FOREIGN KEY 
 ALTER TABLE "Invoice" ADD CONSTRAINT "Invoice_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_paymentId_fkey" FOREIGN KEY ("paymentId") REFERENCES "Payment"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_invoiceId_fkey" FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Account" ADD CONSTRAINT "Account_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -2196,6 +2463,12 @@ ALTER TABLE "SalesOrder" ADD CONSTRAINT "SalesOrder_customerId_fkey" FOREIGN KEY
 ALTER TABLE "SalesOrderItem" ADD CONSTRAINT "SalesOrderItem_salesOrderId_fkey" FOREIGN KEY ("salesOrderId") REFERENCES "SalesOrder"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "ProformaInvoice" ADD CONSTRAINT "ProformaInvoice_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProformaInvoiceItem" ADD CONSTRAINT "ProformaInvoiceItem_proformaInvoiceId_fkey" FOREIGN KEY ("proformaInvoiceId") REFERENCES "ProformaInvoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -2217,7 +2490,19 @@ ALTER TABLE "ReturnItem" ADD CONSTRAINT "ReturnItem_returnId_fkey" FOREIGN KEY (
 ALTER TABLE "DeliveryChallan" ADD CONSTRAINT "DeliveryChallan_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "DeliveryChallan" ADD CONSTRAINT "DeliveryChallan_dealerId_fkey" FOREIGN KEY ("dealerId") REFERENCES "Dealer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "DeliveryChallanItem" ADD CONSTRAINT "DeliveryChallanItem_challanId_fkey" FOREIGN KEY ("challanId") REFERENCES "DeliveryChallan"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DeliveryChallanReturn" ADD CONSTRAINT "DeliveryChallanReturn_challanId_fkey" FOREIGN KEY ("challanId") REFERENCES "DeliveryChallan"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_returnId_fkey" FOREIGN KEY ("returnId") REFERENCES "DeliveryChallanReturn"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_challanItemId_fkey" FOREIGN KEY ("challanItemId") REFERENCES "DeliveryChallanItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "PurchaseReturn" ADD CONSTRAINT "PurchaseReturn_procurementOrderId_fkey" FOREIGN KEY ("procurementOrderId") REFERENCES "ProcurementOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
