@@ -22,8 +22,8 @@ async function gstr1SaleInvoiceNumbers(startDate: string, endDate: string): Prom
 }
 
 async function main() {
-  const today = '2026-09-01';
-  const yesterday = '2026-08-31';
+  const today = new Date().toISOString().split('T')[0];
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   const customer = await prisma.customer.findFirst({ where: { name: { contains: 'Hari', mode: 'insensitive' } } });
   const product = await prisma.product.findFirst({ where: { productType: { not: 'SERVICE' } } });

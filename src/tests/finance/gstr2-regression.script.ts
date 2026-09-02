@@ -23,12 +23,23 @@ async function gstr2BillNumbers(startDate: string, endDate: string) {
 }
 
 async function main() {
-  const today = '2026-09-01';
-  const yesterday = '2026-08-31';
+  const today = new Date().toISOString().split('T')[0];
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   const hq = await FranchiseService.getHqFranchiseOrNull();
-  const vendor = await prisma.vendor.findFirst();
-  const items = await prisma.inventoryItem.findMany({ where: { category: { not: 'FINISHED_GOOD' } }, take: 2 });
+  let vendor = await prisma.vendor.findFirst();
+  if (!vendor) {
+    vendor = await prisma.vendor.create({
+      data: { name: 'Test-Vendor-GSTR2', contact: '9998887776', state: 'Tamil Nadu' }
+    });
+  }
+  let items = await prisma.inventoryItem.findMany({ where: { category: { not: 'FINISHED_GOOD' } }, take: 2 });
+  if (items.length < 2) {
+    const extraItem = await prisma.inventoryItem.create({
+      data: { name: `Test-Raw-Material-${Date.now()}`, sku: `SKU-${Date.now()}`, category: 'RAW_MATERIAL', unit: 'kg', costPrice: 50, gstRate: 5, currentStock: 0 }
+    });
+    items.push(extraItem);
+  }
   if (!hq || !vendor || items.length < 2) throw new Error('Reference HQ franchise / vendor / 2 inventory items not found for test setup');
 
   console.log(`Using HQ=${hq.name} (${hq.id}), vendor=${vendor.name} (${vendor.id}), items=[${items.map(i => i.name).join(', ')}]`);

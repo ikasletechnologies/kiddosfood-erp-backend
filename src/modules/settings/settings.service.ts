@@ -26,26 +26,43 @@ export class SettingsService {
    * Get core company profile
    */
   static async getCompanyProfile() {
-    const raw = await this.getSettingValue('COMPANY_PROFILE', '{}');
-    let profile: any;
-    try {
-      profile = JSON.parse(raw);
-    } catch {
-      profile = {};
+    const raw = await this.getSettingValue('COMPANY_PROFILE', '');
+    let profile: any = {};
+    if (raw && raw.trim() !== '' && raw !== '{}') {
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        profile = {};
+      }
     }
 
-    // The seller's GST registration state (needed to classify CGST+SGST vs
-    // IGST on every document — Sales Order, Proforma, Tax Invoice) has no
-    // dedicated field; it lives on this profile's `state`. When nobody has
-    // configured that yet, fall back to the real HQ franchise's location —
-    // the one place a seller state already exists in this system (and the
-    // same field GST reports already key off, see
-    // FinanceService/splitTaxBySupplyState) — rather than leaving `state`
-    // undefined, which callers have historically covered with their own
-    // hardcoded guesses that disagree with each other and with this value.
+    // If profile has a GSTIN but no explicit state, derive state from GSTIN
     if (!profile.state) {
-      const hq = await FranchiseService.getHqFranchiseOrNull();
-      if (hq?.location) profile = { ...profile, state: hq.location };
+      if (profile.gstNumber || profile.gstin) {
+        const { getStateFromGstin } = require('../../utils/gst-tax.util');
+        const stateFromGstin = getStateFromGstin(profile.gstNumber || profile.gstin);
+        if (stateFromGstin) {
+          profile.state = stateFromGstin;
+        }
+      }
+    }
+
+    // Default configuration for Kiddos Foods if setting is unpopulated in DB
+    if (!profile.companyName && !profile.state) {
+      profile = {
+        companyName: 'Kiddos Foods',
+        legalName: 'Kiddos Foods Private Limited',
+        state: 'Tamil Nadu',
+        gstNumber: '33AAAAA0000A1Z5',
+        gstin: '33AAAAA0000A1Z5',
+        city: 'Chennai',
+        pincode: '600001',
+        address: 'Central Plaza, Tech Hub, Chennai, Tamil Nadu',
+        email: 'contact@kiddosfoods.com',
+        phone: '1112223333',
+        ...profile
+      };
+      await this.setSetting('COMPANY_PROFILE', JSON.stringify(profile), 'GENERAL', 'Enterprise Company Identity Data');
     }
 
     return profile;

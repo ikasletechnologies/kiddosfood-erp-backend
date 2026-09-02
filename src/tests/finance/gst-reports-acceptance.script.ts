@@ -5,6 +5,7 @@ import { GRNService } from '../../modules/grn/grn.service';
 import { PurchaseService } from '../../modules/purchase/purchase.service';
 import { FinanceService } from '../../modules/finance/finance.service';
 import { FranchiseService } from '../../modules/franchise/franchise.service';
+import { SettingsService } from '../../modules/settings/settings.service';
 
 // GST reporting acceptance script. Exercises the full document chain
 // (Estimate -> Sales Order -> Proforma -> Tax Invoice -> Return, and
@@ -88,11 +89,13 @@ async function main() {
     });
     cleanup('delete throwaway serviceProduct', async () => { await prisma.product.delete({ where: { id: serviceProduct.id } }); });
 
-    const hqLocation = hq?.location || 'Karnataka';
-    const diffState = hqLocation.toLowerCase() === 'delhi' ? 'Karnataka' : 'Delhi';
+    const companyProfile = await SettingsService.getCompanyProfile();
+    const hqState = companyProfile?.state || 'Tamil Nadu';
+    const hqLocation = hqState;
+    const diffState = hqState.toLowerCase() === 'delhi' ? 'Karnataka' : 'Delhi';
 
     const customerSame = await prisma.customer.create({
-      data: { name: `GST-Test-Customer-Same-${rnd()}`, phone: `9${Date.now().toString().slice(-9)}`, state: hqLocation }
+      data: { name: `GST-Test-Customer-Same-${rnd()}`, phone: `9${Date.now().toString().slice(-9)}`, state: hqState }
     });
     cleanup('delete customerSame', async () => { await prisma.customer.delete({ where: { id: customerSame.id } }); });
 
@@ -281,7 +284,8 @@ async function main() {
         // so instead assert the totals are both positive and at least as
         // large as what we know we contributed.
         const gstr3b = await FinanceService.getGSTR3BData(hq.id, todayStart, todayEnd);
-        const expectedMinOutputTax = (sameChain ? 120 : 0) + (diffChain ? 120 : 0); // 1000 * 12% each invoice
+        const invoiceTax = 1000 * ((goodsProduct.taxPercent || 5) / 100);
+        const expectedMinOutputTax = (sameChain ? invoiceTax : 0) + (diffChain ? invoiceTax : 0);
         const expectedMinInputTax = grn ? 120 : 0; // 1000 taxable * 12%
         const outputOk = gstr3b.summary.totalOutputTax > 0 && gstr3b.summary.totalOutputTax >= expectedMinOutputTax - 0.5;
         const inputOk = gstr3b.summary.totalInputTax > 0 && gstr3b.summary.totalInputTax >= expectedMinInputTax - 0.5;
