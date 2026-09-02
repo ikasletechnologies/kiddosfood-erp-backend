@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { FinanceService } from '../../modules/finance/finance.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { SettingsService } from '../../modules/settings/settings.service';
 
 async function runEndToEndAcceptanceTest() {
   console.log('====================================================');
@@ -20,8 +21,28 @@ async function runEndToEndAcceptanceTest() {
   let createdItemRMId: string | null = null;
   const createdOrderIds: string[] = [];
   const createdPoIds: string[] = [];
+  const createdVendorInvoiceIds: string[] = [];
+
+  // Seller-state jurisdiction (CGST+SGST vs IGST) resolves from the single
+  // real SettingsService.getCompanyProfile().state, NOT from Franchise.location
+  // — Franchise has no structured state/GSTIN field, by design (one GST
+  // registration serving all franchises). This test used to hardcode
+  // 'Maharashtra'/'Gujarat' stateOfSupply values as if the test franchise's
+  // free-text `location` were the seller state, while the real company
+  // profile could be configured to any other state (e.g. 'Tamil Nadu') —
+  // which made every transaction here classify as inter-state (all IGST)
+  // regardless of intent. Temporarily pointing the real company profile at
+  // 'Maharashtra' for the duration of this test — and restoring it
+  // afterwards — is the same pattern already used correctly in
+  // gstr3b-regression.script.ts / gstr9-regression.script.ts.
+  const originalCompanyProfileSetting = await prisma.systemSetting.findUnique({ where: { key: 'COMPANY_PROFILE' } });
 
   try {
+    await SettingsService.updateCompanyProfile({
+      ...(JSON.parse(originalCompanyProfileSetting?.value || '{}')),
+      state: 'Maharashtra'
+    });
+
     // 1. SETUP: Create Test Franchise
     console.log('1️⃣ Setting up controlled test master data...');
     const franchise = await prisma.franchise.create({
@@ -245,6 +266,29 @@ async function runEndToEndAcceptanceTest() {
     });
     createdPoIds.push(po.id);
 
+    // GSTR-2/GSTR-3B ITC is sourced from VendorInvoice (the Purchase Bill),
+    // never from ProcurementOrder directly — a PO/GRN with no bill against
+    // it must not create GST entries (see gstr3b-regression.script.ts CASE
+    // 8/9). A ProcurementOrder alone here previously left Input Tax at a
+    // correct-but-unexpected ₹0; a real Purchase Bill is required to
+    // exercise the ₹250 ITC this transaction is meant to represent.
+    const vendorInvoice = await prisma.vendorInvoice.create({
+      data: {
+        vendorId: vendor.id,
+        poId: po.id,
+        invoiceNumber: `VINV-${testId}`,
+        amount: 5250,
+        status: 'PAID',
+        billDate: new Date(),
+        subtotal: 5000,
+        taxAmount: 250,
+        cgst: 0,
+        sgst: 0,
+        igst: 250
+      }
+    });
+    createdVendorInvoiceIds.push(vendorInvoice.id);
+
     // Stock Movement for Purchase In
     await prisma.stockMovement.create({
       data: {
@@ -379,8 +423,16 @@ async function runEndToEndAcceptanceTest() {
         await prisma.orderItem.deleteMany({ where: { orderId: { in: createdOrderIds } } });
         await prisma.order.deleteMany({ where: { id: { in: createdOrderIds } } });
       }
+      if (createdVendorInvoiceIds.length > 0) {
+        await prisma.vendorInvoice.deleteMany({ where: { id: { in: createdVendorInvoiceIds } } });
+      }
       if (createdPoIds.length > 0) {
         await prisma.procurementOrder.deleteMany({ where: { id: { in: createdPoIds } } });
+      }
+      if (originalCompanyProfileSetting) {
+        await prisma.systemSetting.update({ where: { key: 'COMPANY_PROFILE' }, data: { value: originalCompanyProfileSetting.value } }).catch(() => {});
+      } else {
+        await prisma.systemSetting.deleteMany({ where: { key: 'COMPANY_PROFILE' } }).catch(() => {});
       }
       if (createdItemAId || createdItemRMId) {
         await prisma.stockMovement.deleteMany({ where: { itemId: { in: [createdItemAId!, createdItemRMId!].filter(Boolean) } } });
