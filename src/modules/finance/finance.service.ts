@@ -517,17 +517,19 @@ export class FinanceService {
   // exists at all.
   private static mergeAllocationsIntoPayments(invoice: any): any {
     if (!invoice) return invoice;
-    const allocationPayments = (invoice.allocations || []).map((a: any) => ({
-      id: a.payment?.id,
-      paidAmount: a.amount,
-      status: a.payment?.status,
-      isCancelled: a.payment?.isCancelled,
-      createdAt: a.payment?.createdAt,
-      paymentMode: a.payment?.paymentMode,
-      paymentNumber: a.payment?.paymentNumber,
-      accountId: a.payment?.accountId,
-      isAllocation: true,
-    }));
+    const allocationPayments = (invoice.allocations || [])
+      .filter((a: any) => a.payment?.invoiceId !== invoice.id)
+      .map((a: any) => ({
+        id: a.payment?.id,
+        paidAmount: a.amount,
+        status: a.payment?.status,
+        isCancelled: a.payment?.isCancelled,
+        createdAt: a.payment?.createdAt,
+        paymentMode: a.payment?.paymentMode,
+        paymentNumber: a.payment?.paymentNumber,
+        accountId: a.payment?.accountId,
+        isAllocation: true,
+      }));
     return { ...invoice, payments: [...(invoice.payments || []), ...allocationPayments] };
   }
 
@@ -1134,7 +1136,17 @@ export class FinanceService {
         _sum: { paidAmount: true },
       }),
       tx.paymentAllocation.aggregate({
-        where: { invoiceId, payment: { status: 'PAID', isCancelled: false } },
+        where: { 
+          invoiceId, 
+          payment: { 
+            status: 'PAID', 
+            isCancelled: false,
+            OR: [
+              { invoiceId: null },
+              { invoiceId: { not: invoiceId } }
+            ]
+          } 
+        },
         _sum: { amount: true },
       }),
     ]);
@@ -1153,15 +1165,24 @@ export class FinanceService {
   // `payments`, so this only adds the missing term and changes no other
   // behavior at any call site.
   private static sumOrderPaidWithAllocations(
-    payments: { paidAmount: number; isCancelled: boolean; status: string }[] | null | undefined,
-    allocations: { amount: number; payment: { status: string; isCancelled: boolean } }[] | null | undefined,
+    payments: { id?: string; paidAmount: number; isCancelled: boolean; status: string }[] | null | undefined,
+    allocations: { amount: number; payment: { id?: string; invoiceId?: string | null; status: string; isCancelled: boolean } }[] | null | undefined,
     isValid: (p: { status: string; isCancelled: boolean }) => boolean
   ): number {
+    const directIds = new Set((payments || []).map((p: any) => p.id).filter(Boolean));
     const direct = (payments || [])
       .filter((p) => isValid(p))
       .reduce((s, p) => s + (p.paidAmount || 0), 0);
     const allocated = (allocations || [])
-      .filter((a) => isValid(a.payment))
+      .filter((a) => {
+        if (!isValid(a.payment)) return false;
+        // If payment id is available, ensure we don't double count a payment already in the direct list
+        if ((a.payment as any).id && directIds.has((a.payment as any).id)) return false;
+        // If the payment was created with an explicit invoiceId (legacy single invoice path),
+        // its paidAmount is already fully counted in the direct `payments` list.
+        if ((a.payment as any).invoiceId) return false;
+        return true;
+      })
       .reduce((s, a) => s + (a.amount || 0), 0);
     return direct + allocated;
   }
