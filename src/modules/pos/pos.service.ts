@@ -6,6 +6,17 @@ import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
 
+// Atomic, collision-safe document numbering using NumberSequence table
+async function nextDocumentNumber(tx: any, key: string, prefix: string, pad = 5): Promise<string> {
+  const year = new Date().getFullYear();
+  const seq = await tx.numberSequence.upsert({
+    where: { key: `${key}_${year}` },
+    create: { key: `${key}_${year}`, value: 1 },
+    update: { value: { increment: 1 } },
+  });
+  return `${prefix}-${year}-${String(seq.value).padStart(pad, '0')}`;
+}
+
 export class POSService {
 
   // --- NEW NATIVE API FLOW (Step-by-Step) ---
@@ -33,19 +44,22 @@ export class POSService {
       fid = first.id;
     }
 
-    return prisma.order.create({
-      data: {
-        invoiceNum: `INV-${Date.now()}`,
-        franchiseId: fid,
-        customerId: (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) ? data.customerId : null,
-        status: 'PENDING',
-        paymentStatus: 'UNPAID',
-        orderType: data.orderType || 'TAKEAWAY',
-        subTotal: 0, 
-        taxAmount: 0, 
-        discountAmount: 0, 
-        totalAmount: 0
-      }
+    return prisma.$transaction(async (tx) => {
+      const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
+      return tx.order.create({
+        data: {
+          invoiceNum,
+          franchiseId: fid!,
+          customerId: (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) ? data.customerId : null,
+          status: 'PENDING',
+          paymentStatus: 'UNPAID',
+          orderType: data.orderType || 'TAX_INVOICE',
+          subTotal: 0, 
+          taxAmount: 0, 
+          discountAmount: 0, 
+          totalAmount: 0
+        }
+      });
     });
   }
 
@@ -306,51 +320,61 @@ export class POSService {
   static async payOrder(orderId: string, method: 'CASH'|'UPI'|'CARD', accountId: string, createdBy?: string) {
     if (!accountId) throw new Error('Source Account ID is required for POS payments.');
 
-    const order = await prisma.order.findUnique({ 
-      where: { id: orderId },
-      include: { invoice: true }
-    });
-    if (!order) throw new Error('Order not found');
-
-    // 1. Create Centralized Payment via FinanceService
-    await FinanceService.createPayment({
-      amount: order.totalAmount,
-      flow: 'IN',
-      status: 'PAID',
-      sourceAccount: accountId, // This might need mapping if accountId is a UUID
-      method: method,
-      sourceModule: 'POS',
-      linkedDocType: 'INVOICE',
-      linkedDocId: order.invoice?.id || order.invoiceNum,
-      entityType: 'CUSTOMER',
-      entityId: order.customerId || 'WALK_IN',
-      orderId: order.id,
-      franchiseId: order.franchiseId,
-      createdBy: createdBy || 'POS_SYSTEM'
-    });
-
-    // 2. Customer Ledger CREDIT (They paid us)
-    if (order.customerId) {
-      await prisma.customerLedger.create({
-        data: {
-          customerId: order.customerId,
-          type: 'CREDIT',
-          amount: order.totalAmount,
-          paymentMode: method,
-          referenceType: 'PAYMENT',
-          referenceId: order.id,
-          accountId,
-          note: `Payment for Order #${order.invoiceNum}`
-        }
+    return prisma.$transaction(async (tx) => {
+      let order = await tx.order.findUnique({ 
+        where: { id: orderId },
+        include: { invoice: true }
       });
-    }
+      if (!order) throw new Error('Order not found');
 
-    const updated = await prisma.order.update({
-      where: { id: orderId },
-      data: { paymentStatus: 'PAID' },
-      include: { payments: true }
+      // Ensure invoice exists
+      let invoice = order.invoice;
+      if (!invoice) {
+        invoice = await FinanceService.createInvoiceFromOrder(orderId, tx);
+      }
+
+      // 1. Create Centralized Payment via FinanceService
+      await FinanceService.createPayment({
+        tx,
+        amount: order.totalAmount,
+        flow: 'IN',
+        status: 'PAID',
+        sourceAccount: accountId,
+        method: method,
+        sourceModule: 'POS',
+        linkedDocType: 'INVOICE',
+        linkedDocId: order.invoiceNum,
+        entityType: order.partyType || (order.customerId ? 'CUSTOMER' : undefined),
+        entityId: order.customerId || order.partyId || undefined,
+        orderId: order.id,
+        invoiceId: invoice?.id,
+        franchiseId: order.franchiseId,
+        createdBy: createdBy || 'POS_SYSTEM'
+      });
+
+      // 2. Customer Ledger CREDIT (They paid us)
+      if (order.customerId) {
+        await tx.customerLedger.create({
+          data: {
+            customerId: order.customerId,
+            type: 'CREDIT',
+            amount: order.totalAmount,
+            paymentMode: method,
+            referenceType: 'PAYMENT',
+            referenceId: order.id,
+            accountId,
+            note: `Payment for Order #${order.invoiceNum}`
+          }
+        });
+      }
+
+      const updated = await tx.order.update({
+        where: { id: orderId },
+        data: { paymentStatus: 'PAID' },
+        include: { payments: true, invoice: true, orderItems: { include: { product: true } }, customer: true }
+      });
+      return updated;
     });
-    return updated;
   }
 
 
@@ -430,14 +454,16 @@ export class POSService {
     }
 
     const result = await prisma.$transaction(async (tx) => {
+      const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
       const order = await tx.order.create({
         data: {
-          invoiceNum: `INV-${Date.now()}`,
+          invoiceNum,
           franchiseId: fid,
           customerId: hasRealCustomer ? data.customerId : null,
           partyType: resolvedPartyType,
           partyId: resolvedPartyId || null,
           customerName: data.customerName || null,
+          orderType: 'TAX_INVOICE',
           subTotal: data.subTotal || (data as any).subtotal || 0,
           taxAmount: data.taxAmount,
           discountAmount: data.discountAmount,
@@ -469,7 +495,20 @@ export class POSService {
         include: { orderItems: true, customer: true }
       });
 
-      // 1. Handle Payment through central logic
+      // 1. Create Tax Invoice in DB inside the same transaction
+      const invoice = await tx.invoice.create({
+        data: {
+          orderId: order.id,
+          totalAmount: order.subTotal,
+          taxAmount: order.taxAmount,
+          finalAmount: order.totalAmount,
+          status: 'PAID',
+          description: 'POS Counter Billing Sale',
+          notes: displayName ? `Counter Sale - ${displayName}` : 'Counter Sale'
+        }
+      });
+
+      // 2. Handle Payment through central logic
       const accountTypeMap: Record<string, string> = {
         'CASH': 'CASH',
         'UPI': 'UPI',
@@ -507,11 +546,28 @@ export class POSService {
         // master-table row (Walk-in, or a Dealer with no record) — see BUG 1.
         note: displayName,
         orderId: order.id,
+        invoiceId: invoice.id,
         franchiseId: fid,
         createdBy: 'POS_CHECKOUT'
       });
 
-      // 2. Inventory Deduction
+      // 3. Customer Ledger CREDIT if real customer
+      if (hasRealCustomer && data.customerId) {
+        await tx.customerLedger.create({
+          data: {
+            customerId: data.customerId,
+            type: 'CREDIT',
+            amount: data.totalAmount,
+            paymentMode: (data.paymentMode as any) || 'CASH',
+            referenceType: 'PAYMENT',
+            referenceId: order.id,
+            accountId: finalAccountId,
+            note: `POS Counter Sale Payment #${order.invoiceNum}`
+          }
+        });
+      }
+
+      // 4. Inventory Deduction
       for (let i = 0; i < data.items.length; i++) {
         const item = data.items[i];
         // orderItems was created from data.items in the same order above, so
@@ -604,7 +660,7 @@ export class POSService {
       const updated = await tx.order.update({
         where: { id: order.id },
         data: { inventory_deducted: true },
-        include: { orderItems: true, payments: true, customer: true }
+        include: { orderItems: { include: { product: true } }, payments: true, customer: true, invoice: true, franchise: true }
       });
 
       return updated;
@@ -614,13 +670,6 @@ export class POSService {
       SocketService.io.emit('new-order', result);
     } catch (err) {
       console.error('[Socket] Failed to emit new-order (legacy)', err);
-    }
-
-    // Phase 5: Trigger Invoice for Legacy Checkout
-    try {
-        await FinanceService.createInvoiceFromOrder(result.id);
-    } catch (err) {
-        console.error('[Accounting] Legacy checkout invoice failed', err);
     }
 
     return result;

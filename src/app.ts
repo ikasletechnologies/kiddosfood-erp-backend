@@ -638,6 +638,10 @@ app.patch('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRAN
 app.put('/api/sales/proforma-invoices/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaStatus);
 app.post('/api/sales/proforma-invoices/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertProformaInvoice);
 
+app.get('/api/sales/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
+app.post('/api/sales/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.createInvoice);
+
 app.get('/api/sales/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getReturnOrders);
 app.post('/api/sales/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createReturnOrder);
 app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateReturnOrder);

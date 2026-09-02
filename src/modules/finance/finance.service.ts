@@ -76,8 +76,8 @@ export class FinanceService {
   /**
    * Automatically generate an Invoice for a completed order
    */
-  static async createInvoiceFromOrder(orderId: string) {
-    return prisma.$transaction(async (tx) => {
+  static async createInvoiceFromOrder(orderId: string, externalTx?: any) {
+    const run = async (tx: any) => {
       const order = await tx.order.findUnique({
         where: { id: orderId }
       });
@@ -115,7 +115,9 @@ export class FinanceService {
       });
 
       return invoice;
-    });
+    };
+
+    return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
 
   /**
@@ -399,13 +401,39 @@ export class FinanceService {
     };
   }
 
-  static async getInvoices(franchiseId?: string) {
+  static async getInvoices(filters?: { franchiseId?: string; startDate?: string; endDate?: string; search?: string; status?: string } | string) {
+    const opts = typeof filters === 'string' ? { franchiseId: filters } : (filters || {});
+    const where: any = {};
+    if (opts.franchiseId) {
+      where.order = { franchiseId: opts.franchiseId };
+    }
+    if (opts.startDate || opts.endDate) {
+      where.createdAt = {};
+      if (opts.startDate) where.createdAt.gte = new Date(opts.startDate);
+      if (opts.endDate) {
+        const end = new Date(opts.endDate);
+        end.setHours(23, 59, 59, 999);
+        where.createdAt.lte = end;
+      }
+    }
+    if (opts.status && opts.status !== 'ALL') {
+      where.status = opts.status;
+    }
+    if (opts.search) {
+      where.OR = [
+        { order: { invoiceNum: { contains: opts.search, mode: 'insensitive' } } },
+        { order: { customerName: { contains: opts.search, mode: 'insensitive' } } },
+        { order: { customer: { name: { contains: opts.search, mode: 'insensitive' } } } },
+      ];
+    }
+
     return prisma.invoice.findMany({
-      where: franchiseId ? { order: { franchiseId } } : undefined,
+      where: Object.keys(where).length > 0 ? where : undefined,
       include: { 
         order: { 
           include: { 
             customer: true,
+            franchise: true,
             orderItems: {
               include: {
                 product: true
@@ -416,6 +444,31 @@ export class FinanceService {
         payments: true 
       },
       orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  static async getInvoiceById(id: string) {
+    return prisma.invoice.findFirst({
+      where: {
+        OR: [
+          { id },
+          { orderId: id }
+        ]
+      },
+      include: {
+        order: {
+          include: {
+            customer: true,
+            franchise: true,
+            orderItems: {
+              include: {
+                product: true
+              }
+            }
+          }
+        },
+        payments: true
+      }
     });
   }
 

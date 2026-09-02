@@ -276,9 +276,30 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
+      const { startDate, fromDate, endDate, toDate, search, status } = req.query;
 
-      const invoices = await FinanceService.getInvoices(franchiseId);
+      const invoices = await FinanceService.getInvoices({
+        franchiseId,
+        startDate: (startDate || fromDate) as string,
+        endDate: (endDate || toDate) as string,
+        search: search as string,
+        status: status as string,
+      });
       res.json(invoices);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async getInvoiceById(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const invoice = await FinanceService.getInvoiceById(req.params.id);
+      if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+      if (user && user.role !== 'SUPER_ADMIN' && invoice.order?.franchiseId && user.franchiseId && invoice.order.franchiseId !== user.franchiseId) {
+        return res.status(403).json({ error: 'Forbidden: Access denied to this invoice' });
+      }
+      res.json(invoice);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
