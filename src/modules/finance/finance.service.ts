@@ -1141,6 +1141,31 @@ export class FinanceService {
     return (direct._sum.paidAmount || 0) + (allocated._sum.amount || 0);
   }
 
+  // Report-query counterpart to getInvoicePaidAmount, for the many read
+  // paths that already fetch an Order with `payments` included and sum
+  // `paidAmount` in memory (Sales Report, Receivables, All Transactions,
+  // customer/dealer balances, ...). Those sums silently missed a
+  // multi-invoice receipt's share, since that Payment's orderId is null —
+  // its money is only visible via `order.invoice.allocations`. Callers pass
+  // their own already-loaded `order.payments` plus (optionally)
+  // `order.invoice.allocations` — see callers for the required `include`
+  // shape — and the SAME validity predicate they already apply to
+  // `payments`, so this only adds the missing term and changes no other
+  // behavior at any call site.
+  private static sumOrderPaidWithAllocations(
+    payments: { paidAmount: number; isCancelled: boolean; status: string }[] | null | undefined,
+    allocations: { amount: number; payment: { status: string; isCancelled: boolean } }[] | null | undefined,
+    isValid: (p: { status: string; isCancelled: boolean }) => boolean
+  ): number {
+    const direct = (payments || [])
+      .filter((p) => isValid(p))
+      .reduce((s, p) => s + (p.paidAmount || 0), 0);
+    const allocated = (allocations || [])
+      .filter((a) => isValid(a.payment))
+      .reduce((s, a) => s + (a.amount || 0), 0);
+    return direct + allocated;
+  }
+
   static async createPayment(data: any) {
     const amount    = parseFloat(data.amount);
     // Server-side backstop for the ₹0/negative payment guard — the frontend
@@ -1929,6 +1954,10 @@ export class FinanceService {
         include: {
           customer: true,
           payments: true,
+          // A multi-invoice receipt's share of this order isn't in
+          // `payments` (that Payment's orderId is null) — it's here, on the
+          // Invoice this order owns. See sumOrderPaidWithAllocations.
+          invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } },
           orderItems: {
             include: {
               product: true
@@ -1942,7 +1971,11 @@ export class FinanceService {
     ]);
 
     const data = sales.map(order => {
-      const paidAmount = order.paymentStatus === 'PAID' ? order.totalAmount : order.payments.reduce((sum, p) => sum + p.paidAmount, 0);
+      // Matches this site's pre-existing (unfiltered) summation exactly —
+      // only the missing allocation term is added, nothing else changes.
+      const paidAmount = order.paymentStatus === 'PAID'
+        ? order.totalAmount
+        : this.sumOrderPaidWithAllocations(order.payments, order.invoice?.allocations, () => true);
       return {
         id: order.id,
         createdAt: order.createdAt,
@@ -2302,7 +2335,16 @@ export class FinanceService {
       prisma.payment.findMany({
         where: whereClause,
         include: {
-          order: { include: { customer: true, payments: true } },
+          order: {
+            include: {
+              customer: true,
+              payments: true,
+              // See sumOrderPaidWithAllocations — a multi-invoice receipt's
+              // share of this order lives here, not in `order.payments`
+              // (that Payment's orderId is null).
+              invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } }
+            }
+          },
           invoice: true,
           account: true,
           vendorInvoice: { include: { vendor: true } }
@@ -2349,7 +2391,11 @@ export class FinanceService {
 
       const orderTotal = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
       const paidForOrder = p.order?.payments?.length
-        ? p.order.payments.filter((x: any) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')).reduce((s: number, x: any) => s + Number(x.paidAmount), 0)
+        ? this.sumOrderPaidWithAllocations(
+            p.order.payments,
+            (p.order as any).invoice?.allocations,
+            (x) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')
+          )
         : Number(p.paidAmount);
       const receivableAmount = Number(p.paidAmount);
       const balanceAmount = Math.max(0, orderTotal - paidForOrder);
@@ -4658,7 +4704,12 @@ export class FinanceService {
         partyId: true,
         customerId: true,
         totalAmount: true,
-        payments: { select: { paidAmount: true, isCancelled: true, status: true } }
+        payments: { select: { paidAmount: true, isCancelled: true, status: true } },
+        // See sumOrderPaidWithAllocations — a multi-invoice receipt's share
+        // of this order lives here, not in `payments` (that Payment's
+        // orderId is null), and was previously invisible to this aggregate,
+        // which could leave an already-fully-paid invoice showing as due.
+        invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } }
       }
     });
 
@@ -4670,9 +4721,11 @@ export class FinanceService {
       if (!resolvedId) continue; // No real master-table row for this party (Walk-in etc) — not trackable.
       if (partyType && resolvedType !== partyType) continue;
 
-      const paid = o.payments
-        .filter((p) => !p.isCancelled && p.status !== 'CANCELLED')
-        .reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const paid = this.sumOrderPaidWithAllocations(
+        o.payments,
+        o.invoice?.allocations,
+        (p) => !p.isCancelled && p.status !== 'CANCELLED'
+      );
       const due = (o.totalAmount || 0) - paid;
       if (due <= 0.01) continue; // Fully-paid (or overpaid, which the createPayment guard should prevent) — nothing outstanding.
 
@@ -4757,17 +4810,35 @@ export class FinanceService {
         ...idFilter
       },
       include: {
-        payments: { include: { account: true }, orderBy: { createdAt: 'asc' } }
+        payments: { include: { account: true }, orderBy: { createdAt: 'asc' } },
+        // A multi-invoice receipt's share of this order lives here, not in
+        // `payments` (that Payment's orderId is null) — see
+        // sumOrderPaidWithAllocations. Also merged into the returned
+        // `payments` history below so it's visible there too, not just in
+        // the paid/balance/status summary.
+        invoice: { select: { allocations: { include: { payment: { include: { account: true } } } } } }
       },
       orderBy: { createdAt: 'desc' }
     });
 
     return orders.map((o) => {
-      const validPayments = o.payments.filter((p) => !p.isCancelled && p.status !== 'CANCELLED');
-      const paid = Number(validPayments.reduce((sum, p) => sum + (p.paidAmount || 0), 0).toFixed(2));
+      const isValid = (p: { isCancelled: boolean; status: string }) => !p.isCancelled && p.status !== 'CANCELLED';
+      const paid = Number(
+        this.sumOrderPaidWithAllocations(o.payments, o.invoice?.allocations, isValid).toFixed(2)
+      );
       const rawBalance = Number(((o.totalAmount || 0) - paid).toFixed(2));
       const balance = rawBalance < 0 ? 0 : rawBalance;
       const status: 'PAID' | 'PARTIAL' | 'UNPAID' = balance <= 0.01 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID');
+
+      const allocationPaymentRows = (o.invoice?.allocations || []).map((a) => ({
+        paymentNumber: a.payment.paymentNumber || '—',
+        date: a.payment.createdAt,
+        method: a.payment.paymentMode,
+        account: a.payment.account?.name || 'Unknown',
+        amount: a.amount,
+        isCancelled: a.payment.isCancelled,
+        status: a.payment.status
+      }));
 
       return {
         orderId: o.id, // Internal key only — never render this in the UI, render invoiceNumber instead.
@@ -4777,15 +4848,18 @@ export class FinanceService {
         paidAmount: paid,
         balance,
         status,
-        payments: o.payments.map((p) => ({
-          paymentNumber: p.paymentNumber || '—',
-          date: p.createdAt,
-          method: p.paymentMode,
-          account: p.account?.name || 'Unknown',
-          amount: p.paidAmount,
-          isCancelled: p.isCancelled,
-          status: p.status
-        }))
+        payments: [
+          ...o.payments.map((p) => ({
+            paymentNumber: p.paymentNumber || '—',
+            date: p.createdAt,
+            method: p.paymentMode,
+            account: p.account?.name || 'Unknown',
+            amount: p.paidAmount,
+            isCancelled: p.isCancelled,
+            status: p.status
+          })),
+          ...allocationPaymentRows
+        ]
       };
     });
   }
@@ -5094,7 +5168,11 @@ export class FinanceService {
       include: {
         customer: true,
         orderItems: { include: { product: true } },
-        payments: true
+        payments: true,
+        // See sumOrderPaidWithAllocations — a multi-invoice receipt's share
+        // of this order lives here, not in `payments` (that Payment's
+        // orderId is null).
+        invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } }
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -5118,9 +5196,11 @@ export class FinanceService {
       const taxAmount = o.taxAmount || 0;
       const split = splitGstAmount(taxAmount, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
       const grandTotal = o.totalAmount || (taxableValue + taxAmount);
+      // Matches this site's pre-existing (unfiltered) summation exactly —
+      // only the missing allocation term is added, nothing else changes.
       const paid = o.paymentStatus === 'PAID'
         ? grandTotal
-        : (o.payments ? o.payments.reduce((ps: number, p: any) => ps + (p.paidAmount || 0), 0) : 0);
+        : this.sumOrderPaidWithAllocations(o.payments, o.invoice?.allocations, () => true);
 
       totalSubTotal += subTotal;
       totalDiscount += discountAmount;

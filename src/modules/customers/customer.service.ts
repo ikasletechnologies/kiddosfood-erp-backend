@@ -51,15 +51,24 @@ export class CustomerService {
       select: {
         customerId: true,
         totalAmount: true,
-        payments: { select: { paidAmount: true, isCancelled: true, status: true } }
+        payments: { select: { paidAmount: true, isCancelled: true, status: true } },
+        // A multi-invoice receipt's share of this order isn't in `payments`
+        // (that Payment's orderId is null) — it's here, on the Invoice this
+        // order owns. Without this, an order paid off via a multi-invoice
+        // receipt still counted its full total as due (see
+        // FinanceService.sumOrderPaidWithAllocations for the same pattern).
+        invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } }
       }
     });
 
     for (const o of orders) {
       if (!o.customerId) continue;
-      const paid = o.payments
-        .filter((p) => !p.isCancelled && p.status !== 'CANCELLED')
-        .reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const isValid = (p: { isCancelled: boolean; status: string }) => !p.isCancelled && p.status !== 'CANCELLED';
+      const direct = o.payments.filter(isValid).reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const allocated = (o.invoice?.allocations || [])
+        .filter((a) => isValid(a.payment))
+        .reduce((sum, a) => sum + (a.amount || 0), 0);
+      const paid = direct + allocated;
       const due = (o.totalAmount || 0) - paid;
       result.set(o.customerId, (result.get(o.customerId) || 0) + due);
     }
