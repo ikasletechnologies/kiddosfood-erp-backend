@@ -4461,20 +4461,33 @@ export class FinanceService {
 
         const lineGross = (item.quantity || 0) * (item.price || 0);
         let lineTaxable = lineGross;
-        let lineTax = 0;
 
-        if (typeof item.taxAmount === 'number' && item.taxAmount > 0 && typeof item.totalAmount === 'number' && item.totalAmount > 0) {
-          lineTax = item.taxAmount;
-          lineTaxable = Number((item.totalAmount - item.taxAmount).toFixed(2));
-        } else if (item.discountPct && item.discountPct > 0) {
+        // item.totalAmount is NOT a reliable "tax-inclusive line total" —
+        // its meaning differs by which flow created the OrderItem row: the
+        // Tax Invoice / quotation-conversion flows persist taxable+tax
+        // (inclusive), but POS's addItemsToOrder persists price*quantity
+        // (tax-exclusive, identical to lineGross). Subtracting taxAmount
+        // from it there double-deducts GST and understated every
+        // POS-sourced HSN row by exactly its tax amount (₹105 taxable
+        // showing as ₹99.75). quantity*price is the one value every
+        // creation path agrees is tax-exclusive, so it — net of whichever
+        // discount actually applies — is the only safe taxable-value basis.
+        if (item.discountPct && item.discountPct > 0) {
           const lineDiscount = Number(((lineGross * item.discountPct) / 100).toFixed(2));
           lineTaxable = Math.max(0, lineGross - lineDiscount);
-          lineTax = Number(((lineTaxable * (item.product?.taxPercent || 0)) / 100).toFixed(2));
         } else if (o.discountAmount && o.discountAmount > 0 && orderTotalGross > 0) {
           const discountRatio = lineGross / orderTotalGross;
           const lineDiscount = Number(((o.discountAmount || 0) * discountRatio).toFixed(2));
           lineTaxable = Math.max(0, lineGross - lineDiscount);
-          lineTax = Number(((lineTaxable * (item.product?.taxPercent || 0)) / 100).toFixed(2));
+        }
+
+        // The persisted per-line taxAmount is trustworthy in every creation
+        // path (it's always the real GST computed on that line at save
+        // time) — trust it directly instead of re-deriving GST from a
+        // taxable value that may be discount-adjusted differently.
+        let lineTax: number;
+        if (typeof item.taxAmount === 'number' && item.taxAmount > 0) {
+          lineTax = item.taxAmount;
         } else if (orderSubTotal > 0 && orderTax > 0) {
           lineTax = Number(((lineTaxable / orderSubTotal) * orderTax).toFixed(2));
         } else {
