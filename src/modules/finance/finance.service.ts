@@ -3448,39 +3448,94 @@ export class FinanceService {
   // ─── Item / Stock Reports ───────────────────────────────────────────────────
 
   static async getStockSummaryData(
-    franchiseId: string,
+    franchiseId?: string,
     filters?: { category?: string; startDate?: Date; endDate?: Date }
   ) {
     const { category, startDate, endDate } = filters || {};
     const inclusiveEndDate = endDate ? new Date(endDate) : undefined;
     if (inclusiveEndDate) inclusiveEndDate.setHours(23, 59, 59, 999);
 
+    const scopeFilter = franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {};
+
     const items = await prisma.inventoryItem.findMany({
       where: {
-        franchiseId,
+        ...scopeFilter,
         isActive: true,
-        ...(category && category !== 'ALL' ? { category: category as ItemCategory } : {}),
-        ...(startDate || inclusiveEndDate ? {
-          createdAt: {
-            ...(startDate ? { gte: startDate } : {}),
-            ...(inclusiveEndDate ? { lte: inclusiveEndDate } : {})
-          }
-        } : {})
+        ...(category && category !== 'ALL' ? { category: category as ItemCategory } : {})
       },
       orderBy: { name: 'asc' }
     });
 
+    const itemIds = items.map(i => i.id);
+
+    // Compute stock from movements as of inclusiveEndDate (or up to current if not provided)
+    const movements = await prisma.stockMovement.findMany({
+      where: {
+        itemId: { in: itemIds },
+        ...(inclusiveEndDate ? { createdAt: { lte: inclusiveEndDate } } : {})
+      },
+      select: { itemId: true, quantity: true, baseQty: true }
+    });
+
+    const stockMap = new Map<string, number>();
+    for (const m of movements) {
+      const val = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
+      stockMap.set(m.itemId, (stockMap.get(m.itemId) || 0) + val);
+    }
+
+    // Reserved quantity in active production runs (PENDING or IN_PROGRESS)
+    const reservedAggs = await prisma.productionItem.groupBy({
+      by: ['inventoryItemId'],
+      where: {
+        inventoryItemId: { in: itemIds },
+        production: {
+          status: { in: ['PENDING', 'IN_PROGRESS'] }
+        }
+      },
+      _sum: { usedQuantity: true }
+    });
+    const reservedMap = new Map<string, number>();
+    for (const r of reservedAggs) {
+      if (r.inventoryItemId) {
+        reservedMap.set(r.inventoryItemId, r._sum.usedQuantity || 0);
+      }
+    }
+
     const data = items.map(item => {
-      const salePrice = item.customerPrice || item.basePrice || 0;
-      const purchasePrice = item.costPrice || 0;
-      const stockQty = item.currentStock || 0;
+      const salePrice = Number(item.customerPrice || item.basePrice || item.franchisePrice || 0);
+      const purchasePrice = Number(item.costPrice || 0);
+
+      const hasMovements = stockMap.has(item.id);
+      const stockQty = hasMovements
+        ? (stockMap.get(item.id) ?? 0)
+        : (inclusiveEndDate ? 0 : (item.currentStock || 0));
+
+      const reservedQty = reservedMap.get(item.id) || 0;
+      const availableQty = Math.max(0, stockQty - reservedQty);
+      const qtyForSale = availableQty;
       const stockValue = stockQty > 0 ? stockQty * purchasePrice : 0;
+
       return {
+        id: item.id,
         itemName: item.name,
+        name: item.name,
+        sku: item.sku,
+        category: item.category,
+        unit: item.unit,
         salePrice,
+        sellingPrice: salePrice,
         purchasePrice,
+        costPrice: purchasePrice,
         stockQty,
-        stockValue
+        currentStock: stockQty,
+        availableQty,
+        availableStock: availableQty,
+        qtyForSale,
+        reservedQty,
+        reservedStock: reservedQty,
+        stockValue,
+        minimumStock: item.minimumStock || 10,
+        status: stockQty <= (item.minimumStock || 10) ? 'LOW' : 'SAFE'
       };
     });
 
