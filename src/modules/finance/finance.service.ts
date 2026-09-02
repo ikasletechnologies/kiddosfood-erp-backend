@@ -2272,7 +2272,11 @@ export class FinanceService {
           order: {
             include: { customer: true }
           },
-          account: true
+          invoice: true,
+          account: true,
+          vendorInvoice: {
+            include: { vendor: true }
+          }
         },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -2282,26 +2286,81 @@ export class FinanceService {
       prisma.payment.aggregate({ where: { AND: [whereClause, this.PAYMENT_OUTFLOW_FILTER] }, _sum: { paidAmount: true } })
     ]);
 
-    const data = payments.map(p => {
+    const expenseIds = Array.from(new Set(
+      payments.filter(p => p.sourceModule === 'EXPENSE' && p.linkedDocId).map(p => p.linkedDocId as string)
+    ));
+    const linkedExpenses = expenseIds.length
+      ? await prisma.expense.findMany({ where: { id: { in: expenseIds } }, select: { id: true, payee: true, category: true } })
+      : [];
+    const expenseById = new Map(linkedExpenses.map(e => [e.id, e]));
+
+    const data = await Promise.all(payments.map(async p => {
       const flow = p.entityType === 'VENDOR' || p.sourceModule === 'EXPENSE' || p.type === 'INTERNAL_TRANSFER' ? 'OUT' : 'IN';
+      let partyName = await this.resolvePartyName(p.entityType, p.entityId);
+
+      if (!partyName) {
+        if (p.order?.customerName) {
+          partyName = p.order.customerName;
+        } else if (p.order?.customer?.name) {
+          partyName = p.order.customer.name;
+        } else if (p.vendorInvoice?.vendor?.name) {
+          partyName = p.vendorInvoice.vendor.name;
+        } else if (p.sourceModule === 'EXPENSE') {
+          const linkedExpense = p.linkedDocId ? expenseById.get(p.linkedDocId) : undefined;
+          partyName = linkedExpense?.payee || (p.entityId ? p.entityId : linkedExpense?.category ? linkedExpense.category : null);
+        }
+      }
+
+      let transactionType = 'Payment';
+      if (p.vendorInvoice || p.entityType === 'VENDOR') {
+        transactionType = 'Purchase';
+      } else if (p.sourceModule === 'POS' || p.order || p.invoice) {
+        transactionType = 'Sale';
+      } else if (p.sourceModule === 'EXPENSE') {
+        transactionType = 'Expense';
+      } else if (p.type === 'INTERNAL_TRANSFER') {
+        transactionType = 'Transfer';
+      } else if (p.entityType === 'CUSTOMER') {
+        transactionType = flow === 'IN' ? 'Receipt' : 'Payment';
+      }
+
+      const total = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
+      const moneyIn = flow === 'IN' ? Number(p.paidAmount) : null;
+      const moneyOut = flow === 'OUT' ? Number(p.paidAmount) : null;
+      const refNo = p.paymentNumber || p.transactionRef || (p.order?.invoiceNum ? `INV-${p.order.invoiceNum}` : p.id?.slice(-8) || p.id);
+
       return {
         id: p.id,
         createdAt: p.createdAt,
+        date: p.createdAt,
         time: p.createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-        particulars: p.transactionRef || (p.entityType === 'VENDOR' ? 'Vendor Payment' : p.entityType === 'CUSTOMER' ? 'Customer Payment' : p.sourceModule || 'Direct Payment'),
-        type: flow === 'IN' ? 'DEBIT' : 'CREDIT',
-        voucherType: p.sourceModule || p.linkedDocType || 'Payment',
-        voucherNo: p.paymentNumber || p.id,
+        name: partyName || null,
+        partyName: partyName || null,
+        refNo,
+        paymentNumber: p.paymentNumber,
+        type: transactionType,
+        transactionType,
+        paymentType: p.paymentMode,
+        paymentMode: p.paymentMode,
+        total,
+        moneyIn,
+        moneyOut,
         amount: p.paidAmount,
+        paidAmount: p.paidAmount,
+        accountingType: flow === 'IN' ? 'DEBIT' : 'CREDIT',
+        flow,
+        particulars: p.transactionRef || (transactionType === 'Purchase' ? 'Vendor Purchase Payment' : transactionType === 'Sale' ? 'Sales Payment Receipt' : transactionType === 'Expense' ? 'Expense Payment' : `${transactionType} Voucher`),
+        status: p.status,
         isCancelled: p.isCancelled,
         createdBy: p.createdBy || 'System',
-        approvedBy: p.approvedBy || 'System'
+        approvedBy: p.approvedBy || 'System',
+        accountName: p.account?.name || null,
+        orderId: p.orderId,
+        invoiceId: p.invoiceId,
+        vendorInvoiceId: p.vendorInvoiceId
       };
-    });
+    }));
 
-    // Sourced from full-range aggregates (not the paginated `data` slice above)
-    // so the totals/closing balance stay correct once a period has more rows
-    // than one page.
     const rangeInflows = rangeInAgg._sum.paidAmount || 0;
     const rangeOutflows = rangeOutAgg._sum.paidAmount || 0;
 
@@ -2311,6 +2370,8 @@ export class FinanceService {
       closingBalance: openingBalance + rangeInflows - rangeOutflows,
       totalDebit: rangeInflows,
       totalCredit: rangeOutflows,
+      totalMoneyIn: rangeInflows,
+      totalMoneyOut: rangeOutflows,
       pagination: {
         page,
         limit,
