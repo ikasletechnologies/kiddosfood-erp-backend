@@ -424,6 +424,16 @@ export class FinanceController {
     }
   }
 
+  static async cancelInvoice(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const result = await FinanceService.cancelInvoice(req.params.id, user);
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ statusCode: 400, message: error.message });
+    }
+  }
+
   static async transferFunds(req: Request, res: Response) {
     try {
       const user = (req as any).user;

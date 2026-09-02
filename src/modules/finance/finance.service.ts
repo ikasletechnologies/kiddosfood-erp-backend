@@ -625,6 +625,35 @@ export class FinanceService {
     });
   }
 
+  static async cancelInvoice(invoiceId: string, user?: any) {
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+      if (!invoice) throw new Error("Invoice not found");
+      if (invoice.status === "CANCELLED") throw new Error("Invoice is already cancelled");
+
+      const activePayments = await tx.payment.findMany({
+        where: { invoiceId, status: "PAID", isCancelled: false }
+      });
+      if (activePayments.length > 0) {
+        throw new Error("Cannot cancel an invoice with active payments. Please cancel payments first.");
+      }
+
+      await tx.invoice.update({
+        where: { id: invoiceId },
+        data: { status: "CANCELLED" }
+      });
+
+      if (invoice.orderId) {
+        await tx.order.update({
+          where: { id: invoice.orderId },
+          data: { status: "CANCELLED", paymentStatus: "CANCELLED" }
+        });
+      }
+
+      return { success: true, message: "Invoice cancelled successfully" };
+    });
+  }
+
   static async getExpenseDetails(expenseId: string) {
     const expense = await prisma.expense.findUnique({
       where: { id: expenseId },

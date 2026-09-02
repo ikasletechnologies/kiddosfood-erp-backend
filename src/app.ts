@@ -612,42 +612,44 @@ app.get('/api/payroll/payslips/:id', authenticate, authorizeRole(['FRANCHISE_ADM
 app.patch('/api/payroll/payslips/:id/mark-paid', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PayrollController.markPaid);
 
 // ─── Sales Module ─────────────────────────────────────────────────────────────
-app.get('/api/sales/quotations', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getQuotations);
-app.post('/api/sales/quotations', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createQuotation);
-app.get('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getQuotation);
-app.patch('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateQuotation);
-app.put('/api/sales/quotations/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateQuotation);
-app.post('/api/sales/quotations/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotation);
-app.post('/api/sales/quotations/:id/convert-to-sale', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
-app.post('/api/sales/quotations/:id/convert-to-sales-order', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
-app.post('/api/estimates/:id/convert-to-sale', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
-app.post('/api/estimates/:id/convert-to-sales-order', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
+app.get('/api/sales/quotations', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getQuotations);
+app.post('/api/sales/quotations', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createQuotation);
+app.get('/api/sales/quotations/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getQuotation);
+app.patch('/api/sales/quotations/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateQuotation);
+app.put('/api/sales/quotations/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateQuotation);
+app.post('/api/sales/quotations/:id/convert', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotation);
+app.post('/api/sales/quotations/:id/convert-to-sale', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
+app.post('/api/sales/quotations/:id/convert-to-sales-order', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
+app.post('/api/estimates/:id/convert-to-sale', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotationToSale);
+app.post('/api/estimates/:id/convert-to-sales-order', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
 
-app.get('/api/sales/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getSalesOrders);
-app.post('/api/sales/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createSalesOrder);
-app.get('/api/sales/orders/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getSalesOrder);
-app.patch('/api/sales/orders/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateSalesOrder);
-app.put('/api/sales/orders/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateSalesOrder);
-app.post('/api/sales/orders/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertSalesOrder);
-app.post('/api/sales/orders/:id/convert-to-sale', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertSalesOrderToSale);
+app.get('/api/sales/orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getSalesOrders);
+app.post('/api/sales/orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createSalesOrder);
+app.get('/api/sales/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getSalesOrder);
+app.patch('/api/sales/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateSalesOrder);
+app.put('/api/sales/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateSalesOrder);
+app.post('/api/sales/orders/:id/convert', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertSalesOrder);
+app.post('/api/sales/orders/:id/convert-to-sale', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertSalesOrderToSale);
 
-app.get('/api/sales/proforma-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getProformaInvoices);
-app.get('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getProformaInvoice);
-app.post('/api/sales/proforma-invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createProformaInvoice);
-app.put('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaInvoice);
-app.patch('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaInvoice);
-app.put('/api/sales/proforma-invoices/:id/status', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateProformaStatus);
-app.post('/api/sales/proforma-invoices/:id/convert', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.convertProformaInvoice);
+app.get('/api/sales/proforma-invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getProformaInvoices);
+app.get('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getProformaInvoice);
+app.post('/api/sales/proforma-invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createProformaInvoice);
+app.put('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateProformaInvoice);
+app.patch('/api/sales/proforma-invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateProformaInvoice);
+app.put('/api/sales/proforma-invoices/:id/status', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateProformaStatus);
+app.post('/api/sales/proforma-invoices/:id/convert', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertProformaInvoice);
+app.post('/api/sales/proforma-invoices/:id/convert-to-sales-order', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertProformaToSalesOrder);
 
-app.get('/api/sales/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
-app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
-app.post('/api/sales/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.createInvoice);
+app.get('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
+app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);
+app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.cancelInvoice);
 
-app.get('/api/sales/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getReturnOrders);
-app.post('/api/sales/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.createReturnOrder);
-app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.updateReturnOrder);
+app.get('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getReturnOrders);
+app.post('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createReturnOrder);
+app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateReturnOrder);
 
-app.get('/api/sales/analytics', authenticate, authorizeRole(['FRANCHISE_ADMIN']), SalesController.getAnalytics);
+app.get('/api/sales/analytics', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getAnalytics);
 
 app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallans);
 app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallan);

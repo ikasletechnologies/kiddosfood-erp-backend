@@ -223,6 +223,15 @@ export class SalesController {
     }
   }
 
+  static async convertProformaToSalesOrder(req: Request, res: Response) {
+    try {
+      const result = await SalesService.convertProformaToSalesOrder(req.params.id, (req as any).user?.userId || 'system');
+      res.json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
   // ─── Return Orders ───────────────────────────────────────────────────────────
 
   static async getReturnOrders(req: Request, res: Response) {

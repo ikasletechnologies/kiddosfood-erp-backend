@@ -999,6 +999,65 @@ export class SalesService {
     }
   }
 
+  // Proforma Invoice -> Sales Order.
+  static async convertProformaToSalesOrder(proformaInvoiceId: string, createdBy: string) {
+    const proforma = await prisma.proformaInvoice.findUnique({ where: { id: proformaInvoiceId }, include: { items: true } });
+    if (!proforma) throw new Error('Proforma Invoice not found.');
+    if (proforma.status === 'CANCELLED') {
+      throw new Error('Cannot convert a cancelled Proforma Invoice.');
+    }
+
+    const existingSO = await prisma.salesOrder.findFirst({
+      where: { proformaInvoiceId: proforma.id }
+    });
+    if (existingSO) {
+      return { success: true, salesOrder: existingSO };
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const salesOrder = await tx.salesOrder.create({
+        data: {
+          orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
+          partyType: proforma.partyType || 'CUSTOMER',
+          partyId: proforma.partyId,
+          customerId: proforma.customerId,
+          customerName: proforma.customerName,
+          customerPhone: proforma.customerPhone,
+          stateOfSupply: proforma.stateOfSupply,
+          status: 'CONFIRMED',
+          subTotal: proforma.subTotal,
+          taxAmount: proforma.taxAmount,
+          discountAmount: proforma.discountAmount,
+          totalAmount: proforma.totalAmount,
+          notes: proforma.notes,
+          proformaInvoiceId: proforma.id,
+          items: {
+            create: proforma.items.map(it => ({
+              productId: it.productId,
+              productName: it.productName,
+              quantity: it.quantity,
+              unit: it.unit || 'NONE',
+              rate: it.rate,
+              discountPercent: it.discountPercent || 0,
+              discountAmount: it.discountAmount || 0,
+              taxPercent: it.taxPercent || 0,
+              taxAmount: it.taxAmount || 0,
+              totalAmount: it.totalAmount
+            }))
+          }
+        },
+        include: { items: true }
+      });
+
+      await tx.proformaInvoice.update({
+        where: { id: proforma.id },
+        data: { status: 'CONVERTED' }
+      });
+
+      return { success: true, salesOrder };
+    });
+  }
+
   static async createProformaInvoice(data: {
     partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
     partyId?: string;
@@ -1180,6 +1239,8 @@ export class SalesService {
     });
 
     const soIds = results.map((r: any) => r.sourceSalesOrderId).filter(Boolean) as string[];
+    const convertedInvIds = results.map((r: any) => r.convertedInvoiceId).filter(Boolean) as string[];
+
     let soMap = new Map<string, string>();
     if (soIds.length > 0) {
       const salesOrders = await prisma.salesOrder.findMany({
@@ -1189,9 +1250,19 @@ export class SalesService {
       soMap = new Map(salesOrders.map(so => [so.id, so.orderNumber]));
     }
 
+    let invMap = new Map<string, string>();
+    if (convertedInvIds.length > 0) {
+      const orders = await prisma.order.findMany({
+        where: { id: { in: convertedInvIds } },
+        select: { id: true, invoiceNum: true }
+      });
+      invMap = new Map(orders.map(o => [o.id, o.invoiceNum || o.id]));
+    }
+
     return results.map((r: any) => ({
       ...r,
-      sourceSalesOrderNumber: r.sourceSalesOrderId ? soMap.get(r.sourceSalesOrderId) : undefined
+      sourceSalesOrderNumber: r.sourceSalesOrderId ? soMap.get(r.sourceSalesOrderId) : undefined,
+      convertedInvoiceNumber: r.convertedInvoiceId ? invMap.get(r.convertedInvoiceId) : undefined
     }));
   }
 
@@ -1240,10 +1311,89 @@ export class SalesService {
         { customerName: { contains: filters.search, mode: 'insensitive' } }
       ];
     }
-    return prisma.salesOrder.findMany({
+    const orders = await prisma.salesOrder.findMany({
       where,
       include: { customer: true, items: true },
       orderBy: { createdAt: 'desc' }
+    });
+
+    const completedOrders = orders.filter(o => o.status === 'DELIVERED' || (o.status as string) === 'CLOSED' || (o.status as string) === 'CONVERTED');
+
+    if (completedOrders.length === 0) return orders;
+
+    const proformaIds = completedOrders.map(o => o.proformaInvoiceId).filter(Boolean) as string[];
+    const quotationIds = completedOrders.map(o => o.quotationId).filter(Boolean) as string[];
+    const customerIds = completedOrders.map(o => o.customerId).filter(Boolean) as string[];
+
+    const [proformas, quotations, allSaleOrders] = await Promise.all([
+      proformaIds.length ? prisma.proformaInvoice.findMany({ where: { id: { in: proformaIds } } }) : [],
+      quotationIds.length ? prisma.quotation.findMany({ where: { id: { in: quotationIds } } }) : [],
+      customerIds.length ? prisma.order.findMany({
+        where: { customerId: { in: customerIds } },
+        select: { id: true, invoiceNum: true, customerId: true, totalAmount: true, createdAt: true },
+        orderBy: { createdAt: 'desc' }
+      }) : []
+    ]);
+
+    const proformaMap = new Map<string, any>();
+    for (const p of proformas) proformaMap.set(p.id, p);
+
+    const quotationMap = new Map<string, any>();
+    for (const q of quotations) quotationMap.set(q.id, q);
+
+    const saleOrdersByCustomer = new Map<string, any[]>();
+
+    for (const sale of allSaleOrders) {
+      if (sale.customerId) {
+        const list = saleOrdersByCustomer.get(sale.customerId) || [];
+        list.push(sale);
+        saleOrdersByCustomer.set(sale.customerId, list);
+      }
+    }
+
+    return orders.map(so => {
+      let convertedInvoiceId: string | null = null;
+      let convertedInvoiceNumber: string | null = null;
+
+      if (so.proformaInvoiceId && proformaMap.has(so.proformaInvoiceId)) {
+        const prof = proformaMap.get(so.proformaInvoiceId);
+        if (prof?.convertedInvoiceId) {
+          const inv = allSaleOrders.find(s => s.id === prof.convertedInvoiceId);
+          if (inv) {
+            convertedInvoiceId = inv.id;
+            convertedInvoiceNumber = inv.invoiceNum;
+          }
+        }
+      }
+
+      if (!convertedInvoiceNumber && so.quotationId && quotationMap.has(so.quotationId)) {
+        const quot = quotationMap.get(so.quotationId);
+        if (quot?.convertedInvoiceId) {
+          const inv = allSaleOrders.find(s => s.id === quot.convertedInvoiceId);
+          if (inv) {
+            convertedInvoiceId = inv.id;
+            convertedInvoiceNumber = inv.invoiceNum;
+          }
+        }
+      }
+
+      if (!convertedInvoiceNumber && (so.status === 'DELIVERED' || (so.status as string) === 'CLOSED' || (so.status as string) === 'CONVERTED') && so.customerId) {
+        const customerSales = saleOrdersByCustomer.get(so.customerId) || [];
+        const match = customerSales.find(s => Math.abs(s.totalAmount - so.totalAmount) < 0.05);
+        if (match) {
+          convertedInvoiceId = match.id;
+          convertedInvoiceNumber = match.invoiceNum;
+        } else if (customerSales.length > 0) {
+          convertedInvoiceId = customerSales[0].id;
+          convertedInvoiceNumber = customerSales[0].invoiceNum;
+        }
+      }
+
+      return {
+        ...so,
+        convertedInvoiceId,
+        convertedInvoiceNumber
+      };
     });
   }
 
