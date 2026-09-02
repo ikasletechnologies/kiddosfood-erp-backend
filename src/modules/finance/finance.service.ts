@@ -1177,6 +1177,19 @@ export class FinanceService {
       if (data.invoiceId) {
         const invoiceForGuard = await tx.invoice.findUnique({ where: { id: data.invoiceId } });
         if (!invoiceForGuard) throw new Error('Invoice not found.');
+        // A cancelled invoice's balance can still read as > 0 (cancelInvoice
+        // only permits cancelling an invoice with zero active payments, so
+        // nothing here retroactively zeroes finalAmount) — without this
+        // check a stale UI or a direct API call could record a real Payment
+        // (and CustomerLedger entry, and account balance movement) against
+        // a bill that no longer represents a valid sale. Checked before any
+        // of Payment/CustomerLedger/account-balance writes below.
+        if (invoiceForGuard.status === 'CANCELLED') {
+          throw new PaymentValidationError(
+            'INVOICE_CANCELLED',
+            'Cannot receive payment for a cancelled invoice.'
+          );
+        }
         orderIdForInvoice = invoiceForGuard.orderId;
         if (flow === 'IN' && status === 'PAID') {
           const paidSoFar = await tx.payment.aggregate({
@@ -1277,6 +1290,33 @@ export class FinanceService {
                 }
              }
           }
+        }
+      }
+
+      // 5a. If this is a Customer Payment, record in CustomerLedger. CREDIT
+      // for an inflow (they paid us, reducing what they owe — mirrors the
+      // DEBIT=owed-to-us/CREDIT=paid-to-us convention CustomerService.create's
+      // opening-balance entry already establishes), DEBIT for an outflow
+      // (e.g. a refund, which increases what we owe them). Only fires on an
+      // exact 'CUSTOMER' match — same reasoning as the VendorLedger block
+      // above: CustomerLedger.customerId is a required FK into Customer, so
+      // a DEALER/FRANCHISE entityId here would violate it.
+      if (data.entityType === 'CUSTOMER') {
+        const customerId = entityId;
+        if (customerId) {
+          await tx.customerLedger.create({
+            data: {
+              customerId,
+              type: flow === 'IN' ? 'CREDIT' : 'DEBIT',
+              amount,
+              paymentMode: resolvedPaymentMode as any,
+              referenceType: 'PAYMENT',
+              referenceId: payment.id,
+              accountId: account?.id,
+              note: data.note || `Payment #${paymentNumber} recorded`,
+              createdAt: data.createdAt ? new Date(data.createdAt) : undefined,
+            },
+          });
         }
       }
 
