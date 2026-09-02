@@ -656,6 +656,7 @@ app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADM
 app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallan);
 app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateDeliveryChallan);
 app.post('/api/sales/delivery-challans/:id/deliver', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.markDeliveryChallanDelivered);
+app.post('/api/sales/delivery-challans/:id/convert-to-sale', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertDeliveryChallanToSale);
 
 app.get('/api/sales/transit-stock', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getTransitStock);
 app.get('/api/sales/dispatch-tracking', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDispatchTracking);

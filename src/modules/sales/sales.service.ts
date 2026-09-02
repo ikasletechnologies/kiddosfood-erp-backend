@@ -2044,8 +2044,8 @@ export class SalesService {
         return tx.deliveryChallan.findUnique({ where: { id }, include: { customer: true, dealer: true, items: true } });
       }
 
-      // Block moving away from CLOSED once delivered
-      if (currentStatus === 'CLOSED' && data.status && data.status !== 'CLOSED') {
+      // Block moving away from CLOSED or CONVERTED once delivered
+      if ((currentStatus === 'CLOSED' || currentStatus === 'CONVERTED') && data.status && data.status !== currentStatus) {
         throw new Error('Cannot change status of a closed delivery challan');
       }
 
@@ -2397,6 +2397,163 @@ export class SalesService {
       }
 
       return tx.deliveryChallanReturn.update({ where: { id: returnId }, data: { status: 'RECEIVED' }, include: { items: true } });
+    }, { timeout: 20000 });
+  }
+
+  static async convertDeliveryChallanToSale(challanId: string, userId: string = 'system') {
+    return prisma.$transaction(async (tx) => {
+      // ATOMIC CLAIM: Only one transaction can successfully change the status from CLOSED to CONVERTED.
+      // This provides PostgreSQL MVCC row-locking to guarantee no duplicate conversions occur.
+      const claimResult = await tx.deliveryChallan.updateMany({
+        where: { id: challanId, status: 'CLOSED' },
+        data: { status: 'CONVERTED' }
+      });
+
+      if (claimResult.count === 0) {
+        throw new Error('Challan is not CLOSED or has already been converted.');
+      }
+
+      const challan = await tx.deliveryChallan.findUnique({
+        where: { id: challanId },
+        include: { items: true, returns: { include: { items: true } } }
+      });
+      if (!challan) throw new Error('Delivery challan not found');
+
+      const allProducts = await tx.product.findMany({ select: { id: true, name: true, sku: true } });
+      const fallbackProduct = allProducts.find(p => p.name.toLowerCase() === 'general item') || allProducts[0];
+
+      let totalNetQty = 0;
+      const orderItemsData: any[] = [];
+      const itemsToCalculate: any[] = [];
+
+      for (const item of challan.items) {
+        let returnedQty = 0;
+        for (const ret of challan.returns) {
+          const retItem = ret.items.find(ri => ri.challanItemId === item.id);
+          if (retItem) {
+            returnedQty += retItem.quantity;
+          }
+        }
+        
+        const netQty = item.quantity - returnedQty;
+        if (netQty < 0) throw new Error(`Net quantity for item ${item.productName} is less than zero.`);
+
+        if (netQty > 0) {
+          totalNetQty += netQty;
+          itemsToCalculate.push({
+            originalItem: item,
+            quantity: netQty,
+            rate: item.rate,
+            taxPercent: item.taxPercent || 0,
+            discountPct: 0
+          });
+        }
+      }
+
+      if (totalNetQty === 0) {
+        throw new Error('Cannot convert to sale: net saleable quantity of all items is 0 due to full return.');
+      }
+
+      const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(itemsToCalculate);
+
+      for (const compItem of computed) {
+        const item = (compItem as any).originalItem;
+        
+        let validProductId = item.productId || '';
+        const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
+        
+        if (productMatch) {
+          validProductId = productMatch.id;
+        } else if (item.productId) {
+          const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
+          if (invItem) {
+            const matchedBySkuOrName = allProducts.find(p => (invItem.sku && p.sku === invItem.sku) || p.name.toLowerCase() === invItem.name.toLowerCase());
+            if (matchedBySkuOrName) {
+              validProductId = matchedBySkuOrName.id;
+            }
+          }
+        }
+
+        if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
+          if (fallbackProduct) {
+            validProductId = fallbackProduct.id;
+          } else {
+            const newProd = await tx.product.create({
+              data: {
+                name: item.productName || 'General Item',
+                basePrice: item.rate,
+                taxPercent: item.taxPercent || 0,
+              }
+            });
+            validProductId = newProd.id;
+            allProducts.push({ id: newProd.id, name: newProd.name, sku: null }); // update cache for loop
+          }
+        }
+
+        orderItemsData.push({
+          productId: validProductId,
+          quantity: compItem.quantity,
+          unit: item.unit || 'NONE',
+          price: item.rate,
+          discountPct: 0,
+          taxAmount: compItem.taxAmount,
+          totalAmount: compItem.totalAmount,
+        });
+      }
+
+      const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
+      const franchiseId = challan.franchiseId || challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
+      
+      const order = await tx.order.create({
+        data: {
+          invoiceNum,
+          partyType: challan.dealerId ? 'DEALER' : 'CUSTOMER',
+          partyId: challan.dealerId || challan.customerId,
+          customerId: challan.customerId,
+          franchiseId: franchiseId,
+          orderType: 'DINE_IN',
+          status: 'COMPLETED',
+          subTotal,
+          taxAmount,
+          discountAmount: 0,
+          totalAmount,
+          paymentStatus: 'UNPAID',
+          paymentType: 'CASH',
+          stateOfSupply: challan.stateOfSupply,
+          inventory_deducted: true,
+          orderItems: {
+            create: orderItemsData
+          }
+        },
+        include: { orderItems: true }
+      });
+
+      const invoice = await tx.invoice.create({
+        data: {
+          orderId: order.id,
+          totalAmount: subTotal,
+          taxAmount,
+          finalAmount: totalAmount,
+          status: 'PENDING',
+          termsAndConditions: challan.termsConditions,
+          notes: challan.notes
+        }
+      });
+
+      const updatedChallan = await tx.deliveryChallan.update({
+        where: { id: challanId },
+        data: {
+          convertedOrderId: order.id,
+          convertedInvoiceId: invoice.id
+        }
+      });
+
+      return {
+        success: true,
+        challan: updatedChallan,
+        sale: order,
+        invoice
+      };
     }, { timeout: 20000 });
   }
 

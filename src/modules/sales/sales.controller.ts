@@ -337,6 +337,17 @@ export class SalesController {
     }
   }
 
+  static async convertDeliveryChallanToSale(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user?.userId || 'system';
+      const result = await SalesService.convertDeliveryChallanToSale(req.params.id, userId);
+      res.json(result);
+    } catch (error) {
+      const message = (error as Error).message;
+      res.status(SalesController.isDcBusinessError(message) ? 400 : 500).json({ error: message });
+    }
+  }
+
   static async getTransitStock(req: Request, res: Response) {
     try {
       res.json(await SalesService.getTransitStock());

@@ -1649,6 +1649,8 @@ model DeliveryChallan {
   dealer            Dealer?               @relation(fields: [dealerId], references: [id])
   items             DeliveryChallanItem[]
   returns           DeliveryChallanReturn[]
+  convertedOrderId  String?
+  convertedInvoiceId String?
 }
 
 model DeliveryChallanItem {

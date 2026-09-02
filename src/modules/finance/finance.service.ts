@@ -1017,88 +1017,30 @@ export class FinanceService {
     return { data, totalPurchaseWithTcs, totalTcs };
   }
 
+  // NOTE: There is no persisted TDS applicability/section/rate model anywhere in the
+  // schema (no TdsConfig, no vendor PAN/threshold tracking, no deduction recorded at
+  // payment time). This previously fabricated a "TDS" row for every single
+  // ProcurementOrder at a flat, unconditional 1% of subtotal under a hardcoded
+  // section 194Q — regardless of whether TDS actually applied to that vendor/order.
+  // That produced misleading reports (e.g. TDS Amount > 0 with no real TDS base,
+  // every row stamped "194Q"). Until genuine TDS applicability/rate/section data is
+  // captured on real transactions, this must return no rows rather than invented ones.
   static async getTdsPayableData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
-    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
-    const { start, end } = parseInclusiveDates(startDate, endDate);
-    const dateFilter = (start || end) ? {
-      createdAt: {
-        ...(start ? { gte: start } : {}),
-        ...(end ? { lte: end } : {})
-      }
-    } : {};
-
-    const purchases = await prisma.procurementOrder.findMany({
-      where: {
-        ...(franchiseId ? { franchiseId } : {}),
-        ...dateFilter,
-        status: { not: 'CANCELLED' as any }
-      },
-      include: { vendor: true },
-      orderBy: { createdAt: 'desc' }
-    });
-
-    const data = purchases.map(p => {
-      const tdsAmount = p.subtotal * 0.01; // TDS 1% under 194Q
-      return {
-        partyName: p.vendor?.name || "Raw Material Vendor",
-        transactionType: "PURCHASE",
-        billNo: p.poNumber || "PO-REF",
-        totalAmount: p.totalAmount,
-        taxableAmount: p.subtotal,
-        tdsAmount,
-        date: p.createdAt.toISOString(),
-        taxName: "TDS 194Q",
-        section: "194Q",
-        rate: 1
-      };
-    });
-
-    const totalPurchaseWithTds = data.reduce((acc, r) => acc + r.taxableAmount, 0);
-    const totalTds = data.reduce((acc, r) => acc + r.tdsAmount, 0);
-
-    return { data, totalPurchaseWithTds, totalTds };
+    void franchiseIdOrFilters;
+    void startDateParam;
+    void endDateParam;
+    return { data: [] as any[], totalPurchaseWithTds: 0, totalTds: 0 };
   }
 
+  // NOTE: Same issue as getTdsPayableData above — this previously fabricated a "TDS"
+  // row for every single completed Order at a flat, unconditional 1% of subTotal
+  // under a hardcoded section 194Q, with no real TDS applicability/rate data behind
+  // it. Returns no rows until genuine TDS tracking exists.
   static async getTdsReceivableData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
-    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
-    const { start, end } = parseInclusiveDates(startDate, endDate);
-    const dateFilter = (start || end) ? {
-      createdAt: {
-        ...(start ? { gte: start } : {}),
-        ...(end ? { lte: end } : {})
-      }
-    } : {};
-
-    const sales = await prisma.order.findMany({
-      where: {
-        ...(franchiseId ? { franchiseId } : {}),
-        ...dateFilter,
-        status: 'COMPLETED'
-      },
-      include: { customer: true },
-      orderBy: { createdAt: 'desc' }
-    });
-
-    const data = sales.map(s => {
-      const tdsAmount = s.subTotal * 0.01; // TDS 1%
-      return {
-        partyName: s.customer?.name || "Cash Customer",
-        transactionType: "SALE",
-        invoiceNo: s.invoiceNum,
-        totalAmount: s.totalAmount,
-        taxableAmount: s.subTotal,
-        tdsAmount,
-        date: s.createdAt.toISOString(),
-        taxName: "TDS 194Q",
-        section: "194Q",
-        rate: 1
-      };
-    });
-
-    const totalSaleWithTds = data.reduce((acc, r) => acc + r.taxableAmount, 0);
-    const totalTds = data.reduce((acc, r) => acc + r.tdsAmount, 0);
-
-    return { data, totalSaleWithTds, totalTds };
+    void franchiseIdOrFilters;
+    void startDateParam;
+    void endDateParam;
+    return { data: [] as any[], totalSaleWithTds: 0, totalTds: 0 };
   }
 
   static async getForm27eqData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
