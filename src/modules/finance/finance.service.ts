@@ -2065,6 +2065,12 @@ export class FinanceService {
       prisma.payment.count({ where: whereClause }),
       prisma.payment.findMany({
         where: whereClause,
+        include: {
+          order: { include: { customer: true } },
+          invoice: true,
+          account: true,
+          vendorInvoice: { include: { vendor: true } }
+        },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit
@@ -2073,21 +2079,65 @@ export class FinanceService {
       prisma.payment.aggregate({ where: { AND: [whereClause, this.PAYMENT_OUTFLOW_FILTER] }, _sum: { paidAmount: true } })
     ]);
 
-    const data = payments.map(p => {
+    const expenseIds = Array.from(new Set(
+      payments.filter(p => p.sourceModule === 'EXPENSE' && p.linkedDocId).map(p => p.linkedDocId as string)
+    ));
+    const linkedExpenses = expenseIds.length
+      ? await prisma.expense.findMany({ where: { id: { in: expenseIds } }, select: { id: true, payee: true, category: true } })
+      : [];
+    const expenseById = new Map(linkedExpenses.map(e => [e.id, e]));
+
+    const data = await Promise.all(payments.map(async p => {
       const flow = p.entityType === 'VENDOR' || p.sourceModule === 'EXPENSE' || p.type === 'INTERNAL_TRANSFER' ? 'OUT' : 'IN';
+      let partyName = await this.resolvePartyName(p.entityType, p.entityId);
+
+      if (!partyName) {
+        if (p.order?.customerName) {
+          partyName = p.order.customerName;
+        } else if (p.order?.customer?.name) {
+          partyName = p.order.customer.name;
+        } else if (p.vendorInvoice?.vendor?.name) {
+          partyName = p.vendorInvoice.vendor.name;
+        } else if (p.sourceModule === 'EXPENSE') {
+          const linkedExpense = p.linkedDocId ? expenseById.get(p.linkedDocId) : undefined;
+          partyName = linkedExpense?.payee || (p.entityId ? p.entityId : linkedExpense?.category ? linkedExpense.category : null);
+        }
+      }
+
+      const particulars =
+        p.transactionRef ||
+        (p.order?.invoiceNum ? `POS Sale #${p.order.invoiceNum}` : null) ||
+        (p.sourceModule === 'EXPENSE' ? 'Expense Payment' : null) ||
+        (p.sourceModule === 'POS' ? 'Counter Billing Payment' : null) ||
+        (p.entityType === 'VENDOR' ? 'Vendor Payment' : p.entityType === 'CUSTOMER' ? 'Customer Payment' : p.sourceModule ? `${p.sourceModule} Payment` : 'Payment Voucher');
+
       return {
         id: p.id,
         createdAt: p.createdAt,
         refNo: p.paymentNumber || p.id,
-        particulars: p.transactionRef || (p.entityType === 'VENDOR' ? 'Vendor Payment' : p.entityType === 'CUSTOMER' ? 'Customer Payment' : p.sourceModule || 'Direct Payment'),
-        type: flow === 'IN' ? 'DEBIT' : 'CREDIT',
+        paymentNumber: p.paymentNumber,
+        name: partyName || null,
+        partyName: partyName || null,
+        particulars,
+        description: particulars,
+        entity: partyName || particulars,
+        entityType: p.entityType,
+        entityId: p.entityId,
+        paymentMode: p.paymentMode,
+        method: p.paymentMode,
+        paymentType: p.paymentMode,
+        type: p.paymentMode,
+        accountingType: flow === 'IN' ? 'DEBIT' : 'CREDIT',
+        flow,
         amount: p.paidAmount,
+        paidAmount: p.paidAmount,
         status: p.status,
         isCancelled: p.isCancelled,
         createdBy: p.createdBy || 'System',
-        approvedBy: p.approvedBy || 'System'
+        approvedBy: p.approvedBy || 'System',
+        accountName: p.account?.name || null
       };
-    });
+    }));
 
     return {
       data,
