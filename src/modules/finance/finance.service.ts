@@ -4309,6 +4309,14 @@ export class FinanceService {
 
     const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
 
+    const invItems = await prisma.inventoryItem.findMany({ select: { id: true, sku: true, name: true, hsnCode: true } });
+    const invBySku = new Map<string, string>();
+    const invByName = new Map<string, string>();
+    for (const inv of invItems) {
+      if (inv.sku && inv.hsnCode) invBySku.set(inv.sku, inv.hsnCode);
+      if (inv.name && inv.hsnCode) invByName.set(inv.name.toLowerCase().trim(), inv.hsnCode);
+    }
+
     const hsnMap: Record<string, {
       hsn: string; productName: string; unit: string; gstRate: number; quantity: number;
       totalValue: number; taxableValue: number;
@@ -4320,12 +4328,19 @@ export class FinanceService {
       const orderTax = o.taxAmount || 0;
       const franchiseLocation = sellerStates.get(o.franchiseId) ?? null;
 
-      o.orderItems.forEach(item => {
-        // Service lines never appear in the goods (HSN) summary, even on an
-        // order that also has goods lines.
-        if (item.product?.productType === 'SERVICE') return;
+      const goodsItems = o.orderItems.filter((item) => item.product?.productType !== 'SERVICE');
+      const orderTotalGross = goodsItems.reduce((sum, it) => sum + (it.quantity || 0) * (it.price || 0), 0);
 
-        const hsn = item.product?.hsnCode || 'NA';
+      goodsItems.forEach(item => {
+        let hsn: string | null | undefined = item.product?.hsnCode;
+        if (!hsn && item.product?.sku && invBySku.has(item.product.sku)) {
+          hsn = invBySku.get(item.product.sku);
+        }
+        if (!hsn && item.product?.name && invByName.has(item.product.name.toLowerCase().trim())) {
+          hsn = invByName.get(item.product.name.toLowerCase().trim());
+        }
+        hsn = hsn || 'NA';
+
         const key = `${hsn}|${item.product?.id || 'unknown'}|${item.unit || 'UNIT'}`;
         if (!hsnMap[key]) {
           hsnMap[key] = {
@@ -4342,18 +4357,29 @@ export class FinanceService {
           };
         }
 
-        const lineSubtotal = (item.quantity || 0) * (item.price || 0);
-        const discountRatio = orderSubTotal > 0 ? (lineSubtotal / orderSubTotal) : 0;
-        const lineDiscount = (o.discountAmount || 0) * discountRatio;
-        const lineTaxable = Math.max(0, lineSubtotal - lineDiscount);
-
+        const lineGross = (item.quantity || 0) * (item.price || 0);
+        let lineTaxable = lineGross;
         let lineTax = 0;
-        if (typeof item.taxAmount === 'number' && item.taxAmount > 0) {
+
+        if (typeof item.taxAmount === 'number' && item.taxAmount > 0 && typeof item.totalAmount === 'number' && item.totalAmount > 0) {
           lineTax = item.taxAmount;
-        } else if (orderSubTotal > 0) {
-          lineTax = (lineTaxable / orderSubTotal) * orderTax;
+          lineTaxable = Number((item.totalAmount - item.taxAmount).toFixed(2));
+        } else if (item.discountPct && item.discountPct > 0) {
+          const lineDiscount = Number(((lineGross * item.discountPct) / 100).toFixed(2));
+          lineTaxable = Math.max(0, lineGross - lineDiscount);
+          lineTax = Number(((lineTaxable * (item.product?.taxPercent || 0)) / 100).toFixed(2));
+        } else if (o.discountAmount && o.discountAmount > 0 && orderTotalGross > 0) {
+          const discountRatio = lineGross / orderTotalGross;
+          const lineDiscount = Number(((o.discountAmount || 0) * discountRatio).toFixed(2));
+          lineTaxable = Math.max(0, lineGross - lineDiscount);
+          lineTax = Number(((lineTaxable * (item.product?.taxPercent || 0)) / 100).toFixed(2));
+        } else if (orderSubTotal > 0 && orderTax > 0) {
+          lineTax = Number(((lineTaxable / orderSubTotal) * orderTax).toFixed(2));
+        } else {
+          lineTax = Number(((lineTaxable * (item.product?.taxPercent || 0)) / 100).toFixed(2));
         }
 
+        const lineTotal = Number((lineTaxable + lineTax).toFixed(2));
         const split = splitGstAmount(lineTax, o.stateOfSupply, franchiseLocation);
 
         hsnMap[key].quantity += item.quantity || 0;
@@ -4361,7 +4387,7 @@ export class FinanceService {
         hsnMap[key].igstAmount += split.igst;
         hsnMap[key].cgstAmount += split.cgst;
         hsnMap[key].sgstAmount += split.sgst;
-        hsnMap[key].totalValue += (item.totalAmount || (lineTaxable + lineTax));
+        hsnMap[key].totalValue += lineTotal;
       });
     });
 

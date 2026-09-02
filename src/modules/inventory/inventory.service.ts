@@ -42,9 +42,11 @@ function mapCategoryToDb(category?: string): ItemCategory {
 // the same product name, which the bulk-import flow explicitly creates as
 // two distinct SKUs). Without that scope, a name match could try to
 // overwrite an unrelated product's SKU and hit its unique constraint.
-async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory }) {
+async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory; hsnCode?: string | null; sacCode?: string | null; gstRate?: number | null }) {
   const existingProduct = await tx.product.findFirst({ where: { sku: item.sku } })
     ?? await tx.product.findFirst({ where: { name: { equals: item.name, mode: 'insensitive' }, sku: null } });
+
+  const taxPercent = item.gstRate !== undefined && item.gstRate !== null ? item.gstRate : 5;
 
   if (!existingProduct) {
     await tx.product.create({
@@ -52,6 +54,9 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
         name: item.name,
         sku: item.sku,
         basePrice: item.basePrice || 0,
+        taxPercent,
+        hsnCode: item.hsnCode || null,
+        sacCode: item.sacCode || null,
         isActive: true,
         productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
         category: 'Automated Sync'
@@ -64,7 +69,10 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
       data: {
         name: item.name,
         sku: item.sku,
-        basePrice: item.basePrice || 0
+        basePrice: item.basePrice || 0,
+        taxPercent: item.gstRate !== undefined && item.gstRate !== null ? item.gstRate : existingProduct.taxPercent,
+        hsnCode: item.hsnCode !== undefined ? item.hsnCode : existingProduct.hsnCode,
+        sacCode: item.sacCode !== undefined ? item.sacCode : existingProduct.sacCode
       }
     });
     console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
