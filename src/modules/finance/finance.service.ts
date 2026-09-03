@@ -3187,44 +3187,116 @@ export class FinanceService {
   }) {
     const { franchiseId, startDate, endDate } = filters;
 
-    // Fetch customer order items
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
+    const dateFilter = (startDate || endDate) ? {
+      createdAt: {
+        ...(startDate ? { gte: startDate } : {}),
+        ...(endDate ? { lte: endDate } : {})
+      }
+    } : {};
+
+    // 1. Fetch Sales Orders with their items & customer details
+    const orders = await prisma.order.findMany({
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        status: { not: 'CANCELLED' as any },
+        ...dateFilter
+      },
       include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          },
+        customer: true,
+        orderItems: {
           include: {
-            orderItems: true
+            product: true
           }
         }
       }
     });
 
-    const report = customers.map(cust => {
-      let saleQuantity = 0;
-      let saleAmount = 0;
-
-      for (const order of cust.orders) {
-        saleAmount += order.totalAmount;
-        for (const item of order.orderItems) {
-          saleQuantity += item.quantity;
+    // 2. Fetch Purchases (Procurement Orders) with their items & vendor details
+    const purchases = await prisma.procurementOrder.findMany({
+      where: {
+        ...(franchiseId ? { franchiseId } : {}),
+        status: { not: 'CANCELLED' as any },
+        ...dateFilter
+      },
+      include: {
+        vendor: true,
+        poItems: {
+          include: {
+            inventoryItem: true
+          }
         }
       }
+    });
 
-      return {
-        partyName: cust.name,
-        saleQuantity,
-        saleAmount,
-        purchaseQuantity: 0,
-        purchaseAmount: 0
-      };
-    }).filter(r => r.saleAmount > 0);
+    // 3. Group by (Party Name, Item Name)
+    const groupMap: Record<string, {
+      partyName: string;
+      itemName: string;
+      saleQuantity: number;
+      saleAmount: number;
+      purchaseQuantity: number;
+      purchaseAmount: number;
+    }> = {};
+
+    // Process Sales
+    for (const order of orders) {
+      const partyName = (order.customer?.name || order.customerName || (order.partyType ? `${order.partyType} Party` : 'Walk-In Customer')).trim() || 'Walk-In Customer';
+      for (const item of order.orderItems) {
+        const itemName = (item.product?.name || 'Unknown Product').trim() || 'Unknown Product';
+        const key = `${partyName.toLowerCase()}:::${itemName.toLowerCase()}`;
+
+        if (!groupMap[key]) {
+          groupMap[key] = {
+            partyName,
+            itemName,
+            saleQuantity: 0,
+            saleAmount: 0,
+            purchaseQuantity: 0,
+            purchaseAmount: 0
+          };
+        }
+
+        const qty = Number(item.quantity || 0);
+        const amt = Number(item.totalAmount ?? ((item.quantity || 0) * (item.price || 0)));
+        groupMap[key].saleQuantity += qty;
+        groupMap[key].saleAmount += amt;
+      }
+    }
+
+    // Process Purchases
+    for (const po of purchases) {
+      const partyName = (po.vendor?.name || 'Unknown Vendor').trim() || 'Unknown Vendor';
+      for (const item of po.poItems) {
+        const itemName = (item.inventoryItem?.name || item.itemName || 'Unknown Item').trim() || 'Unknown Item';
+        const key = `${partyName.toLowerCase()}:::${itemName.toLowerCase()}`;
+
+        if (!groupMap[key]) {
+          groupMap[key] = {
+            partyName,
+            itemName,
+            saleQuantity: 0,
+            saleAmount: 0,
+            purchaseQuantity: 0,
+            purchaseAmount: 0
+          };
+        }
+
+        const qty = Number(item.quantity || 0);
+        const amt = Number(item.total ?? ((item.quantity || 0) * (item.price || 0)));
+        groupMap[key].purchaseQuantity += qty;
+        groupMap[key].purchaseAmount += amt;
+      }
+    }
+
+    const report = Object.values(groupMap).map(row => ({
+      partyName: row.partyName,
+      itemName: row.itemName,
+      saleQuantity: Number(row.saleQuantity.toFixed(2)),
+      saleAmount: Number(row.saleAmount.toFixed(2)),
+      purchaseQuantity: Number(row.purchaseQuantity.toFixed(2)),
+      purchaseAmount: Number(row.purchaseAmount.toFixed(2))
+    })).filter(r => r.saleQuantity > 0 || r.saleAmount > 0 || r.purchaseQuantity > 0 || r.purchaseAmount > 0)
+      .sort((a, b) => a.partyName.localeCompare(b.partyName) || a.itemName.localeCompare(b.itemName));
 
     return report;
   }
@@ -3547,7 +3619,6 @@ export class FinanceService {
       where: { franchiseId, isActive: true },
       orderBy: { name: 'asc' }
     });
-
     const data = items
       .filter(item => (item.currentStock || 0) <= (item.minimumStock || 10))
       .map(item => {
@@ -3565,41 +3636,115 @@ export class FinanceService {
     return data;
   }
 
-  static async getItemWiseProfitLoss(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getItemWiseProfitLoss(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
-    const [sales, purchases] = await Promise.all([
+    const productionDateFilter = (start || end) ? {
+      producedAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
+
+    const [orders, returnOrders, procurementOrders, purchaseReturns, inventoryItems, products, stockMovements, productions] = await Promise.all([
       prisma.order.findMany({
         where: {
-          franchiseId,
-          ...dateFilter,
-          status: 'COMPLETED'
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['CANCELLED'] },
+          ...dateFilter
         },
         include: {
           orderItems: {
-            include: { product: true }
+            include: {
+              product: {
+                include: {
+                  recipe: {
+                    include: {
+                      recipeItems: {
+                        include: { inventoryItem: true }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
+        },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.returnOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['REJECTED'] },
+          ...dateFilter
+        },
+        include: {
+          items: true
         }
       }),
       prisma.procurementOrder.findMany({
         where: {
-          franchiseId,
-          ...dateFilter,
-          status: 'DELIVERED'
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['CANCELLED'] },
+          ...dateFilter
         },
         include: {
           poItems: {
             include: { inventoryItem: true }
           }
         }
+      }),
+      prisma.purchaseReturn.findMany({
+        where: {
+          status: { notIn: ['REJECTED'] },
+          ...dateFilter
+        },
+        include: {
+          items: true
+        }
+      }),
+      prisma.inventoryItem.findMany({
+        where: franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {}
+      }),
+      prisma.product.findMany(),
+      prisma.stockMovement.findMany({
+        where: end ? { createdAt: { lte: end } } : {},
+        select: { itemId: true, quantity: true, baseQty: true, createdAt: true, unitCost: true }
+      }),
+      prisma.production.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['CANCELLED'] },
+          ...productionDateFilter
+        },
+        include: {
+          recipe: {
+            include: { product: true }
+          },
+          items: {
+            include: { inventoryItem: true }
+          }
+        }
       })
     ]);
+
+    // Compute opening and closing stock quantities
+    const openingStockQtyMap = new Map<string, number>();
+    const closingStockQtyMap = new Map<string, number>();
+
+    for (const m of stockMovements) {
+      const val = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
+      if (start && m.createdAt < start) {
+        openingStockQtyMap.set(m.itemId, (openingStockQtyMap.get(m.itemId) || 0) + val);
+      }
+      closingStockQtyMap.set(m.itemId, (closingStockQtyMap.get(m.itemId) || 0) + val);
+    }
 
     const itemMap: Record<string, {
       itemName: string;
@@ -3614,88 +3759,274 @@ export class FinanceService {
       mfgCost: number;
       consumptionCost: number;
       netProfitLoss: number;
+      quantitySold: number;
+      quantityPurchased: number;
     }> = {};
 
-    sales.forEach(s => {
-      s.orderItems.forEach(item => {
-        const name = item.product?.name || item.id;
-        if (!itemMap[name]) {
-          itemMap[name] = {
-            itemName: name,
-            sale: 0, saleReturn: 0, purchase: 0, purchaseReturn: 0,
-            openingStock: 0, closingStock: 0, taxReceivable: 0, taxPayable: 0,
-            mfgCost: 0, consumptionCost: 0, netProfitLoss: 0
-          };
-        }
-        itemMap[name].sale += item.totalAmount || 0;
-        itemMap[name].taxPayable += item.taxAmount || 0;
-        itemMap[name].netProfitLoss += item.totalAmount || 0;
-      });
-    });
+    const getOrCreate = (rawName: string) => {
+      const trimmed = (rawName || 'Unknown Item').trim() || 'Unknown Item';
+      const key = trimmed.toLowerCase();
+      if (!itemMap[key]) {
+        itemMap[key] = {
+          itemName: trimmed,
+          sale: 0,
+          saleReturn: 0,
+          purchase: 0,
+          purchaseReturn: 0,
+          openingStock: 0,
+          closingStock: 0,
+          taxReceivable: 0,
+          taxPayable: 0,
+          mfgCost: 0,
+          consumptionCost: 0,
+          netProfitLoss: 0,
+          quantitySold: 0,
+          quantityPurchased: 0
+        };
+      }
+      return itemMap[key];
+    };
 
-    purchases.forEach(p => {
-      p.poItems.forEach(item => {
-        const name = item.itemName || item.inventoryItem?.name || item.id;
-        if (!itemMap[name]) {
-          itemMap[name] = {
-            itemName: name,
-            sale: 0, saleReturn: 0, purchase: 0, purchaseReturn: 0,
-            openingStock: 0, closingStock: 0, taxReceivable: 0, taxPayable: 0,
-            mfgCost: 0, consumptionCost: 0, netProfitLoss: 0
-          };
-        }
-        itemMap[name].purchase += item.total || 0;
-        itemMap[name].taxReceivable += (item.cgst + item.sgst + item.igst) || 0;
-        itemMap[name].netProfitLoss -= item.total || 0;
-      });
-    });
+    // 1. Process Inventory Items (for opening and closing stock)
+    for (const item of inventoryItems) {
+      const cost = Number(item.costPrice || item.basePrice || 0);
+      
+      const opQty = openingStockQtyMap.get(item.id) ?? 0;
+      const clQty = closingStockQtyMap.has(item.id) 
+        ? (closingStockQtyMap.get(item.id) ?? 0) 
+        : (end ? 0 : (item.currentStock || 0));
 
-    const data = Object.values(itemMap);
+      const opVal = Number((opQty > 0 ? opQty * cost : 0).toFixed(2));
+      const clVal = Number((clQty > 0 ? clQty * cost : 0).toFixed(2));
 
-    return data;
-  }
-
-  static async getItemCategoryWiseProfitLoss(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
+      if (opVal > 0 || clVal > 0) {
+        const entry = getOrCreate(item.name);
+        entry.openingStock += opVal;
+        entry.closingStock += clVal;
+      }
     }
 
-    const [orders, purchases] = await Promise.all([
+    // 2. Process Sales (Orders)
+    for (const order of orders) {
+      for (const item of order.orderItems) {
+        const name = item.product?.name || 'Unknown Item';
+        const entry = getOrCreate(name);
+        const qty = Number(item.quantity || 0);
+        const lineTotal = Number(item.totalAmount ?? ((item.price || 0) * qty));
+        const tax = Number(item.taxAmount || 0);
+
+        entry.sale += lineTotal;
+        entry.taxPayable += tax;
+        entry.quantitySold += qty;
+
+        // Recipe-based raw material consumption tracking
+        if (item.product?.recipe && item.product.recipe.recipeItems?.length) {
+          const scalar = qty / (item.product.recipe.yieldQty || 1);
+          for (const ri of item.product.recipe.recipeItems) {
+            const rawCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
+            const consumedVal = ri.quantityRequired * scalar * rawCost;
+            entry.consumptionCost += Number(consumedVal.toFixed(2));
+          }
+        }
+      }
+    }
+
+    // 3. Process Sale Returns / Credit Notes
+    for (const ret of returnOrders) {
+      for (const item of ret.items) {
+        const entry = getOrCreate(item.productName || 'Unknown Item');
+        const amt = Number(item.totalAmount ?? ((item.quantity || 0) * (item.rate || 0)));
+        entry.saleReturn += amt;
+      }
+    }
+
+    // 4. Process Purchases (Procurement Orders)
+    for (const po of procurementOrders) {
+      for (const item of po.poItems) {
+        const name = item.inventoryItem?.name || item.itemName || 'Unknown Item';
+        const entry = getOrCreate(name);
+        const qty = Number(item.quantity || 0);
+        const lineTotal = Number(item.total ?? (qty * (item.price || 0)));
+        const tax = Number(item.cgst + item.sgst + item.igst || (lineTotal * 0.05));
+
+        entry.purchase += lineTotal;
+        entry.taxReceivable += tax;
+        entry.quantityPurchased += qty;
+      }
+    }
+
+    // 5. Process Purchase Returns / Debit Notes
+    for (const pr of purchaseReturns) {
+      for (const item of pr.items) {
+        const entry = getOrCreate(item.itemName || 'Unknown Item');
+        const amt = Number(item.totalAmount ?? ((item.quantity || 0) * (item.rate || 0)));
+        entry.purchaseReturn += amt;
+      }
+    }
+
+    // 6. Process Production Manufacturing Cost
+    for (const prod of productions) {
+      const prodName = prod.recipe?.product?.name || prod.recipe?.name;
+      if (prodName) {
+        const entry = getOrCreate(prodName);
+        const prodCost = Number(prod.totalCost ?? ((prod.materialCost || 0) + (prod.laborCost || 0) + (prod.overheadCost || 0)));
+        entry.mfgCost += prodCost;
+      }
+
+      // Consumed raw materials in this production batch
+      for (const pi of prod.items) {
+        const rawName = pi.inventoryItem?.name;
+        if (rawName) {
+          const rawEntry = getOrCreate(rawName);
+          const usedCost = Number(pi.totalCost ?? (pi.usedQuantity * (pi.unitCost || pi.inventoryItem?.costPrice || 0)));
+          rawEntry.consumptionCost += usedCost;
+        }
+      }
+    }
+
+    // 7. Calculate Net Profit/Loss for each item
+    const report = Object.values(itemMap)
+      .map(row => {
+        const sale = Number(row.sale.toFixed(2));
+        const saleReturn = Number(row.saleReturn.toFixed(2));
+        const purchase = Number(row.purchase.toFixed(2));
+        const purchaseReturn = Number(row.purchaseReturn.toFixed(2));
+        const openingStock = Number(row.openingStock.toFixed(2));
+        const closingStock = Number(row.closingStock.toFixed(2));
+        const taxReceivable = Number(row.taxReceivable.toFixed(2));
+        const taxPayable = Number(row.taxPayable.toFixed(2));
+        const mfgCost = Number(row.mfgCost.toFixed(2));
+        const consumptionCost = Number(row.consumptionCost.toFixed(2));
+
+        const netRevenue = sale - saleReturn;
+        
+        let costOfItem = 0;
+        if (mfgCost > 0) {
+          costOfItem = mfgCost;
+        } else if (consumptionCost > 0) {
+          costOfItem = consumptionCost;
+        } else if (purchase > 0 || openingStock > 0) {
+          const cogs = openingStock + (purchase - purchaseReturn) - closingStock;
+          costOfItem = cogs > 0 ? cogs : Math.max(0, purchase - purchaseReturn);
+        }
+
+        const netProfitLoss = Number((netRevenue - costOfItem).toFixed(2));
+
+        return {
+          itemName: row.itemName,
+          name: row.itemName,
+          sale,
+          saleReturn,
+          creditNote: saleReturn,
+          purchase,
+          purchaseReturn,
+          debitNote: purchaseReturn,
+          openingStock,
+          closingStock,
+          taxReceivable,
+          taxPayable,
+          mfgCost,
+          consumptionCost,
+          netProfitLoss,
+          profit: netProfitLoss,
+          revenue: sale,
+          cost: costOfItem,
+          quantitySold: row.quantitySold,
+          margin: sale > 0 ? Number(((netProfitLoss / sale) * 100).toFixed(2)) : 0
+        };
+      })
+      .filter(r => r.sale > 0 || r.purchase > 0 || r.saleReturn > 0 || r.purchaseReturn > 0 || r.openingStock > 0 || r.closingStock > 0 || r.mfgCost > 0 || r.consumptionCost > 0)
+      .sort((a, b) => b.sale - a.sale);
+
+    return report;
+  }
+
+  static async getItemCategoryWiseProfitLoss(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
+
+    const [orders, inventoryItems] = await Promise.all([
       prisma.order.findMany({
-        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
-        include: { orderItems: { include: { product: true } } }
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: 'COMPLETED',
+          ...dateFilter
+        },
+        include: {
+          orderItems: {
+            include: {
+              product: {
+                include: {
+                  recipe: {
+                    include: {
+                      recipeItems: {
+                        include: { inventoryItem: true }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }),
-      prisma.procurementOrder.findMany({
-        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
-        include: { poItems: { include: { inventoryItem: true } } }
+      prisma.inventoryItem.findMany({
+        where: franchiseId ? { franchiseId } : {}
       })
     ]);
 
-    const categoryMap: Record<string, { category: string; sale: number; purchase: number; netProfitLoss: number }> = {};
+    const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
+    const categoryMap: Record<string, { category: string; sale: number; revenue: number; cost: number; profit: number; netProfitLoss: number; margin: number }> = {};
 
-    orders.forEach(s => {
-      s.orderItems.forEach(item => {
+    for (const order of orders) {
+      for (const item of order.orderItems) {
         const category = item.product?.category || 'Uncategorized';
-        if (!categoryMap[category]) categoryMap[category] = { category, sale: 0, purchase: 0, netProfitLoss: 0 };
-        categoryMap[category].sale += item.totalAmount || 0;
-        categoryMap[category].netProfitLoss += item.totalAmount || 0;
-      });
-    });
+        if (!categoryMap[category]) {
+          categoryMap[category] = { category, sale: 0, revenue: 0, cost: 0, profit: 0, netProfitLoss: 0, margin: 0 };
+        }
 
-    purchases.forEach(p => {
-      p.poItems.forEach(item => {
-        const category = item.inventoryItem?.category || 'Uncategorized';
-        if (!categoryMap[category]) categoryMap[category] = { category, sale: 0, purchase: 0, netProfitLoss: 0 };
-        categoryMap[category].purchase += item.total || 0;
-        categoryMap[category].netProfitLoss -= item.total || 0;
-      });
-    });
+        const qty = item.quantity || 0;
+        const lineRevenue = (item.price * qty) || ((item.totalAmount || 0) - (item.taxAmount || 0)) || (item.totalAmount || 0);
 
-    return Object.values(categoryMap);
+        let lineCost = 0;
+        if (item.totalCost !== null && item.totalCost !== undefined) {
+          lineCost = item.totalCost;
+        } else if (item.product?.recipe && item.product.recipe.recipeItems?.length) {
+          const scalar = qty / (item.product.recipe.yieldQty || 1);
+          for (const ri of item.product.recipe.recipeItems) {
+            const unitCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
+            lineCost += ri.quantityRequired * scalar * unitCost;
+          }
+        } else {
+          const invItem = invItemMap.get(item.product?.sku || '');
+          const unitCost = invItem?.costPrice || 0;
+          lineCost = qty * unitCost;
+        }
+
+        categoryMap[category].sale += lineRevenue;
+        categoryMap[category].revenue += lineRevenue;
+        categoryMap[category].cost += lineCost;
+      }
+    }
+
+    return Object.values(categoryMap).map(cat => {
+      const profit = Number((cat.revenue - cat.cost).toFixed(2));
+      const margin = cat.revenue > 0 ? Number(((profit / cat.revenue) * 100).toFixed(2)) : 0;
+      return {
+        ...cat,
+        revenue: Number(cat.revenue.toFixed(2)),
+        sale: Number(cat.sale.toFixed(2)),
+        cost: Number(cat.cost.toFixed(2)),
+        profit,
+        netProfitLoss: profit,
+        margin
+      };
+    });
   }
 
   static async getStockDetailData(franchiseId?: string, startDate?: string | Date, endDate?: string | Date) {
@@ -3779,155 +4110,407 @@ export class FinanceService {
     });
   }
 
-  static async getItemDetailData(franchiseId?: string, itemName?: string, startDate?: string | Date, endDate?: string | Date) {
-    const whereClause: any = { isActive: true };
-    if (franchiseId) whereClause.franchiseId = franchiseId;
-    if (itemName) whereClause.name = { contains: itemName, mode: 'insensitive' };
+  static async getItemDetailData(
+    filtersOrFranchiseId?: string | { franchiseId?: string; itemName?: string; itemId?: string; productId?: string; startDate?: string | Date; endDate?: string | Date; search?: string; q?: string },
+    itemNameArg?: string,
+    startDateArg?: string | Date,
+    endDateArg?: string | Date,
+    itemIdArg?: string,
+    searchArg?: string
+  ): Promise<any> {
+    let franchiseId: string | undefined;
+    let itemName: string | undefined;
+    let itemId: string | undefined;
+    let startDate: string | Date | undefined;
+    let endDate: string | Date | undefined;
+    let search: string | undefined;
 
-    const start = startDate ? new Date(startDate) : undefined;
-    const end = endDate ? new Date(endDate) : undefined;
-
-    const items = await prisma.inventoryItem.findMany({
-      where: whereClause,
-      include: {
-        vendor: true,
-        movements: {
-          where: {
-            ...(start || end ? {
-              createdAt: {
-                ...(start ? { gte: start } : {}),
-                ...(end ? { lte: end } : {})
-              }
-            } : {})
-          },
-          orderBy: { createdAt: 'desc' }
-        }
-      },
-      orderBy: { name: 'asc' }
-    });
-
-    const itemIds = items.map(i => i.id);
-    const priorMovements = start ? await prisma.stockMovement.findMany({
-      where: {
-        itemId: { in: itemIds },
-        createdAt: { lt: start }
-      }
-    }) : [];
-
-    const priorInwardTypes = ['PURCHASE_IN', 'PRODUCTION_IN', 'TRANSFER_IN', 'RECALL_RETURN_IN'];
-    const priorOutwardTypes = ['SALES_OUT', 'PRODUCTION_OUT', 'WASTE_OUT', 'TRANSFER_OUT', 'RETURN_OUT', 'RETURN_QUARANTINE_IN'];
-
-    const priorMap: Record<string, number> = {};
-    priorMovements.forEach(m => {
-      if (!priorMap[m.itemId]) priorMap[m.itemId] = 0;
-      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
-        priorMap[m.itemId] += m.quantity;
-      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
-        priorMap[m.itemId] -= Math.abs(m.quantity);
-      }
-    });
-
-    return items.map(item => {
-      const beginningQuantity = start ? (priorMap[item.id] || 0) : 0;
-      return {
-        id: item.id,
-        name: item.name,
-        sku: item.sku,
-        category: item.category,
-        unit: item.unit,
-        hsnCode: item.hsnCode,
-        gstRate: item.gstRate,
-        currentStock: item.currentStock,
-        minimumStock: item.minimumStock,
-        beginningQuantity: Number(beginningQuantity.toFixed(2)),
-        costPrice: item.costPrice || 0,
-        basePrice: item.basePrice || 0,
-        customerPrice: item.customerPrice || 0,
-        vendorName: item.vendor?.name || '—',
-        recentMovements: item.movements.map(m => ({
-          date: m.createdAt.toISOString().split('T')[0],
-          type: m.movementType,
-          quantity: m.quantity,
-          referenceType: m.referenceType || '—',
-          note: m.note || '—'
-        }))
-      };
-    });
-  }
-
-  static async getBankStatementData(franchiseIdOrFilters?: any, accountIdParam?: string, startDateParam?: string, endDateParam?: string) {
-    const { franchiseId, startDate, endDate, extra } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
-    const accountId = typeof franchiseIdOrFilters === 'object' && franchiseIdOrFilters !== null ? franchiseIdOrFilters.accountId : accountIdParam;
-    const { start, end } = parseInclusiveDates(startDate, endDate);
-    const dateFilter = (start || end) ? {
-      createdAt: {
-        ...(start ? { gte: start } : {}),
-        ...(end ? { lte: end } : {})
-      }
-    } : {};
-
-    let accountIds: string[] = [];
-    if (accountId && accountId !== 'NONE') {
-      accountIds = [accountId];
+    if (typeof filtersOrFranchiseId === 'object' && filtersOrFranchiseId !== null) {
+      franchiseId = filtersOrFranchiseId.franchiseId;
+      itemName = filtersOrFranchiseId.itemName;
+      itemId = filtersOrFranchiseId.itemId || filtersOrFranchiseId.productId;
+      startDate = filtersOrFranchiseId.startDate;
+      endDate = filtersOrFranchiseId.endDate;
+      search = filtersOrFranchiseId.search || filtersOrFranchiseId.q;
     } else {
-      const bankAccounts = await prisma.account.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), type: 'BANK' }
-      });
-      accountIds = bankAccounts.map((a: any) => a.id);
+      franchiseId = filtersOrFranchiseId;
+      itemName = itemNameArg;
+      startDate = startDateArg;
+      endDate = endDateArg;
+      itemId = itemIdArg;
+      search = searchArg;
     }
 
-    if (accountIds.length === 0) return { data: [], closingBalance: 0 };
+    const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    const payments = await prisma.payment.findMany({
+    const itemWhere: any = { isActive: true };
+    if (franchiseId) {
+      itemWhere.OR = [
+        { franchiseId },
+        { franchiseId: null }
+      ];
+    }
+    if (itemId) {
+      itemWhere.id = itemId;
+    } else if (itemName) {
+      itemWhere.name = { contains: itemName, mode: 'insensitive' };
+    }
+    if (search) {
+      itemWhere.AND = [
+        ...(itemWhere.AND || []),
+        {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { sku: { contains: search, mode: 'insensitive' } }
+          ]
+        }
+      ];
+    }
+
+    const matchedItems = await prisma.inventoryItem.findMany({
+      where: itemWhere,
+      select: { id: true, name: true, sku: true, unit: true, currentStock: true }
+    });
+
+    const itemIds = matchedItems.map(i => i.id);
+
+    if (itemIds.length === 0) {
+      const emptyResult: any = [];
+      emptyResult.summary = {
+        openingQuantity: 0,
+        beginningQuantity: 0,
+        totalSaleQuantity: 0,
+        totalPurchaseQuantity: 0,
+        totalAdjustmentQuantity: 0,
+        closingQuantity: 0,
+        finalClosingQuantity: 0,
+        totalMovements: 0,
+        numberOfMovements: 0
+      };
+      emptyResult.data = [];
+      emptyResult.items = [];
+      emptyResult.movements = [];
+      return emptyResult;
+    }
+
+    const purchaseTypes = ['PURCHASE_IN'];
+    const saleTypes = ['SALES_OUT'];
+
+    let priorBalance = 0;
+    if (start) {
+      const priorMovements = await prisma.stockMovement.findMany({
+        where: {
+          itemId: { in: itemIds },
+          createdAt: { lt: start }
+        },
+        select: { movementType: true, quantity: true }
+      });
+
+      for (const m of priorMovements) {
+        if (purchaseTypes.includes(m.movementType) || m.movementType === 'PRODUCTION_IN' || m.movementType === 'TRANSFER_IN' || m.movementType === 'RECALL_RETURN_IN') {
+          priorBalance += Math.abs(m.quantity);
+        } else if (saleTypes.includes(m.movementType) || m.movementType === 'PRODUCTION_OUT' || m.movementType === 'WASTE_OUT' || m.movementType === 'TRANSFER_OUT' || m.movementType === 'RETURN_OUT' || m.movementType === 'RETURN_QUARANTINE_IN') {
+          priorBalance -= Math.abs(m.quantity);
+        } else if (m.movementType === 'ADJUSTMENT') {
+          priorBalance += m.quantity;
+        } else {
+          priorBalance += m.quantity;
+        }
+      }
+    }
+
+    const movements = await prisma.stockMovement.findMany({
       where: {
-        accountId: { in: accountIds },
-        isCancelled: false,
-        status: 'PAID',
-        ...dateFilter
+        itemId: { in: itemIds },
+        ...(start || end ? {
+          createdAt: {
+            ...(start ? { gte: start } : {}),
+            ...(end ? { lte: end } : {})
+          }
+        } : {})
+      },
+      include: {
+        item: { select: { id: true, name: true, unit: true, sku: true } }
       },
       orderBy: { createdAt: 'asc' }
     });
 
-    let runningBalance = 0;
-    
-    // Fetch opening balance
-    const pastPayments = await prisma.payment.findMany({
-      where: {
-        accountId: { in: accountIds },
-        isCancelled: false,
-        status: 'PAID',
-        ...(start ? { createdAt: { lt: start } } : {})
+    let runningBalance = priorBalance;
+    let totalSaleQuantity = 0;
+    let totalPurchaseQuantity = 0;
+    let totalAdjustmentQuantity = 0;
+
+    const data = movements.map(m => {
+      let saleQty = 0;
+      let purchaseQty = 0;
+      let adjQty = 0;
+
+      if (saleTypes.includes(m.movementType)) {
+        saleQty = Math.abs(m.quantity);
+        runningBalance -= saleQty;
+        totalSaleQuantity += saleQty;
+      } else if (purchaseTypes.includes(m.movementType)) {
+        purchaseQty = Math.abs(m.quantity);
+        runningBalance += purchaseQty;
+        totalPurchaseQuantity += purchaseQty;
+      } else if (m.movementType === 'ADJUSTMENT') {
+        adjQty = m.quantity;
+        runningBalance += adjQty;
+        totalAdjustmentQuantity += adjQty;
+      } else {
+        adjQty = m.quantity;
+        runningBalance += adjQty;
+        totalAdjustmentQuantity += adjQty;
       }
-    });
 
-    const getAmountChange = (p: any) => {
-      if (p.entityType === 'CUSTOMER') return p.paidAmount;
-      if (p.entityType === 'VENDOR') return -p.paidAmount;
-      if (p.sourceModule === 'EXPENSE') return -p.paidAmount;
-      if (p.type === 'INTERNAL_TRANSFER') {
-        if (p.paymentNumber && p.paymentNumber.endsWith('-IN')) return p.paidAmount;
-        return -p.paidAmount;
-      }
-      return 0; // fallback
-    };
-
-    pastPayments.forEach((p: any) => {
-      runningBalance += getAmountChange(p);
-    });
-
-    const data = payments.map((p: any) => {
-      const change = getAmountChange(p);
-      runningBalance += change;
       return {
-        date: p.createdAt.toISOString(),
-        description: p.transactionRef || p.paymentNumber || "Bank Transaction",
-        withdrawalAmount: change < 0 ? Math.abs(change) : 0,
-        depositAmount: change > 0 ? change : 0,
-        balanceAmount: runningBalance
+        id: m.id,
+        date: m.createdAt.toISOString(),
+        transactionDate: m.createdAt.toISOString(),
+        itemId: m.itemId,
+        itemName: m.item?.name || '—',
+        unit: m.item?.unit || 'PCS',
+        movementType: m.movementType,
+        saleQuantity: Number(saleQty.toFixed(2)),
+        purchaseQuantity: Number(purchaseQty.toFixed(2)),
+        adjustmentQuantity: Number(adjQty.toFixed(2)),
+        closingQuantity: Number(runningBalance.toFixed(2)),
+        referenceType: m.referenceType,
+        referenceId: m.referenceId,
+        note: m.note
       };
     });
 
-    return { data, closingBalance: runningBalance };
+    const finalClosingQuantity = runningBalance;
+
+    const summary = {
+      openingQuantity: Number(priorBalance.toFixed(2)),
+      beginningQuantity: Number(priorBalance.toFixed(2)),
+      totalSaleQuantity: Number(totalSaleQuantity.toFixed(2)),
+      totalPurchaseQuantity: Number(totalPurchaseQuantity.toFixed(2)),
+      totalAdjustmentQuantity: Number(totalAdjustmentQuantity.toFixed(2)),
+      closingQuantity: Number(finalClosingQuantity.toFixed(2)),
+      finalClosingQuantity: Number(finalClosingQuantity.toFixed(2)),
+      totalMovements: movements.length,
+      numberOfMovements: movements.length
+    };
+
+    const result: any = data;
+    result.summary = summary;
+    result.items = data;
+    result.data = data;
+    result.movements = data;
+
+    return result;
+  }
+
+  static async getBankStatementData(franchiseIdOrFilters?: any, accountIdParam?: string, startDateParam?: string, endDateParam?: string) {
+    const { franchiseId, startDate, endDate, extra } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const accountId = typeof franchiseIdOrFilters === 'object' && franchiseIdOrFilters !== null ? franchiseIdOrFilters.accountId : (accountIdParam || extra?.accountId);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+
+    // 1. Fetch relevant Bank Account(s)
+    const whereAccounts: any = { type: 'BANK', status: 'ACTIVE' };
+    if (franchiseId) whereAccounts.franchiseId = franchiseId;
+    if (accountId && accountId !== 'ALL' && accountId !== 'NONE' && accountId !== '') {
+      whereAccounts.id = accountId;
+    }
+
+    const bankAccounts = await prisma.account.findMany({
+      where: whereAccounts,
+      orderBy: { name: 'asc' }
+    });
+
+    if (bankAccounts.length === 0) {
+      return {
+        data: [],
+        summary: {
+          openingBalance: 0,
+          totalDeposits: 0,
+          totalWithdrawals: 0,
+          closingBalance: 0,
+          totalTransactions: 0
+        },
+        openingBalance: 0,
+        totalDeposits: 0,
+        totalWithdrawals: 0,
+        closingBalance: 0,
+        totalTransactions: 0,
+        accountName: 'No Bank Account Found'
+      };
+    }
+
+    const targetAccountIds = bankAccounts.map(a => a.id);
+
+    // 2. Fetch all non-cancelled payments for these bank accounts
+    const allPayments = await prisma.payment.findMany({
+      where: {
+        accountId: { in: targetAccountIds },
+        isCancelled: false,
+        status: 'PAID'
+      },
+      include: {
+        account: true,
+        order: { include: { customer: true } },
+        vendorInvoice: { include: { vendor: true } }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const getPaymentDirection = (p: any): 'IN' | 'OUT' => {
+      if (p.entityType === 'CUSTOMER') return 'IN';
+      if (p.entityType === 'VENDOR') return 'OUT';
+      if (p.sourceModule === 'EXPENSE') return 'OUT';
+      if (p.type === 'INTERNAL_TRANSFER') {
+        if (p.paymentNumber && p.paymentNumber.endsWith('-IN')) return 'IN';
+        return 'OUT';
+      }
+      return (p.flow === 'OUT' || p.flow === 'EXPENSE') ? 'OUT' : 'IN';
+    };
+
+    // Calculate initial base balance for each account before all historical payments
+    const accountNetChange = new Map<string, number>();
+    targetAccountIds.forEach(id => accountNetChange.set(id, 0));
+
+    allPayments.forEach(p => {
+      const accId = p.accountId || '';
+      const dir = getPaymentDirection(p);
+      const amt = Number(p.paidAmount || 0);
+      const curr = accountNetChange.get(accId) || 0;
+      accountNetChange.set(accId, curr + (dir === 'IN' ? amt : -amt));
+    });
+
+    const accountInitialBalance = new Map<string, number>();
+    bankAccounts.forEach(acc => {
+      const net = accountNetChange.get(acc.id) || 0;
+      accountInitialBalance.set(acc.id, (acc.balance || 0) - net);
+    });
+
+    // Calculate opening balance per account at startDate
+    const accountOpeningBalanceAtStart = new Map<string, number>();
+    const accountRunningBalance = new Map<string, number>();
+
+    bankAccounts.forEach(acc => {
+      const initial = accountInitialBalance.get(acc.id) || 0;
+      accountOpeningBalanceAtStart.set(acc.id, initial);
+    });
+
+    const priorPayments = start ? allPayments.filter(p => p.createdAt < start) : [];
+    priorPayments.forEach(p => {
+      const accId = p.accountId || '';
+      const dir = getPaymentDirection(p);
+      const amt = Number(p.paidAmount || 0);
+      const curr = accountOpeningBalanceAtStart.get(accId) || 0;
+      accountOpeningBalanceAtStart.set(accId, curr + (dir === 'IN' ? amt : -amt));
+    });
+
+    bankAccounts.forEach(acc => {
+      accountRunningBalance.set(acc.id, accountOpeningBalanceAtStart.get(acc.id) || 0);
+    });
+
+    let totalOpeningBalance = 0;
+    bankAccounts.forEach(acc => {
+      totalOpeningBalance += accountOpeningBalanceAtStart.get(acc.id) || 0;
+    });
+
+    // Filter payments within the active period
+    const periodPayments = allPayments.filter(p => {
+      if (start && p.createdAt < start) return false;
+      if (end && p.createdAt > end) return false;
+      return true;
+    });
+
+    let totalDeposits = 0;
+    let totalWithdrawals = 0;
+
+    const data = periodPayments.map(p => {
+      const accId = p.accountId || '';
+      const dir = getPaymentDirection(p);
+      const amt = Number(p.paidAmount || 0);
+      const deposit = dir === 'IN' ? amt : 0;
+      const withdrawal = dir === 'OUT' ? amt : 0;
+
+      totalDeposits += deposit;
+      totalWithdrawals += withdrawal;
+
+      // Update account-specific running balance
+      const currentAccBal = (accountRunningBalance.get(accId) || 0) + (deposit - withdrawal);
+      accountRunningBalance.set(accId, currentAccBal);
+
+      let description = '';
+      if (p.entityType === 'CUSTOMER') {
+        const custName = p.order?.customer?.name || p.order?.customerName || (p.entityId ? 'Customer' : 'Walk-in Customer');
+        description = p.order?.invoiceNum ? `Customer Receipt - ${custName} (${p.order.invoiceNum})` : `Customer Receipt - ${custName}`;
+      } else if (p.entityType === 'VENDOR') {
+        const vendName = p.vendorInvoice?.vendor?.name || 'Vendor';
+        description = p.vendorInvoice?.invoiceNumber ? `Vendor Payment - ${vendName} (${p.vendorInvoice.invoiceNumber})` : `Vendor Payment - ${vendName}`;
+      } else if (p.sourceModule === 'EXPENSE') {
+        description = p.transactionRef || 'Expense Payment';
+      } else {
+        description = p.transactionRef || p.paymentNumber || 'Bank Transaction';
+      }
+
+      const reference = p.paymentNumber || p.transactionRef || (p.linkedDocId ? `DOC-${p.linkedDocId.slice(0, 8)}` : '—');
+
+      return {
+        id: p.id,
+        date: p.createdAt.toISOString(),
+        transactionDate: p.createdAt.toISOString(),
+        accountName: p.account?.name || 'Bank',
+        accountId: p.accountId,
+        description,
+        particulars: description,
+        reference,
+        refNo: reference,
+        referenceNo: reference,
+        paymentNumber: p.paymentNumber,
+        paymentMode: p.paymentMode,
+        method: p.paymentMode,
+        type: dir === 'IN' ? 'DEPOSIT' : 'WITHDRAWAL',
+        flow: dir,
+        debit: withdrawal,
+        credit: deposit,
+        withdrawal: withdrawal,
+        deposit: deposit,
+        withdrawalAmount: withdrawal,
+        depositAmount: deposit,
+        debitAmount: withdrawal,
+        creditAmount: deposit,
+        balance: Number(currentAccBal.toFixed(2)),
+        balanceAmount: Number(currentAccBal.toFixed(2)),
+        runningBalance: Number(currentAccBal.toFixed(2)),
+        accountBalance: Number(currentAccBal.toFixed(2))
+      };
+    });
+
+    let totalClosingBalance = 0;
+    bankAccounts.forEach(acc => {
+      totalClosingBalance += accountRunningBalance.get(acc.id) || 0;
+    });
+
+    totalOpeningBalance = Number(totalOpeningBalance.toFixed(2));
+    totalDeposits = Number(totalDeposits.toFixed(2));
+    totalWithdrawals = Number(totalWithdrawals.toFixed(2));
+    totalClosingBalance = Number(totalClosingBalance.toFixed(2));
+
+    const summary = {
+      openingBalance: totalOpeningBalance,
+      totalDeposits,
+      totalWithdrawals,
+      closingBalance: totalClosingBalance,
+      totalTransactions: data.length
+    };
+
+    return {
+      data,
+      summary,
+      openingBalance: totalOpeningBalance,
+      totalDeposits,
+      totalWithdrawals,
+      closingBalance: totalClosingBalance,
+      totalTransactions: data.length,
+      accountName: bankAccounts.length === 1 ? bankAccounts[0].name : 'All Bank Accounts'
+    };
   }
 
   static async getDiscountReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
@@ -4642,8 +5225,8 @@ export class FinanceService {
     return { data, totalDiscount: data.reduce((s, r) => s + r.totalDiscountAmount, 0) };
   }
 
-  static async getSalePurchaseByCategoryData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string) {
-    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+  static async getSalePurchaseByCategoryData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string): Promise<any> {
+    const { franchiseId, startDate, endDate, category: filterCategory } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam, categoryParam);
     const { start, end } = parseInclusiveDates(startDate, endDate);
     const dateFilter = (start || end) ? {
       createdAt: {
@@ -4654,57 +5237,233 @@ export class FinanceService {
 
     const [orders, purchases] = await Promise.all([
       prisma.order.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), status: 'COMPLETED', ...dateFilter },
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          ...finalSaleWhere(dateFilter)
+        },
         include: { orderItems: { include: { product: true } } }
       }),
       prisma.procurementOrder.findMany({
-        where: { ...(franchiseId ? { franchiseId } : {}), status: { not: 'CANCELLED' as any }, ...dateFilter },
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['CANCELLED'] as any },
+          ...dateFilter
+        },
         include: { poItems: { include: { inventoryItem: true } } }
       })
     ]);
 
-    const categoryMap: Record<string, { category: string; saleAmount: number; purchaseAmount: number }> = {};
+    interface CategoryAgg {
+      category: string;
+      categoryName: string;
+      saleQty: number;
+      saleQuantity: number;
+      saleAmount: number;
+      purchaseQty: number;
+      purchaseQuantity: number;
+      purchaseAmount: number;
+      grossMargin: number;
+    }
+
+    const categoryMap: Record<string, CategoryAgg> = {};
+
+    const getOrCreate = (cat: string) => {
+      const key = cat || 'Uncategorized';
+      if (!categoryMap[key]) {
+        categoryMap[key] = {
+          category: key,
+          categoryName: key,
+          saleQty: 0,
+          saleQuantity: 0,
+          saleAmount: 0,
+          purchaseQty: 0,
+          purchaseQuantity: 0,
+          purchaseAmount: 0,
+          grossMargin: 0
+        };
+      }
+      return categoryMap[key];
+    };
 
     orders.forEach(o => {
       o.orderItems.forEach(item => {
-        const category = item.product?.category || 'Uncategorized';
-        if (!categoryMap[category]) categoryMap[category] = { category, saleAmount: 0, purchaseAmount: 0 };
-        categoryMap[category].saleAmount += item.totalAmount || 0;
+        const cat = item.product?.category || 'Uncategorized';
+        if (filterCategory && cat.toLowerCase() !== filterCategory.toLowerCase()) return;
+        const agg = getOrCreate(cat);
+        const qty = item.quantity || 0;
+        const amt = item.totalAmount || (qty * (item.price || 0));
+        agg.saleQty += qty;
+        agg.saleQuantity += qty;
+        agg.saleAmount += amt;
       });
     });
 
     purchases.forEach(p => {
       p.poItems.forEach(item => {
-        const category = item.inventoryItem?.category || 'Uncategorized';
-        if (!categoryMap[category]) categoryMap[category] = { category, saleAmount: 0, purchaseAmount: 0 };
-        categoryMap[category].purchaseAmount += item.total || 0;
+        const cat = item.inventoryItem?.category || 'Uncategorized';
+        if (filterCategory && cat.toLowerCase() !== filterCategory.toLowerCase()) return;
+        const agg = getOrCreate(cat);
+        const qty = item.quantity || 0;
+        const amt = item.total || (qty * (item.price || 0));
+        agg.purchaseQty += qty;
+        agg.purchaseQuantity += qty;
+        agg.purchaseAmount += amt;
       });
     });
 
-    return Object.values(categoryMap);
+    const data = Object.values(categoryMap).map(r => ({
+      ...r,
+      saleQty: Number(r.saleQty.toFixed(2)),
+      saleQuantity: Number(r.saleQuantity.toFixed(2)),
+      saleAmount: Number(r.saleAmount.toFixed(2)),
+      purchaseQty: Number(r.purchaseQty.toFixed(2)),
+      purchaseQuantity: Number(r.purchaseQuantity.toFixed(2)),
+      purchaseAmount: Number(r.purchaseAmount.toFixed(2)),
+      grossMargin: Number((r.saleAmount - r.purchaseAmount).toFixed(2))
+    }));
+
+    const totalSaleQty = data.reduce((s, r) => s + r.saleQty, 0);
+    const totalSaleAmount = data.reduce((s, r) => s + r.saleAmount, 0);
+    const totalPurchaseQty = data.reduce((s, r) => s + r.purchaseQty, 0);
+    const totalPurchaseAmount = data.reduce((s, r) => s + r.purchaseAmount, 0);
+
+    const summary = {
+      totalSaleQty: Number(totalSaleQty.toFixed(2)),
+      totalSaleQuantity: Number(totalSaleQty.toFixed(2)),
+      totalSaleAmount: Number(totalSaleAmount.toFixed(2)),
+      totalPurchaseQty: Number(totalPurchaseQty.toFixed(2)),
+      totalPurchaseQuantity: Number(totalPurchaseQty.toFixed(2)),
+      totalPurchaseAmount: Number(totalPurchaseAmount.toFixed(2)),
+      totalGrossMargin: Number((totalSaleAmount - totalPurchaseAmount).toFixed(2)),
+      categoryCount: data.length
+    };
+
+    const result: any = data;
+    result.summary = summary;
+    result.categories = data;
+    result.data = data;
+
+    return result;
   }
 
-  static async getStockByCategoryData(franchiseId?: string) {
+  static async getStockByCategoryData(franchiseIdOrFilters?: any, categoryParam?: string): Promise<any> {
+    let franchiseId: string | undefined;
+    let category: string | undefined;
+    let search: string | undefined;
+
+    if (typeof franchiseIdOrFilters === 'object' && franchiseIdOrFilters !== null) {
+      franchiseId = franchiseIdOrFilters.franchiseId;
+      category = franchiseIdOrFilters.category || categoryParam;
+      search = franchiseIdOrFilters.search || franchiseIdOrFilters.q;
+    } else {
+      franchiseId = franchiseIdOrFilters;
+      category = categoryParam;
+    }
+
+    const where: any = { isActive: true };
+    if (franchiseId) {
+      where.OR = [
+        { franchiseId },
+        { franchiseId: null }
+      ];
+    }
+    if (category && category !== 'ALL' && category !== '') {
+      where.category = category.toUpperCase();
+    }
+    if (search) {
+      where.AND = [
+        ...(where.AND || []),
+        {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { sku: { contains: search, mode: 'insensitive' } },
+            { category: { contains: search, mode: 'insensitive' } }
+          ]
+        }
+      ];
+    }
+
     const items = await prisma.inventoryItem.findMany({
-      where: { ...(franchiseId ? { franchiseId } : {}), isActive: true },
+      where,
       orderBy: { category: 'asc' }
     });
 
-    const categoryMap: Record<string, { category: string; itemCount: number; totalStock: number; totalValue: number }> = {};
+    interface CatAgg {
+      category: string;
+      categoryName: string;
+      itemCount: number;
+      totalItem: number;
+      totalItems: number;
+      uniqueItemCount: number;
+      totalStock: number;
+      stockQuantity: number;
+      totalValue: number;
+      stockValue: number;
+    }
+
+    const categoryMap: Record<string, CatAgg> = {};
 
     items.forEach(item => {
-      const cat = item.category as string;
-      if (!categoryMap[cat]) categoryMap[cat] = { category: cat, itemCount: 0, totalStock: 0, totalValue: 0 };
+      const cat = item.category || 'Uncategorized';
+      if (!categoryMap[cat]) {
+        categoryMap[cat] = {
+          category: cat,
+          categoryName: cat,
+          itemCount: 0,
+          totalItem: 0,
+          totalItems: 0,
+          uniqueItemCount: 0,
+          totalStock: 0,
+          stockQuantity: 0,
+          totalValue: 0,
+          stockValue: 0
+        };
+      }
+      const currentStock = item.currentStock || 0;
+      const costPrice = item.costPrice || 0;
       categoryMap[cat].itemCount += 1;
-      categoryMap[cat].totalStock += item.currentStock || 0;
-      categoryMap[cat].totalValue += (item.currentStock || 0) * (item.costPrice || 0);
+      categoryMap[cat].totalItem += 1;
+      categoryMap[cat].totalItems += 1;
+      categoryMap[cat].uniqueItemCount += 1;
+      categoryMap[cat].totalStock += currentStock;
+      categoryMap[cat].stockQuantity += currentStock;
+      categoryMap[cat].totalValue += currentStock * costPrice;
+      categoryMap[cat].stockValue += currentStock * costPrice;
     });
 
-    return Object.values(categoryMap).map(r => ({
+    const data = Object.values(categoryMap).map(r => ({
       ...r,
       totalStock: Number(r.totalStock.toFixed(2)),
-      totalValue: Number(r.totalValue.toFixed(2))
+      stockQuantity: Number(r.stockQuantity.toFixed(2)),
+      totalValue: Number(r.totalValue.toFixed(2)),
+      stockValue: Number(r.stockValue.toFixed(2))
     }));
+
+    const totalItem = items.length;
+    const totalStock = data.reduce((s, r) => s + r.totalStock, 0);
+    const totalValue = data.reduce((s, r) => s + r.totalValue, 0);
+
+    const summary = {
+      totalItem,
+      totalItems: totalItem,
+      totalItemCount: totalItem,
+      uniqueItemCount: totalItem,
+      itemCount: totalItem,
+      totalStock: Number(totalStock.toFixed(2)),
+      totalStockQuantity: Number(totalStock.toFixed(2)),
+      stockQuantity: Number(totalStock.toFixed(2)),
+      totalValue: Number(totalValue.toFixed(2)),
+      totalStockValue: Number(totalValue.toFixed(2)),
+      stockValue: Number(totalValue.toFixed(2)),
+      categoryCount: data.length
+    };
+
+    const result: any = data;
+    result.summary = summary;
+    result.categories = data;
+    result.data = data;
+
+    return result;
   }
 
   static async getExpensesReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string) {
@@ -5084,56 +5843,119 @@ export class FinanceService {
     return filtered.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  static async getSalePurchaseByItemData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
-    }
+  static async getSalePurchaseByItemData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string): Promise<any> {
+    const { franchiseId, startDate, endDate } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateFilter = (start || end) ? {
+      createdAt: {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      }
+    } : {};
 
     const [orders, purchases] = await Promise.all([
       prisma.order.findMany({
-        where: { franchiseId, status: 'COMPLETED', ...dateFilter },
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          ...finalSaleWhere(dateFilter)
+        },
         include: { orderItems: { include: { product: true } } }
       }),
       prisma.procurementOrder.findMany({
-        where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter },
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: { notIn: ['CANCELLED'] as any },
+          ...dateFilter
+        },
         include: { poItems: { include: { inventoryItem: true } } }
       })
     ]);
 
-    const itemMap: Record<string, { itemName: string; category: string; saleQty: number; saleAmount: number; purchaseQty: number; purchaseAmount: number }> = {};
+    const itemMap: Record<string, { itemName: string; category: string; saleQty: number; saleQuantity: number; saleAmount: number; purchaseQty: number; purchaseQuantity: number; purchaseAmount: number; grossMargin: number }> = {};
 
     orders.forEach(o => {
       o.orderItems.forEach(item => {
         const name = item.product?.name || 'Unknown Item';
         const category = item.product?.category || 'General';
-        if (!itemMap[name]) itemMap[name] = { itemName: name, category, saleQty: 0, saleAmount: 0, purchaseQty: 0, purchaseAmount: 0 };
-        itemMap[name].saleQty += item.quantity || 0;
-        itemMap[name].saleAmount += item.totalAmount || 0;
+        if (!itemMap[name]) {
+          itemMap[name] = {
+            itemName: name,
+            category,
+            saleQty: 0,
+            saleQuantity: 0,
+            saleAmount: 0,
+            purchaseQty: 0,
+            purchaseQuantity: 0,
+            purchaseAmount: 0,
+            grossMargin: 0
+          };
+        }
+        const qty = item.quantity || 0;
+        const amt = item.totalAmount || (qty * (item.price || 0));
+        itemMap[name].saleQty += qty;
+        itemMap[name].saleQuantity += qty;
+        itemMap[name].saleAmount += amt;
       });
     });
 
     purchases.forEach(p => {
       p.poItems.forEach(item => {
-        const name = item.inventoryItem?.name || 'Unknown Item';
+        const name = item.inventoryItem?.name || item.itemName || 'Unknown Item';
         const category = item.inventoryItem?.category || 'Raw Material';
-        if (!itemMap[name]) itemMap[name] = { itemName: name, category, saleQty: 0, saleAmount: 0, purchaseQty: 0, purchaseAmount: 0 };
-        itemMap[name].purchaseQty += item.quantity || 0;
-        itemMap[name].purchaseAmount += item.total || 0;
+        if (!itemMap[name]) {
+          itemMap[name] = {
+            itemName: name,
+            category,
+            saleQty: 0,
+            saleQuantity: 0,
+            saleAmount: 0,
+            purchaseQty: 0,
+            purchaseQuantity: 0,
+            purchaseAmount: 0,
+            grossMargin: 0
+          };
+        }
+        const qty = item.quantity || 0;
+        const amt = item.total || (qty * (item.price || 0));
+        itemMap[name].purchaseQty += qty;
+        itemMap[name].purchaseQuantity += qty;
+        itemMap[name].purchaseAmount += amt;
       });
     });
 
-    return Object.values(itemMap).map(r => ({
+    const data = Object.values(itemMap).map(r => ({
       ...r,
       saleQty: Number(r.saleQty.toFixed(2)),
+      saleQuantity: Number(r.saleQuantity.toFixed(2)),
       saleAmount: Number(r.saleAmount.toFixed(2)),
       purchaseQty: Number(r.purchaseQty.toFixed(2)),
+      purchaseQuantity: Number(r.purchaseQuantity.toFixed(2)),
       purchaseAmount: Number(r.purchaseAmount.toFixed(2)),
       grossMargin: Number((r.saleAmount - r.purchaseAmount).toFixed(2))
     }));
+
+    const totalSaleQty = data.reduce((s, r) => s + r.saleQty, 0);
+    const totalSaleAmount = data.reduce((s, r) => s + r.saleAmount, 0);
+    const totalPurchaseQty = data.reduce((s, r) => s + r.purchaseQty, 0);
+    const totalPurchaseAmount = data.reduce((s, r) => s + r.purchaseAmount, 0);
+
+    const summary = {
+      totalSaleQty: Number(totalSaleQty.toFixed(2)),
+      totalSaleQuantity: Number(totalSaleQty.toFixed(2)),
+      totalSaleAmount: Number(totalSaleAmount.toFixed(2)),
+      totalPurchaseQty: Number(totalPurchaseQty.toFixed(2)),
+      totalPurchaseQuantity: Number(totalPurchaseQty.toFixed(2)),
+      totalPurchaseAmount: Number(totalPurchaseAmount.toFixed(2)),
+      totalGrossMargin: Number((totalSaleAmount - totalPurchaseAmount).toFixed(2)),
+      itemCount: data.length
+    };
+
+    const result: any = data;
+    result.summary = summary;
+    result.items = data;
+    result.data = data;
+
+    return result;
   }
 
   static async getStockSummaryByItemData(franchiseId?: string) {
@@ -5293,145 +6115,339 @@ export class FinanceService {
     return data;
   }
 
-  static async getSaleOrdersReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string; status?: string }) {
+  static async getSaleOrdersReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string; status?: string; search?: string; customerId?: string }) {
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
+
     const where: any = {};
-    if (filters.franchiseId) where.franchiseId = filters.franchiseId;
-    if (filters.status) where.status = filters.status;
-    if (filters.startDate || filters.endDate) {
+    if (filters.status && filters.status !== 'ALL' && filters.status !== '') {
+      where.status = filters.status;
+    }
+    if (filters.customerId) {
+      where.customerId = filters.customerId;
+    }
+    if (start || end) {
       where.createdAt = {
-        ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
-        ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
       };
     }
+    if (filters.franchiseId) {
+      where.OR = [
+        { customer: { franchiseId: filters.franchiseId } },
+        { customerId: null }
+      ];
+    }
+    if (filters.search) {
+      where.OR = [
+        ...(where.OR || []),
+        { orderNumber: { contains: filters.search, mode: 'insensitive' } },
+        { customerName: { contains: filters.search, mode: 'insensitive' } },
+        { customer: { name: { contains: filters.search, mode: 'insensitive' } } }
+      ];
+    }
 
-    const orders = await prisma.order.findMany({
+    const salesOrders = await prisma.salesOrder.findMany({
       where,
       include: {
         customer: true,
-        orderItems: { include: { product: true } },
-        payments: true,
-        // See sumOrderPaidWithAllocations — a multi-invoice receipt's share
-        // of this order lives here, not in `payments` (that Payment's
-        // orderId is null).
-        invoice: { select: { allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true } } } } } }
+        items: true
       },
       orderBy: { createdAt: 'desc' }
     });
 
-    const sellerStates = await resolveSellerStatesFor(orders.map((o) => o.franchiseId));
+    const sellerStates = await resolveSellerStatesFor(
+      salesOrders.map(so => so.customer?.franchiseId || filters.franchiseId).filter(Boolean) as string[]
+    );
 
+    let totalSalesOrderValue = 0;
     let totalSubTotal = 0;
+    let totalTax = 0;
     let totalDiscount = 0;
     let totalTaxableValue = 0;
     let totalCgst = 0;
     let totalSgst = 0;
     let totalIgst = 0;
-    let totalTax = 0;
-    let totalRevenue = 0;
-    let totalPaid = 0;
+    let totalRoundOff = 0;
 
-    const mappedOrders = orders.map((o: any) => {
-      const subTotal = o.subTotal || 0;
-      const discountAmount = o.discountAmount || 0;
-      const taxableValue = Math.max(0, subTotal - discountAmount);
-      const taxAmount = o.taxAmount || 0;
-      const split = splitGstAmount(taxAmount, o.stateOfSupply, sellerStates.get(o.franchiseId) ?? null);
-      const grandTotal = o.totalAmount || (taxableValue + taxAmount);
-      // Matches this site's pre-existing (unfiltered) summation exactly —
-      // only the missing allocation term is added, nothing else changes.
-      const paid = o.paymentStatus === 'PAID'
-        ? grandTotal
-        : this.sumOrderPaidWithAllocations(o.payments, o.invoice?.allocations, () => true);
+    let draftOrderCount = 0;
+    let pendingOrderCount = 0;
+    let confirmedOrderCount = 0;
+    let processingOrderCount = 0;
+    let shippedOrderCount = 0;
+    let deliveredOrderCount = 0;
+    let cancelledOrderCount = 0;
+    let openOrderCount = 0;
 
-      totalSubTotal += subTotal;
-      totalDiscount += discountAmount;
-      totalTaxableValue += taxableValue;
-      totalCgst += split.cgst;
-      totalSgst += split.sgst;
-      totalIgst += split.igst;
-      totalTax += taxAmount;
-      totalRevenue += grandTotal;
-      totalPaid += paid;
+    let confirmedOrderValue = 0;
+    let draftOrderValue = 0;
+    let cancelledOrderValue = 0;
+
+    const data = salesOrders.map(so => {
+      const status = so.status;
+      const isCancelled = status === 'CANCELLED';
+      const isDraft = status === 'DRAFT';
+      const isPending = status === 'PENDING';
+      const isConfirmed = status === 'CONFIRMED';
+      const isProcessing = status === 'PROCESSING';
+      const isShipped = status === 'SHIPPED';
+      const isDelivered = status === 'DELIVERED';
+      const isOpen = ['CONFIRMED', 'PROCESSING', 'SHIPPED', 'PENDING'].includes(status);
+
+      if (isDraft) draftOrderCount++;
+      if (isPending) pendingOrderCount++;
+      if (isConfirmed) confirmedOrderCount++;
+      if (isProcessing) processingOrderCount++;
+      if (isShipped) shippedOrderCount++;
+      if (isDelivered) deliveredOrderCount++;
+      if (isCancelled) cancelledOrderCount++;
+      if (isOpen) openOrderCount++;
+
+      const subTotal = so.subTotal || 0;
+      const discountAmount = so.discountAmount || 0;
+      const taxableValue = subTotal;
+      const taxAmount = so.taxAmount || 0;
+      const calculatedTotal = taxableValue + taxAmount;
+      const finalTotal = so.totalAmount || calculatedTotal;
+      const roundOff = Number((finalTotal - calculatedTotal).toFixed(2));
+
+      const fId = so.customer?.franchiseId || filters.franchiseId;
+      const split = splitGstAmount(taxAmount, so.stateOfSupply, (fId ? sellerStates.get(fId) : null) ?? null);
+
+      if (!isCancelled) {
+        totalSalesOrderValue += finalTotal;
+        totalSubTotal += subTotal;
+        totalTaxableValue += taxableValue;
+        totalTax += taxAmount;
+        totalDiscount += discountAmount;
+        totalRoundOff += roundOff;
+        totalCgst += split.cgst;
+        totalSgst += split.sgst;
+        totalIgst += split.igst;
+        if (!isDraft && !isPending) {
+          confirmedOrderValue += finalTotal;
+        }
+      } else {
+        cancelledOrderValue += finalTotal;
+      }
+
+      if (isDraft) {
+        draftOrderValue += finalTotal;
+      }
+
+      const orderDate = so.orderDate || so.createdAt;
 
       return {
-        id: o.id,
-        orderNumber: o.invoiceNum || o.id,
-        createdAt: o.createdAt,
-        customerName: o.customer?.name || 'Walk-in Customer',
-        customerPhone: o.customer?.phone || '—',
-        customerGstin: o.customer?.gstNumber || '—',
-        stateOfSupply: o.stateOfSupply || '—',
-        status: o.status,
-        paymentStatus: o.paymentStatus || 'PAID',
-        paymentMode: o.paymentType || 'CASH',
+        id: so.id,
+        orderId: so.id,
+        salesOrderId: so.id,
+        salesOrderNo: so.orderNumber,
+        orderNumber: so.orderNumber,
+        orderNo: so.orderNumber,
+        date: orderDate.toISOString(),
+        orderDate: orderDate.toISOString(),
+        createdAt: so.createdAt.toISOString(),
+        dueDate: so.dueDate ? so.dueDate.toISOString() : null,
+        deliveryDate: so.deliveryDate ? so.deliveryDate.toISOString() : null,
+        customerName: so.customerName || so.customer?.name || 'Walk-in Customer',
+        customer: so.customerName || so.customer?.name || 'Walk-in Customer',
+        customerPhone: so.customerPhone || so.customer?.phone || '—',
+        customerId: so.customerId,
+        status: so.status,
+        orderStatus: so.status,
+        paymentStatus: so.paymentStatus || 'UNPAID',
         subTotal: Number(subTotal.toFixed(2)),
+        taxAmount: Number(taxAmount.toFixed(2)),
         discountAmount: Number(discountAmount.toFixed(2)),
         taxableValue: Number(taxableValue.toFixed(2)),
         cgst: Number(split.cgst.toFixed(2)),
         sgst: Number(split.sgst.toFixed(2)),
         igst: Number(split.igst.toFixed(2)),
-        cess: 0,
-        taxAmount: Number(taxAmount.toFixed(2)),
-        totalAmount: Number(grandTotal.toFixed(2)),
-        paidAmount: Number(paid.toFixed(2)),
-        balanceAmount: Number(Math.max(0, grandTotal - paid).toFixed(2))
+        roundOff,
+        totalAmount: Number(finalTotal.toFixed(2)),
+        amount: Number(finalTotal.toFixed(2)),
+        itemCount: so.items.length,
+        items: so.items
       };
     });
 
+    const summary = {
+      totalOrders: salesOrders.length,
+      numberOfOrders: salesOrders.length,
+      totalSalesOrderValue: Number(totalSalesOrderValue.toFixed(2)),
+      totalOrderValue: Number(totalSalesOrderValue.toFixed(2)),
+      totalAmount: Number(totalSalesOrderValue.toFixed(2)),
+      totalRevenue: Number(totalSalesOrderValue.toFixed(2)),
+      confirmedOrderValue: Number(confirmedOrderValue.toFixed(2)),
+      activeOrderValue: Number(confirmedOrderValue.toFixed(2)),
+      draftOrderValue: Number(draftOrderValue.toFixed(2)),
+      cancelledOrderValue: Number(cancelledOrderValue.toFixed(2)),
+      totalSubTotal: Number(totalSubTotal.toFixed(2)),
+      totalTaxableValue: Number(totalTaxableValue.toFixed(2)),
+      totalTax: Number(totalTax.toFixed(2)),
+      totalCgst: Number(totalCgst.toFixed(2)),
+      totalSgst: Number(totalSgst.toFixed(2)),
+      totalIgst: Number(totalIgst.toFixed(2)),
+      totalDiscount: Number(totalDiscount.toFixed(2)),
+      totalRoundOff: Number(totalRoundOff.toFixed(2)),
+      draftOrders: draftOrderCount,
+      draftOrderCount,
+      pendingOrders: pendingOrderCount,
+      pendingOrderCount,
+      confirmedOrders: confirmedOrderCount,
+      confirmedOrderCount,
+      processingOrders: processingOrderCount,
+      processingOrderCount,
+      shippedOrders: shippedOrderCount,
+      shippedOrderCount,
+      deliveredOrders: deliveredOrderCount,
+      deliveredOrderCount,
+      completedOrders: deliveredOrderCount,
+      cancelledOrders: cancelledOrderCount,
+      cancelledOrderCount,
+      openOrders: openOrderCount,
+      openOrderCount,
+      activeOrders: openOrderCount
+    };
+
     return {
-      summary: {
-        totalOrders: orders.length,
-        totalSubTotal: Number(totalSubTotal.toFixed(2)),
-        totalDiscount: Number(totalDiscount.toFixed(2)),
-        totalTaxableValue: Number(totalTaxableValue.toFixed(2)),
-        totalCgst: Number(totalCgst.toFixed(2)),
-        totalSgst: Number(totalSgst.toFixed(2)),
-        totalIgst: Number(totalIgst.toFixed(2)),
-        totalTax: Number(totalTax.toFixed(2)),
-        totalRevenue: Number(totalRevenue.toFixed(2)),
-        totalPaid: Number(totalPaid.toFixed(2)),
-        totalPending: Number(Math.max(0, totalRevenue - totalPaid).toFixed(2))
-      },
-      orders: mappedOrders,
-      data: mappedOrders
+      summary,
+      orders: data,
+      data
     };
   }
 
-  static async getSaleOrderItemsReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string }) {
+  static async getSaleOrderItemsReportData(filters: { franchiseId?: string; startDate?: string; endDate?: string; status?: string; search?: string; customerId?: string }): Promise<any> {
+    const { start, end } = parseInclusiveDates(filters.startDate, filters.endDate);
+
     const where: any = {};
-    if (filters.franchiseId) where.order = { franchiseId: filters.franchiseId };
-    if (filters.startDate || filters.endDate) {
-      where.order = {
-        ...(where.order || {}),
+    if (filters.status && filters.status !== 'ALL' && filters.status !== '') {
+      where.salesOrder = { status: filters.status };
+    }
+    if (filters.customerId) {
+      where.salesOrder = { ...(where.salesOrder || {}), customerId: filters.customerId };
+    }
+    if (start || end) {
+      where.salesOrder = {
+        ...(where.salesOrder || {}),
         createdAt: {
-          ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
-          ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
         }
       };
     }
+    if (filters.franchiseId) {
+      where.salesOrder = {
+        ...(where.salesOrder || {}),
+        OR: [
+          { customer: { franchiseId: filters.franchiseId } },
+          { customerId: null }
+        ]
+      };
+    }
+    if (filters.search) {
+      where.OR = [
+        { productName: { contains: filters.search, mode: 'insensitive' } },
+        { salesOrder: { orderNumber: { contains: filters.search, mode: 'insensitive' } } },
+        { salesOrder: { customerName: { contains: filters.search, mode: 'insensitive' } } }
+      ];
+    }
 
-    const items = await prisma.orderItem.findMany({
+    const items = await prisma.salesOrderItem.findMany({
       where,
       include: {
-        product: true,
-        order: { select: { id: true, invoiceNum: true, createdAt: true, status: true, customer: { select: { name: true } } } }
-      }
+        salesOrder: {
+          include: { customer: true }
+        }
+      },
+      orderBy: { salesOrder: { createdAt: 'desc' } }
     });
 
-    return items.map(item => ({
-      id: item.id,
-      orderId: item.orderId,
-      orderNumber: item.order?.invoiceNum,
-      orderDate: item.order?.createdAt,
-      orderStatus: item.order?.status,
-      customerName: item.order?.customer?.name || 'Walk-in',
-      productName: item.product?.name || 'Item',
-      productSku: item.product?.sku,
-      quantity: item.quantity,
-      unitPrice: item.price,
-      totalAmount: item.totalAmount || (item.quantity * item.price),
-      totalCost: item.totalCost || 0
-    }));
+    const quantityByUnit: Record<string, number> = {};
+    let totalLineItemValue = 0;
+    let totalTax = 0;
+    let totalDiscount = 0;
+    let totalQuantity = 0;
+
+    const data = items.map(item => {
+      const isCancelled = item.salesOrder?.status === 'CANCELLED';
+      const unit = item.unit ? item.unit.toUpperCase().trim() : 'PCS';
+      const qty = item.quantity || 0;
+
+      if (!isCancelled) {
+        totalQuantity += qty;
+        totalLineItemValue += item.totalAmount || 0;
+        totalTax += item.taxAmount || 0;
+        totalDiscount += item.discountAmount || 0;
+        quantityByUnit[unit] = (quantityByUnit[unit] || 0) + qty;
+      }
+
+      const orderDate = item.salesOrder?.orderDate || item.salesOrder?.createdAt || new Date();
+
+      return {
+        id: item.id,
+        itemId: item.id,
+        salesOrderId: item.salesOrderId,
+        orderId: item.salesOrderId,
+        salesOrderNo: item.salesOrder?.orderNumber || '—',
+        orderNumber: item.salesOrder?.orderNumber || '—',
+        orderNo: item.salesOrder?.orderNumber || '—',
+        date: orderDate.toISOString(),
+        orderDate: orderDate.toISOString(),
+        customerName: item.salesOrder?.customerName || item.salesOrder?.customer?.name || 'Walk-in Customer',
+        customer: item.salesOrder?.customerName || item.salesOrder?.customer?.name || 'Walk-in Customer',
+        customerId: item.salesOrder?.customerId,
+        itemName: item.productName,
+        productName: item.productName,
+        productId: item.productId,
+        orderedQty: item.quantity,
+        quantity: item.quantity,
+        qty: item.quantity,
+        unit,
+        uom: unit,
+        rate: item.rate,
+        unitPrice: item.rate,
+        price: item.rate,
+        discountPercent: item.discountPercent,
+        discountAmount: item.discountAmount,
+        taxPercent: item.taxPercent,
+        taxAmount: item.taxAmount,
+        totalAmount: item.totalAmount,
+        amount: item.totalAmount,
+        lineAmount: item.totalAmount,
+        status: item.salesOrder?.status || 'DRAFT',
+        orderStatus: item.salesOrder?.status || 'DRAFT'
+      };
+    });
+
+    const distinctUnits = Object.keys(quantityByUnit);
+    let formattedQuantity = '';
+    if (distinctUnits.length === 1) {
+      formattedQuantity = `${totalQuantity} ${distinctUnits[0]}`;
+    } else if (distinctUnits.length > 1) {
+      formattedQuantity = distinctUnits.map(u => `${quantityByUnit[u]} ${u}`).join(' • ');
+    } else {
+      formattedQuantity = '0';
+    }
+
+    const summary = {
+      totalOrderedQuantity: Number(totalQuantity.toFixed(2)),
+      totalQuantity: Number(totalQuantity.toFixed(2)),
+      formattedQuantity,
+      quantityByUnit,
+      totalLineItems: items.length,
+      numberOfItems: items.length,
+      totalLineItemValue: Number(totalLineItemValue.toFixed(2)),
+      totalAmount: Number(totalLineItemValue.toFixed(2)),
+      totalTax: Number(totalTax.toFixed(2)),
+      totalDiscount: Number(totalDiscount.toFixed(2))
+    };
+
+    const result: any = data;
+    result.summary = summary;
+    result.items = data;
+    result.data = data;
+
+    return result;
   }
 
   static async getSaleOrderItemReportData(filters: any) {

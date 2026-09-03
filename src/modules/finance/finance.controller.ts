@@ -850,7 +850,12 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const report = await FinanceService.getStockByCategoryData(franchiseId);
+      const { category, search, q } = req.query;
+      const report = await FinanceService.getStockByCategoryData({
+        franchiseId,
+        category: category as string,
+        search: (search || q) as string
+      });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -876,9 +881,16 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { itemName, startDate, endDate } = req.query;
+      const { itemName, itemId, productId, startDate, endDate, search, q } = req.query;
 
-      const report = await FinanceService.getItemDetailData(franchiseId, itemName as string, startDate as string, endDate as string);
+      const report = await FinanceService.getItemDetailData({
+        franchiseId,
+        itemName: itemName as string,
+        itemId: (itemId || productId) as string,
+        startDate: startDate as string,
+        endDate: endDate as string,
+        search: (search || q) as string
+      });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -1101,8 +1113,15 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate, status } = req.query;
-      const report = await FinanceService.getSaleOrdersReportData({ franchiseId, startDate: startDate as string, endDate: endDate as string, status: status as string });
+      const { startDate, endDate, status, search, customerId, partyId } = req.query;
+      const report = await FinanceService.getSaleOrdersReportData({
+        franchiseId,
+        startDate: startDate as string,
+        endDate: endDate as string,
+        status: status as string,
+        search: (search as string) || (req.query.q as string),
+        customerId: (customerId as string) || (partyId as string)
+      });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -1114,8 +1133,15 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
-      const report = await FinanceService.getSaleOrderItemsReportData({ franchiseId, startDate: startDate as string, endDate: endDate as string });
+      const { startDate, endDate, status, search, customerId, partyId } = req.query;
+      const report = await FinanceService.getSaleOrderItemsReportData({
+        franchiseId,
+        startDate: startDate as string,
+        endDate: endDate as string,
+        status: status as string,
+        search: (search as string) || (req.query.q as string),
+        customerId: (customerId as string) || (partyId as string)
+      });
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
