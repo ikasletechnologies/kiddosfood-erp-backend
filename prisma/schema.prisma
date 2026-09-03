@@ -76,13 +76,13 @@ model Customer {
   franchiseId        String?
   franchise          Franchise?        @relation(fields: [franchiseId], references: [id])
   ledgerEntries      CustomerLedger[]
+  deliveryChallans   DeliveryChallan[]
   orders             Order[]
   productions        Production[]
+  proformaInvoices   ProformaInvoice[]
   quotations         Quotation[]
   returnOrders       ReturnOrder[]
   salesOrders        SalesOrder[]
-  deliveryChallans   DeliveryChallan[]
-  proformaInvoices   ProformaInvoice[]
 
   @@index([franchiseId])
 }
@@ -139,11 +139,6 @@ model Franchise {
   ownerName          String
   contactNum         String
   status             String             @default("ACTIVE")
-  // Explicit source of truth for "is this franchise HQ" — replaces the
-  // ~11 independent id==='hq-001'/name-contains-'HQ' heuristics that used
-  // to be scattered across the codebase and could disagree with each other.
-  // Exactly one franchise should have this set; FranchiseService.getHqFranchise()
-  // enforces that invariant at read time.
   isHQ               Boolean            @default(false)
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
@@ -151,16 +146,24 @@ model Franchise {
   creditLimit        Float              @default(0)
   outstandingAmount  Float              @default(0)
   walletBalance      Float              @default(0)
+  primaryWarehouseId String?
+  accounts           Account[]
   activityLogs       ActivityLog[]
   businessPartners   BusinessPartner[]
+  cartons            Carton[]
+  cheques            Cheque[]
   customers          Customer[]
+  dailySettlements   DailySettlement[]
   dealers            Dealer[]
   expenses           Expense[]
+  primaryWarehouse   Warehouse?         @relation("PrimaryWarehouse", fields: [primaryWarehouseId], references: [id])
   ledgerEntries      FranchiseLedger[]
   franchiseOrders    FranchiseOrder[]
   franchiseRequests  FranchiseRequest[]
   inventory          InventoryItem[]
+  loanAccounts       LoanAccount[]
   orders             Order[]
+  procurementOrders  ProcurementOrder[]
   productBatches     ProductBatch[]
   productions        Production[]
   returnOrders       ReturnOrder[]
@@ -168,16 +171,8 @@ model Franchise {
   outgoingTransfers  StockTransfer[]    @relation("OutgoingTransfers")
   incomingTransfers  StockTransfer[]    @relation("IncomingTransfers")
   users              User[]
-  workflowRequests   WorkflowRequest[]
-  cheques            Cheque[]
-  accounts           Account[]
-  procurementOrders  ProcurementOrder[]
-  loanAccounts       LoanAccount[]
-  dailySettlements   DailySettlement[]
   wasteEntries       WasteEntry[]
-  cartons            Carton[]
-  primaryWarehouseId String?
-  primaryWarehouse   Warehouse?         @relation("PrimaryWarehouse", fields: [primaryWarehouseId], references: [id])
+  workflowRequests   WorkflowRequest[]
 }
 
 model DailySettlement {
@@ -187,18 +182,8 @@ model DailySettlement {
   cashTotal    Float     @default(0)
   upiTotal     Float     @default(0)
   cardTotal    Float     @default(0)
-  // Sum of any PaymentMode outside CASH/UPI/CARD (BANK_TRANSFER, CHEQUE,
-  // NEFT, RTGS, IMPS) collected the same day — kept separate so the three
-  // UI cards never silently swallow a payment mode they don't render.
   otherTotal   Float     @default(0)
-  // Sales value of the day's completed Orders — this is the reconciliation
-  // target that cashTotal+upiTotal+cardTotal+otherTotal must equal before
-  // close is allowed (see POSService.closeDay).
   grandTotal   Float     @default(0)
-  // Approved-return refund payouts recorded the same day (flow OUT,
-  // sourceModule POS, linkedDocType DIRECT). Not netted into the mode
-  // totals above — kept explicit per the "don't corrupt payment totals"
-  // rule — netTotal is grandTotal - refundTotal.
   refundTotal  Float     @default(0)
   netTotal     Float     @default(0)
   orderCount   Int       @default(0)
@@ -222,22 +207,11 @@ model Cheque {
   status       ChequeStatus @default(PENDING)
   notes        String?
   franchiseId  String
-  franchise    Franchise    @relation(fields: [franchiseId], references: [id])
   accountId    String?
-  account      Account?     @relation(fields: [accountId], references: [id])
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
-}
-
-enum ChequeType {
-  PAYABLE
-  RECEIVABLE
-}
-
-enum ChequeStatus {
-  PENDING
-  CLEARED
-  BOUNCED
+  account      Account?     @relation(fields: [accountId], references: [id])
+  franchise    Franchise    @relation(fields: [franchiseId], references: [id])
 }
 
 model InventoryItem {
@@ -262,10 +236,13 @@ model InventoryItem {
   franchisePrice       Float?                 @default(0)
   dealerPrice          Float?                 @default(0)
   customerPrice        Float?                 @default(0)
+  baseUnitId           String?
   grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
+  baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
   franchise            Franchise?             @relation(fields: [franchiseId], references: [id])
   vendor               Vendor?                @relation(fields: [vendorId], references: [id])
+  conversions          ItemUnitConversion[]
   poItems              ProcurementOrderItem[]
   productionItems      ProductionItem[]
   purchaseRequestItems PurchaseRequestItem[]
@@ -274,15 +251,8 @@ model InventoryItem {
   requestItems         StockRequestItem[]
   transferItems        StockTransferItem[]
   vendors              VendorMaterial[]
-  conversions          ItemUnitConversion[]
-  baseUnitId           String?
-  baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
   wasteEntries         WasteEntry[]
 
-  // Scoped per franchise, not globally: the same master item (identical SKU)
-  // legitimately has one row per location it's stocked at (HQ + each
-  // branch/franchise) — see StockTransfer completion, which credits the
-  // destination branch's row for this SKU rather than inventing a new one.
   @@unique([sku, franchiseId])
 }
 
@@ -295,47 +265,36 @@ model WasteEntry {
   reason             String
   note               String?
   costAtTime         Float?
-  // Links a DAMAGED/SPOILED entry back to the packaging run that produced
-  // it (Confirm Packaging) — null for wastage logged manually via the
-  // standalone Wastage Control "Log Spoilage" flow.
   productPackagingId String?
   createdAt          DateTime          @default(now())
-  inventoryItem      InventoryItem     @relation(fields: [inventoryItemId], references: [id])
   franchise          Franchise?        @relation(fields: [franchiseId], references: [id])
-  warehouse          Warehouse?        @relation(fields: [warehouseId], references: [id])
+  inventoryItem      InventoryItem     @relation(fields: [inventoryItemId], references: [id])
   productPackaging   ProductPackaging? @relation(fields: [productPackagingId], references: [id])
+  warehouse          Warehouse?        @relation(fields: [warehouseId], references: [id])
 }
 
 model StockMovement {
-  id            String            @id @default(uuid())
-  itemId        String
-  movementType  StockMovementType
-  quantity       Float
-  baseQty        Float?
+  id              String            @id @default(uuid())
+  itemId          String
+  movementType    StockMovementType
+  quantity        Float
+  baseQty         Float?
   transactionUnit String?
-  unitId         String?
-  referenceType String?
-  referenceId   String?
-  note          String?
-  createdBy     String?
-  createdAt     DateTime          @default(now())
-  binId         String?
-  warehouseId   String?
-  // The specific lot this transaction drew from (outbound) or created
-  // (inbound), so the ledger can show a Batch ID per line instead of only
-  // an item-level total. Null for movements with no traceable batch (e.g.
-  // opening balances, or outbound quantity that spanned more than one lot).
-  batchId       String?
-  // Unit cost at the time of this transaction — the FIFO-consumed cost for
-  // outbound movements, the receipt cost for inbound ones, or a fallback to
-  // the item's moving-average costPrice. Stored on the movement itself so
-  // the ledger doesn't need to re-derive historical cost on every read.
-  unitCost      Float?
-  bin           WarehouseBin?     @relation(fields: [binId], references: [id])
-  item          InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  warehouse     Warehouse?        @relation(fields: [warehouseId], references: [id])
-  unit          Unit?             @relation(fields: [unitId], references: [id])
-  batch         InventoryBatch?   @relation(fields: [batchId], references: [id])
+  unitId          String?
+  referenceType   String?
+  referenceId     String?
+  note            String?
+  createdBy       String?
+  createdAt       DateTime          @default(now())
+  binId           String?
+  warehouseId     String?
+  batchId         String?
+  unitCost        Float?
+  batch           InventoryBatch?   @relation(fields: [batchId], references: [id])
+  bin             WarehouseBin?     @relation(fields: [binId], references: [id])
+  item            InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  unit            Unit?             @relation(fields: [unitId], references: [id])
+  warehouse       Warehouse?        @relation(fields: [warehouseId], references: [id])
 
   @@index([movementType, createdAt])
 }
@@ -415,13 +374,6 @@ model ProcurementOrder {
   status               POStatus               @default(PENDING_APPROVAL)
   totalAmount          Float
   advancePaid          Float                  @default(0)
-  // How much of `advancePaid` came from pre-existing vendor advance/credit
-  // (as opposed to fresh cash paid at PO creation) — tracked separately so
-  // it can be displayed ("₹100 Advance Applied") and so the same advance
-  // can't be re-applied to another PO. Consumption is tracked here, not via
-  // an extra offsetting VendorLedger entry, so the vendor's running ledger
-  // balance isn't zeroed out before the purchase liability it's meant to
-  // offset actually exists.
   advanceApplied       Float                  @default(0)
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
@@ -513,19 +465,19 @@ model GoodsReceiptItem {
   priceOverrideBy     String?
   priceOverrideAt     DateTime?
   unit                String            @default("UNIT")
-  binId          String?
-  expDate        DateTime?
-  lotNumber      String?
-  mfgDate        DateTime?
-  qcStatus       QCStatus          @default(PENDING)
-  vendorBatchNo  String?
-  warehouseId    String?
-  warehouseBinId String?
-  grn            GoodsReceipt      @relation(fields: [grnId], references: [id])
-  inventoryItem  InventoryItem?    @relation(fields: [materialId], references: [id], onDelete: Cascade)
-  warehouseBin   WarehouseBin?     @relation(fields: [warehouseBinId], references: [id])
-  warehouse      Warehouse?        @relation(fields: [warehouseId], references: [id])
-  inspection     InspectionRecord?
+  binId               String?
+  expDate             DateTime?
+  lotNumber           String?
+  mfgDate             DateTime?
+  qcStatus            QCStatus          @default(PENDING)
+  vendorBatchNo       String?
+  warehouseId         String?
+  warehouseBinId      String?
+  grn                 GoodsReceipt      @relation(fields: [grnId], references: [id])
+  inventoryItem       InventoryItem?    @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  warehouseBin        WarehouseBin?     @relation(fields: [warehouseBinId], references: [id])
+  warehouse           Warehouse?        @relation(fields: [warehouseId], references: [id])
+  inspection          InspectionRecord?
 }
 
 model VendorInvoice {
@@ -538,11 +490,6 @@ model VendorInvoice {
   status           InvoiceStatus    @default(PENDING)
   createdAt        DateTime         @default(now())
   billDate         DateTime?
-  // Tax/commercial breakdown — `amount` was historically the only figure
-  // stored (always gross-or-whatever-the-caller-sent, with no way to tell
-  // which), which is how GST silently vanished when a bill was generated
-  // without deriving these from the PO. `amount` remains the authoritative
-  // GROSS invoice total; these are the breakdown behind it.
   subtotal         Float?
   taxAmount        Float?
   cgst             Float?
@@ -550,10 +497,6 @@ model VendorInvoice {
   igst             Float?
   discountAmount   Float?           @default(0)
   freightCost      Float?           @default(0)
-  // How much of this invoice's gross amount has been settled via vendor
-  // advance (as opposed to a cash/bank Payment) — kept separate so the
-  // invoice's own gross `amount` never gets silently reduced by a
-  // settlement (advance is a settlement method, not an invoice discount).
   advanceApplied   Float            @default(0)
   warehouseId      String?
   payments         Payment[]
@@ -623,43 +566,37 @@ model RecipeItem {
 }
 
 model Production {
-  id             String               @id @default(uuid())
-  // Canonical, business-facing identity. Generated once when the production
-  // run is created and copied verbatim to ProductBatch on completion.
-  productionBatchCode String?         @unique
-  productionType String
-  recipeId       String
-  quantity       Float
-  franchiseId    String
-  status         ProductionStatus     @default(PENDING)
-  producedBy     String?
-  producedAt     DateTime             @default(now())
-  customerId     String?
-  endTime        DateTime?
-  expiryDate     DateTime?
-  startTime      DateTime?
-  actualYield    Float?
-  currentStage   ProductionStage      @default(QUEUED)
-  stageUpdatedAt DateTime?
-  operatorId     String?
-  remarks        String?
-  materialCost   Float?
-  laborCost      Float?               @default(0)
-  overheadCost   Float?               @default(0)
-  totalCost      Float?
-  // The actual scoping unit for stock: which warehouse this run drew its raw
-  // materials from and validated availability against. franchiseId remains
-  // required by the schema (other reports still key off it) but stock
-  // validation no longer looks at it — see production.service.ts.
-  warehouseId    String?
-  operator       Employee?            @relation(fields: [operatorId], references: [id])
-  batches        ProductBatch[]
-  customer       Customer?            @relation(fields: [customerId], references: [id])
-  franchise      Franchise            @relation(fields: [franchiseId], references: [id])
-  recipe         Recipe               @relation(fields: [recipeId], references: [id])
-  warehouse      Warehouse?           @relation(fields: [warehouseId], references: [id])
-  items          ProductionItem[]
-  stageLogs      ProductionStageLog[]
+  id                  String               @id @default(uuid())
+  productionBatchCode String?              @unique
+  productionType      String
+  recipeId            String
+  quantity            Float
+  franchiseId         String
+  status              ProductionStatus     @default(PENDING)
+  producedBy          String?
+  producedAt          DateTime             @default(now())
+  customerId          String?
+  endTime             DateTime?
+  expiryDate          DateTime?
+  startTime           DateTime?
+  actualYield         Float?
+  currentStage        ProductionStage      @default(QUEUED)
+  stageUpdatedAt      DateTime?
+  operatorId          String?
+  remarks             String?
+  materialCost        Float?
+  laborCost           Float?               @default(0)
+  overheadCost        Float?               @default(0)
+  totalCost           Float?
+  warehouseId         String?
+  batches             ProductBatch?
+  customer            Customer?            @relation(fields: [customerId], references: [id])
+  franchise           Franchise            @relation(fields: [franchiseId], references: [id])
+  operator            Employee?            @relation(fields: [operatorId], references: [id])
+  recipe              Recipe               @relation(fields: [recipeId], references: [id])
+  warehouse           Warehouse?           @relation(fields: [warehouseId], references: [id])
+  items               ProductionItem[]
+  stageLogs           ProductionStageLog[]
 
   @@index([franchiseId, status, producedAt])
 }
@@ -672,31 +609,17 @@ model ProductionStageLog {
   production   Production      @relation(fields: [productionId], references: [id])
 }
 
-enum ProductionStage {
-  QUEUED
-  MIXING
-  COOKING
-  COOLING
-  READY_FOR_QC
-}
-
-enum PackagingStatus {
-  PENDING
-  PARTIALLY_PACKED
-  PACKAGED
-}
-
 model ProductBatch {
   id               String             @id @default(uuid())
   productId        String?
-  productionId     String?             @unique
+  productionId     String?            @unique
   quantity         Float
   expiryDate       DateTime?
   batchCode        String?
   createdAt        DateTime           @default(now())
   franchiseId      String?
   mfgDate          DateTime?          @default(now())
-  qcStatus         String?            @default("PENDING") // PENDING, APPROVED, PARTIALLY_APPROVED, REJECTED, REWORK
+  qcStatus         String?            @default("PENDING")
   moistureCheck    Float?
   colorCheck       String?
   textureCheck     String?
@@ -708,38 +631,17 @@ model ProductBatch {
   cartonedQty      Float?             @default(0)
   unitCost         Float?
   totalCost        Float?
+  recall           BatchRecall?
+  cartons          Carton[]
+  inventoryBatches InventoryBatch[]
   franchise        Franchise?         @relation(fields: [franchiseId], references: [id])
   product          Product?           @relation(fields: [productId], references: [id])
   production       Production?        @relation(fields: [productionId], references: [id])
   packagings       ProductPackaging[]
-  cartons          Carton[]
-  inventoryBatches InventoryBatch[]
-  recall           BatchRecall?
 
   @@index([franchiseId, expiryDate])
 }
 
-enum RecallStatus {
-  IN_PROGRESS
-  COMPLETED
-  CANCELLED
-}
-
-enum RecallStep {
-  INITIATED
-  DISTRIBUTION_LOCATED
-  SALES_BLOCKED
-  REPORT_GENERATED
-  RETURN_COLLECTED
-  COMPLETED
-}
-
-// One row per ProductBatch, ever — productBatchId is unique so the DB itself
-// rejects a second concurrent "initiate" for the same batch (see
-// recall.service.ts's create-then-fallback-to-update-if-CANCELLED pattern).
-// This is the single source of truth for whether a batch is under recall and
-// what step that recall has reached; the frontend must not derive this from
-// its own timers.
 model BatchRecall {
   id                String             @id @default(uuid())
   productBatchId    String             @unique
@@ -747,9 +649,6 @@ model BatchRecall {
   step              RecallStep         @default(INITIATED)
   reason            String
   reasonNotes       String?
-  // Real, computed figures — never hardcoded. distributedQty is populated by
-  // locateDistribution() from actual InventoryBatch/StockMovement records;
-  // returnedQty accumulates from collectReturn() and is bounded by it.
   distributedQty    Float              @default(0)
   returnedQty       Float              @default(0)
   affectedLocations Json?
@@ -763,13 +662,11 @@ model BatchRecall {
   events            BatchRecallEvent[]
 }
 
-// Persisted audit trail — the frontend's "Live Recall Audit Log" reads this,
-// it does not generate its own messages.
 model BatchRecallEvent {
   id          String      @id @default(uuid())
   recallId    String
   event       String
-  status      String // SUCCESS, FAILED, INFO
+  status      String
   actor       String?
   affectedQty Float?
   details     Json?
@@ -796,18 +693,11 @@ model Carton {
 model ProductPackaging {
   id              String             @id @default(uuid())
   batchId         String
-  packetSize      String // e.g. "100g", "500g", "1KG"
+  packetSize      String
   quantityPackets Int
-  totalWeight     Float // quantityPackets * size
+  totalWeight     Float
   barcode         String             @unique
   printedLabels   Boolean            @default(false)
-  // Two-phase packaging: a ticket starts as AWAITING_CONFIRMATION with no
-  // inventory touched. Bulk deduction and Finished Goods creation only
-  // happen at Confirm (see ProductionService.confirmPackaging). Historical
-  // rows (created before this field existed, under the old one-shot flow)
-  // default to CONFIRMED via the schema default itself — their Finished
-  // Goods stock already exists, so they're retroactively "done". Every new
-  // ticket passes status explicitly at creation, overriding this default.
   status          PackagingRunStatus @default(CONFIRMED)
   stickersPrinted Int?
   physicalChecked Boolean?
@@ -818,12 +708,6 @@ model ProductPackaging {
   createdAt       DateTime           @default(now())
   batch           ProductBatch       @relation(fields: [batchId], references: [id], onDelete: Cascade)
   wasteEntries    WasteEntry[]
-}
-
-enum PackagingRunStatus {
-  AWAITING_CONFIRMATION
-  CONFIRMED
-  CANCELLED
 }
 
 model FranchiseOrder {
@@ -928,48 +812,35 @@ model StockTransferItem {
 }
 
 model Order {
-  id                 String        @id @default(uuid())
-  invoiceNum         String        @unique
-  partyType          PartyType?
-  partyId            String?
-  customerId         String?
-  // Snapshot display name for the party at invoice time — mirrors
-  // Quotation/SalesOrder/ProformaInvoice.customerName. Needed because
-  // Dealer/Franchise parties have no FK relation here (only customerId ->
-  // Customer), so without this the Tax Invoice view has no way to show
-  // who the invoice is for.
-  customerName       String?
-  branchId           String?
-  franchiseId        String
-  orderType          String        @default("DINE_IN")
-  status             OrderStatus   @default(COMPLETED)
-  subTotal           Float
-  taxAmount          Float
-  discountAmount     Float         @default(0)
-  totalAmount        Float
-  paymentStatus      String        @default("PAID")
-  paymentType        String        @default("CASH")
-  stateOfSupply      String?
-  inventory_deducted Boolean       @default(false)
-  sourceQuotationId  String?
-  // Full chain traceability when this Tax Invoice was created via
-  // Proforma → Convert (see SalesService.convertProformaToInvoice), not the
-  // legacy direct Estimate → Tax Invoice path. Nullable: a standalone
-  // invoice (created from /sales/invoices directly, or the legacy direct
-  // Quotation convert) has neither.
+  id                      String        @id @default(uuid())
+  invoiceNum              String        @unique
+  partyType               PartyType?
+  partyId                 String?
+  customerId              String?
+  customerName            String?
+  branchId                String?
+  franchiseId             String
+  orderType               String        @default("DINE_IN")
+  status                  OrderStatus   @default(COMPLETED)
+  subTotal                Float
+  taxAmount               Float
+  discountAmount          Float         @default(0)
+  totalAmount             Float
+  paymentStatus           String        @default("PAID")
+  paymentType             String        @default("CASH")
+  stateOfSupply           String?
+  inventory_deducted      Boolean       @default(false)
+  sourceQuotationId       String?
   sourceProformaInvoiceId String?
-  createdAt          DateTime      @default(now())
-  delivery           Delivery?
-  invoice            Invoice?
-  customer           Customer?     @relation(fields: [customerId], references: [id])
-  franchise          Franchise     @relation(fields: [franchiseId], references: [id])
-  orderItems         OrderItem[]
-  payments           Payment[]
-  returns            ReturnOrder[]
+  createdAt               DateTime      @default(now())
+  delivery                Delivery?
+  invoice                 Invoice?
+  customer                Customer?     @relation(fields: [customerId], references: [id])
+  franchise               Franchise     @relation(fields: [franchiseId], references: [id])
+  orderItems              OrderItem[]
+  payments                Payment[]
+  returns                 ReturnOrder[]
 
-  // Dashboard/reporting hot paths: revenue-by-range (with and without a
-  // franchise filter), pending-dispatch status lookups, and per-customer
-  // outstanding-balance queries.
   @@index([franchiseId, createdAt])
   @@index([createdAt])
   @@index([franchiseId, status])
@@ -1014,10 +885,6 @@ model Payment {
   linkedDocId         String?
   linkedDocType       LinkedDocType?
   paymentNumber       String?               @unique
-  // Client-supplied key (one per logical "Make Payment" submission) so a
-  // retry/double-click/API re-entry with the same key returns the existing
-  // Payment instead of creating a second one. Nullable + unique: most
-  // callers won't send one, but any that do get a real DB-level guarantee.
   idempotencyKey      String?               @unique
   reversalOfPaymentId String?
   sourceModule        PaymentSourceModule   @default(MANUAL)
@@ -1033,38 +900,30 @@ model Payment {
 }
 
 model Invoice {
-  id                 String    @id @default(uuid())
-  orderId            String    @unique
+  id                 String              @id @default(uuid())
+  orderId            String              @unique
   totalAmount        Float
   taxAmount          Float
   finalAmount        Float
-  roundOff           Float     @default(0)
-  status             String    @default("PAID")
+  roundOff           Float               @default(0)
+  status             String              @default("PAID")
   termsAndConditions String?
   description        String?
   notes              String?
-  createdAt          DateTime  @default(now())
-  order              Order     @relation(fields: [orderId], references: [id])
+  createdAt          DateTime            @default(now())
+  order              Order               @relation(fields: [orderId], references: [id])
   payments           Payment[]
   allocations        PaymentAllocation[]
 }
 
-// One receipt (Payment) can be split across several Tax Invoices for the
-// same customer — e.g. a ₹350 receipt paying ₹100 on Invoice A, ₹200 on
-// Invoice B, ₹50 on Invoice C. Payment.invoiceId stays single-valued and is
-// left null for a payment spanning 2+ invoices (a single-invoice payment,
-// whether entered via the legacy one-invoice flow or as a one-row
-// allocation, keeps using Payment.invoiceId directly and never gets a row
-// here — see FinanceService.createPayment). This table is additive only:
-// no existing Payment/Invoice data is migrated into it.
 model PaymentAllocation {
   id        String   @id @default(uuid())
   paymentId String
   invoiceId String
   amount    Float
   createdAt DateTime @default(now())
-  payment   Payment  @relation(fields: [paymentId], references: [id])
   invoice   Invoice  @relation(fields: [invoiceId], references: [id])
+  payment   Payment  @relation(fields: [paymentId], references: [id])
 
   @@index([paymentId])
   @@index([invoiceId])
@@ -1081,11 +940,11 @@ model Account {
   status          String           @default("ACTIVE")
   franchiseId     String?
   franchise       Franchise?       @relation(fields: [franchiseId], references: [id])
+  cheques         Cheque[]
   customerLedgers CustomerLedger[]
   expenses        Expense[]
   payments        Payment[]
   vendorLedgers   VendorLedger[]
-  cheques         Cheque[]
 }
 
 model Expense {
@@ -1242,13 +1101,13 @@ model Employee {
   upiId                 String?
   verificationStatus    String?          @default("PENDING")
   workLocation          String?
+  attendanceLogs        AttendanceLog[]
   salaryStructure       SalaryStructure? @relation(fields: [salaryStructureId], references: [id])
   user                  User             @relation(fields: [userId], references: [id])
   shifts                EmployeeShift[]
   leaves                Leave[]
-  payslips              Payslip[]
-  attendanceLogs        AttendanceLog[]
   leaveBalances         LeaveBalance[]
+  payslips              Payslip[]
   productionsOperated   Production[]
 }
 
@@ -1381,40 +1240,32 @@ model Payslip {
 }
 
 model Quotation {
-  id               String          @id @default(uuid())
-  quotationNumber  String          @unique
-  // Generic party selection (Customer / Dealer / Franchise). customerId +
-  // the `customer` relation below stay populated only when partyType is
-  // CUSTOMER (preserves the existing relation/include); partyId is the
-  // universal id regardless of type.
-  partyType        PartyType       @default(CUSTOMER)
-  partyId          String?
-  customerId       String?
-  customerName     String?
-  customerPhone    String?
-  customerEmail    String?
-  validUntil       DateTime?
-  // GST place of supply as of the accepted Estimate — carried forward
-  // verbatim to the converted SalesOrder (see convertQuotationToSalesOrder)
-  // rather than re-asked, since it determines CGST+SGST vs IGST and must
-  // stay consistent with the totals the customer already accepted.
-  stateOfSupply    String?
-  status           QuotationStatus @default(DRAFT)
-  subTotal         Float
-  taxAmount        Float
-  discountAmount   Float           @default(0)
-  totalAmount      Float
-  termsConditions  String?
-  notes            String?
-  createdBy        String?
-  convertedOrderId String?
+  id                 String          @id @default(uuid())
+  quotationNumber    String          @unique
+  partyType          PartyType       @default(CUSTOMER)
+  partyId            String?
+  customerId         String?
+  customerName       String?
+  customerPhone      String?
+  customerEmail      String?
+  validUntil         DateTime?
+  stateOfSupply      String?
+  status             QuotationStatus @default(DRAFT)
+  subTotal           Float
+  taxAmount          Float
+  discountAmount     Float           @default(0)
+  totalAmount        Float
+  termsConditions    String?
+  notes              String?
+  createdBy          String?
+  convertedOrderId   String?
   convertedInvoiceId String?
-  trackingNumber   String?
-  courierName      String?
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
-  customer         Customer?       @relation(fields: [customerId], references: [id])
-  items            QuotationItem[]
+  trackingNumber     String?
+  courierName        String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  customer           Customer?       @relation(fields: [customerId], references: [id])
+  items              QuotationItem[]
 }
 
 model QuotationItem {
@@ -1434,61 +1285,36 @@ model QuotationItem {
 }
 
 model SalesOrder {
-  id              String           @id @default(uuid())
-  orderNumber     String           @unique
-  // One Sales Order per source Estimate — @unique is the DB-level duplicate-
-  // prevention guard for convertQuotationToSalesOrder, so retried/parallel
-  // requests never sneak in a second SO for the same Quotation ID.
-  quotationId     String?          @unique
-  // One Proforma Invoice per Sales Order — the @unique is the DB-level
-  // duplicate-prevention guard for "Create Proforma Invoice" (see
-  // SalesService.convertSalesOrderToProforma), not just an app-level check.
-  proformaInvoiceId String?        @unique
-  // One key per logical "Save Order" submission from the direct-create form
-  // (createSalesOrder has no source document to dedup against, unlike the
-  // Estimate-convert path above) — a retry/double-click/API re-entry with
-  // the same key returns the existing SalesOrder instead of creating a
-  // second one. Mirrors Payment.idempotencyKey.
-  idempotencyKey  String?          @unique
-  // Copied forward from the source Estimate at conversion time — see
-  // Quotation.partyType/partyId above for the same generic-party pattern.
-  partyType       PartyType        @default(CUSTOMER)
-  partyId         String?
-  customerId      String?
-  customerName    String?
-  customerPhone   String?
-  status          SalesOrderStatus @default(DRAFT)
-  subTotal        Float
-  taxAmount       Float
-  discountAmount  Float            @default(0)
-  totalAmount     Float
-  // The date this Sales Order itself was created/committed — distinct from
-  // Quotation.createdAt (the estimate's own date) and never copied from the
-  // source Estimate's validUntil, which is a price-offer expiry, not an
-  // order date. Set once at creation (direct-create or conversion) and not
-  // meant to move afterward.
-  orderDate       DateTime?        @default(now())
-  // Fulfilment/payment commitment date — a distinct business concept from
-  // Quotation.validUntil ("this price offer expires on..."). Editable after
-  // creation, unlike orderDate.
-  dueDate         DateTime?
-  // GST place of supply. On a quotation-converted order this is copied
-  // forward from Quotation.stateOfSupply (see convertQuotationToSalesOrder)
-  // rather than re-entered, since changing it can flip CGST+SGST vs IGST
-  // and desync the order from the totals the customer already accepted.
-  stateOfSupply   String?
-  deliveryDate    DateTime?
-  deliveryAddress String?
-  trackingNumber  String?
-  courierName     String?
-  notes           String?
-  createdBy       String?
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @updatedAt
-  paymentStatus   String           @default("UNPAID")
-  returns         ReturnOrder[]
-  customer        Customer?        @relation(fields: [customerId], references: [id])
-  items           SalesOrderItem[]
+  id                String           @id @default(uuid())
+  orderNumber       String           @unique
+  quotationId       String?          @unique
+  proformaInvoiceId String?          @unique
+  idempotencyKey    String?          @unique
+  partyType         PartyType        @default(CUSTOMER)
+  partyId           String?
+  customerId        String?
+  customerName      String?
+  customerPhone     String?
+  status            SalesOrderStatus @default(DRAFT)
+  subTotal          Float
+  taxAmount         Float
+  discountAmount    Float            @default(0)
+  totalAmount       Float
+  orderDate         DateTime?        @default(now())
+  dueDate           DateTime?
+  stateOfSupply     String?
+  deliveryDate      DateTime?
+  deliveryAddress   String?
+  trackingNumber    String?
+  courierName       String?
+  notes             String?
+  createdBy         String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  paymentStatus     String           @default("UNPAID")
+  returns           ReturnOrder[]
+  customer          Customer?        @relation(fields: [customerId], references: [id])
+  items             SalesOrderItem[]
 }
 
 model SalesOrderItem {
@@ -1507,11 +1333,6 @@ model SalesOrderItem {
   salesOrder      SalesOrder @relation(fields: [salesOrderId], references: [id])
 }
 
-// A formal pre-invoice used for advance/payment requests or commercial
-// confirmation — genuinely distinct from Quotation (which is just an
-// estimate) even though the fields largely mirror it. Sits between
-// SalesOrder and the Tax Invoice (Order+Invoice) in the document chain:
-// Quotation -> SalesOrder -> ProformaInvoice -> Order/Invoice -> Payment.
 model ProformaInvoice {
   id                 String                @id @default(uuid())
   proformaNumber     String                @unique
@@ -1530,8 +1351,6 @@ model ProformaInvoice {
   paymentTerms       String?
   notes              String?
   createdBy          String?
-  // Duplicate-prevention for "Convert to Tax Invoice", same pattern as
-  // SalesOrder.proformaInvoiceId above.
   convertedInvoiceId String?               @unique
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
@@ -1563,10 +1382,6 @@ model ReturnOrder {
   reason           String
   status           ReturnStatus    @default(PENDING)
   refundAmount     Float
-  // GST breakdown of refundAmount, backfilled from the original sale's tax
-  // split at approval time (see SalesService.updateReturnOrder). Null while
-  // PENDING — an unapproved return is not yet an "applicable" credit note
-  // and must not feed any GST report.
   taxableValue     Float?
   gstRate          Float?
   cgst             Float?
@@ -1581,17 +1396,13 @@ model ReturnOrder {
   franchiseId      String?
   franchiseOrderId String?
   posOrderId       String?
-  // Client-supplied key (one per "Submit Return Request" form session) so a
-  // retry/double-click/network re-entry with the same key returns the
-  // already-created return instead of creating a second one. Mirrors
-  // Payment.idempotencyKey / SalesOrder.idempotencyKey.
   idempotencyKey   String?         @unique
   items            ReturnItem[]
   customer         Customer?       @relation(fields: [customerId], references: [id])
   franchise        Franchise?      @relation(fields: [franchiseId], references: [id])
   franchiseOrder   FranchiseOrder? @relation(fields: [franchiseOrderId], references: [id])
-  salesOrder       SalesOrder?     @relation(fields: [salesOrderId], references: [id])
   posOrder         Order?          @relation(fields: [posOrderId], references: [id])
+  salesOrder       SalesOrder?     @relation(fields: [salesOrderId], references: [id])
 
   @@index([franchiseId, createdAt])
   @@index([createdAt])
@@ -1610,102 +1421,81 @@ model ReturnItem {
 }
 
 model DeliveryChallan {
-  id                String                @id @default(uuid())
-  challanNumber     String                @unique
-  customerId        String?
-  // External B2B reseller destination — architecturally distinct from
-  // Customer (separate master, own scoping) even though stock accounting
-  // treats it identically: dispatch deducts source stock, no destination
-  // receipt (see SalesService.dispatchChallanStock/receiveChallanStock).
-  dealerId          String?
-  salesOrderId      String?
-  franchiseId       String?
-  sourceFranchiseId String?
-  sourceInvoiceId   String?
-  status            String                @default("DRAFT")
-  challanDate       DateTime              @default(now())
-  dueDate           DateTime?
-  vehicleNo         String?
-  driverName        String?
-  stateOfSupply     String?
-  notes             String?
-  termsConditions   String?
-  subTotal          Float                 @default(0)
-  taxAmount         Float                 @default(0)
-  totalAmount       Float                 @default(0)
-  // One key per "Save Challan"/"Dispatch" submission — a retry/double-click
-  // returns the existing record instead of creating a second one. Mirrors
-  // Payment.idempotencyKey / SalesOrder.idempotencyKey.
-  idempotencyKey    String?               @unique
-  // Delivery confirmation — captured by the explicit "Mark Delivered"
-  // action (SalesService.markChallanDelivered), distinct from a generic
-  // status PATCH so these are never left blank on a CLOSED challan.
-  receivedBy        String?
-  deliveredAt       DateTime?
-  podReference      String?
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @updatedAt
-  customer          Customer?             @relation(fields: [customerId], references: [id])
-  dealer            Dealer?               @relation(fields: [dealerId], references: [id])
-  items             DeliveryChallanItem[]
-  returns           DeliveryChallanReturn[]
-  convertedOrderId  String?
+  id                 String                  @id @default(uuid())
+  challanNumber      String                  @unique
+  customerId         String?
+  dealerId           String?
+  salesOrderId       String?
+  franchiseId        String?
+  sourceFranchiseId  String?
+  sourceInvoiceId    String?
+  status             String                  @default("DRAFT")
+  challanDate        DateTime                @default(now())
+  dueDate            DateTime?
+  vehicleNo          String?
+  driverName         String?
+  stateOfSupply      String?
+  notes              String?
+  termsConditions    String?
+  subTotal           Float                   @default(0)
+  taxAmount          Float                   @default(0)
+  totalAmount        Float                   @default(0)
+  idempotencyKey     String?                 @unique
+  receivedBy         String?
+  deliveredAt        DateTime?
+  podReference       String?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  convertedOrderId   String?
   convertedInvoiceId String?
+  customer           Customer?               @relation(fields: [customerId], references: [id])
+  dealer             Dealer?                 @relation(fields: [dealerId], references: [id])
+  items              DeliveryChallanItem[]
+  returns            DeliveryChallanReturn[]
 }
 
 model DeliveryChallanItem {
-  id          String          @id @default(uuid())
+  id          String                      @id @default(uuid())
   challanId   String
   productId   String?
   productName String
   batchNumber String?
   quantity    Float
-  unit        String          @default("NONE")
-  rate        Float           @default(0)
-  taxPercent  Float           @default(0)
-  taxAmount   Float           @default(0)
-  totalAmount Float           @default(0)
-  challan     DeliveryChallan @relation(fields: [challanId], references: [id])
+  unit        String                      @default("NONE")
+  rate        Float                       @default(0)
+  taxPercent  Float                       @default(0)
+  taxAmount   Float                       @default(0)
+  totalAmount Float                       @default(0)
+  challan     DeliveryChallan             @relation(fields: [challanId], references: [id])
   returns     DeliveryChallanReturnItem[]
 }
 
-// Physical goods returned against an already-dispatched Delivery Challan.
-// Deliberately separate from the DC itself (never edits the original
-// dispatched quantity — see SalesService.createDeliveryChallanReturn) and
-// from the financial Sales Return/Credit Note workflow (physical goods
-// movement vs. financial adjustment are different concepts; see
-// ReturnOrder for the sales-return side).
 model DeliveryChallanReturn {
-  id           String                    @id @default(uuid())
-  returnNumber String                    @unique
-  challanId    String
-  reason       String
-  otherReason  String?
-  status       String                    @default("PENDING") // PENDING -> RECEIVED
-  createdBy    String?
-  // Mirrors DeliveryChallan.idempotencyKey — a retry/double-click on
-  // "Create Return" returns the existing return instead of a second one.
-  idempotencyKey String?                 @unique
-  createdAt    DateTime                  @default(now())
-  updatedAt    DateTime                  @updatedAt
-  challan      DeliveryChallan           @relation(fields: [challanId], references: [id])
-  items        DeliveryChallanReturnItem[]
+  id             String                      @id @default(uuid())
+  returnNumber   String                      @unique
+  challanId      String
+  reason         String
+  otherReason    String?
+  status         String                      @default("PENDING")
+  createdBy      String?
+  idempotencyKey String?                     @unique
+  createdAt      DateTime                    @default(now())
+  updatedAt      DateTime                    @updatedAt
+  challan        DeliveryChallan             @relation(fields: [challanId], references: [id])
+  items          DeliveryChallanReturnItem[]
 }
 
 model DeliveryChallanReturnItem {
-  id             String                @id @default(uuid())
-  returnId       String
-  challanItemId  String
-  productId      String?
-  productName    String
-  quantity       Float
-  unit           String                @default("NONE")
-  // Set at warehouse receipt time (RECEIVED), null while PENDING — a
-  // return is created the moment the party hands goods back, but its
-  // stock disposition isn't known until QC classifies the condition.
-  condition      String?               // GOOD | DAMAGED | EXPIRED | REJECTED | QUARANTINE
-  return         DeliveryChallanReturn @relation(fields: [returnId], references: [id])
-  challanItem    DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
+  id            String                @id @default(uuid())
+  returnId      String
+  challanItemId String
+  productId     String?
+  productName   String
+  quantity      Float
+  unit          String                @default("NONE")
+  condition     String?
+  challanItem   DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
+  return        DeliveryChallanReturn @relation(fields: [returnId], references: [id])
 }
 
 model PurchaseReturn {
@@ -1717,8 +1507,6 @@ model PurchaseReturn {
   returnSource       String               @default("MANUAL")
   status             String               @default("PENDING")
   refundAmount       Float
-  // GST breakdown of refundAmount, backfilled at approval time. See
-  // ReturnOrder's matching fields for the same rationale.
   taxableValue       Float?
   gstRate            Float?
   cgst               Float?
@@ -1753,7 +1541,7 @@ model ActivityLog {
   details           Json?
   createdAt         DateTime   @default(now())
   franchise         Franchise? @relation(fields: [targetFranchiseId], references: [id])
-  user              User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user              User?      @relation(fields: [userId], references: [id])
 }
 
 model FranchiseRequest {
@@ -1850,11 +1638,6 @@ model VendorQuotationItem {
 model Warehouse {
   id                   String             @id @default(uuid())
   name                 String
-  // Normalized form of `name` (lowercased, punctuation/whitespace stripped),
-  // computed and maintained by the application. The @unique constraint is
-  // the real guarantee against duplicate warehouses like "Home" vs "Home
-  // (Hopes)" — an app-level pre-check alone can't close the race window
-  // between two concurrent create requests; this can.
   nameKey              String             @unique
   code                 String?
   status               String             @default("ACTIVE")
@@ -1862,14 +1645,14 @@ model Warehouse {
   type                 String?
   createdAt            DateTime           @default(now())
   updatedAt            DateTime           @updatedAt
-  grnItems             GoodsReceiptItem[]
-  movements            StockMovement[]
-  bins                 WarehouseBin[]
-  orders               ProcurementOrder[]
   primaryForFranchises Franchise[]        @relation("PrimaryWarehouse")
+  grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
+  orders               ProcurementOrder[]
   productions          Production[]
+  movements            StockMovement[]
   vendorInvoices       VendorInvoice[]
+  bins                 WarehouseBin[]
   wasteEntries         WasteEntry[]
 }
 
@@ -1894,10 +1677,6 @@ model InventoryBatch {
   currentQty      Float
   unitCost        Float?
   productBatchId  String?
-  // Which physical warehouse this lot was received into / belongs to. FIFO
-  // consumption filters by this so production only draws from the warehouse
-  // actually selected, not just "somewhere in the business." Nullable because
-  // batches created before this existed have no warehouse on record.
   warehouseId     String?
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
@@ -1908,11 +1687,6 @@ model InventoryBatch {
   stockMovements  StockMovement[]
 }
 
-// Atomic counter for generating collision-free sequential numbers (e.g. GRN
-// lot/batch numbers). A row-level UPDATE ... increment inside a transaction
-// serializes concurrent callers at the DB level — unlike deriving a number
-// from Date.now()/row counts, which two requests can race and both compute
-// the same value from.
 model NumberSequence {
   key   String @id
   value Int    @default(0)
@@ -1954,6 +1728,112 @@ model SystemSetting {
   group       String   @default("GENERAL")
   description String?
   updatedAt   DateTime @updatedAt
+}
+
+model Unit {
+  id             String               @id @default(uuid())
+  name           String
+  shortName      String
+  items          InventoryItem[]
+  conversions    ItemUnitConversion[]
+  stockMovements StockMovement[]
+}
+
+model ItemUnitConversion {
+  id         String        @id @default(uuid())
+  itemId     String
+  unitId     String
+  multiplier Float
+  item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  unit       Unit          @relation(fields: [unitId], references: [id])
+
+  @@unique([itemId, unitId])
+}
+
+model Draft {
+  id        String   @id @default(uuid())
+  type      String
+  userId    String?
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model LoanAccount {
+  id                 String            @id @default(uuid())
+  accountName        String
+  accountNumber      String?
+  lenderName         String?
+  loanType           String            @default("RECEIVED")
+  principalAmount    Float             @default(0)
+  interestRate       Float             @default(0)
+  loanDate           DateTime          @default(now())
+  outstandingBalance Float             @default(0)
+  interestPaid       Float             @default(0)
+  principalPaid      Float             @default(0)
+  franchiseId        String
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  franchise          Franchise         @relation(fields: [franchiseId], references: [id])
+  transactions       LoanTransaction[]
+}
+
+model LoanTransaction {
+  id            String      @id @default(uuid())
+  loanAccountId String
+  date          DateTime    @default(now())
+  type          String
+  amount        Float
+  endingBalance Float
+  note          String?
+  createdAt     DateTime    @default(now())
+  loanAccount   LoanAccount @relation(fields: [loanAccountId], references: [id], onDelete: Cascade)
+}
+
+enum ChequeType {
+  PAYABLE
+  RECEIVABLE
+}
+
+enum ChequeStatus {
+  PENDING
+  CLEARED
+  BOUNCED
+}
+
+enum ProductionStage {
+  QUEUED
+  MIXING
+  COOKING
+  COOLING
+  READY_FOR_QC
+}
+
+enum PackagingStatus {
+  PENDING
+  PARTIALLY_PACKED
+  PACKAGED
+}
+
+enum RecallStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum RecallStep {
+  INITIATED
+  DISTRIBUTION_LOCATED
+  SALES_BLOCKED
+  REPORT_GENERATED
+  RETURN_COLLECTED
+  COMPLETED
+}
+
+enum PackagingRunStatus {
+  AWAITING_CONFIRMATION
+  CONFIRMED
+  CANCELLED
 }
 
 enum UserRole {
@@ -2070,11 +1950,6 @@ enum StockMovementType {
   ADJUSTMENT
   RETURN_OUT
   RECALL_RETURN_IN
-  // Delivery Challan return received in DAMAGED/EXPIRED/REJECTED/QUARANTINE
-  // condition — logged for traceability but deliberately does NOT call
-  // InventoryService.stockIn, so it never inflates available stock (see
-  // SalesService.receiveDeliveryChallanReturn). GOOD-condition returns use
-  // the existing RETURN_OUT's inverse via a normal stockIn instead.
   RETURN_QUARANTINE_IN
 }
 
@@ -2239,9 +2114,6 @@ enum QuotationStatus {
   CONVERTED
 }
 
-// Which master table `partyId` on Quotation/SalesOrder points to — a
-// generic FK-by-convention (like convertedOrderId elsewhere in this
-// schema) since it must reference one of three different tables.
 enum PartyType {
   CUSTOMER
   DEALER
@@ -2281,26 +2153,6 @@ enum PRStatus {
   CONVERTED_TO_PO
 }
 
-model Unit {
-  id             String               @id @default(uuid())
-  name           String
-  shortName      String
-  items          InventoryItem[]
-  conversions    ItemUnitConversion[]
-  stockMovements StockMovement[]
-}
-
-model ItemUnitConversion {
-  id         String        @id @default(uuid())
-  itemId     String
-  unitId     String
-  multiplier Float
-  item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  unit       Unit          @relation(fields: [unitId], references: [id])
-
-  @@unique([itemId, unitId])
-}
-
 enum RFQMasterStatus {
   OPEN
   CLOSED
@@ -2330,44 +2182,4 @@ enum InventoryStockState {
   BLOCKED
   EXPIRED
   RETURNED
-}
-
-model Draft {
-  id        String   @id @default(uuid())
-  type      String // e.g. "invoice", "order", "delivery_challan", "estimation", "proforma", "payment_in", "return"
-  userId    String? // for user tracking
-  data      Json // raw JSON of form items, customer selections, rates, etc.
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-model LoanAccount {
-  id                 String            @id @default(uuid())
-  accountName        String
-  accountNumber      String?
-  lenderName         String?
-  loanType           String            @default("RECEIVED") // RECEIVED or GIVEN
-  principalAmount    Float             @default(0)
-  interestRate       Float             @default(0)
-  loanDate           DateTime          @default(now())
-  outstandingBalance Float             @default(0)
-  interestPaid       Float             @default(0)
-  principalPaid      Float             @default(0)
-  franchiseId        String
-  franchise          Franchise         @relation(fields: [franchiseId], references: [id])
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
-  transactions       LoanTransaction[]
-}
-
-model LoanTransaction {
-  id            String      @id @default(uuid())
-  loanAccountId String
-  date          DateTime    @default(now())
-  type          String // DISBURSEMENT, PRINCIPAL_PAID, INTEREST_CHARGED, INTEREST_PAID
-  amount        Float
-  endingBalance Float
-  note          String?
-  createdAt     DateTime    @default(now())
-  loanAccount   LoanAccount @relation(fields: [loanAccountId], references: [id], onDelete: Cascade)
 }

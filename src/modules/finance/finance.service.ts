@@ -3028,16 +3028,24 @@ export class FinanceService {
     endDate?: Date;
   }) {
     const { franchiseId, customerId, startDate, endDate } = filters;
+    const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch all customers for current franchise to populate dropdown
+    // Fetch all customers and vendors for current franchise to populate dropdown
     const customersList = await prisma.customer.findMany({
       where: { franchiseId },
       select: { id: true, name: true, phone: true }
     });
+    const vendorsList = await prisma.vendor.findMany({
+      select: { id: true, name: true, contact: true }
+    });
+    const combinedParties = [
+      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone })),
+      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact }))
+    ];
 
     if (!customerId) {
       return {
-        customers: customersList,
+        customers: combinedParties,
         transactions: [],
         summary: {
           totalSale: 0,
@@ -3051,17 +3059,32 @@ export class FinanceService {
       };
     }
 
-    // Fetch customer ledgers
-    const ledgers = await prisma.customerLedger.findMany({
-      where: {
-        customerId,
-        createdAt: {
-          ...(startDate ? { gte: startDate } : {}),
-          ...(endDate ? { lte: endDate } : {})
-        }
-      },
-      orderBy: { createdAt: 'asc' }
-    });
+    // Fetch customer or vendor ledgers
+    const isCustomer = customersList.some(c => c.id === customerId);
+    let ledgers: any[] = [];
+    if (isCustomer) {
+      ledgers = await prisma.customerLedger.findMany({
+        where: {
+          customerId,
+          createdAt: {
+            ...(start ? { gte: start } : {}),
+            ...(end ? { lte: end } : {})
+          }
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+    } else {
+      ledgers = await prisma.vendorLedger.findMany({
+        where: {
+          vendorId: customerId,
+          createdAt: {
+            ...(start ? { gte: start } : {}),
+            ...(end ? { lte: end } : {})
+          }
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+    }
 
     // Format transaction rows
     let runningBalance = 0;
@@ -3082,20 +3105,22 @@ export class FinanceService {
     });
 
     // Compute summaries
-    const totalSale = ledgers.filter(l => l.referenceType === 'SALE').reduce((s, l) => s + l.amount, 0);
-    const totalMoneyIn = ledgers.filter(l => l.type === 'CREDIT').reduce((s, l) => s + l.amount, 0);
+    const totalSale = isCustomer ? ledgers.filter(l => l.referenceType === 'SALE').reduce((s, l) => s + l.amount, 0) : 0;
+    const totalPurchase = !isCustomer ? ledgers.filter(l => l.referenceType === 'PURCHASE' || l.referenceType === 'PURCHASE_BILL').reduce((s, l) => s + l.amount, 0) : 0;
+    const totalMoneyIn = isCustomer ? ledgers.filter(l => l.type === 'CREDIT').reduce((s, l) => s + l.amount, 0) : 0;
+    const totalMoneyOut = !isCustomer ? ledgers.filter(l => l.type === 'DEBIT').reduce((s, l) => s + l.amount, 0) : 0;
 
     return {
-      customers: customersList,
+      customers: combinedParties,
       transactions,
       summary: {
         totalSale,
-        totalPurchase: 0,
+        totalPurchase,
         totalExpense: 0,
         totalMoneyIn,
-        totalMoneyOut: 0,
-        totalReceivable: runningBalance >= 0 ? runningBalance : 0,
-        totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
+        totalMoneyOut,
+        totalReceivable: isCustomer && runningBalance >= 0 ? runningBalance : 0,
+        totalPayable: (!isCustomer && runningBalance < 0) ? Math.abs(runningBalance) : 0
       }
     };
   }
@@ -3106,31 +3131,28 @@ export class FinanceService {
     endDate?: Date;
   }) {
     const { franchiseId, startDate, endDate } = filters;
+    const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch all customers for franchise
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
+    // Fetch all final sales for the franchise
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({
+        franchiseId,
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
+        }
+      }),
       include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          },
+        customer: true,
+        orderItems: {
           include: {
-            orderItems: {
+            product: {
               include: {
-                product: {
+                recipe: {
                   include: {
-                    recipe: {
+                    recipeItems: {
                       include: {
-                        recipeItems: {
-                          include: {
-                            inventoryItem: true
-                          }
-                        }
+                        inventoryItem: true
                       }
                     }
                   }
@@ -3142,38 +3164,48 @@ export class FinanceService {
       }
     });
 
-    const reportRows = customers.map(cust => {
-      let totalSaleAmount = 0;
-      let totalCost = 0;
+    const partyMap = new Map<string, { partyName: string; phoneNo: string; totalSaleAmount: number; totalCost: number }>();
 
-      for (const order of cust.orders) {
-        totalSaleAmount += order.totalAmount;
-        for (const item of order.orderItems) {
-          if (item.totalCost !== null && item.totalCost !== undefined) {
-            totalCost += item.totalCost;
-            continue;
-          }
-          let itemCost = 0;
-          const recipeItems = item.product?.recipe?.recipeItems || [];
-          if (recipeItems.length > 0) {
-            for (const ri of recipeItems) {
-              const materialCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
-              itemCost += ri.quantityRequired * materialCost;
-            }
-          } else {
-            itemCost = item.product?.basePrice || 0;
-          }
-          totalCost += itemCost * item.quantity;
-        }
+    for (const order of orders) {
+      const partyId = order.customerId || 'CASH_CUSTOMER';
+      const partyName = order.customer ? order.customer.name : (order.customerName || 'Cash Customer');
+      const phoneNo = order.customer ? (order.customer.phone || '—') : '—';
+      
+      if (!partyMap.has(partyId)) {
+        partyMap.set(partyId, { partyName, phoneNo, totalSaleAmount: 0, totalCost: 0 });
       }
+      
+      const partyData = partyMap.get(partyId)!;
+      
+      // Use tax-exclusive sales for P&L
+      const taxExclusiveAmount = order.totalAmount - (order.taxAmount || 0);
+      partyData.totalSaleAmount += taxExclusiveAmount;
+      
+      for (const item of order.orderItems) {
+        if (item.totalCost !== null && item.totalCost !== undefined) {
+          partyData.totalCost += item.totalCost;
+          continue;
+        }
+        let itemCost = 0;
+        const recipeItems = item.product?.recipe?.recipeItems || [];
+        if (recipeItems.length > 0) {
+          for (const ri of recipeItems) {
+            const materialCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
+            itemCost += ri.quantityRequired * materialCost;
+          }
+        } else {
+          itemCost = item.product?.basePrice || 0;
+        }
+        partyData.totalCost += itemCost * item.quantity;
+      }
+    }
 
-      const profit = totalSaleAmount - totalCost;
-
+    const reportRows = Array.from(partyMap.values()).map(data => {
       return {
-        partyName: cust.name,
-        phoneNo: cust.phone || '—',
-        totalSaleAmount,
-        profit
+        partyName: data.partyName,
+        phoneNo: data.phoneNo,
+        totalSaleAmount: data.totalSaleAmount,
+        profit: data.totalSaleAmount - data.totalCost
       };
     }).filter(r => r.totalSaleAmount > 0);
 
@@ -3186,47 +3218,84 @@ export class FinanceService {
     endDate?: Date;
   }) {
     const { franchiseId, startDate, endDate } = filters;
+    const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch customer order items
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
+    // Fetch customer order items (Sales)
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({
+        franchiseId,
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
+        }
+      }),
       include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          },
+        customer: true,
+        orderItems: {
           include: {
-            orderItems: true
+            product: true
           }
         }
       }
     });
 
-    const report = customers.map(cust => {
-      let saleQuantity = 0;
-      let saleAmount = 0;
-
-      for (const order of cust.orders) {
-        saleAmount += order.totalAmount;
-        for (const item of order.orderItems) {
-          saleQuantity += item.quantity;
+    // Fetch vendor procurement items (Purchases)
+    const pos = await prisma.procurementOrder.findMany({
+      where: {
+        franchiseId,
+        status: { not: 'CANCELLED' },
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
+        }
+      },
+      include: {
+        vendor: true,
+        poItems: {
+          include: {
+            inventoryItem: true
+          }
         }
       }
+    });
 
-      return {
-        partyName: cust.name,
-        saleQuantity,
-        saleAmount,
-        purchaseQuantity: 0,
-        purchaseAmount: 0
-      };
-    }).filter(r => r.saleAmount > 0);
+    const partyItemMap = new Map<string, any>();
 
-    return report;
+    // Process Sales
+    for (const order of orders) {
+      const partyName = (order as any).customer ? (order as any).customer.name : (order.customerName || 'Cash Customer');
+      for (const item of order.orderItems) {
+        const itemName = item.product?.name || 'Unknown Item';
+        const uom = (item.product as any)?.inventoryItem?.unit || (item.product as any)?.unit || 'Unit';
+        const key = `${partyName}_${itemName}`;
+        
+        if (!partyItemMap.has(key)) {
+          partyItemMap.set(key, { partyName, itemName, uom, saleQuantity: 0, saleAmount: 0, purchaseQuantity: 0, purchaseAmount: 0 });
+        }
+        const row = partyItemMap.get(key);
+        row.saleQuantity += item.quantity;
+        row.saleAmount += (item.totalAmount || (item.quantity * ((item as any).unitPrice || 0)));
+      }
+    }
+
+    // Process Purchases
+    for (const po of pos) {
+      const partyName = (po as any).vendor?.name || 'Unknown Vendor';
+      for (const item of (po as any).poItems || []) {
+        const itemName = item.inventoryItem?.name || item.itemName || 'Unknown Item';
+        const uom = item.inventoryItem?.unit || 'Unit';
+        const key = `${partyName}_${itemName}`;
+        
+        if (!partyItemMap.has(key)) {
+          partyItemMap.set(key, { partyName, itemName, uom, saleQuantity: 0, saleAmount: 0, purchaseQuantity: 0, purchaseAmount: 0 });
+        }
+        const row = partyItemMap.get(key);
+        row.purchaseQuantity += item.quantity;
+        row.purchaseAmount += item.totalAmount;
+      }
+    }
+
+    return Array.from(partyItemMap.values());
   }
 
   static async getSalePurchaseByParty(filters: {
@@ -3235,31 +3304,87 @@ export class FinanceService {
     endDate?: Date;
   }) {
     const { franchiseId, startDate, endDate } = filters;
+    const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Aggregate sales per customer
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
-      include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          }
+    const partyMap = new Map<string, { partyName: string; partyType: string; totalSale: number; totalPurchase: number; net: number }>();
+
+    // Fetch Sales
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({
+        franchiseId,
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
         }
-      }
+      }),
+      include: { customer: true }
     });
 
-    const report = customers.map(cust => {
-      const saleAmount = cust.orders.reduce((sum, o) => sum + o.totalAmount, 0);
-      return {
-        partyName: cust.name,
-        saleAmount,
-        purchaseAmount: 0
-      };
-    }).filter(r => r.saleAmount > 0);
+    const dealerIds = [...new Set(orders.filter(o => o.partyType === 'DEALER' && o.partyId).map(o => o.partyId!))];
+    const franchiseIds = [...new Set(orders.filter(o => o.partyType === 'FRANCHISE' && o.partyId).map(o => o.partyId!))];
+    
+    const dealers = dealerIds.length > 0 ? await prisma.dealer.findMany({ where: { id: { in: dealerIds } } }) : [];
+    const franchises = franchiseIds.length > 0 ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } } }) : [];
+    
+    const dealerMap = new Map(dealers.map(d => [d.id, d.name]));
+    const franchiseMap = new Map(franchises.map(f => [f.id, f.name]));
+
+    for (const order of orders) {
+      let partyName = 'Walk-in Customer';
+      let partyType = 'Cash Customers';
+      
+      const pType = order.partyType || 'CUSTOMER';
+      
+      if (pType === 'CUSTOMER') {
+        if (order.customerId && order.customer) {
+          partyName = order.customer.name;
+          partyType = 'Customers';
+        } else if (order.customerName) {
+          partyName = order.customerName;
+          partyType = 'Cash Customers';
+        }
+      } else if (pType === 'DEALER' && order.partyId && dealerMap.has(order.partyId)) {
+        partyName = dealerMap.get(order.partyId)!;
+        partyType = 'Dealers';
+      } else if (pType === 'FRANCHISE' && order.partyId && franchiseMap.has(order.partyId)) {
+        partyName = franchiseMap.get(order.partyId)!;
+        partyType = 'Franchises';
+      }
+
+      if (!partyMap.has(partyName)) {
+        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
+      }
+      partyMap.get(partyName)!.totalSale += order.totalAmount;
+    }
+
+    // Fetch Purchases
+    const pos = await prisma.procurementOrder.findMany({
+      where: {
+        franchiseId,
+        status: { not: 'CANCELLED' },
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
+        }
+      },
+      include: { vendor: true }
+    });
+
+    for (const po of pos) {
+      const partyName = po.vendor?.name || 'Unknown Vendor';
+      const partyType = 'Vendors';
+      if (!partyMap.has(partyName)) {
+        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
+      }
+      partyMap.get(partyName)!.totalPurchase += po.totalAmount;
+    }
+
+    const report = Array.from(partyMap.values())
+      .map(r => ({
+        ...r,
+        net: r.totalSale - r.totalPurchase
+      }))
+      .filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
 
     return report;
   }
@@ -4759,51 +4884,75 @@ export class FinanceService {
   }
 
   static async getExpenseItemReportData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string) {
-    return this.getExpensesReportData(franchiseIdOrFilters, startDateParam, endDateParam, categoryParam);
+    const { franchiseId, startDate, endDate, category } = normalizeReportFilters(franchiseIdOrFilters, startDateParam, endDateParam, categoryParam);
+    const { start, end } = parseInclusiveDates(startDate, endDate);
+    const where: any = {
+      ...(franchiseId ? { franchiseId } : {}),
+      isCancelled: false,
+      purchaseOrderId: { not: null }
+    };
+    if (start || end) {
+      where.date = {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
+      };
+    }
+    if (category) where.category = category;
+
+    const expenses = await prisma.expense.findMany({
+      where,
+      include: { 
+        purchaseOrder: {
+          include: {
+            poItems: { include: { inventoryItem: true } }
+          }
+        }
+      },
+      orderBy: { date: 'desc' }
+    });
+
+    const items: any[] = [];
+    for (const exp of expenses) {
+      if (exp.purchaseOrder && (exp.purchaseOrder as any).poItems) {
+        for (const item of (exp.purchaseOrder as any).poItems) {
+          items.push({
+            id: item.id || Math.random().toString(),
+            date: exp.date,
+            expenseNumber: exp.expenseNumber,
+            category: exp.category,
+            expenseItem: item.inventoryItem?.name || item.itemName || 'Unknown Item',
+            quantity: item.quantity,
+            unitRate: item.price,
+            amount: item.total || (item.quantity * item.price)
+          });
+        }
+      }
+    }
+
+    return { expenses: items };
   }
 
   static async getSalePurchaseByPartyGroupData(franchiseId: string, startDate?: string, endDate?: string) {
-    const dateFilter: any = {};
-    if (startDate || endDate) {
-      dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
-      };
+    const parties = await this.getSalePurchaseByParty({
+      franchiseId,
+      startDate: startDate ? new Date(startDate) : undefined,
+      endDate: endDate ? new Date(endDate) : undefined
+    });
+
+    const groupMap: Record<string, { groupName: string; totalSale: number; totalPurchase: number; net: number }> = {};
+    const getGroup = (name: string) => {
+      if (!groupMap[name]) groupMap[name] = { groupName: name, totalSale: 0, totalPurchase: 0, net: 0 };
+      return groupMap[name];
+    };
+
+    for (const party of parties) {
+      const group = getGroup(party.partyType);
+      group.totalSale += party.totalSale;
+      group.totalPurchase += party.totalPurchase;
+      group.net += party.net;
     }
 
-    const [customers, vendors] = await Promise.all([
-      prisma.customer.findMany({
-        where: { franchiseId },
-        include: {
-          orders: {
-            where: { status: { not: 'CANCELLED' as any }, ...dateFilter }
-          }
-        }
-      }),
-      prisma.vendor.findMany({
-        include: {
-          orders: {
-            where: { franchiseId, status: { not: 'CANCELLED' as any }, ...dateFilter }
-          }
-        }
-      })
-    ]);
-
-    const groupMap: Record<string, { groupName: string; saleAmount: number; purchaseAmount: number }> = {};
-
-    customers.forEach(c => {
-      const group = 'Customers';
-      if (!groupMap[group]) groupMap[group] = { groupName: group, saleAmount: 0, purchaseAmount: 0 };
-      groupMap[group].saleAmount += c.orders.reduce((s, o) => s + o.totalAmount, 0);
-    });
-
-    vendors.forEach(v => {
-      const group = v.category || 'Vendors';
-      if (!groupMap[group]) groupMap[group] = { groupName: group, saleAmount: 0, purchaseAmount: 0 };
-      groupMap[group].purchaseAmount += v.orders.reduce((s, o) => s + o.totalAmount, 0);
-    });
-
-    return Object.values(groupMap);
+    return Object.values(groupMap).filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
   }
 
   /**
@@ -5011,11 +5160,12 @@ export class FinanceService {
     endDate?: string,
     opts?: { partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' | 'ALL'; search?: string; datasetType?: 'RECEIVABLE' | 'PAYABLE' }
   ) {
+    const { start, end } = parseInclusiveDates(startDate, endDate);
     const dateFilter: any = {};
-    if (startDate || endDate) {
+    if (start || end) {
       dateFilter.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {})
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {})
       };
     }
 
