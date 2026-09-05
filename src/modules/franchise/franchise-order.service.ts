@@ -185,9 +185,9 @@ export class FranchiseOrderService {
       }
 
       const subtotal    = orderItems.reduce((s, i) => s + i.totalAmount, 0);
-      const taxAmount   = Number(lineTax.toFixed(2));
-      const delivery    = 50; // Flat delivery charge
-      const grandTotal  = subtotal + taxAmount + delivery;
+      const taxAmount   = 0; // Excluded for Franchise Product Orders
+      const delivery    = 0; // No delivery charge for Franchise Product Orders
+      const grandTotal  = subtotal;
 
       const order = await tx.franchiseOrder.create({
         data: {
@@ -196,8 +196,8 @@ export class FranchiseOrderService {
           orderType,
           paymentType: data.paymentType ?? PaymentType.CREDIT,
           subtotal,
-          taxAmount,
-          deliveryCharges: delivery,
+          taxAmount: 0,
+          deliveryCharges: 0,
           totalAmount: grandTotal,
           priority: data.priority ?? 'NORMAL',
           notes: data.notes,

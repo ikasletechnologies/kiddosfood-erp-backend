@@ -1,7 +1,8 @@
 import prisma from '../../lib/prisma';
+import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
-import { ItemCategory, PaymentMode } from '@prisma/client';
+import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
 
@@ -1684,17 +1685,26 @@ export class FinanceService {
     partyId?: string;
     customerId?: string;
     items: {
-      productId: string;
-      qty: number;
+      productId?: string;
+      productName?: string;
+      qty?: number;
+      quantity?: number;
       unit?: string;
-      rate: number;
-      gst: number;
+      rate?: number;
+      price?: number;
+      gst?: number;
+      taxPercent?: number;
       discount?: number;
+      discountPct?: number;
+      discountAmount?: number;
       batchNumber?: string;
     }[];
     receivedAmount?: number;
     paymentMode?: any;
     discountAmount?: number;
+    deliveryCharge?: number;
+    deliveryCharges?: number;
+    sourceFranchiseOrderId?: string;
     roundOff?: number;
     stateOfSupply?: string;
     paymentType?: string;
@@ -1729,10 +1739,17 @@ export class FinanceService {
       }[] = [];
 
       for (const item of data.items) {
-        const itemSubtotal = item.qty * item.rate;
-        const itemDiscount = itemSubtotal * (item.discount || 0) / 100;
-        const itemTaxableAmount = itemSubtotal - itemDiscount;
-        const itemTax = itemTaxableAmount * (item.gst / 100);
+        const qty = Number(item.qty ?? item.quantity ?? 0);
+        const rate = Number(item.rate ?? item.price ?? 0);
+        const gst = Number(item.gst ?? item.taxPercent ?? 0);
+        const discountPct = Number(item.discount ?? item.discountPct ?? 0);
+
+        const itemSubtotal = qty * rate;
+        const itemDiscount = item.discountAmount !== undefined
+          ? Number(item.discountAmount)
+          : (itemSubtotal * discountPct / 100);
+        const itemTaxableAmount = Math.max(0, itemSubtotal - itemDiscount);
+        const itemTax = itemTaxableAmount * (gst / 100);
 
         subTotal += itemSubtotal;
         if (!data.discountAmount) {
@@ -1741,18 +1758,19 @@ export class FinanceService {
         totalTax += itemTax;
 
         orderItemsData.push({
-          productId: item.productId,
-          quantity: item.qty,
+          productId: item.productId || '',
+          quantity: qty,
           unit: item.unit || 'NONE',
-          price: item.rate,
-          discountPct: item.discount || 0,
+          price: rate,
+          discountPct: discountPct,
           taxAmount: itemTax,
           totalAmount: itemSubtotal - itemDiscount + itemTax,
           batchNumber: item.batchNumber || null
         });
       }
 
-      const totalAmount = subTotal + totalTax - totalDiscount;
+      const deliveryCharge = Number(data.deliveryCharge ?? data.deliveryCharges ?? 0);
+      const totalAmount = subTotal + totalTax - totalDiscount + deliveryCharge;
       const year = new Date().getFullYear();
       // Atomic sequence (same NumberSequence pattern as payment/GRN numbers)
       // instead of COUNT()-based generation, which two invoices saved in the
@@ -1773,12 +1791,22 @@ export class FinanceService {
       const roundOff = data.roundOff || 0;
       const finalAmount = totalAmount + roundOff;
 
+      let resolvedCustomerName = (data as any).customerName || null;
+      if (!resolvedCustomerName && data.partyType === 'FRANCHISE' && data.partyId) {
+        const fr = await tx.franchise.findUnique({ where: { id: data.partyId } });
+        if (fr) resolvedCustomerName = fr.name;
+      } else if (!resolvedCustomerName && data.partyType === 'CUSTOMER' && data.customerId) {
+        const cust = await tx.customer.findUnique({ where: { id: data.customerId } });
+        if (cust) resolvedCustomerName = cust.name;
+      }
+
       const order = await tx.order.create({
         data: {
           invoiceNum,
           partyType: (data.partyType || 'CUSTOMER') as any,
           partyId: data.partyId,
           customerId: data.customerId,
+          customerName: resolvedCustomerName,
           franchiseId: data.franchiseId,
           orderType: 'DINE_IN',
           status: 'COMPLETED',
@@ -1809,6 +1837,62 @@ export class FinanceService {
           notes: data.notes || null,
         }
       });
+
+      // If created from a Franchise Order, update the related FranchiseOrder with the final approved amount
+      if (data.sourceFranchiseOrderId) {
+        const fOrder = await tx.franchiseOrder.findUnique({
+          where: { id: data.sourceFranchiseOrderId },
+        });
+
+        if (fOrder) {
+          const oldTotal = fOrder.totalAmount;
+          const newTotal = finalAmount;
+          const difference = newTotal - oldTotal;
+
+          await tx.franchiseOrder.update({
+            where: { id: data.sourceFranchiseOrderId },
+            data: {
+              status: 'APPROVED',
+              subtotal: subTotal - totalDiscount,
+              taxAmount: totalTax,
+              deliveryCharges: deliveryCharge,
+              totalAmount: newTotal,
+            }
+          });
+
+          if (Math.abs(difference) > 0.001) {
+            const currentFranchise = await tx.franchise.findUnique({ where: { id: fOrder.franchiseId } });
+            const newOutstanding = (currentFranchise?.outstandingAmount || 0) + difference;
+
+            await tx.franchiseLedger.create({
+              data: {
+                franchiseId: fOrder.franchiseId,
+                type: difference > 0 ? LedgerType.DEBIT : LedgerType.CREDIT,
+                amount: Math.abs(difference),
+                balanceAfter: newOutstanding,
+                referenceType: FranchiseLedgerRefType.ORDER,
+                referenceId: fOrder.orderNumber,
+                note: `Invoice ${invoiceNum} adjustment (Delivery: ₹${deliveryCharge}, Tax: ₹${totalTax.toFixed(2)})`,
+              }
+            });
+
+            await tx.franchise.update({
+              where: { id: fOrder.franchiseId },
+              data: { outstandingAmount: newOutstanding }
+            });
+          }
+
+          try {
+            SocketService.io.emit('franchise-order-updated', {
+              id: fOrder.id,
+              status: 'APPROVED',
+              totalAmount: newTotal,
+            });
+          } catch (err) {
+            console.error('[Socket] Failed to emit franchise-order-updated', err);
+          }
+        }
+      }
 
       // "Collect payment now" at invoice-creation time is routed through the
       // same central FinanceService.createPayment() mechanism the standalone
@@ -1898,7 +1982,9 @@ export class FinanceService {
       }
 
       // Automatically deduct inventory based on the items sold
-      await POSService.deductInventoryIfNecessary(order.id, tx);
+      if (!data.sourceFranchiseOrderId && data.partyType !== 'FRANCHISE') {
+        await POSService.deductInventoryIfNecessary(order.id, tx);
+      }
 
       return {
         ...invoice,

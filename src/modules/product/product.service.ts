@@ -168,7 +168,18 @@ export class ProductService {
         const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
                    inventory.find(i => i.name.trim().toLowerCase() === pName);
         
-        if (!inv) return null;
+        if (!inv) {
+          return {
+            ...p,
+            currentStock: 0,
+            inventoryFranchiseId: franchiseId || null,
+            inventoryBasePrice: p.basePrice,
+            inventoryCostPrice: 0,
+            baseUnit: null,
+            conversions: [],
+            packSize: parseSkuPackSize(p.sku)
+          };
+        }
 
         return {
           ...p,
