@@ -91,9 +91,22 @@ export class DashboardAnalyticsService {
         where: { ...(franchiseId ? { franchiseId } : {}), date: { gte: today, lte: periodEnd } },
         _sum: { amount: true }
       }),
-      prisma.procurementOrder.aggregate({
-        where: { ...poWhere, createdAt: { gte: today, lte: periodEnd }, status: { not: 'CANCELLED' } },
-        _sum: { totalAmount: true }
+      // "Total Purchase" must reflect what was actually received/billed, not
+      // the PO's ordered commitment — GRN approval can change the unit price
+      // (see GRNService.approve / GoodsReceiptItem.price), so the Purchase
+      // Bill (VendorInvoice), whose amount is computed from the GRN's actual
+      // price, is the correct source; ProcurementOrder.totalAmount only ever
+      // reflects the PO's original price and would over/undercount whenever
+      // an actual price override happened during receiving.
+      prisma.vendorInvoice.aggregate({
+        where: {
+          procurementOrder: poWhere,
+          OR: [
+            { billDate: { gte: today, lte: periodEnd } },
+            { billDate: null, createdAt: { gte: today, lte: periodEnd } }
+          ]
+        },
+        _sum: { amount: true }
       }),
       prisma.orderItem.groupBy({
         by: ['productId'],
@@ -216,8 +229,8 @@ export class DashboardAnalyticsService {
     );
     const totalCOGS = stockMovementCOGS > 0 ? stockMovementCOGS : orderItemsCOGS;
     const franchisePurchaseTotal = franchiseId ? fSum : 0;
-    const totalPurchase = ((periodPurchase._sum?.totalAmount || 0) > 0
-      ? (periodPurchase._sum?.totalAmount || 0)
+    const totalPurchase = ((periodPurchase._sum?.amount || 0) > 0
+      ? (periodPurchase._sum?.amount || 0)
       : totalCOGS) + franchisePurchaseTotal;
 
     const topSellerProductIds = topSellerGroups.map(g => g.productId);

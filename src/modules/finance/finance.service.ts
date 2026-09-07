@@ -3800,6 +3800,15 @@ export class FinanceService {
         include: {
           poItems: {
             include: { inventoryItem: true }
+          },
+          // Actual purchase value/cost must come from what was actually
+          // received (GoodsReceiptItem.price), not the PO's ordered
+          // commitment (ProcurementOrderItem.price) — GRN approval can
+          // override the unit price. poItems above is kept only to look up
+          // each material's GST rate (not stored on GoodsReceiptItem).
+          goodsReceipts: {
+            where: { status: 'COMPLETED' },
+            include: { items: { include: { inventoryItem: true } } }
           }
         }
       }),
@@ -3943,18 +3952,27 @@ export class FinanceService {
       }
     }
 
-    // 4. Process Purchases (Procurement Orders)
+    // 4. Process Purchases — actual received value from completed GRNs
+    // (GoodsReceiptItem.price/acceptedQty), not the PO's ordered
+    // commitment (ProcurementOrderItem.price/quantity). An un-received PO
+    // contributes nothing here, which is correct: nothing was actually
+    // purchased/incurred yet.
     for (const po of procurementOrders) {
-      for (const item of po.poItems) {
-        const name = item.inventoryItem?.name || item.itemName || 'Unknown Item';
-        const entry = getOrCreate(name);
-        const qty = Number(item.quantity || 0);
-        const lineTotal = Number(item.total ?? (qty * (item.price || 0)));
-        const tax = Number(item.cgst + item.sgst + item.igst || (lineTotal * 0.05));
+      for (const grn of po.goodsReceipts || []) {
+        for (const item of grn.items) {
+          if (!item.acceptedQty) continue;
+          const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
+          const name = item.inventoryItem?.name || poItem?.itemName || 'Unknown Item';
+          const entry = getOrCreate(name);
+          const qty = Number(item.acceptedQty || 0);
+          const lineTotal = Number(qty * (item.price || 0));
+          const gstRate = Number(poItem?.gstRate || 0);
+          const tax = Number((lineTotal * gstRate) / 100);
 
-        entry.purchase += lineTotal;
-        entry.taxReceivable += tax;
-        entry.quantityPurchased += qty;
+          entry.purchase += lineTotal;
+          entry.taxReceivable += tax;
+          entry.quantityPurchased += qty;
+        }
       }
     }
 
@@ -5352,7 +5370,16 @@ export class FinanceService {
           status: { notIn: ['CANCELLED'] as any },
           ...dateFilter
         },
-        include: { poItems: { include: { inventoryItem: true } } }
+        include: {
+          poItems: { include: { inventoryItem: true } },
+          // Purchase value must reflect what was actually received
+          // (GoodsReceiptItem.price), not the PO's ordered price — see
+          // getItemWiseProfitLoss for the same fix and rationale.
+          goodsReceipts: {
+            where: { status: 'COMPLETED' },
+            include: { items: { include: { inventoryItem: true } } }
+          }
+        }
       })
     ]);
 
@@ -5402,15 +5429,19 @@ export class FinanceService {
     });
 
     purchases.forEach(p => {
-      p.poItems.forEach(item => {
-        const cat = item.inventoryItem?.category || 'Uncategorized';
-        if (filterCategory && cat.toLowerCase() !== filterCategory.toLowerCase()) return;
-        const agg = getOrCreate(cat);
-        const qty = item.quantity || 0;
-        const amt = item.total || (qty * (item.price || 0));
-        agg.purchaseQty += qty;
-        agg.purchaseQuantity += qty;
-        agg.purchaseAmount += amt;
+      p.goodsReceipts.forEach(grn => {
+        grn.items.forEach(item => {
+          if (!item.acceptedQty) return;
+          const poItem = p.poItems.find(pi => pi.inventoryItemId === item.materialId);
+          const cat = item.inventoryItem?.category || poItem?.inventoryItem?.category || 'Uncategorized';
+          if (filterCategory && cat.toLowerCase() !== filterCategory.toLowerCase()) return;
+          const agg = getOrCreate(cat);
+          const qty = item.acceptedQty || 0;
+          const amt = qty * (item.price || 0);
+          agg.purchaseQty += qty;
+          agg.purchaseQuantity += qty;
+          agg.purchaseAmount += amt;
+        });
       });
     });
 
@@ -5995,7 +6026,16 @@ export class FinanceService {
           status: { notIn: ['CANCELLED'] as any },
           ...dateFilter
         },
-        include: { poItems: { include: { inventoryItem: true } } }
+        include: {
+          poItems: { include: { inventoryItem: true } },
+          // Purchase value must reflect what was actually received
+          // (GoodsReceiptItem.price), not the PO's ordered price — see
+          // getItemWiseProfitLoss for the same fix and rationale.
+          goodsReceipts: {
+            where: { status: 'COMPLETED' },
+            include: { items: { include: { inventoryItem: true } } }
+          }
+        }
       })
     ]);
 
@@ -6027,27 +6067,31 @@ export class FinanceService {
     });
 
     purchases.forEach(p => {
-      p.poItems.forEach(item => {
-        const name = item.inventoryItem?.name || item.itemName || 'Unknown Item';
-        const category = item.inventoryItem?.category || 'Raw Material';
-        if (!itemMap[name]) {
-          itemMap[name] = {
-            itemName: name,
-            category,
-            saleQty: 0,
-            saleQuantity: 0,
-            saleAmount: 0,
-            purchaseQty: 0,
-            purchaseQuantity: 0,
-            purchaseAmount: 0,
-            grossMargin: 0
-          };
-        }
-        const qty = item.quantity || 0;
-        const amt = item.total || (qty * (item.price || 0));
-        itemMap[name].purchaseQty += qty;
-        itemMap[name].purchaseQuantity += qty;
-        itemMap[name].purchaseAmount += amt;
+      p.goodsReceipts.forEach(grn => {
+        grn.items.forEach(item => {
+          if (!item.acceptedQty) return;
+          const poItem = p.poItems.find(pi => pi.inventoryItemId === item.materialId);
+          const name = item.inventoryItem?.name || poItem?.itemName || 'Unknown Item';
+          const category = item.inventoryItem?.category || poItem?.inventoryItem?.category || 'Raw Material';
+          if (!itemMap[name]) {
+            itemMap[name] = {
+              itemName: name,
+              category,
+              saleQty: 0,
+              saleQuantity: 0,
+              saleAmount: 0,
+              purchaseQty: 0,
+              purchaseQuantity: 0,
+              purchaseAmount: 0,
+              grossMargin: 0
+            };
+          }
+          const qty = item.acceptedQty || 0;
+          const amt = qty * (item.price || 0);
+          itemMap[name].purchaseQty += qty;
+          itemMap[name].purchaseQuantity += qty;
+          itemMap[name].purchaseAmount += amt;
+        });
       });
     });
 
