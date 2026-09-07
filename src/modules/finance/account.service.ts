@@ -160,8 +160,17 @@ export class AccountService {
         // — a JSON blob the expense form serializes for its own line-items/
         // GST/note UI, see accounting/expenses/page.tsx handleSave — as if
         // it were a user-facing Particulars string.
-        vendorLedgers: { orderBy: { createdAt: 'desc' }, take: 20 },
-        customerLedgers: { orderBy: { createdAt: 'desc' }, take: 20 }
+        // Same reasoning as `expenses` above, for the identical bug:
+        // FinanceService.createPayment writes a VendorLedger/CustomerLedger
+        // row with this SAME accountId for every payment it posts
+        // (referenceType PAYMENT/ADVANCE, referenceId: payment.id) — that's
+        // the vendor/customer-side mirror of the Payment row already
+        // included above, not a second real transaction. Every
+        // VendorLedger/CustomerLedger row that ever gets an accountId comes
+        // from that one path (confirmed: recognizeLiability/recognizeReturn/
+        // recordAdvancePayment never set accountId), so including them here
+        // doubled every vendor/customer payment as a +/- pair with the same
+        // amount and near-identical timestamp.
       }
     });
 
