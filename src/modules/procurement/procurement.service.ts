@@ -119,17 +119,98 @@ export class ProcurementService {
     }
   }
 
+  /**
+   * Vendor "Material History" — what was ACTUALLY supplied, built purely
+   * from completed GRNs (GoodsReceiptItem.acceptedQty/price), never from
+   * ProcurementOrderItem.quantity/price/total or VendorMaterial (both are
+   * PO-commitment/quoted-price data, not a supply transaction). A PO with
+   * no completed GRN yet contributes nothing — nothing was actually
+   * received. Multiple completed GRNs for the same material accumulate
+   * (qty and goods value sum; each GRN's own matching PO-line GST rate is
+   * applied to that GRN's own goods value before summing, so a rate change
+   * between GRNs can't be blended into one wrong blended rate) instead of
+   * the last one silently overwriting the others. Shared by getVendors()
+   * and getVendorById() so the vendor list and vendor detail page can never
+   * disagree on this figure.
+   */
+  private static aggregateMaterialHistory(orders: any[]): Array<{
+    id: string;
+    materialId: string;
+    material: any;
+    quantity: number;
+    totalQuantity: number;
+    price: number;
+    goodsValue: number;
+    gstAmount: number;
+    totalAmount: number;
+    lastUpdated: Date;
+  }> {
+    const map = new Map<string, {
+      material: any;
+      quantity: number;
+      goodsValue: number;
+      gstAmount: number;
+      totalAmount: number;
+      lastUpdated: Date;
+    }>();
+
+    for (const order of orders || []) {
+      for (const grn of order.goodsReceipts || []) {
+        if (grn.status !== 'COMPLETED') continue;
+        for (const item of grn.items || []) {
+          if (!item.inventoryItem || !item.acceptedQty) continue;
+
+          const materialId = item.inventoryItem.id;
+          const acceptedQty = Number(item.acceptedQty) || 0;
+          const price = Number(item.price) || 0;
+          const poItem = (order.poItems || []).find((pi: any) => pi.inventoryItemId === item.materialId);
+          const gstRate = Number(poItem?.gstRate ?? item.inventoryItem?.gstRate ?? 0);
+
+          const lineGoodsValue = acceptedQty * price;
+          const lineGst = (lineGoodsValue * gstRate) / 100;
+          const lastUpdated = grn.receivedAt || grn.createdAt || order.createdAt;
+
+          const prev = map.get(materialId);
+          map.set(materialId, {
+            material: item.inventoryItem,
+            quantity: (prev?.quantity || 0) + acceptedQty,
+            goodsValue: (prev?.goodsValue || 0) + lineGoodsValue,
+            gstAmount: (prev?.gstAmount || 0) + lineGst,
+            totalAmount: (prev?.totalAmount || 0) + lineGoodsValue + lineGst,
+            lastUpdated: (!prev || lastUpdated > prev.lastUpdated) ? lastUpdated : prev.lastUpdated
+          });
+        }
+      }
+    }
+
+    return Array.from(map.entries()).map(([materialId, data]) => ({
+      id: materialId,
+      materialId,
+      material: data.material,
+      quantity: Number(data.quantity.toFixed(4)),
+      totalQuantity: Number(data.quantity.toFixed(4)),
+      // Weighted-average actual price across all completed GRNs — for a
+      // single GRN this is just that GRN's own price.
+      price: data.quantity > 0 ? Number((data.goodsValue / data.quantity).toFixed(4)) : 0,
+      goodsValue: Number(data.goodsValue.toFixed(2)),
+      gstAmount: Number(data.gstAmount.toFixed(2)),
+      totalAmount: Number(data.totalAmount.toFixed(2)),
+      lastUpdated: data.lastUpdated
+    }));
+  }
+
   static async getVendors() {
     const vendors = await prisma.vendor.findMany({
-      include: { 
+      include: {
         _count: { select: { orders: true } },
         suppliedMaterials: { include: { material: true } },
         ledgerEntries: { select: { type: true, amount: true, referenceType: true } },
-        orders: { 
-          include: { 
-            poItems: { include: { inventoryItem: true } }
-          }, 
-          orderBy: { createdAt: 'desc' } 
+        orders: {
+          include: {
+            poItems: { include: { inventoryItem: true } },
+            goodsReceipts: { where: { status: 'COMPLETED' }, include: { items: { include: { inventoryItem: true } } } }
+          },
+          orderBy: { createdAt: 'desc' }
         }
       },
       orderBy: { name: 'asc' }
@@ -201,55 +282,7 @@ export class ProcurementService {
           }))._sum.advanceApplied || 0
         : 0;
 
-      const materialMap = new Map<string, { material: any; price: number; quantity: number; totalQuantity: number; totalAmount: number; lastUpdated: Date }>();
-      if (v.suppliedMaterials) {
-        for (const sm of v.suppliedMaterials) {
-          if (sm.material) {
-            const qty = Number(sm.quantity) || 0;
-            const p = Number(sm.price) || Number(sm.material.costPrice) || Number(sm.material.basePrice) || 0;
-            materialMap.set(sm.materialId, {
-              material: sm.material,
-              price: p,
-              quantity: qty,
-              totalQuantity: qty,
-              totalAmount: qty * p,
-              lastUpdated: sm.lastUpdated || v.createdAt
-            });
-          }
-        }
-      }
-
-      const sortedOrders = [...(v.orders || [])].reverse();
-      for (const order of sortedOrders) {
-        for (const item of order.poItems || []) {
-          if (item.inventoryItem) {
-            const prev = materialMap.get(item.inventoryItem.id);
-            const itemQty = Number(item.quantity) || 0;
-            const itemPrice = Number(item.price) || 0;
-            const itemTotal = Number(item.total) || (itemQty * itemPrice);
-
-            materialMap.set(item.inventoryItem.id, {
-              material: item.inventoryItem,
-              price: itemPrice,
-              quantity: itemQty,
-              totalQuantity: (prev?.totalQuantity || 0) + itemQty,
-              totalAmount: (prev?.totalAmount || 0) + itemTotal,
-              lastUpdated: order.createdAt
-            });
-          }
-        }
-      }
-
-      const suppliedMaterials = Array.from(materialMap.entries()).map(([mId, data]) => ({
-        id: mId,
-        materialId: mId,
-        price: data.price,
-        quantity: data.quantity,
-        totalQuantity: data.totalQuantity,
-        totalAmount: data.totalAmount,
-        lastUpdated: data.lastUpdated,
-        material: data.material
-      }));
+      const suppliedMaterials = this.aggregateMaterialHistory(v.orders || []);
 
       return {
         ...v,
@@ -270,11 +303,11 @@ export class ProcurementService {
       where: { id },
       include: { 
         orders: { 
-          include: { 
+          include: {
             poItems: { include: { inventoryItem: true } },
-            goodsReceipts: { include: { items: { include: { inventoryItem: true } } } },
+            goodsReceipts: { where: { status: 'COMPLETED' }, include: { items: { include: { inventoryItem: true } } } },
             invoices: true
-          }, 
+          },
           orderBy: { createdAt: 'desc' }
         },
         invoices: true,
@@ -345,67 +378,7 @@ export class ProcurementService {
         }))._sum.advanceApplied || 0
       : 0;
 
-    const materialMap = new Map<string, { material: any; price: number; quantity: number; totalQuantity: number; totalAmount: number; lastUpdated: Date }>();
-    
-    if (vendor.suppliedMaterials) {
-      for (const sm of vendor.suppliedMaterials) {
-        if (sm.material) {
-          const qty = Number(sm.quantity) || 0;
-          const p = Number(sm.price) || Number(sm.material.costPrice) || Number(sm.material.basePrice) || 0;
-          materialMap.set(sm.materialId, {
-            material: sm.material,
-            price: p,
-            quantity: qty,
-            totalQuantity: qty,
-            totalAmount: qty * p,
-            lastUpdated: sm.lastUpdated || vendor.createdAt
-          });
-        }
-      }
-    }
-
-    const sortedOrders = [...vendor.orders].reverse();
-    for (const order of sortedOrders) {
-      for (const item of order.poItems) {
-        if (item.inventoryItem) {
-          const prev = materialMap.get(item.inventoryItem.id);
-          const itemQty = Number(item.quantity) || 0;
-          const itemPrice = Number(item.price) || 0;
-          const itemTotal = Number(item.total) || (itemQty * itemPrice);
-
-          materialMap.set(item.inventoryItem.id, {
-            material: item.inventoryItem,
-            price: itemPrice,
-            quantity: itemQty,
-            totalQuantity: (prev?.totalQuantity || 0) + itemQty,
-            totalAmount: (prev?.totalAmount || 0) + itemTotal,
-            lastUpdated: order.createdAt
-          });
-        }
-      }
-      for (const grn of order.goodsReceipts || []) {
-        for (const item of grn.items || []) {
-          if (item.inventoryItem) {
-            const prev = materialMap.get(item.inventoryItem.id);
-            if (prev) {
-              prev.lastUpdated = grn.createdAt || order.createdAt;
-              if (item.price) prev.price = Number(item.price);
-            }
-          }
-        }
-      }
-    }
-
-    const suppliedMaterials = Array.from(materialMap.entries()).map(([mId, data]) => ({
-      id: mId,
-      materialId: mId,
-      price: data.price,
-      quantity: data.quantity,
-      totalQuantity: data.totalQuantity,
-      totalAmount: data.totalAmount,
-      lastUpdated: data.lastUpdated,
-      material: data.material
-    }));
+    const suppliedMaterials = this.aggregateMaterialHistory(vendor.orders || []);
 
     return {
       ...vendor,
@@ -1102,17 +1075,74 @@ export class ProcurementService {
     });
   }
 
+  /**
+   * Aggregates a PO's own actual-commercial fields (subtotal/GST/discount/
+   * freight/total) from its VendorInvoice rows — those are already computed
+   * from the GRN's actual price via VendorInvoiceService.computeCommercialsFromPO
+   * at GRN-approval or bill-generation time, so this reuses that existing
+   * source rather than re-deriving a second commercial calculation. With no
+   * invoice yet (nothing received/billed), the actual figures equal the
+   * PO's own — there's nothing else to show yet. The PO's own
+   * subtotal/cgst/sgst/igst/discountAmount/freightCost/totalAmount fields
+   * are never read from here into a mutation — this only adds new `actual*`
+   * fields alongside them.
+   */
+  private static withActualCommercials(po: any, livePaid: number) {
+    const invoices = po.invoices || [];
+    const hasActualInvoice = invoices.length > 0;
+    const sumInv = (field: string) => invoices.reduce((s: number, inv: any) => s + (inv[field] || 0), 0);
+
+    const actualSubtotal = hasActualInvoice ? sumInv('subtotal') : (po.subtotal || 0);
+    const actualCgst = hasActualInvoice ? sumInv('cgst') : (po.cgst || 0);
+    const actualSgst = hasActualInvoice ? sumInv('sgst') : (po.sgst || 0);
+    const actualIgst = hasActualInvoice ? sumInv('igst') : (po.igst || 0);
+    const actualDiscountAmount = hasActualInvoice ? sumInv('discountAmount') : (po.discountAmount || 0);
+    const actualFreightCost = hasActualInvoice ? sumInv('freightCost') : (po.freightCost || 0);
+    const actualTotalAmount = hasActualInvoice ? sumInv('amount') : po.totalAmount;
+
+    // Outstanding is computed PER INVOICE from its own amount/advanceApplied/
+    // actual payments — never from ProcurementOrder.paid. That field is
+    // capped at po.totalAmount by unrelated PO-level payment bookkeeping
+    // (recordAdvancePayment/applyAdvanceToPO use Math.min(po.totalAmount, ...)),
+    // so once the real invoice total (GRN-actual-price-derived) exceeds the
+    // PO's own total, po.paid silently understates what was actually paid —
+    // confirmed against a live PO where the vendor was paid the full actual
+    // ₹393.75 (ledger balance 0) but po.paid had only recorded ₹341.25.
+    const actualBalanceDue = hasActualInvoice
+      ? Number(invoices.reduce((sum: number, inv: any) => {
+          const paidOnInvoice = (inv.payments || [])
+            .filter((p: any) => !p.isCancelled)
+            .reduce((s: number, p: any) => s + (p.paidAmount || 0), 0);
+          const outstanding = (inv.amount || 0) - (inv.advanceApplied || 0) - paidOnInvoice;
+          return sum + Math.max(0, outstanding);
+        }, 0).toFixed(2))
+      : Math.max(0, Number((po.totalAmount - livePaid).toFixed(2)));
+
+    return {
+      hasActualInvoice,
+      actualSubtotal: Number(actualSubtotal.toFixed(2)),
+      actualCgst: Number(actualCgst.toFixed(2)),
+      actualSgst: Number(actualSgst.toFixed(2)),
+      actualIgst: Number(actualIgst.toFixed(2)),
+      actualDiscountAmount: Number(actualDiscountAmount.toFixed(2)),
+      actualFreightCost: Number(actualFreightCost.toFixed(2)),
+      actualTotalAmount: Number(actualTotalAmount.toFixed(2)),
+      actualBalanceDue
+    };
+  }
+
   static async getPurchaseOrders(franchiseId?: string) {
     const orders = await prisma.procurementOrder.findMany({
       where: {
         ...(franchiseId ? { franchiseId } : {})
       },
-      include: { 
-        vendor: true, 
-        poItems: { include: { inventoryItem: true } }, 
+      include: {
+        vendor: true,
+        poItems: { include: { inventoryItem: true } },
         goodsReceipts: { include: { items: true } },
         warehouse: true,
-        franchise: true
+        franchise: true,
+        invoices: { include: { payments: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -1144,22 +1174,37 @@ export class ProcurementService {
         paid: livePaid,
         balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2))),
         totalItemsCount,
-        receivedItemsCount
+        receivedItemsCount,
+        ...this.withActualCommercials(po, livePaid)
       };
     });
   }
 
   static async getPurchaseOrderById(id: string) {
-    return prisma.procurementOrder.findUnique({
+    const po = await prisma.procurementOrder.findUnique({
       where: { id },
-      include: { 
-        vendor: true, 
-        poItems: { include: { inventoryItem: true } }, 
+      include: {
+        vendor: true,
+        poItems: { include: { inventoryItem: true } },
         goodsReceipts: { include: { items: true } },
         warehouse: true,
-        franchise: true
+        franchise: true,
+        invoices: { include: { payments: true } }
       }
     });
+    if (!po) return null;
+
+    const linkedPayments = await prisma.vendorLedger.findMany({
+      where: { vendorId: po.vendorId, referenceId: po.id, type: 'CREDIT' }
+    });
+    const livePaid = Math.max(po.paid || 0, linkedPayments.reduce((s, l) => s + l.amount, 0));
+
+    return {
+      ...po,
+      paid: livePaid,
+      balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2))),
+      ...this.withActualCommercials(po, livePaid)
+    };
   }
 
   static async cancelPO(poId: string) {

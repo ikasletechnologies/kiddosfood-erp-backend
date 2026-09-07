@@ -256,21 +256,25 @@ export class FinanceService {
       }
     }
 
-    // 2. Purchases — posted (non-cancelled) procurement, plus the input tax
-    // booked against those POs. Same aggregate pattern as getTrialBalance/
-    // getBalanceSheetReport, so all three reports agree on what "Purchase" means.
-    const purchaseAggregate = await prisma.procurementOrder.aggregate({
+    // 2. Purchases — the actually recognized liability (VendorInvoice),
+    // whose amount/cgst/sgst/igst are derived from the GRN's actual price
+    // via VendorInvoiceService.computeCommercialsFromPO + recognizeLiability
+    // — not ProcurementOrder.totalAmount, which is only ever the PO's
+    // ordered commitment and never reflects a GRN price override. Same
+    // vendorInvoice-aggregate + buildBillDateFilter pattern already used by
+    // GSTR-2/GSTR-3B/GSTR-9 for the identical reason (see those below), so
+    // this report now agrees with GST reporting on what "Purchase" means.
+    // A PO with no VendorInvoice yet (never received/billed) correctly
+    // contributes ₹0 here, instead of counting its full ordered value as an
+    // already-incurred purchase.
+    const purchaseAggregate = await prisma.vendorInvoice.aggregate({
       where: {
-        franchiseId: filters.franchiseId,
-        status: { not: 'CANCELLED' },
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
+        procurementOrder: { franchiseId: filters.franchiseId, status: { not: 'CANCELLED' } },
+        ...buildBillDateFilter(filters.startDate, filters.endDate)
       },
-      _sum: { totalAmount: true, cgst: true, sgst: true, igst: true }
+      _sum: { amount: true, cgst: true, sgst: true, igst: true }
     });
-    const totalPurchases = purchaseAggregate._sum.totalAmount || 0;
+    const totalPurchases = purchaseAggregate._sum.amount || 0;
     const totalInputTax = (purchaseAggregate._sum.cgst || 0) + (purchaseAggregate._sum.sgst || 0) + (purchaseAggregate._sum.igst || 0);
 
     // 3. Expenses
@@ -2677,18 +2681,27 @@ export class FinanceService {
       }
     }
 
-    // 3. Fetch Procurement Orders to calculate Sundry Creditors liability
+    // 3. Fetch Procurement Orders to calculate Sundry Creditors liability.
+    // The liability owed per PO is the recognized VendorInvoice amount
+    // (GRN-actual-price-derived, via VendorInvoiceService.recognizeLiability)
+    // — not po.totalAmount, which is only the PO's ordered commitment and
+    // never reflects a GRN price override. po.paid is unaffected (already
+    // tracks real payments/advances against this PO) — only the liability
+    // side of the netting changes. A PO with no invoice yet (nothing
+    // received/billed) correctly contributes ₹0, not its full ordered value.
     const pos = await prisma.procurementOrder.findMany({
       where: {
         ...(franchiseId ? { franchiseId } : {}),
         status: { not: "CANCELLED" as any },
         ...dateFilter
-      }
+      },
+      include: { invoices: true }
     });
 
     let sundryCreditorsBalance = 0;
     for (const po of pos) {
-      const unpaid = po.totalAmount - (po.paid || po.advancePaid || 0);
+      const recognizedLiability = (po.invoices || []).reduce((sum, inv) => sum + (inv.amount || 0), 0);
+      const unpaid = recognizedLiability - (po.paid || po.advancePaid || 0);
       sundryCreditorsBalance += unpaid;
     }
 
@@ -2703,16 +2716,17 @@ export class FinanceService {
     });
     const totalSales = salesAggregate._sum.totalAmount || 0;
 
-    // 5. Calculate Purchase Costs
-    const purchaseAggregate = await prisma.procurementOrder.aggregate({
+    // 5. Calculate Purchase Costs — same VendorInvoice-based source as
+    // getProfitAndLoss's Purchases line (see there for the full rationale),
+    // so P&L and Trial Balance can no longer disagree on this figure.
+    const purchaseAggregate = await prisma.vendorInvoice.aggregate({
       where: {
-        ...(franchiseId ? { franchiseId } : {}),
-        status: { not: "CANCELLED" as any },
-        ...dateFilter
+        procurementOrder: { ...(franchiseId ? { franchiseId } : {}), status: { not: "CANCELLED" as any } },
+        ...buildBillDateFilter(startDate, endDate)
       },
-      _sum: { totalAmount: true }
+      _sum: { amount: true }
     });
-    const totalPurchases = purchaseAggregate._sum.totalAmount || 0;
+    const totalPurchases = purchaseAggregate._sum.amount || 0;
 
     // 6. Calculate Indirect Expenses
     const expenseDateFilter = (start || end) ? {
@@ -2810,7 +2824,11 @@ export class FinanceService {
       }
     }
 
-    // 4. Fetch Procurement Orders to calculate Sundry Creditors liability
+    // 4. Fetch Procurement Orders to calculate Sundry Creditors liability.
+    // Same fix as getTrialBalanceReport: liability per PO is the recognized
+    // VendorInvoice amount (GRN-actual-price-derived), not po.totalAmount
+    // (the PO's ordered commitment) — po.paid is untouched. A PO with no
+    // invoice yet correctly contributes ₹0.
     const pos = await prisma.procurementOrder.findMany({
       where: {
         franchiseId: filters.franchiseId,
@@ -2819,12 +2837,14 @@ export class FinanceService {
           ...(filters.startDate ? { gte: filters.startDate } : {}),
           ...(filters.endDate ? { lte: filters.endDate } : {})
         }
-      }
+      },
+      include: { invoices: true }
     });
 
     let sundryCreditorsBalance = 0;
     for (const po of pos) {
-      const unpaid = po.totalAmount - (po.paid || po.advancePaid || 0);
+      const recognizedLiability = (po.invoices || []).reduce((sum, inv) => sum + (inv.amount || 0), 0);
+      const unpaid = recognizedLiability - (po.paid || po.advancePaid || 0);
       sundryCreditorsBalance += unpaid;
     }
 
@@ -2851,10 +2871,11 @@ export class FinanceService {
       if (net > 0) sundryDebtors.push({ name: cust.name, amount: net });
     }
 
-    // Build sundry creditors breakdown
+    // Build sundry creditors breakdown — same recognized-liability source as above.
     const sundryCreditors: { name: string; amount: number }[] = [];
     for (const po of pos) {
-      const unpaid = po.totalAmount - (po.paid || po.advancePaid || 0);
+      const recognizedLiability = (po.invoices || []).reduce((sum, inv) => sum + (inv.amount || 0), 0);
+      const unpaid = recognizedLiability - (po.paid || po.advancePaid || 0);
       if (unpaid > 0) {
         const vendor = await prisma.vendor.findUnique({ where: { id: po.vendorId } });
         sundryCreditors.push({ name: vendor?.name || 'Vendor', amount: unpaid });
@@ -3052,15 +3073,18 @@ export class FinanceService {
         });
         credit = salesAgg._sum.totalAmount || 0;
       } else if (isPurchase) {
-        const purchAgg = await prisma.procurementOrder.aggregate({
+        // Same VendorInvoice-based source as getProfitAndLoss/
+        // getTrialBalanceReport's Purchase Accounts line — the actually
+        // recognized (GRN-actual-price-derived) liability, not the PO's
+        // ordered commitment.
+        const purchAgg = await prisma.vendorInvoice.aggregate({
           where: {
-            franchiseId,
-            status: { not: 'CANCELLED' },
-            createdAt: { gte: month.from, lte: month.to }
+            procurementOrder: { franchiseId, status: { not: 'CANCELLED' } },
+            ...buildBillDateFilter(month.from, month.to)
           },
-          _sum: { totalAmount: true }
+          _sum: { amount: true }
         });
-        debit = purchAgg._sum.totalAmount || 0;
+        debit = purchAgg._sum.amount || 0;
       } else if (isExpense) {
         const expAgg = await prisma.expense.aggregate({
           where: {
@@ -3407,26 +3431,28 @@ export class FinanceService {
       partyMap.get(partyName)!.totalSale += order.totalAmount;
     }
 
-    // Fetch Purchases
-    const pos = await prisma.procurementOrder.findMany({
+    // Fetch Purchases — actually recognized liability (VendorInvoice,
+    // GRN-actual-price-derived), not po.totalAmount (the PO's ordered
+    // commitment). Queried directly off VendorInvoice (bill-level, keyed by
+    // its own billDate — see buildBillDateFilter) since ProcurementOrder has
+    // no billDate field of its own; same source/rationale as
+    // getProfitAndLoss/getTrialBalanceReport's Purchase line. A PO with no
+    // invoice yet (nothing received/billed) correctly contributes nothing.
+    const invoices = await prisma.vendorInvoice.findMany({
       where: {
-        franchiseId,
-        status: { not: 'CANCELLED' },
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
+        procurementOrder: { franchiseId, status: { not: 'CANCELLED' } },
+        ...buildBillDateFilter(startDate, endDate)
       },
-      include: { vendor: true }
+      include: { procurementOrder: { include: { vendor: true } } }
     });
 
-    for (const po of pos) {
-      const partyName = po.vendor?.name || 'Unknown Vendor';
+    for (const inv of invoices) {
+      const partyName = inv.procurementOrder?.vendor?.name || 'Unknown Vendor';
       const partyType = 'Vendors';
       if (!partyMap.has(partyName)) {
         partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
       }
-      partyMap.get(partyName)!.totalPurchase += po.totalAmount;
+      partyMap.get(partyName)!.totalPurchase += (inv.amount || 0);
     }
 
     const report = Array.from(partyMap.values())

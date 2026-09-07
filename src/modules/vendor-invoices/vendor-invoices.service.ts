@@ -153,6 +153,7 @@ export class VendorInvoiceService {
     freightCost?: number;
     items?: any[];
     billDate?: string;
+    paymentType?: string;
   }) {
     return prisma.$transaction(async (tx) => {
       let actualPoId = data.poId;
@@ -265,6 +266,10 @@ export class VendorInvoiceService {
               freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
               warehouseId: commercials?.warehouseId,
               billDate: data.billDate ? new Date(data.billDate) : undefined,
+              // Preserve the existing value when the caller doesn't send one
+              // (rather than resetting to the CASH default), same as every
+              // other field above that falls back to targetInvoice's own value.
+              paymentType: data.paymentType ?? targetInvoice.paymentType,
             }
           });
           invoiceId = targetInvoice.id;
@@ -288,7 +293,8 @@ export class VendorInvoiceService {
             freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
             warehouseId: commercials?.warehouseId,
             status: 'PENDING',
-            billDate: data.billDate ? new Date(data.billDate) : new Date()
+            billDate: data.billDate ? new Date(data.billDate) : new Date(),
+            paymentType: data.paymentType || 'CASH',
           }
         });
         invoiceId = created.id;

@@ -499,6 +499,12 @@ model VendorInvoice {
   freightCost      Float?           @default(0)
   advanceApplied   Float            @default(0)
   warehouseId      String?
+  // Bill payment TERMS (Cash vs Credit), distinct from how it's later
+  // actually settled (Payment.paymentMode: CASH/BANK/UPI/CHEQUE). A Credit
+  // bill that gets paid via bank transfer stays paymentType=CREDIT — only
+  // its status moves to PAID. Defaults to CASH for pre-existing rows,
+  // matching the same default already used on Order.paymentType.
+  paymentType      String           @default("CASH")
   payments         Payment[]
   grn              GoodsReceipt?    @relation(fields: [grnId], references: [id])
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
