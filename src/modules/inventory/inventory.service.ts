@@ -1,3 +1,4 @@
+import { FranchiseService } from '../franchise/franchise.service';
 import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType } from '@prisma/client';
@@ -175,7 +176,12 @@ export class InventoryService {
   // so omitting it here correctly means "every franchise" (SUPER_ADMIN's
   // global view), not "no results" — do not substitute a default franchise.
   static async getInventory(franchiseId: string | undefined, includeInactive = false, excludeCategories?: ItemCategory[], category?: ItemCategory, asOfDate?: string) {
-    const scopeFilter = franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {};
+    let scopeFilter: any = {};
+    if (franchiseId) {
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      const isHQ = !hq || hq.id === franchiseId;
+      scopeFilter = isHQ ? { OR: [{ franchiseId }, { franchiseId: null }] } : { franchiseId };
+    }
 
     const items = await prisma.inventoryItem.findMany({
       where: {
@@ -971,11 +977,11 @@ export class InventoryService {
     });
   }
 
-  static async getAlerts(franchiseId: string) {
+  static async getAlerts(franchiseId?: string) {
     const items = await this.getInventory(franchiseId);
     return items.filter(item => {
-      // currentStock is always in the canonical unit (Phase 4) — compare directly
-      return item.currentStock <= item.minimumStock;
+      const threshold = item.minimumStock ?? 0;
+      return item.currentStock <= threshold;
     });
   }
 

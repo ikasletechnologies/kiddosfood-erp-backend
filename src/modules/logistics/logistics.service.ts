@@ -199,15 +199,19 @@ export class LogisticsService {
         // Find existing item in destination branch (by SKU, falling back to
         // name — a branch may already stock the same item under a
         // differently-generated SKU), or create it if not present.
-        let destInv = await tx.inventoryItem.findFirst({
-          where: {
-            franchiseId: transfer.toBranchId,
-            OR: [
-              { sku: item.inventoryItem.sku },
-              { name: { equals: item.inventoryItem.name, mode: 'insensitive' } }
-            ]
-          }
-        });
+        let destInv = item.inventoryItem.sku
+          ? await tx.inventoryItem.findFirst({
+              where: {
+                franchiseId: transfer.toBranchId,
+                sku: item.inventoryItem.sku,
+              },
+            })
+          : await tx.inventoryItem.findFirst({
+              where: {
+                franchiseId: transfer.toBranchId,
+                name: { equals: item.inventoryItem.name, mode: 'insensitive' },
+              },
+            });
 
         if (!destInv) {
           // InventoryItem.sku is unique per franchise (not globally), so the
