@@ -199,6 +199,78 @@ export class ProcurementService {
     }));
   }
 
+  /**
+   * Materials a vendor is actually eligible to have returned: reuses
+   * aggregateMaterialHistory (the same actual-GRN-price source already
+   * powering Vendor Material History) for the received qty/weighted actual
+   * rate, then subtracts whatever quantity of that material is already
+   * claimed by a non-rejected/non-cancelled PurchaseReturn for this vendor.
+   * A PO-only material with no completed GRN never appears here at all —
+   * nothing was actually received, so there's nothing to return.
+   *
+   * Matches a return's `itemName` back to a material by case-insensitive
+   * name (not materialId) because PurchaseReturnItem has no material
+   * relation — the same matching convention PurchaseService.createPurchaseReturn
+   * already uses when resolving a return line to an InventoryItem, not a
+   * new rule invented here.
+   *
+   * This is the single source of truth for both the Manual Purchase Return
+   * UI's material picker AND PurchaseService's server-side validation —
+   * calling this same method from both places, rather than reimplementing
+   * the subtraction in two places that could drift apart.
+   */
+  static async getVendorReturnableMaterials(vendorId: string) {
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: vendorId },
+      include: {
+        orders: {
+          include: {
+            poItems: { include: { inventoryItem: true } },
+            goodsReceipts: { where: { status: 'COMPLETED' }, include: { items: { include: { inventoryItem: true } } } }
+          }
+        }
+      }
+    });
+    if (!vendor) return [];
+
+    const materials = this.aggregateMaterialHistory(vendor.orders || []);
+    if (materials.length === 0) return [];
+
+    // GRN_REJECTION returns are excluded here on purpose: rejected stock was
+    // never part of the accepted quantity aggregateMaterialHistory just
+    // computed above (acceptedQty already excludes it), so subtracting a
+    // rejection return from that same pool would double-count the same
+    // units as unavailable. Only MANUAL returns — previously accepted stock
+    // physically sent back — actually reduce what's still returnable.
+    const existingReturns = await prisma.purchaseReturn.findMany({
+      where: { vendorId, status: { notIn: ['REJECTED', 'CANCELLED'] }, returnSource: { not: 'GRN_REJECTION' } },
+      include: { items: true }
+    });
+    const returnedByName = new Map<string, number>();
+    for (const pr of existingReturns) {
+      for (const item of pr.items) {
+        const key = (item.itemName || '').toLowerCase().trim();
+        returnedByName.set(key, (returnedByName.get(key) || 0) + item.quantity);
+      }
+    }
+
+    return materials
+      .map(m => {
+        const key = (m.material?.name || '').toLowerCase().trim();
+        const alreadyReturned = returnedByName.get(key) || 0;
+        const availableQty = Number(Math.max(0, m.quantity - alreadyReturned).toFixed(4));
+        return {
+          materialId: m.materialId,
+          name: m.material?.name as string,
+          sku: m.material?.sku as string | undefined,
+          unit: m.material?.unit as string,
+          rate: m.price,
+          availableQty
+        };
+      })
+      .filter(m => m.availableQty > 0);
+  }
+
   static async getVendors() {
     const vendors = await prisma.vendor.findMany({
       include: {

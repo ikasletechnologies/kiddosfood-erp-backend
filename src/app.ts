@@ -422,6 +422,7 @@ app.patch('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN']), Proc
 app.delete('/api/vendors/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.deleteVendor);
 app.post('/api/vendors/link-material', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.linkMaterial);
 app.get('/api/vendors/:id/ledger', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getVendorLedger);
+app.get('/api/vendors/:id/returnable-materials', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProcurementController.getVendorReturnableMaterials);
 app.get('/api/vendors/:id/aging', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getVendorAging);
 app.post('/api/vendors/:id/payment', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.recordPayment);
 app.post('/api/vendors/:id/adjustment', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.recordAdjustment);

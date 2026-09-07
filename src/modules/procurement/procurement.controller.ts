@@ -206,6 +206,15 @@ export class ProcurementController {
     }
   }
 
+  static async getVendorReturnableMaterials(req: Request, res: Response) {
+    try {
+      const materials = await ProcurementService.getVendorReturnableMaterials(req.params.id);
+      res.json(materials);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getVendorSummary(_req: Request, res: Response) {
     try {
       const summary = await ProcurementService.getVendorsSummary();
