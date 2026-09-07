@@ -168,33 +168,51 @@ export class ProductService {
         const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
                    inventory.find(i => i.name.trim().toLowerCase() === pName);
         
+        const packSize = parseSkuPackSize(p.sku);
+        const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || 'PC';
+
         if (!inv) {
+          // If resolving for a branch franchise (non-HQ), exclude products
+          // that have not yet been transferred/inwarded into this franchise's inventory.
+          if (!resolvingHQStock) {
+            return null;
+          }
           return {
             ...p,
+            unit: resolvedUnit,
             currentStock: 0,
             inventoryFranchiseId: franchiseId || null,
             inventoryBasePrice: p.basePrice,
             inventoryCostPrice: 0,
             baseUnit: null,
             conversions: [],
-            packSize: parseSkuPackSize(p.sku)
+            packSize
           };
         }
 
         return {
           ...p,
+          unit: resolvedUnit,
           currentStock: inv.currentStock,
           inventoryFranchiseId: inv.franchiseId || (franchiseId || null),
           inventoryBasePrice: inv.basePrice,
           inventoryCostPrice: inv.costPrice,
           baseUnit: inv.baseUnit,
           conversions: inv.conversions,
-          packSize: parseSkuPackSize(p.sku)
+          packSize
         };
       }).filter(Boolean) as any[];
     }
 
-    return products.map(p => ({ ...p, packSize: parseSkuPackSize(p.sku) }));
+    return products.map(p => {
+      const packSize = parseSkuPackSize(p.sku);
+      const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || p.recipe?.yieldUnit || 'PC';
+      return {
+        ...p,
+        unit: resolvedUnit,
+        packSize
+      };
+    });
   }
 
   /**

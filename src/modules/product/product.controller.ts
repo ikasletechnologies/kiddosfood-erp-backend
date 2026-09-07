@@ -35,8 +35,10 @@ export class ProductController {
         return res.json(products);
       }
 
-      // If user is logged in and no specific franchise/source is requested, use their own
-      if (!franchiseId && !stockSource && user?.franchiseId) {
+      // If user is a franchise user, strictly enforce their franchiseId
+      if (user?.role !== 'SUPER_ADMIN' && user?.franchiseId) {
+        franchiseId = user.franchiseId;
+      } else if (!franchiseId && !stockSource && user?.franchiseId) {
         franchiseId = user.franchiseId;
       }
 

@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderStatus, FranchiseOrderType, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
+import { FranchiseOrderStatus, FranchiseOrderType, FranchiseOrderFulfillment, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { FinanceService } from '../finance/finance.service';
+import { AccountService } from '../finance/account.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from './franchise.service';
 import SocketService from '../../lib/socket';
@@ -19,15 +20,17 @@ async function getHqFranchise(tx: any) {
   return FranchiseService.getHqFranchiseOrNull(tx);
 }
 
-async function findHqStockItem(tx: any, hqId: string, product: { sku: string | null; name: string }) {
-  const scopeFilter = { OR: [{ franchiseId: hqId }, { franchiseId: null }] };
+async function findHqStockItem(tx: any, hqId: string | null | undefined, product: { sku?: string | null; name: string }) {
+  const scopeFilter = hqId
+    ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] }
+    : { franchiseId: null };
 
   if (product.sku) {
     const itemBySku = await tx.inventoryItem.findFirst({
       where: {
         AND: [
           scopeFilter,
-          { sku: product.sku }
+          { sku: { equals: product.sku, mode: 'insensitive' } }
         ]
       }
     });
@@ -45,9 +48,7 @@ async function findHqStockItem(tx: any, hqId: string, product: { sku: string | n
 }
 
 // Decides whether an order can be pulled straight from HQ's finished-goods stock,
-// or needs to go through production — and if so, whether the raw materials for the
-// shortfall are actually on hand. Production is a fulfillment path, not a mandatory
-// status: an order only needs it when HQ doesn't already have enough finished stock.
+// or needs to go through production based on orderType (STOCK vs REQUEST) and live HQ inventory.
 async function computeFulfillment(tx: any, orderId: string) {
   const fullOrder = await tx.franchiseOrder.findUnique({
     where: { id: orderId },
@@ -62,8 +63,18 @@ async function computeFulfillment(tx: any, orderId: string) {
     }
   });
 
-  const hq = await getHqFranchise(tx);
-  let allInStock = true;
+  if (!fullOrder) {
+    return { fulfillmentPath: FranchiseOrderFulfillment.STOCK, materialsReady: true, materialsShortfall: null };
+  }
+
+  // FLOW 1: Check Stock & Order -> strictly STOCK fulfillment (no production)
+  if (fullOrder.orderType === FranchiseOrderType.STOCK) {
+    return { fulfillmentPath: FranchiseOrderFulfillment.STOCK, materialsReady: true, materialsShortfall: null };
+  }
+
+  const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+  const hqId = hq?.id || null;
+
   const shortfalls: Array<{
     product: string;
     neededFromProduction: number;
@@ -73,27 +84,35 @@ async function computeFulfillment(tx: any, orderId: string) {
 
   for (const item of fullOrder.items) {
     const product = item.product;
-    const isFinishedGood = item.productType === ProductType.FINISHED_GOOD;
+    const requestedQty = Number(item.quantity || 0);
 
-    // MADE_TO_ORDER items are never carried as HQ finished stock — they always route to production.
-    const invItem = isFinishedGood && hq ? await findHqStockItem(tx, hq.id, product) : null;
-    const available = invItem?.currentStock || 0;
-    const shortBy = Math.max(0, item.quantity - available);
+    // Look up HQ finished good stock for this product
+    const hqItem = await findHqStockItem(tx, hqId, product);
+    const availableHqStock = Math.max(0, Number(hqItem?.currentStock || 0));
 
-    if (shortBy <= 0) continue;
-    allInStock = false;
+    const neededFromProduction = Math.max(0, requestedQty - availableHqStock);
+
+    if (neededFromProduction <= 0) {
+      // Line item is fully covered by existing HQ finished goods stock!
+      continue;
+    }
 
     const recipe = product.recipe;
-    if (!recipe || recipe.recipeItems.length === 0) {
-      shortfalls.push({ product: product.name, neededFromProduction: shortBy, recipeConfigured: false, materials: [] });
+    if (!recipe || !recipe.recipeItems || recipe.recipeItems.length === 0) {
+      shortfalls.push({
+        product: product.name,
+        neededFromProduction,
+        recipeConfigured: false,
+        materials: []
+      });
       continue;
     }
 
     const materials = recipe.recipeItems.map((ri: any) => {
-      const required = Math.round((ri.quantityRequired / (recipe.yieldQty || 1)) * shortBy * 100) / 100;
-      const availableQty = ri.inventoryItem.currentStock || 0;
+      const required = Math.round((ri.quantityRequired / (recipe.yieldQty || 1)) * neededFromProduction * 100) / 100;
+      const availableQty = ri.inventoryItem?.currentStock || 0;
       return {
-        name: ri.inventoryItem.name,
+        name: ri.inventoryItem?.name || 'Raw Material',
         unit: ri.unit,
         required,
         available: availableQty,
@@ -101,13 +120,86 @@ async function computeFulfillment(tx: any, orderId: string) {
       };
     });
 
-    shortfalls.push({ product: product.name, neededFromProduction: shortBy, recipeConfigured: true, materials });
+    shortfalls.push({
+      product: product.name,
+      neededFromProduction,
+      recipeConfigured: true,
+      materials
+    });
   }
 
-  const fulfillmentPath = allInStock ? 'STOCK' : 'PRODUCTION';
-  const materialsReady = allInStock || shortfalls.every(s => s.recipeConfigured && s.materials.every(m => m.shortBy <= 0));
+  if (shortfalls.length === 0) {
+    return { fulfillmentPath: FranchiseOrderFulfillment.STOCK, materialsReady: true, materialsShortfall: null };
+  }
 
-  return { fulfillmentPath, materialsReady, materialsShortfall: allInStock ? null : shortfalls };
+  const materialsReady = shortfalls.every(s => s.recipeConfigured && s.materials.every(m => m.shortBy <= 0));
+  return { fulfillmentPath: FranchiseOrderFulfillment.PRODUCTION, materialsReady, materialsShortfall: shortfalls };
+}
+
+function computeFulfillmentForOrderSync(order: any, hqInventoryMap: { bySku: Map<string, any>; byName: Map<string, any> }) {
+  if (order.orderType === FranchiseOrderType.STOCK) {
+    return { fulfillmentPath: FranchiseOrderFulfillment.STOCK, materialsReady: true, materialsShortfall: null };
+  }
+
+  const shortfalls: Array<{
+    product: string;
+    neededFromProduction: number;
+    recipeConfigured: boolean;
+    materials: Array<{ name: string; unit: string; required: number; available: number; shortBy: number }>;
+  }> = [];
+
+  for (const item of (order.items || [])) {
+    const product = item.product;
+    if (!product) continue;
+    const requestedQty = Number(item.quantity || 0);
+
+    const hqItem = (product.sku && hqInventoryMap.bySku.get(product.sku.toUpperCase()))
+      || hqInventoryMap.byName.get(product.name.toUpperCase());
+
+    const availableHqStock = Math.max(0, Number(hqItem?.currentStock || 0));
+    const neededFromProduction = Math.max(0, requestedQty - availableHqStock);
+
+    if (neededFromProduction <= 0) {
+      continue;
+    }
+
+    const recipe = product.recipe;
+    if (!recipe || !recipe.recipeItems || recipe.recipeItems.length === 0) {
+      shortfalls.push({
+        product: product.name,
+        neededFromProduction,
+        recipeConfigured: false,
+        materials: []
+      });
+      continue;
+    }
+
+    const materials = recipe.recipeItems.map((ri: any) => {
+      const required = Math.round((ri.quantityRequired / (recipe.yieldQty || 1)) * neededFromProduction * 100) / 100;
+      const availableQty = ri.inventoryItem?.currentStock || 0;
+      return {
+        name: ri.inventoryItem?.name || 'Raw Material',
+        unit: ri.unit,
+        required,
+        available: availableQty,
+        shortBy: Math.max(0, Math.round((required - availableQty) * 100) / 100),
+      };
+    });
+
+    shortfalls.push({
+      product: product.name,
+      neededFromProduction,
+      recipeConfigured: true,
+      materials
+    });
+  }
+
+  if (shortfalls.length === 0) {
+    return { fulfillmentPath: FranchiseOrderFulfillment.STOCK, materialsReady: true, materialsShortfall: null };
+  }
+
+  const materialsReady = shortfalls.every(s => s.recipeConfigured && s.materials.every(m => m.shortBy <= 0));
+  return { fulfillmentPath: FranchiseOrderFulfillment.PRODUCTION, materialsReady, materialsShortfall: shortfalls };
 }
 
 export class FranchiseOrderService {
@@ -121,7 +213,7 @@ export class FranchiseOrderService {
     notes?: string;
     items: Array<{ productId: string; quantity: number }>;
   }) {
-    const orderType = data.orderType ?? FranchiseOrderType.STOCK;
+    const orderType = data.orderType ?? FranchiseOrderType.REQUEST;
     return prisma.$transaction(async tx => {
       // Load products to validate and price them
       const productIds = data.items.map(i => i.productId);
@@ -241,30 +333,222 @@ export class FranchiseOrderService {
         console.error('[Socket] Failed to emit new-franchise-order', err);
       }
 
+      const fulfillment = await computeFulfillment(tx, order.id);
+      await tx.franchiseOrder.update({
+        where: { id: order.id },
+        data: {
+          fulfillmentPath: fulfillment.fulfillmentPath,
+          materialsReady: fulfillment.materialsReady,
+          materialsShortfall: fulfillment.materialsShortfall as any,
+        }
+      });
+      (order as any).fulfillmentPath = fulfillment.fulfillmentPath;
+      (order as any).materialsReady = fulfillment.materialsReady;
+      (order as any).materialsShortfall = fulfillment.materialsShortfall as any;
+
       return order;
     });
   }
 
   // ─── Get Orders ────────────────────────────────────────────────────────────
   static async getOrders(filters: { franchiseId?: string; status?: FranchiseOrderStatus }) {
-    return prisma.franchiseOrder.findMany({
+    const orders = await prisma.franchiseOrder.findMany({
       where: {
         ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
         ...(filters.status ? { status: filters.status } : {}),
       },
       include: {
-        items: { include: { product: true } },
+        items: {
+          include: {
+            product: {
+              include: {
+                recipe: {
+                  include: {
+                    recipeItems: {
+                      include: {
+                        inventoryItem: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
         franchise: true,
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    if (orders.length === 0) return [];
+
+    const hq = await FranchiseService.getHqFranchiseOrNull(prisma);
+    const hqId = hq?.id || null;
+
+    const hqInventory = await prisma.inventoryItem.findMany({
+      where: {
+        OR: hqId ? [{ franchiseId: hqId }, { franchiseId: null }] : [{ franchiseId: null }]
+      }
+    });
+
+    const hqInventoryMap = {
+      bySku: new Map<string, any>(),
+      byName: new Map<string, any>()
+    };
+
+    for (const it of hqInventory) {
+      if (it.sku) hqInventoryMap.bySku.set(it.sku.toUpperCase(), it);
+      if (it.name) hqInventoryMap.byName.set(it.name.toUpperCase(), it);
+    }
+
+    const orderIds = orders.map(o => o.id);
+    const orderNumbers = orders.map(o => o.orderNumber);
+
+    const salesOrders = await prisma.order.findMany({
+      where: {
+        OR: [
+          { sourceQuotationId: { in: orderIds } },
+          { invoice: { notes: { in: orderNumbers.map(num => `Franchise Order Ref: ${num}`) } } },
+        ]
+      },
+      include: { invoice: true }
+    });
+
+    const invoiceByOrderId = new Map<string, { id: string; invoiceNum: string; status: string; finalAmount: number }>();
+    const invoiceByOrderNumber = new Map<string, { id: string; invoiceNum: string; status: string; finalAmount: number }>();
+
+    for (const so of salesOrders) {
+      if (so.invoice) {
+        const invData = {
+          id: so.invoice.id,
+          invoiceNum: so.invoiceNum,
+          status: so.invoice.status,
+          finalAmount: so.invoice.finalAmount,
+        };
+        if (so.sourceQuotationId) {
+          invoiceByOrderId.set(so.sourceQuotationId, invData);
+        }
+        for (const oNum of orderNumbers) {
+          if (so.invoice.notes?.includes(oNum)) {
+            invoiceByOrderNumber.set(oNum, invData);
+          }
+        }
+      }
+    }
+
+    return orders.map(order => {
+      const inv = invoiceByOrderId.get(order.id) || invoiceByOrderNumber.get(order.orderNumber) || null;
+
+      // Dynamically re-evaluate fulfillment readiness for active orders against live HQ inventory
+      let fulfillment: {
+        fulfillmentPath: FranchiseOrderFulfillment | null;
+        materialsReady: boolean | null;
+        materialsShortfall: any;
+      } = {
+        fulfillmentPath: order.fulfillmentPath,
+        materialsReady: order.materialsReady,
+        materialsShortfall: order.materialsShortfall,
+      };
+
+      if (order.status === FranchiseOrderStatus.PENDING || order.status === FranchiseOrderStatus.APPROVED) {
+        fulfillment = computeFulfillmentForOrderSync(order, hqInventoryMap);
+      }
+
+      return {
+        ...order,
+        ...fulfillment,
+        hasInvoice: !!inv,
+        invoice: inv,
+        invoiceNum: inv?.invoiceNum || null,
+        invoiceId: inv?.id || null,
+      };
+    });
   }
 
   static async getOrderById(id: string) {
-    return prisma.franchiseOrder.findUnique({
+    const order = await prisma.franchiseOrder.findUnique({
       where: { id },
-      include: { items: { include: { product: true } }, franchise: true },
+      include: {
+        items: {
+          include: {
+            product: {
+              include: {
+                recipe: {
+                  include: {
+                    recipeItems: {
+                      include: {
+                        inventoryItem: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        franchise: true,
+      },
     });
+    if (!order) return null;
+
+    const hq = await FranchiseService.getHqFranchiseOrNull(prisma);
+    const hqId = hq?.id || null;
+
+    const hqInventory = await prisma.inventoryItem.findMany({
+      where: {
+        OR: hqId ? [{ franchiseId: hqId }, { franchiseId: null }] : [{ franchiseId: null }]
+      }
+    });
+
+    const hqInventoryMap = {
+      bySku: new Map<string, any>(),
+      byName: new Map<string, any>()
+    };
+
+    for (const it of hqInventory) {
+      if (it.sku) hqInventoryMap.bySku.set(it.sku.toUpperCase(), it);
+      if (it.name) hqInventoryMap.byName.set(it.name.toUpperCase(), it);
+    }
+
+    let fulfillment: {
+      fulfillmentPath: FranchiseOrderFulfillment | null;
+      materialsReady: boolean | null;
+      materialsShortfall: any;
+    } = {
+      fulfillmentPath: order.fulfillmentPath,
+      materialsReady: order.materialsReady,
+      materialsShortfall: order.materialsShortfall,
+    };
+
+    if (order.status === FranchiseOrderStatus.PENDING || order.status === FranchiseOrderStatus.APPROVED) {
+      fulfillment = computeFulfillmentForOrderSync(order, hqInventoryMap);
+    }
+
+    const salesOrder = await prisma.order.findFirst({
+      where: {
+        OR: [
+          { sourceQuotationId: order.id },
+          { invoice: { notes: { contains: order.orderNumber } } }
+        ]
+      },
+      include: { invoice: true }
+    });
+
+    const inv = salesOrder?.invoice ? {
+      id: salesOrder.invoice.id,
+      invoiceNum: salesOrder.invoiceNum,
+      status: salesOrder.invoice.status,
+      finalAmount: salesOrder.invoice.finalAmount,
+    } : null;
+
+    return {
+      ...order,
+      ...fulfillment,
+      hasInvoice: !!inv,
+      invoice: inv,
+      invoiceNum: inv?.invoiceNum || null,
+      invoiceId: inv?.id || null,
+    };
   }
 
   // ─── Status Transitions ────────────────────────────────────────────────────
@@ -357,15 +641,22 @@ export class FranchiseOrderService {
             // STOCK IMPACT: Branch Stock INCREASE
             // Increment/create the Franchise's local InventoryItem for this finished good product.
             const product = item.product;
-            const invItem = await tx.inventoryItem.findFirst({
-              where: {
-                franchiseId: order.franchiseId,
-                OR: [
-                  ...(product.sku ? [{ sku: product.sku }] : []),
-                  { name: { equals: product.name, mode: 'insensitive' } }
-                ]
-              }
-            });
+            // Match by SKU alone when the product has one — OR-ing in a name match
+            // let two distinctly-SKU'd weight variants sharing the same product name
+            // (e.g. 450G/900G) collide, collapsing different variants onto a single row.
+            const invItem = product.sku
+              ? await tx.inventoryItem.findFirst({
+                  where: {
+                    franchiseId: order.franchiseId,
+                    sku: product.sku,
+                  },
+                })
+              : await tx.inventoryItem.findFirst({
+                  where: {
+                    franchiseId: order.franchiseId,
+                    name: { equals: product.name, mode: 'insensitive' },
+                  },
+                });
 
             if (invItem) {
               // Every stock change must leave a ledger trail — record receiveAtCost so
@@ -451,48 +742,79 @@ export class FranchiseOrderService {
   // ─── Payment ───────────────────────────────────────────────────────────────
   static async recordPayment(id: string, amount: number, accountId?: string, paidBy?: string) {
     return prisma.$transaction(async (tx) => {
-      const order = await tx.franchiseOrder.findUnique({ where: { id } });
+      const order = await tx.franchiseOrder.findUnique({
+        where: { id },
+        include: { franchise: true }
+      });
       if (!order) throw new Error('Order not found');
 
-      // Determine source account ID
-      let sourceAccountId: string | undefined = accountId;
-      if (!sourceAccountId) {
-        // Find CASH account for the franchise (or HQ if franchiseId is null)
-        const cashAcc = await tx.account.findFirst({
-          where: {
-            type: 'CASH',
-            franchiseId: order.franchiseId || null,
-          },
-          select: { id: true },
-        });
-        if (!cashAcc) throw new Error('Default CASH account not found');
-        sourceAccountId = cashAcc.id;
+      if (order.paymentStatus === 'PAID') {
+        throw new Error('This order has already been paid.');
       }
 
-      await tx.franchiseOrder.update({
-        where: { id },
-        data: { paymentStatus: 'PAID' },
+      const payAmount = (amount && amount > 0) ? amount : order.totalAmount;
+      if (!(payAmount > 0)) {
+        throw new Error('Payment amount must be greater than zero.');
+      }
+
+      // 1. Resolve & Validate Franchise Payment Account
+      let franchiseAcc: any = null;
+
+      if (accountId) {
+        franchiseAcc = await tx.account.findUnique({ where: { id: accountId } });
+        if (!franchiseAcc || franchiseAcc.franchiseId !== order.franchiseId) {
+          throw new Error('Selected payment account was not found or does not belong to your franchise.');
+        }
+      } else {
+        // Fallback to the first active account configured for this franchise
+        franchiseAcc = await tx.account.findFirst({
+          where: {
+            franchiseId: order.franchiseId,
+            status: 'ACTIVE'
+          },
+          orderBy: [{ type: 'asc' }, { createdAt: 'asc' }]
+        });
+      }
+
+      if (!franchiseAcc) {
+        throw new Error(
+          `No active Bank or Cash Account found for ${order.franchise?.name || 'this franchise'}. Please configure a Bank Account in the Franchise section first.`
+        );
+      }
+
+      if (franchiseAcc.status !== 'ACTIVE') {
+        throw new Error(`The selected account "${franchiseAcc.name}" is inactive. Please select an active account.`);
+      }
+
+      // 2. Validate Franchise Account Balance
+      if (franchiseAcc.balance < payAmount) {
+        throw new Error(
+          `Insufficient Franchise Account Balance in "${franchiseAcc.name}". Available: ₹${franchiseAcc.balance.toLocaleString('en-IN')}, Required: ₹${payAmount.toLocaleString('en-IN')}.`
+        );
+      }
+
+      // 3. Debit Franchise Account (OUTFLOW)
+      await AccountService.adjustBalance(tx, franchiseAcc.id, payAmount, 'OUTFLOW');
+
+      // 4. Record Franchise OUTFLOW Payment
+      await tx.payment.create({
+        data: {
+          paidAmount: payAmount,
+          status: 'SUCCESS',
+          accountId: franchiseAcc.id,
+          paymentMode: (franchiseAcc.type === 'BANK' ? 'BANK_TRANSFER' : (franchiseAcc.type === 'UPI' ? 'UPI' : 'CASH')) as any,
+          sourceModule: 'FRANCHISE',
+          linkedDocType: 'INVOICE',
+          linkedDocId: order.orderNumber,
+          entityType: 'FRANCHISE',
+          entityId: order.franchiseId,
+          transactionRef: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
+          createdBy: paidBy || 'FRANCHISE_SYSTEM'
+        }
       });
 
-      // 1. Central Payment & Account Adjustment (Money IN from Franchise)
-      await FinanceService.createPayment({
-        tx,
-        amount: amount || order.totalAmount,
-        flow: 'IN',
-        status: 'PAID',
-        sourceAccount: sourceAccountId,
-        method: order.paymentType as any,
-        sourceModule: 'FRANCHISE',
-        linkedDocType: 'INVOICE',
-        linkedDocId: order.orderNumber,
-        entityType: 'FRANCHISE',
-        entityId: order.franchiseId,
-        createdBy: paidBy || 'FRANCHISE_SYSTEM'
-      });
-
-      // 2. Create Franchise Ledger Entry (CREDIT)
+      // 5. Update Franchise Ledger (CREDIT reducing outstanding balance to HQ)
       const currentFranchise = await tx.franchise.findUnique({ where: { id: order.franchiseId } });
-      const payAmount = amount || order.totalAmount;
       const newOutstanding = (currentFranchise?.outstandingAmount || 0) - payAmount;
 
       await tx.franchiseLedger.create({
@@ -503,18 +825,58 @@ export class FranchiseOrderService {
           balanceAfter: newOutstanding,
           referenceType: FranchiseLedgerRefType.PAYMENT,
           referenceId: order.orderNumber,
-          note: `Payment for order ${order.orderNumber}`,
+          note: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
         }
       });
 
-      // 3. Update Franchise Balance
-      return tx.franchise.update({
+      // 6. Update Franchise Outstanding Amount
+      await tx.franchise.update({
         where: { id: order.franchiseId },
         data: { outstandingAmount: newOutstanding }
       });
+
+      // 7. Credit HQ Collections & Receiving Account (HQ Side INFLOW)
+      const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+      if (hq) {
+        const hqAccount = await tx.account.findFirst({
+          where: {
+            OR: [{ franchiseId: hq.id }, { franchiseId: null }],
+            status: 'ACTIVE'
+          },
+          orderBy: { createdAt: 'asc' }
+        });
+
+        if (hqAccount) {
+          await AccountService.adjustBalance(tx, hqAccount.id, payAmount, 'INFLOW');
+        }
+
+        await tx.payment.create({
+          data: {
+            paidAmount: payAmount,
+            status: 'SUCCESS',
+            accountId: hqAccount?.id || null,
+            paymentMode: (franchiseAcc.type === 'BANK' ? 'BANK_TRANSFER' : (franchiseAcc.type === 'UPI' ? 'UPI' : 'CASH')) as any,
+            sourceModule: 'FRANCHISE',
+            linkedDocType: 'INVOICE',
+            linkedDocId: order.orderNumber,
+            entityType: 'FRANCHISE',
+            entityId: order.franchiseId,
+            transactionRef: `Franchise payment received from ${currentFranchise?.name || 'Franchise'} for order ${order.orderNumber}`,
+            createdBy: paidBy || 'FRANCHISE_SYSTEM'
+          }
+        });
+      }
+
+      // 8. Mark Franchise Order as PAID
+      const updatedOrder = await tx.franchiseOrder.update({
+        where: { id },
+        data: { paymentStatus: 'PAID' },
+        include: { items: { include: { product: true } }, franchise: true },
+      });
+
+      return updatedOrder;
     });
-  }
-}
+  }}
 
 // FIFO batch deduction
 async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string) {
@@ -543,23 +905,20 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
   const product = await tx.product.findUnique({ where: { id: productId } });
   if (product) {
     const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+    const invItem = await findHqStockItem(tx, hq?.id || null, product);
 
-    if (hq) {
-      const invItem = await findHqStockItem(tx, hq.id, product);
-
-      if (invItem) {
-        // Ledger-backed decrement — this used to bypass StockMovement
-        // entirely, so HQ's dispatch to a franchise never appeared in the
-        // ledger even though currentStock changed.
-        await InventoryService.recordMovement(tx, {
-          itemId: invItem.id,
-          type: 'TRANSFER_OUT',
-          quantity: -quantityNeeded,
-          referenceType: 'FRANCHISE_ORDER',
-          referenceId: orderId,
-          note: orderNumber ? `Dispatched to franchise (Order ${orderNumber})` : 'Dispatched to franchise',
-        });
-      }
+    if (invItem) {
+      // Ledger-backed decrement — this used to bypass StockMovement
+      // entirely, so HQ's dispatch to a franchise never appeared in the
+      // ledger even though currentStock changed.
+      await InventoryService.recordMovement(tx, {
+        itemId: invItem.id,
+        type: 'TRANSFER_OUT',
+        quantity: -quantityNeeded,
+        referenceType: 'FRANCHISE_ORDER',
+        referenceId: orderId,
+        note: orderNumber ? `Dispatched to franchise (Order ${orderNumber})` : 'Dispatched to franchise',
+      });
     }
   }
 

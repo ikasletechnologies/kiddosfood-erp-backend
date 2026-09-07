@@ -1709,6 +1709,7 @@ export class FinanceService {
     deliveryCharge?: number;
     deliveryCharges?: number;
     sourceFranchiseOrderId?: string;
+    sourceQuotationId?: string;
     roundOff?: number;
     stateOfSupply?: string;
     paymentType?: string;
@@ -1807,6 +1808,7 @@ export class FinanceService {
       const order = await tx.order.create({
         data: {
           invoiceNum,
+          sourceQuotationId: data.sourceFranchiseOrderId || (data as any).sourceQuotationId || null,
           partyType: (data.partyType || 'CUSTOMER') as any,
           partyId: data.partyId,
           customerId: data.customerId,
@@ -1853,10 +1855,12 @@ export class FinanceService {
           const newTotal = finalAmount;
           const difference = newTotal - oldTotal;
 
+          const statusToSet = fOrder.status === 'PENDING' ? 'APPROVED' : fOrder.status;
+
           await tx.franchiseOrder.update({
             where: { id: data.sourceFranchiseOrderId },
             data: {
-              status: 'APPROVED',
+              status: statusToSet,
               subtotal: subTotal - totalDiscount,
               taxAmount: totalTax,
               deliveryCharges: deliveryCharge,
