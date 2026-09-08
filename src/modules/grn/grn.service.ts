@@ -124,6 +124,19 @@ export class GRNService {
               throw new Error(`Actual unit price for ${poItem.inventoryItemId} differs from PO price (₹${poPrice}) — an override reason is required`);
             }
 
+            const mfgDate = item.mfgDate ? new Date(item.mfgDate) : null;
+            const expDate = item.expDate ? new Date(item.expDate) : null;
+
+            if (mfgDate && isNaN(mfgDate.getTime())) {
+              throw new Error(`Invalid Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
+            }
+            if (expDate && isNaN(expDate.getTime())) {
+              throw new Error(`Invalid Expiry (EXP) date for ${poItem.inventoryItemId}`);
+            }
+            if (mfgDate && expDate && expDate.getTime() < mfgDate.getTime()) {
+              throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
+            }
+
             return {
               materialId: item.materialId,
               quantity: qty,
@@ -138,10 +151,10 @@ export class GRNService {
               priceOverrideAt: priceOverridden ? new Date() : null,
               unit: poItem?.unit || 'UNIT',
               qcStatus: (item.qcStatus as any) || 'PENDING',
-              vendorBatchNo: item.vendorBatchNo,
-              mfgDate: item.mfgDate ? new Date(item.mfgDate) : null,
-              expDate: item.expDate ? new Date(item.expDate) : null,
-              lotNumber: item.lotNumber,
+              vendorBatchNo: item.vendorBatchNo ? item.vendorBatchNo.trim() : null,
+              mfgDate,
+              expDate,
+              lotNumber: item.lotNumber ? item.lotNumber.trim() : null,
               warehouseId: item.warehouseId,
               binId: item.binId
             };
@@ -169,10 +182,25 @@ export class GRNService {
       // approval is the actual financial trigger (posts VendorLedger via
       // the auto-generated bill below), so re-validate against whatever is
       // actually persisted rather than trusting it was never bypassed.
-      for (const item of grn.items) {
+            for (const item of grn.items) {
         if (item.price < 0) throw new Error(`Item ${item.materialId} has an invalid negative price`);
         if (item.priceOverridden && !(item.priceOverrideReason || '').trim()) {
-          throw new Error(`Item ${item.materialId} has a price override with no reason recorded — cannot approve`);
+          throw new Error(`Item ${item.materialId} has a price override with no reason recorded - cannot approve`);
+        }
+        if (item.acceptedQty > 0) {
+          const batchNo = (item.lotNumber || item.vendorBatchNo || '').trim();
+          if (!batchNo) {
+            throw new Error(`Batch/Lot number is required for material item "${item.materialId}" before approval.`);
+          }
+          if (!item.mfgDate || isNaN(new Date(item.mfgDate).getTime())) {
+            throw new Error(`Valid Manufacturing (MFG) date is required for material item "${item.materialId}" before approval.`);
+          }
+          if (!item.expDate || isNaN(new Date(item.expDate).getTime())) {
+            throw new Error(`Valid Expiry (EXP) date is required for material item "${item.materialId}" before approval.`);
+          }
+          if (new Date(item.expDate).getTime() < new Date(item.mfgDate).getTime()) {
+            throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for material item "${item.materialId}".`);
+          }
         }
       }
 
@@ -191,7 +219,7 @@ export class GRNService {
       for (const item of grn.items) {
         if (item.acceptedQty <= 0) continue;
 
-        const batchRef = item.lotNumber || item.vendorBatchNo || billNumber;
+        const batchRef = (item.lotNumber || item.vendorBatchNo || '').trim() || billNumber;
 
         // 2. Mark GRN Item as APPROVED
         await tx.goodsReceiptItem.update({

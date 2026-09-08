@@ -747,9 +747,20 @@ export class ProcurementService {
     const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
     const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
     const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
-    const discountAmount = Number(data.discountAmount) || 0;
-    const freightCost = Number(data.freightCost) || 0;
-    const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost;
+
+    const discountAmount = data.discountAmount !== undefined && data.discountAmount !== null ? Number(data.discountAmount) : 0;
+    if (isNaN(discountAmount) || !isFinite(discountAmount) || discountAmount < 0) {
+      throw new Error('Discount must be a valid non-negative number.');
+    }
+    if (discountAmount > totalSubtotal) {
+      throw new Error('Discount cannot exceed subtotal.');
+    }
+
+    const freightCost = data.freightCost !== undefined && data.freightCost !== null ? Number(data.freightCost) : 0;
+    if (isNaN(freightCost) || !isFinite(freightCost) || freightCost < 0) {
+      throw new Error('Freight cost must be a valid non-negative number.');
+    }
+    const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost);
 
     // Existing usable credit — see getAvailableAdvance for why this isn't
     // just the raw ledger balance (it also excludes advance already
@@ -916,8 +927,6 @@ export class ProcurementService {
       if (data.franchiseId !== undefined) updateData.franchiseId = data.franchiseId || null;
       if (data.warehouseId !== undefined) updateData.warehouseId = data.warehouseId || null;
       if (data.purchaseType !== undefined) updateData.purchaseType = data.purchaseType;
-      if (data.discountAmount !== undefined) updateData.discountAmount = Number(data.discountAmount) || 0;
-      if (data.freightCost !== undefined) updateData.freightCost = Number(data.freightCost) || 0;
       if (data.expectedDeliveryDate !== undefined) {
         updateData.expectedDeliveryDate = data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null;
       }
@@ -974,9 +983,20 @@ export class ProcurementService {
         const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
         const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
         const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
-        const discount = data.discountAmount !== undefined ? (Number(data.discountAmount) || 0) : (po.discountAmount || 0);
-        const freight = data.freightCost !== undefined ? (Number(data.freightCost) || 0) : (po.freightCost || 0);
-        const totalAmount = totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight;
+
+        const discount = data.discountAmount !== undefined ? Number(data.discountAmount) : (po.discountAmount || 0);
+        if (isNaN(discount) || !isFinite(discount) || discount < 0) {
+          throw new Error('Discount must be a valid non-negative number.');
+        }
+        if (discount > totalSubtotal) {
+          throw new Error('Discount cannot exceed subtotal.');
+        }
+
+        const freight = data.freightCost !== undefined ? Number(data.freightCost) : (po.freightCost || 0);
+        if (isNaN(freight) || !isFinite(freight) || freight < 0) {
+          throw new Error('Freight cost must be a valid non-negative number.');
+        }
+        const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight);
 
         await tx.procurementOrderItem.deleteMany({ where: { poId } });
 
@@ -984,6 +1004,8 @@ export class ProcurementService {
         updateData.cgst = totalCGST;
         updateData.sgst = totalSGST;
         updateData.igst = totalIGST;
+        updateData.discountAmount = discount;
+        updateData.freightCost = freight;
         updateData.totalAmount = totalAmount;
         updateData.balance = Math.max(0, totalAmount - po.paid);
         updateData.poItems = { create: poItemsData };
@@ -997,6 +1019,25 @@ export class ProcurementService {
             create: { vendorId: data.vendorId || po.vendorId, materialId: item.inventoryItemId, price: item.price }
           });
         }
+      } else if (data.discountAmount !== undefined || data.freightCost !== undefined) {
+        const discount = data.discountAmount !== undefined ? Number(data.discountAmount) : (po.discountAmount || 0);
+        if (isNaN(discount) || !isFinite(discount) || discount < 0) {
+          throw new Error('Discount must be a valid non-negative number.');
+        }
+        if (discount > po.subtotal) {
+          throw new Error('Discount cannot exceed subtotal.');
+        }
+
+        const freight = data.freightCost !== undefined ? Number(data.freightCost) : (po.freightCost || 0);
+        if (isNaN(freight) || !isFinite(freight) || freight < 0) {
+          throw new Error('Freight cost must be a valid non-negative number.');
+        }
+
+        const totalAmount = Math.max(0, po.subtotal + po.cgst + po.sgst + po.igst - discount + freight);
+        updateData.discountAmount = discount;
+        updateData.freightCost = freight;
+        updateData.totalAmount = totalAmount;
+        updateData.balance = Math.max(0, totalAmount - po.paid);
       }
 
       return tx.procurementOrder.update({
