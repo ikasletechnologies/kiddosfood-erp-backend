@@ -1257,7 +1257,13 @@ export class ProductionService {
       include: {
         product: true,
         franchise: true,
-        production: { include: { recipe: true } },
+        production: {
+          include: {
+            recipe: true,
+            items: { include: { inventoryItem: true } },
+            stageLogs: { orderBy: { enteredAt: 'asc' } },
+          },
+        },
         packagings: true,
         recall: true,
       },

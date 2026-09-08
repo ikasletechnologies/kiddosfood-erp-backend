@@ -292,9 +292,11 @@ export class InventoryController {
       // No franchise = no filter (see everything), same rule raw-materials.controller.ts
       // already uses — previously this substituted an arbitrary franchise
       // instead, which silently hid stock that lives under a different one.
-      const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
+      let franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string) || undefined;
+      if (franchiseId === 'undefined' || franchiseId === 'null') franchiseId = undefined;
       const warehouseId = (req.query.warehouseId as string) || undefined;
-      const category = (req.query.category as any) || undefined;
+      let category = (req.query.category as any) || undefined;
+      if (category === 'undefined' || category === 'null') category = undefined;
 
       const summary = await InventoryService.getRawMaterialStockSummary(warehouseId, franchiseId, category);
       res.json(summary);
