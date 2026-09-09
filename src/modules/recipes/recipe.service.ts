@@ -43,8 +43,8 @@ export class RecipeService {
 
       let recipeId = data.id;
 
-      // Recipe.productId is unique (one recipe per product) — check first
-      // and name the conflicting recipe, rather than letting Postgres reject
+      // Recipe.productId is unique (one recipe per product)
+      // check first and name the conflicting recipe, rather than letting Postgres reject
       // the write and leaking a raw constraint-violation stack trace to the
       // client. Excludes the recipe being edited so re-saving it with the
       // same product it already has doesn't false-positive.
@@ -75,8 +75,7 @@ export class RecipeService {
         });
       } else {
         // Auto-generate a unique, sequential recipe code (RCP-0001, RCP-0002, ...)
-        // when none was typed in, so codes can't collide or be mistyped. Typing
-        // a code manually still wins — this only fills the gap when left blank.
+        // when none was typed in, so codes can't collide or be mistyped.
         const recipeCode = data.recipeCode || `RCP-${((await tx.recipe.count()) + 1).toString().padStart(4, '0')}`;
 
         const recipe = await tx.recipe.create({
@@ -107,52 +106,100 @@ export class RecipeService {
 
       return tx.recipe.findUnique({
         where: { id: recipeId },
-        include: { recipeItems: { include: { inventoryItem: true } } }
+        include: {
+          recipeItems: { include: { inventoryItem: true } },
+          _count: { select: { productions: true } }
+        }
       });
     });
   }
 
-  // Recipe Costing reports need per-recipe cost without an N+1 request per
-  // row — this reuses calculateCost's own line-costing loop against the
-  // recipeItems already loaded here, instead of a second query per recipe.
   static async getRecipes() {
     const recipes = await prisma.recipe.findMany({
       include: {
         product: true,
-        recipeItems: { include: { inventoryItem: true } }
+        recipeItems: { include: { inventoryItem: true } },
+        _count: {
+          select: { productions: true }
+        }
       }
     });
     return recipes.map((recipe) => {
       const { totalCost, breakdown } = RecipeService.computeCostBreakdown(recipe.recipeItems);
+      const productionCount = recipe._count?.productions || 0;
       return {
         ...recipe,
         totalCost,
         costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
         costBreakdown: breakdown,
+        productionCount,
+        isUsedInProduction: productionCount > 0,
       };
     });
   }
 
   static async getRecipeById(id: string) {
-    return prisma.recipe.findUnique({
+    const recipe = await prisma.recipe.findUnique({
       where: { id },
       include: { 
         product: true, 
-        recipeItems: { include: { inventoryItem: true } } 
+        recipeItems: { include: { inventoryItem: true } },
+        _count: {
+          select: { productions: true }
+        }
       }
     });
+    if (!recipe) return null;
+    const productionCount = recipe._count?.productions || 0;
+    return {
+      ...recipe,
+      productionCount,
+      isUsedInProduction: productionCount > 0,
+    };
   }
 
   static async getRecipeByProduct(productId: string) {
-    return prisma.recipe.findUnique({
+    const recipe = await prisma.recipe.findUnique({
       where: { productId },
       include: { 
-        recipeItems: { include: { inventoryItem: true } } 
+        recipeItems: { include: { inventoryItem: true } },
+        _count: {
+          select: { productions: true }
+        }
       }
     });
+    if (!recipe) return null;
+    const productionCount = recipe._count?.productions || 0;
+    return {
+      ...recipe,
+      productionCount,
+      isUsedInProduction: productionCount > 0,
+    };
   }
 
   static async deleteRecipe(id: string) {
+    const recipe = await prisma.recipe.findUnique({
+      where: { id },
+      include: {
+        _count: {
+          select: { productions: true }
+        }
+      }
+    });
+
+    if (!recipe) {
+      const err: any = new Error('Recipe not found');
+      err.status = 404;
+      throw err;
+    }
+
+    const productionCount = recipe._count?.productions || 0;
+    if (productionCount > 0) {
+      const err: any = new Error('This recipe cannot be deleted because it is already used in production.');
+      err.status = 400;
+      throw err;
+    }
+
     return prisma.$transaction(async (tx) => {
       await tx.recipeItem.deleteMany({ where: { recipeId: id } });
       return tx.recipe.delete({ where: { id } });
@@ -190,7 +237,7 @@ export class RecipeService {
 
     for (const item of recipeItems) {
       const unitCost = item.inventoryItem.costPrice || item.inventoryItem.basePrice || 0;
-      let qtyInStockUnit: number;
+      let qtyInStockUnit;
       try {
         qtyInStockUnit = convertMeasurement(
           item.quantityRequired,
