@@ -1659,13 +1659,11 @@ export class SalesService {
     customerId?: string;
     franchiseId?: string;
     reason: string;
+    status?: 'PENDING' | 'APPROVED' | 'COMPLETED' | 'REJECTED';
     items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string }>;
     refundMethod?: string;
     idempotencyKey?: string;
   }) {
-    // Idempotency: a retry/double-click/API re-entry carrying the same key
-    // must return the already-created return instead of posting a second
-    // one — mirrors FinanceService.createPayment's idempotencyKey handling.
     if (data.idempotencyKey) {
       const existing = await prisma.returnOrder.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
@@ -1674,24 +1672,113 @@ export class SalesService {
       if (existing) return existing;
     }
 
-    const refundAmount = data.items.reduce((sum, item) => sum + item.quantity * item.rate, 0);
+    return await prisma.$transaction(async (tx) => {
+      // 1. Resolve Authoritative Party & Relationships from the linked order
+      let resolvedCustomerId: string | null = null;
+      let resolvedFranchiseId: string | null = data.franchiseId || null;
 
-    try {
-      return await prisma.returnOrder.create({
+      if (data.posOrderId) {
+        const po = await tx.order.findUnique({ where: { id: data.posOrderId } });
+        if (po) {
+          if (po.customerId && !/walk[-_ ]?in/i.test(po.customerId)) {
+            const cust = await tx.customer.findUnique({ where: { id: po.customerId } });
+            resolvedCustomerId = cust ? cust.id : null;
+          }
+          if (po.franchiseId) {
+            resolvedFranchiseId = po.franchiseId;
+          }
+        }
+      } else if (data.salesOrderId) {
+        const so = await tx.salesOrder.findUnique({ where: { id: data.salesOrderId } });
+        if (so) {
+          if (so.customerId) {
+            const cust = await tx.customer.findUnique({ where: { id: so.customerId } });
+            resolvedCustomerId = cust ? cust.id : null;
+          }
+          if ((so as any).franchiseId) {
+            resolvedFranchiseId = (so as any).franchiseId;
+          } else if (so.partyType === 'FRANCHISE' && so.partyId) {
+            resolvedFranchiseId = so.partyId;
+          }
+        }
+      } else if (data.franchiseOrderId) {
+        const fo = await tx.franchiseOrder.findUnique({ where: { id: data.franchiseOrderId } });
+        if (fo && fo.franchiseId) {
+          resolvedFranchiseId = fo.franchiseId;
+        }
+      } else if (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) {
+        const cust = await tx.customer.findUnique({ where: { id: data.customerId } });
+        resolvedCustomerId = cust ? cust.id : null;
+      }
+
+      // 2. Validate return quantities against original order and prior returns
+      if (data.posOrderId || data.salesOrderId || data.franchiseOrderId) {
+        const priorReturns = await tx.returnOrder.findMany({
+          where: {
+            ...(data.posOrderId ? { posOrderId: data.posOrderId } : {}),
+            ...(data.salesOrderId ? { salesOrderId: data.salesOrderId } : {}),
+            ...(data.franchiseOrderId ? { franchiseOrderId: data.franchiseOrderId } : {}),
+            status: { not: 'REJECTED' }
+          },
+          include: { items: true }
+        });
+
+        const previouslyReturned: Record<string, number> = {};
+        for (const pr of priorReturns) {
+          for (const it of pr.items) {
+            const key = it.productId || it.productName;
+            previouslyReturned[key] = (previouslyReturned[key] || 0) + it.quantity;
+          }
+        }
+
+        let originalItems: Array<{ productId?: string; productName?: string; quantity: number }> = [];
+        if (data.posOrderId) {
+          const po = await tx.order.findUnique({ where: { id: data.posOrderId }, include: { orderItems: { include: { product: true } } } });
+          if (po) originalItems = po.orderItems.map((oi: any) => ({ productId: oi.productId, productName: oi.product?.name, quantity: oi.quantity }));
+        } else if (data.salesOrderId) {
+          const so = await tx.salesOrder.findUnique({ where: { id: data.salesOrderId }, include: { items: true } });
+          if (so) originalItems = so.items.map((si: any) => ({ productId: si.productId, productName: si.productName, quantity: si.quantity }));
+        } else if (data.franchiseOrderId) {
+          const fo = await tx.franchiseOrder.findUnique({ where: { id: data.franchiseOrderId }, include: { items: { include: { product: true } } } });
+          if (fo) originalItems = fo.items.map((fi: any) => ({ productId: fi.productId, productName: fi.product?.name, quantity: fi.quantity }));
+        }
+
+        for (const item of data.items) {
+          if (item.quantity <= 0) {
+            throw new Error(`Return quantity for ${item.productName} must be greater than zero.`);
+          }
+          const orig = originalItems.find(o => (item.productId && o.productId === item.productId) || (item.productName && o.productName === item.productName));
+          if (orig) {
+            const key = item.productId || item.productName;
+            const already = previouslyReturned[key] || 0;
+            const returnable = orig.quantity - already;
+            if (item.quantity > returnable + 0.001) {
+              throw new Error(`Cannot return ${item.quantity} units of ${item.productName}. Original sold: ${orig.quantity}, already returned: ${already}, maximum returnable: ${returnable}.`);
+            }
+          }
+        }
+      }
+
+      const refundAmount = data.items.reduce((sum, item) => sum + item.quantity * item.rate, 0);
+      const returnNumber = await generateReturnNumber();
+      const initialStatus = data.status || 'PENDING';
+
+      const returnOrder = await tx.returnOrder.create({
         data: {
-          returnNumber: await generateReturnNumber(),
-          salesOrderId: data.salesOrderId,
-          franchiseOrderId: data.franchiseOrderId,
-          posOrderId: data.posOrderId,
-          customerId: data.customerId,
-          franchiseId: data.franchiseId,
+          returnNumber,
+          salesOrderId: data.salesOrderId || null,
+          franchiseOrderId: data.franchiseOrderId || null,
+          posOrderId: data.posOrderId || null,
+          customerId: resolvedCustomerId,
+          franchiseId: resolvedFranchiseId,
           reason: data.reason,
           refundAmount,
           refundMethod: data.refundMethod,
+          status: initialStatus as any,
           idempotencyKey: data.idempotencyKey || undefined,
           items: {
             create: data.items.map((item) => ({
-              productId: item.productId,
+              productId: item.productId || null,
               productName: item.productName,
               quantity: item.quantity,
               rate: item.rate,
@@ -1702,62 +1789,116 @@ export class SalesService {
         },
         include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
       });
-    } catch (err: any) {
-      // True concurrent race: two requests both passed the check above
-      // before either committed, and the loser hit the idempotencyKey
-      // unique constraint. Return the winner's row rather than failing a
-      // legitimate retry.
-      if (data.idempotencyKey && err?.code === 'P2002') {
-        const winner = await prisma.returnOrder.findUnique({
-          where: { idempotencyKey: data.idempotencyKey },
-          include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
-        });
-        if (winner) return winner;
+
+      // If created directly in APPROVED or COMPLETED status, restore stock immediately
+      if (initialStatus === 'APPROVED' || initialStatus === 'COMPLETED') {
+        await SalesService.restoreStockForReturnOrder(tx, returnOrder, 'SYSTEM');
       }
-      throw err;
+
+      return returnOrder;
+    });
+  }
+
+  // Internal helper to restore returned stock into inventory
+  static async restoreStockForReturnOrder(tx: any, returnOrder: any, userId: string = 'system') {
+    const { FranchiseService } = require('../franchise/franchise.service');
+    const { InventoryService } = require('../inventory/inventory.service');
+
+    let scopeFranchiseId = returnOrder.franchiseId || returnOrder.posOrder?.franchiseId || null;
+    const targetScopeId = await FranchiseService.toInventoryScopeId(tx, scopeFranchiseId);
+
+    for (const item of returnOrder.items) {
+      const cond = (item.condition || 'GOOD').toUpperCase();
+      let invItem: any = null;
+
+      if (item.productId) {
+        const product = await tx.product.findUnique({ where: { id: item.productId } });
+        if (product?.sku) {
+          invItem = await tx.inventoryItem.findFirst({
+            where: { sku: product.sku, franchiseId: targetScopeId }
+          });
+        }
+        if (!invItem && product?.name) {
+          invItem = await tx.inventoryItem.findFirst({
+            where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: targetScopeId }
+          });
+        }
+      }
+      if (!invItem && item.productName) {
+        invItem = await tx.inventoryItem.findFirst({
+          where: { name: { equals: item.productName, mode: 'insensitive' }, franchiseId: targetScopeId }
+        });
+      }
+
+      if (invItem) {
+        if (cond === 'GOOD') {
+          await InventoryService.stockIn({
+            itemId: invItem.id,
+            quantity: item.quantity,
+            type: 'PURCHASE_IN',
+            referenceType: 'SALES_RETURN',
+            referenceId: returnOrder.id,
+            note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
+            userId
+          }, tx);
+        } else {
+          await tx.stockMovement.create({
+            data: {
+              itemId: invItem.id,
+              movementType: 'RETURN_QUARANTINE_IN',
+              quantity: item.quantity,
+              baseQty: 0,
+              referenceType: 'SALES_RETURN',
+              referenceId: returnOrder.id,
+              note: `Sales Return ${returnOrder.returnNumber} (${cond}): +${item.quantity} ${item.productName} (quarantine)`,
+              createdBy: userId
+            }
+          });
+        }
+      }
     }
   }
 
   static async updateReturnOrder(id: string, data: { status?: string; approvedBy?: string }) {
-    const updateData: any = {
-      status: data.status as any,
-      approvedBy: data.approvedBy,
-      approvedAt: data.status === 'APPROVED' ? new Date() : undefined
-    };
-
-    // Backfill the GST breakdown only on approval — a PENDING return isn't
-    // yet an "applicable" credit note and must not feed any GST report
-    // (see the ReturnOrder schema comment). Approximated (not ledger-grade)
-    // since ReturnItem carries no per-line tax of its own: taxableValue is
-    // the refund total, gstRate is a quantity-weighted average of the
-    // returned products' own rates, and the CGST/SGST vs IGST split reuses
-    // the same canonical util and buyer/seller states as every other report.
-    if (data.status === 'APPROVED') {
-      const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
-      const ret = await prisma.returnOrder.findUnique({
+    return await prisma.$transaction(async (tx) => {
+      const existing = await tx.returnOrder.findUnique({
         where: { id },
         include: {
           items: true,
           posOrder: { select: { stateOfSupply: true, franchiseId: true } },
-          salesOrder: { select: { stateOfSupply: true } }
+          salesOrder: { select: { stateOfSupply: true } },
+          franchiseOrder: true
         }
       });
 
-      if (ret) {
-        const buyerState = ret.posOrder?.stateOfSupply || ret.salesOrder?.stateOfSupply || null;
-        const franchiseId = ret.franchiseId || ret.posOrder?.franchiseId || null;
+      if (!existing) throw new Error('Return Order not found');
+
+      const updateData: any = {
+        status: data.status as any,
+        approvedBy: data.approvedBy,
+        approvedAt: data.status === 'APPROVED' ? new Date() : undefined
+      };
+
+      // When transitioning from PENDING to APPROVED or COMPLETED, restore stock
+      if ((data.status === 'APPROVED' || data.status === 'COMPLETED') && existing.status !== 'APPROVED' && existing.status !== 'COMPLETED') {
+        await SalesService.restoreStockForReturnOrder(tx, existing, data.approvedBy || 'SYSTEM');
+
+        // Backfill GST breakdown
+        const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
+        const buyerState = existing.posOrder?.stateOfSupply || existing.salesOrder?.stateOfSupply || null;
+        const franchiseId = existing.franchiseId || existing.posOrder?.franchiseId || null;
         const sellerState = await resolveSellerState(franchiseId);
 
-        const productIds = ret.items.map((i) => i.productId).filter(Boolean) as string[];
+        const productIds = existing.items.map((i) => i.productId).filter(Boolean) as string[];
         const products = productIds.length
-          ? await prisma.product.findMany({ where: { id: { in: productIds } }, select: { id: true, taxPercent: true } })
+          ? await tx.product.findMany({ where: { id: { in: productIds } }, select: { id: true, taxPercent: true } })
           : [];
         const rateMap = new Map(products.map((p) => [p.id, p.taxPercent]));
 
-        const taxableValue = ret.refundAmount || 0;
+        const taxableValue = existing.refundAmount || 0;
         let weightedRateSum = 0;
         let weightTotal = 0;
-        for (const item of ret.items) {
+        for (const item of existing.items) {
           const rate = item.productId && rateMap.has(item.productId) ? (rateMap.get(item.productId) as number) : 5;
           const lineValue = item.totalAmount || item.quantity * item.rate;
           weightedRateSum += rate * lineValue;
@@ -1774,9 +1915,13 @@ export class SalesService {
         updateData.igst = split.igst;
         updateData.taxAmount = taxAmount;
       }
-    }
 
-    return prisma.returnOrder.update({ where: { id }, data: updateData });
+      return tx.returnOrder.update({
+        where: { id },
+        data: updateData,
+        include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+      });
+    });
   }
 
   static async recordRefund(returnId: string, data: { accountId: string; method: string; createdBy?: string }) {

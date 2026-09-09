@@ -583,8 +583,6 @@ export class POSService {
       // 4. Inventory Deduction
       for (let i = 0; i < data.items.length; i++) {
         const item = data.items[i];
-        // orderItems was created from data.items in the same order above, so
-        // index-align to attach real FIFO cost back onto the matching line.
         const orderItem = order.orderItems[i];
         const product = await tx.product.findUnique({
           where: { id: item.productId || (item as any).id },
@@ -594,7 +592,37 @@ export class POSService {
         if (product) {
           const pName = (product.name || '').trim();
           let lineCost = 0;
-          if (product.recipe && product.recipe.recipeItems.length > 0) {
+          const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
+
+          // Look for direct Finished Goods / Inventory Item first
+          const inventoryItem = product.sku
+            ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+            : await tx.inventoryItem.findFirst({ where: { name: { equals: pName, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+
+          if (inventoryItem) {
+            const itemUnit = (item as any).unit || 'NONE';
+            const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, itemUnit, item.quantity, tx);
+            const requiredBaseQty = conversionResult.requiredBaseQty;
+            const unitId = conversionResult.unitId;
+
+            if (inventoryItem.currentStock < requiredBaseQty) {
+              throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
+            }
+
+            const { fifo } = await InventoryService.recordMovement(tx, {
+              itemId: inventoryItem.id,
+              type: 'SALES_OUT',
+              quantity: -item.quantity,
+              baseQty: -requiredBaseQty,
+              transactionUnit: unitId,
+              referenceType: 'ORDER',
+              referenceId: order.id,
+              note: `POS Sale: ${item.quantity}x ${product.name}`
+            });
+            const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
+            lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+          } else if (product.recipe && product.recipe.recipeItems.length > 0) {
+            // Recipe on-demand deduction fallback
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
               const rawQuantityToDeduct = ri.quantityRequired * scalar;
@@ -628,52 +656,7 @@ export class POSService {
               lineCost += (fifo?.totalCost || 0) + (untracked > 0 ? untracked * (invItem?.costPrice || 0) : 0);
             }
           } else {
-            // Direct deduction fallback. fid is a real Franchise id (never
-            // null) but InventoryItem scoping uses the separate null-means-
-            // HQ convention — resolve through the same canonical converter
-            // every other writer uses rather than comparing to fid
-            // directly, which silently found nothing for every correctly
-            // HQ-scoped (franchiseId=NULL) item once normalized.
-            const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
-            // Match by SKU alone when the product has one — see the
-            // identical fix/comment in deductInventoryIfNecessary above.
-            // OR-ing in a name match let same-named weight variants
-            // (e.g. 250G/500G) collide onto whichever row the name also
-            // matched, ignoring the more specific SKU match.
-            const inventoryItem = product.sku
-              ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
-              : await tx.inventoryItem.findFirst({ where: { name: { equals: pName, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
-
-            // A silent no-op here used to let the whole transaction (Order,
-            // Payment, Account balance) commit while inventory_deducted got
-            // set true with zero stock actually moved. Throwing rolls back
-            // this entire $transaction — no Order, no Payment, no Account
-            // update — instead of reporting a sale that never happened.
-            if (!inventoryItem) {
-              throw new Error(`Inventory item not found for SKU ${product.sku || pName} — cannot complete this sale.`);
-            }
-
-            const itemUnit = (item as any).unit || 'NONE';
-            const conversionResult = await InventoryService.convertUnitToBase(inventoryItem.id, itemUnit, item.quantity, tx);
-            const requiredBaseQty = conversionResult.requiredBaseQty;
-            const unitId = conversionResult.unitId;
-
-            if (inventoryItem.currentStock < requiredBaseQty) {
-              throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
-            }
-
-            const { fifo } = await InventoryService.recordMovement(tx, {
-              itemId: inventoryItem.id,
-              type: 'SALES_OUT',
-              quantity: -item.quantity,
-              baseQty: -requiredBaseQty,
-              transactionUnit: unitId,
-              referenceType: 'ORDER',
-              referenceId: order.id,
-              note: `Direct stock reduction: ${item.quantity}x ${product.name}`
-            });
-            const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
-            lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+            throw new Error(`Inventory item not found for SKU ${product.sku || pName} — cannot complete this sale.`);
           }
 
           if (orderItem) {
@@ -706,8 +689,24 @@ export class POSService {
   }
 
   static async getAllOrders(filters: any) {
+    const where: any = { ...filters };
+    if (where.search) {
+      const rawSearch = String(where.search).trim();
+      const cleanSearch = rawSearch.replace(/^#+/, '').trim();
+      delete where.search;
+      where.OR = [
+        { invoiceNum: { contains: cleanSearch, mode: 'insensitive' } },
+        { customerName: { contains: rawSearch, mode: 'insensitive' } },
+        { customer: { name: { contains: rawSearch, mode: 'insensitive' } } },
+        { id: { equals: cleanSearch } }
+      ];
+    }
+    if (where.invoiceNum) {
+      const cleanInvoice = String(where.invoiceNum).replace(/^#+/, '').trim();
+      where.invoiceNum = { contains: cleanInvoice, mode: 'insensitive' };
+    }
     return prisma.order.findMany({
-      where: filters,
+      where,
       include: { 
         orderItems: { include: { product: true } }, 
         customer: true, 

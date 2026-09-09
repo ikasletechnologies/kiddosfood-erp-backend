@@ -650,6 +650,7 @@ export class ProductionService {
     batchId: string;
     packetSize: string;
     quantityPackets: number;
+    productId?: string;
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
@@ -668,6 +669,16 @@ export class ProductionService {
       const recall = await tx.batchRecall.findUnique({ where: { productBatchId: data.batchId } });
       if (recall?.status === 'IN_PROGRESS') {
         throw new Error('Packaging blocked — batch is under recall.');
+      }
+
+      if (data.productId) {
+        const chosen = await tx.product.findUnique({ where: { id: data.productId } });
+        if (chosen) {
+          await tx.productBatch.update({
+            where: { id: batch.id },
+            data: { productId: chosen.id },
+          });
+        }
       }
 
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
@@ -699,15 +710,24 @@ export class ProductionService {
         throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
       }
 
-      // Cap against this batch's own QC-approved quantity — only approved
-      // output ever became usable stock, so that's the real packaging ceiling
-      // (not the raw batch.quantity, which includes anything QC rejected).
-      const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
-      if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
-        throw new Error('This batch is already fully packaged.');
+      // Cap against this batch's own QC-approved quantity minus both already-confirmed
+      // packaging runs AND any in-flight pending packaging runs.
+      const confirmedWeight = batch.packagedQty || 0;
+      const pendingRuns = await tx.productPackaging.findMany({
+        where: {
+          batchId: batch.id,
+          status: 'AWAITING_CONFIRMATION',
+        },
+        select: { totalWeight: true },
+      });
+      const pendingWeight = pendingRuns.reduce((sum, r) => sum + (r.totalWeight || 0), 0);
+      const remainingAvailable = (batch.approvedQty || 0) - confirmedWeight - pendingWeight;
+
+      if (batch.packagingStatus === 'PACKAGED' || remainingAvailable <= 0.001) {
+        throw new Error('This batch is already fully packaged (or all remaining bulk is reserved by pending packaging runs).');
       }
-      if (totalWeightNeeded > remainingInBatch + 0.001) {
-        throw new Error(`Cannot package more than the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
+      if (totalWeightNeeded > remainingAvailable + 0.001) {
+        throw new Error(`Cannot package more than the batch's available approved quantity (${Math.max(0, remainingAvailable).toFixed(2)} ${bulkItem.unit} available; ${pendingWeight.toFixed(2)} ${bulkItem.unit} is already reserved in pending runs).`);
       }
 
       const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
@@ -832,15 +852,35 @@ export class ProductionService {
       if (data.productId) {
         selectedProduct = await tx.product.findUnique({ where: { id: data.productId } });
         if (!selectedProduct) {
-          throw new Error('Selected sellable product not found.');
+          // If not found by primary ID, try looking up by SKU or exact Name
+          selectedProduct = await tx.product.findFirst({
+            where: {
+              OR: [
+                { sku: data.productId },
+                { name: { equals: data.productId, mode: 'insensitive' } },
+              ],
+            },
+          });
         }
-        if (selectedProduct.isActive === false) {
+        if (!selectedProduct) {
+          // If data.productId was actually a Recipe ID, check if that recipe links to a real Product
+          const recipe = await tx.recipe.findUnique({
+            where: { id: data.productId },
+            include: { product: true },
+          });
+          if (recipe?.product) {
+            selectedProduct = recipe.product;
+          }
+        }
+        if (selectedProduct && selectedProduct.isActive === false) {
           throw new Error('Selected sellable product is inactive.');
         }
-        await tx.productBatch.update({
-          where: { id: batch.id },
-          data: { productId: selectedProduct.id }
-        });
+        if (selectedProduct) {
+          await tx.productBatch.update({
+            where: { id: batch.id },
+            data: { productId: selectedProduct.id },
+          });
+        }
       }
 
       const franchiseId = batch.franchiseId || batch.production?.franchiseId;
@@ -998,6 +1038,51 @@ export class ProductionService {
       });
 
       return { packaging: confirmedPackaging, retailItem, bulkItem, wasteEntries };
+    });
+  }
+
+  static async cancelPackaging(data: { packagingId: string; userId?: string; reason?: string }) {
+    return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "ProductPackaging" WHERE id = ${data.packagingId} FOR UPDATE`;
+      const packaging = await tx.productPackaging.findUnique({
+        where: { id: data.packagingId },
+        include: {
+          batch: {
+            include: { product: true, production: { include: { recipe: true } } },
+          },
+        },
+      });
+      if (!packaging) throw new Error('Packaging run not found');
+      if (packaging.status !== 'AWAITING_CONFIRMATION') {
+        throw new Error(`This packaging run is already ${packaging.status.toLowerCase().replace('_', ' ')} and cannot be cancelled.`);
+      }
+
+      const batch = packaging.batch;
+      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+      if (!franchiseId) throw new Error('Franchise ID not found for batch');
+      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
+
+      const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
+
+      // Refund / release the reserved bulk stock back to InventoryItem
+      await InventoryService.recordMovement(tx, {
+        itemId: bulkItem.id,
+        type: 'PRODUCTION_IN',
+        quantity: packaging.totalWeight,
+        referenceType: 'PACKAGING',
+        referenceId: batch.id,
+        note: `Packaging run cancelled: Released reserved bulk stock of ${packaging.totalWeight} ${bulkItem.unit} for ticket ${packaging.barcode}${data.reason ? ` (Reason: ${data.reason})` : ''}`,
+        userId: data.userId,
+      });
+
+      const updatedPackaging = await tx.productPackaging.update({
+        where: { id: packaging.id },
+        data: {
+          status: 'CANCELLED',
+        },
+      });
+
+      return { packaging: updatedPackaging, bulkItem };
     });
   }
 
@@ -1233,7 +1318,7 @@ export class ProductionService {
   static async getPackagings(franchiseId?: string) {
     const packagings = await prisma.productPackaging.findMany({
       where: franchiseId ? { batch: { franchiseId } } : {},
-      include: { batch: { include: { product: true, production: { include: { recipe: true } } } } },
+      include: { batch: { include: { product: true, production: { include: { recipe: { include: { product: true } } } } } } },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -1242,13 +1327,21 @@ export class ProductionService {
     // recipe with no linked Product, and Confirm Packaging (Awaiting
     // Confirmation + History) consumes this same list, so it was showing a
     // blank product name for any such batch.
-    return packagings.map(p => ({
-      ...p,
-      batch: {
-        ...p.batch,
-        product: p.batch.product || (p.batch.production?.recipe ? { id: p.batch.production.recipe.id, name: p.batch.production.recipe.name, sku: p.batch.production.recipe.recipeCode ?? null } : null),
-      },
-    }));
+    return packagings.map(p => {
+      const linkedProduct = p.batch.product || p.batch.production?.recipe?.product || null;
+      return {
+        ...p,
+        batch: {
+          ...p.batch,
+          product: linkedProduct || (p.batch.production?.recipe ? {
+            id: null,
+            name: p.batch.production.recipe.name,
+            sku: p.batch.production.recipe.recipeCode ?? null,
+            category: p.batch.production.recipe.category ?? 'FINISHED_GOOD',
+          } : null),
+        },
+      };
+    });
   }
 
   static async getAllProductBatches(franchiseId?: string) {
