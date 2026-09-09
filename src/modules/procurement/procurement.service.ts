@@ -674,6 +674,7 @@ export class ProcurementService {
   static async createPurchaseOrder(data: {
     vendorId: string;
     franchiseId?: string;
+    poNumber?: string;
     advancePaid?: number;
     accountId?: string; // Source account for advance
     expectedDeliveryDate?: string;
@@ -784,8 +785,24 @@ export class ProcurementService {
     // credit could be "applied" to every future PO forever.
     const appliedFromCredit = Math.min(providedAmount, existingCredit);
 
-    const result = await prisma.$transaction(async (tx) => {
-      const poNumber = await ProcurementService.generatePONumber(tx);
+    try {
+      return await prisma.$transaction(async (tx) => {
+      // The client generates and displays this number the instant the "New PO"
+      // screen loads, with no backend round trip — we just persist whatever it
+      // shows so the number on screen always matches what gets saved. Anything
+      // that creates a PO without one (older clients, scripts, tests) still gets
+      // a real sequential number from generatePONumber, unchanged.
+      const requestedPoNumber = data.poNumber?.trim();
+      let poNumber: string;
+      if (requestedPoNumber) {
+        const clash = await tx.procurementOrder.findUnique({ where: { poNumber: requestedPoNumber } });
+        if (clash) {
+          throw new Error(`Purchase Order number "${requestedPoNumber}" is already in use. Please refresh and try again.`);
+        }
+        poNumber = requestedPoNumber;
+      } else {
+        poNumber = await ProcurementService.generatePONumber(tx);
+      }
 
       const po = await tx.procurementOrder.create({
         data: {
@@ -883,9 +900,13 @@ export class ProcurementService {
       }
 
       return po;
-    });
-
-    return result;
+      });
+    } catch (error: any) {
+      if (error?.code === 'P2002' && error?.meta?.target?.includes?.('poNumber')) {
+        throw new Error(`Purchase Order number "${data.poNumber}" is already in use. Please refresh and try again.`);
+      }
+      throw error;
+    }
   }
 
   /**
