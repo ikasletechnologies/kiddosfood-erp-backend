@@ -259,6 +259,7 @@ app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPE
 app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.inspectBatch);
 app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPackaging);
 app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.confirmPackaging);
+app.post('/api/production/packagings/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.cancelPackaging);
 app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.savePackagingVerification);
 app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
 // Batch Recall — eligibility/state are shared source of truth for both the
@@ -275,7 +276,6 @@ app.post('/api/production/batches/:id/recall/complete', authenticate, authorizeR
 app.post('/api/production/batches/:id/recall/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.cancel);
 app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getOne);
 app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.updateStatus);
-
 // Logistics (Stock Requests & Transfers)
 app.get('/api/logistics/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.getRequests);
 app.post('/api/logistics/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LogisticsController.createRequest);
@@ -430,11 +430,13 @@ app.get('/api/suppliers', authenticate, authorizeRole(['SUPER_ADMIN']), Procurem
 app.post('/api/suppliers', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createVendor); // Alias
 
 app.get('/api/procurement/orders', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getPOs);
+app.get('/api/procurement/orders/next-number', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getNextPONumber);
 app.get('/api/procurement/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getOne);
 app.post('/api/procurement/po', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createPO);
 
 // Purchase Orders (HQ Only)
 app.get('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getPOs);
+app.get('/api/purchase-orders/next-number', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getNextPONumber);
 app.post('/api/purchase-orders', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.createPO);
 app.get('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.getOne);
 app.patch('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.updatePO);

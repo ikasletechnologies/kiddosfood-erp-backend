@@ -124,12 +124,13 @@ export class ProductionController {
   // confirmPackaging below.
   static async startPackaging(req: Request, res: Response) {
     try {
-      const { packetSize, quantityPackets } = req.body;
+      const { packetSize, quantityPackets, productId } = req.body;
       const user = (req as any).user;
       const result = await ProductionService.startPackaging({
         batchId: req.params.id,
         packetSize,
         quantityPackets: Number(quantityPackets),
+        productId: productId ? String(productId) : undefined,
         userId: user?.userId
       });
       res.json(result);
@@ -170,6 +171,21 @@ export class ProductionController {
         spoiledQty: Number(spoiledQty),
         productId: productId ? String(productId) : undefined,
         userId: user?.userId
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async cancelPackaging(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { reason } = req.body || {};
+      const result = await ProductionService.cancelPackaging({
+        packagingId: req.params.id,
+        userId: user?.userId,
+        reason,
       });
       res.json(result);
     } catch (error: any) {

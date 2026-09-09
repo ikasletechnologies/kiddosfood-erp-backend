@@ -691,9 +691,16 @@ export class ProcurementService {
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     const [vendor, sellerState] = await Promise.all([
-      prisma.vendor.findUnique({ where: { id: data.vendorId }, select: { state: true } }),
+      prisma.vendor.findUnique({ where: { id: data.vendorId }, select: { id: true, name: true, state: true, status: true } }),
       resolveSellerState(data.franchiseId)
     ]);
+
+    if (!vendor) {
+      throw new Error('Vendor not found.');
+    }
+    if (vendor.status !== 'ACTIVE') {
+      throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
+    }
 
     const poItemsData = await Promise.all(data.items.map(async (item) => {
       const inventoryItem = await prisma.inventoryItem.findUnique({
@@ -778,9 +785,7 @@ export class ProcurementService {
     const appliedFromCredit = Math.min(providedAmount, existingCredit);
 
     const result = await prisma.$transaction(async (tx) => {
-      const year = new Date().getFullYear();
-      const count = await tx.procurementOrder.count();
-      const poNumber = `PO-${year}-${(count + 1).toString().padStart(4, '0')}`;
+      const poNumber = await ProcurementService.generatePONumber(tx);
 
       const po = await tx.procurementOrder.create({
         data: {
@@ -923,7 +928,14 @@ export class ProcurementService {
       }
 
       const updateData: any = {};
-      if (data.vendorId) updateData.vendorId = data.vendorId;
+      if (data.vendorId) {
+        const newVendor = await tx.vendor.findUnique({ where: { id: data.vendorId }, select: { id: true, status: true } });
+        if (!newVendor) throw new Error('Vendor not found.');
+        if (newVendor.status !== 'ACTIVE') {
+          throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
+        }
+        updateData.vendorId = data.vendorId;
+      }
       if (data.franchiseId !== undefined) updateData.franchiseId = data.franchiseId || null;
       if (data.warehouseId !== undefined) updateData.warehouseId = data.warehouseId || null;
       if (data.purchaseType !== undefined) updateData.purchaseType = data.purchaseType;
@@ -1112,6 +1124,10 @@ export class ProcurementService {
       
       const updateData: any = { status };
       if (status === 'APPROVED') {
+        const vendor = await tx.vendor.findUnique({ where: { id: po.vendorId }, select: { status: true } });
+        if (vendor && vendor.status !== 'ACTIVE') {
+          throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
+        }
         updateData.approvedAt = new Date();
         updateData.approvedBy = 'SUPER_ADMIN'; 
       }
@@ -1833,6 +1849,83 @@ export class ProcurementService {
     const yyyymmdd = `${target.getFullYear()}${String(target.getMonth() + 1).padStart(2, '0')}${String(target.getDate()).padStart(2, '0')}`;
     const nextSeq = String(count + 1).padStart(4, '0');
     return { nextPaymentNumber: `VPAY-${yyyymmdd}-${nextSeq}` };
+  }
+
+    private static async nextPOSequence(tx: any, year: number): Promise<number> {
+    const key = `PO_${year}`;
+    const existingSeq = await tx.numberSequence.findUnique({ where: { key } });
+    if (!existingSeq) {
+      const existingPOs = await tx.procurementOrder.findMany({
+        where: { poNumber: { startsWith: `PO-${year}-` } },
+        select: { poNumber: true }
+      });
+      let maxNum = 0;
+      for (const po of existingPOs) {
+        if (po.poNumber) {
+          const parts = po.poNumber.split('-');
+          const num = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(num) && num > maxNum) {
+            maxNum = num;
+          }
+        }
+      }
+      const created = await tx.numberSequence.upsert({
+        where: { key },
+        create: { key, value: maxNum + 1 },
+        update: { value: { increment: 1 } }
+      });
+      return created.value;
+    }
+
+    const seq = await tx.numberSequence.update({
+      where: { key },
+      data: { value: { increment: 1 } }
+    });
+    return seq.value;
+  }
+
+  static async generatePONumber(tx?: any): Promise<string> {
+    const year = new Date().getFullYear();
+    const run = async (t: any) => {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const seq = await ProcurementService.nextPOSequence(t, year);
+        const candidate = `PO-${year}-${seq.toString().padStart(4, '0')}`;
+        const collision = await t.procurementOrder.findUnique({ where: { poNumber: candidate } });
+        if (!collision) {
+          return candidate;
+        }
+      }
+      const fallbackSeq = await ProcurementService.nextPOSequence(t, year);
+      return `PO-${year}-${fallbackSeq.toString().padStart(4, '0')}`;
+    };
+    return tx ? run(tx) : prisma.$transaction(run);
+  }
+
+  static async getNextPONumber(): Promise<{ nextPONumber: string }> {
+    const year = new Date().getFullYear();
+    const key = `PO_${year}`;
+    const existingSeq = await prisma.numberSequence.findUnique({ where: { key } });
+    let nextVal = 1;
+    if (existingSeq) {
+      nextVal = existingSeq.value + 1;
+    } else {
+      const existingPOs = await prisma.procurementOrder.findMany({
+        where: { poNumber: { startsWith: `PO-${year}-` } },
+        select: { poNumber: true }
+      });
+      let maxNum = 0;
+      for (const po of existingPOs) {
+        if (po.poNumber) {
+          const parts = po.poNumber.split('-');
+          const num = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(num) && num > maxNum) {
+            maxNum = num;
+          }
+        }
+      }
+      nextVal = maxNum + 1;
+    }
+    return { nextPONumber: `PO-${year}-${nextVal.toString().padStart(4, '0')}` };
   }
 
   private static async generateOpeningBalanceNumber(tx: any): Promise<string> {

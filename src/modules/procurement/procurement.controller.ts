@@ -277,6 +277,15 @@ export class ProcurementController {
     }
   }
 
+  static async getNextPONumber(req: Request, res: Response) {
+    try {
+      const data = await ProcurementService.getNextPONumber();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
   static async getNextPaymentNumber(req: Request, res: Response) {
     try {
       const data = await ProcurementService.getNextPaymentNumber(req.query.date as string | undefined);
