@@ -5,6 +5,7 @@ import { FinanceService } from '../finance/finance.service';
 import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
+import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 // Atomic, collision-safe document numbering using NumberSequence table
 async function nextDocumentNumber(tx: any, key: string, prefix: string, pad = 5): Promise<string> {
@@ -205,7 +206,7 @@ export class POSService {
              let lineCost = 0;
 
              for (const item of product.recipe.recipeItems) {
-               const required = item.quantityRequired * scalar;
+               const rawRequired = item.quantityRequired * scalar;
 
                // Safety 1: Check Stock Before Deduct
                const inventoryItem = await tx.inventoryItem.findUnique({
@@ -213,22 +214,34 @@ export class POSService {
                });
 
                if (!inventoryItem) throw new Error(`Inventory mapping missing for recipe item in ${product.name}`);
-               if (inventoryItem.currentStock < required) {
-                 throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${required}, Stock: ${inventoryItem.currentStock}`);
+
+               let requiredInBaseUnit = rawRequired;
+               if (item.unit && inventoryItem.unit && item.unit.toUpperCase() !== inventoryItem.unit.toUpperCase() && item.unit.toUpperCase() !== 'UNIT') {
+                 try {
+                   requiredInBaseUnit = convertMeasurement(rawRequired, item.unit.toUpperCase() as ValidUnit, inventoryItem.unit.toUpperCase() as ValidUnit).toNumber();
+                 } catch (convErr: any) {
+                   console.warn(`[POS] Unit conversion fallback for ${inventoryItem.name}: ${convErr.message}`);
+                   requiredInBaseUnit = rawRequired;
+                 }
+               }
+
+               if (inventoryItem.currentStock < requiredInBaseUnit) {
+                 throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredInBaseUnit} ${inventoryItem.unit}, Stock: ${inventoryItem.currentStock} ${inventoryItem.unit}`);
                }
 
                // Deduct stock explicitly inside tx
                const { fifo } = await InventoryService.recordMovement(tx, {
                  itemId: item.inventoryItemId,
                  type: 'SALES_OUT',
-                 quantity: -required,
+                 quantity: -rawRequired,
+                 transactionUnit: item.unit,
                  referenceType: 'ORDER',
                  referenceId: order.id,
                  note: `Auto-deduction for Order ${order.invoiceNum} (Product: ${product.name})`
                });
 
-               const untracked = required - (fifo?.consumedFromBatches || 0);
-               lineCost += (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
+               const untracked = requiredInBaseUnit - (fifo?.consumedFromBatches || 0);
+               lineCost += (fifo?.totalCost || 0) + (untracked > 0 ? untracked * (inventoryItem.costPrice || 0) : 0);
              }
 
              await tx.orderItem.update({
@@ -584,18 +597,35 @@ export class POSService {
           if (product.recipe && product.recipe.recipeItems.length > 0) {
             const scalar = item.quantity / product.recipe.yieldQty;
             for (const ri of product.recipe.recipeItems) {
-              const quantityToDeduct = ri.quantityRequired * scalar;
+              const rawQuantityToDeduct = ri.quantityRequired * scalar;
               const invItem = await tx.inventoryItem.findUnique({ where: { id: ri.inventoryItemId } });
+              if (!invItem) throw new Error(`Inventory mapping missing for recipe item in ${product.name}`);
+
+              let requiredInBaseUnit = rawQuantityToDeduct;
+              if (ri.unit && invItem.unit && ri.unit.toUpperCase() !== invItem.unit.toUpperCase() && ri.unit.toUpperCase() !== 'UNIT') {
+                try {
+                  requiredInBaseUnit = convertMeasurement(rawQuantityToDeduct, ri.unit.toUpperCase() as ValidUnit, invItem.unit.toUpperCase() as ValidUnit).toNumber();
+                } catch (convErr: any) {
+                  console.warn(`[POS] Unit conversion fallback for ${invItem.name}: ${convErr.message}`);
+                  requiredInBaseUnit = rawQuantityToDeduct;
+                }
+              }
+
+              if (invItem.currentStock < requiredInBaseUnit) {
+                throw new Error(`Out of stock: ${invItem.name}. Required: ${requiredInBaseUnit} ${invItem.unit}, Available: ${invItem.currentStock} ${invItem.unit}`);
+              }
+
               const { fifo } = await InventoryService.recordMovement(tx, {
                 itemId: ri.inventoryItemId,
                 type: 'SALES_OUT',
-                quantity: -quantityToDeduct,
+                quantity: -rawQuantityToDeduct,
+                transactionUnit: ri.unit,
                 referenceType: 'ORDER',
                 referenceId: order.id,
                 note: `POS Sale: ${item.quantity}x ${product.name}`
               });
-              const untracked = quantityToDeduct - (fifo?.consumedFromBatches || 0);
-              lineCost += (fifo?.totalCost || 0) + untracked * (invItem?.costPrice || 0);
+              const untracked = requiredInBaseUnit - (fifo?.consumedFromBatches || 0);
+              lineCost += (fifo?.totalCost || 0) + (untracked > 0 ? untracked * (invItem?.costPrice || 0) : 0);
             }
           } else {
             // Direct deduction fallback. fid is a real Franchise id (never
