@@ -143,6 +143,7 @@ app.get('/health', async (_req: Request, res: Response) => {
 });
 
 // Warehouse Management
+app.get('/api/warehouses/next-code', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getNextWarehouseCode);
 app.get('/api/warehouses', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouses);
 app.post('/api/warehouses', (req, res, next) => { console.log('🎯 WAREHOUSE POST ROUTE HIT'); next(); }, authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.createWarehouse);
 app.get('/api/warehouses/:id/stock', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouseStock);

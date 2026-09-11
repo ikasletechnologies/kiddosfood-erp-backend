@@ -768,7 +768,7 @@ export class ProcurementService {
     if (isNaN(freightCost) || !isFinite(freightCost) || freightCost < 0) {
       throw new Error('Freight cost must be a valid non-negative number.');
     }
-    const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost);
+    const totalAmount = Math.round(Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost));
 
     // Existing usable credit — see getAvailableAdvance for why this isn't
     // just the raw ledger balance (it also excludes advance already
@@ -1029,7 +1029,7 @@ export class ProcurementService {
         if (isNaN(freight) || !isFinite(freight) || freight < 0) {
           throw new Error('Freight cost must be a valid non-negative number.');
         }
-        const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight);
+        const totalAmount = Math.round(Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight));
 
         await tx.procurementOrderItem.deleteMany({ where: { poId } });
 
@@ -1066,7 +1066,7 @@ export class ProcurementService {
           throw new Error('Freight cost must be a valid non-negative number.');
         }
 
-        const totalAmount = Math.max(0, po.subtotal + po.cgst + po.sgst + po.igst - discount + freight);
+        const totalAmount = Math.round(Math.max(0, po.subtotal + po.cgst + po.sgst + po.igst - discount + freight));
         updateData.discountAmount = discount;
         updateData.freightCost = freight;
         updateData.totalAmount = totalAmount;

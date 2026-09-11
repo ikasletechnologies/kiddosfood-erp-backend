@@ -188,31 +188,71 @@ export class InventoryController {
     try {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const includeInactive = req.query.includeInactive === 'true' || req.query.all === 'true';
 
       if (franchiseFilter.franchiseId) {
         const franchise = await prisma.franchise.findUnique({
           where: { id: franchiseFilter.franchiseId },
-          select: { name: true, primaryWarehouse: { select: { id: true, name: true, code: true, status: true } } },
+          select: { 
+            name: true, 
+            primaryWarehouse: { 
+              select: { 
+                id: true, 
+                name: true, 
+                code: true, 
+                status: true, 
+                location: true, 
+                type: true, 
+                createdAt: true,
+                updatedAt: true,
+                bins: { select: { id: true } }
+              } 
+            } 
+          },
         });
-        if (!franchise?.primaryWarehouse || franchise.primaryWarehouse.status !== 'ACTIVE') {
+        if (!franchise?.primaryWarehouse || (!includeInactive && franchise.primaryWarehouse.status !== 'ACTIVE')) {
           return res.json([]);
         }
+        const pw = franchise.primaryWarehouse;
         return res.json([{
-          ...franchise.primaryWarehouse,
+          id: pw.id,
+          name: pw.name,
+          code: pw.code,
+          status: pw.status,
+          location: pw.location,
+          type: pw.type,
+          createdAt: pw.createdAt,
+          updatedAt: pw.updatedAt,
+          binsCount: pw.bins?.length || 0,
           franchiseId: franchiseFilter.franchiseId,
           franchiseName: franchise.name,
         }]);
       }
 
+      const statusCondition = includeInactive
+        ? (req.query.status && req.query.status !== 'ALL' ? { status: req.query.status as string } : {})
+        : (req.query.status ? { status: req.query.status as string } : { status: 'ACTIVE' });
+
       const warehouses = await prisma.warehouse.findMany({
-        where: { status: 'ACTIVE' },
-        include: { primaryForFranchises: { select: { id: true, name: true } } },
-        orderBy: { name: 'asc' }
+        where: statusCondition,
+        include: {
+          primaryForFranchises: { select: { id: true, name: true } },
+          bins: { select: { id: true } },
+          _count: { select: { inventoryBatches: true, movements: true } }
+        },
+        orderBy: { createdAt: 'desc' }
       });
       const result = warehouses.map((w: any) => {
-        const { primaryForFranchises, ...rest } = w;
+        const { primaryForFranchises, bins, _count, ...rest } = w;
         const owner = primaryForFranchises?.[0];
-        return { ...rest, franchiseId: owner?.id ?? null, franchiseName: owner?.name ?? null };
+        return {
+          ...rest,
+          binsCount: bins?.length || 0,
+          batchCount: _count?.inventoryBatches || 0,
+          movementsCount: _count?.movements || 0,
+          franchiseId: owner?.id ?? null,
+          franchiseName: owner?.name ?? null
+        };
       });
       res.json(result);
     } catch (error: any) {
@@ -226,6 +266,15 @@ export class InventoryController {
       res.json(report);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
+    }
+  }
+
+  static async getNextWarehouseCode(req: Request, res: Response) {
+    try {
+      const code = await WarehouseService.previewNextWarehouseCode();
+      res.json({ code });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
   }
 
@@ -246,7 +295,7 @@ export class InventoryController {
   static async updateWarehouse(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      const { name, location, type } = req.body;
+      const { name, location, type, status } = req.body;
 
       let nameKey: string | undefined;
       if (name !== undefined) {
@@ -260,9 +309,23 @@ export class InventoryController {
         }
       }
 
+      const updateData: any = {};
+      if (name !== undefined) {
+        updateData.name = name.trim();
+        updateData.nameKey = nameKey;
+      }
+      if (location !== undefined) updateData.location = location ? location.trim() : null;
+      if (type !== undefined) updateData.type = type;
+      if (status !== undefined) {
+        const normalized = String(status).toUpperCase().trim();
+        if (normalized === 'ACTIVE' || normalized === 'INACTIVE') {
+          updateData.status = normalized;
+        }
+      }
+
       const warehouse = await prisma.warehouse.update({
         where: { id },
-        data: { name: name !== undefined ? name.trim() : undefined, nameKey, location, type }
+        data: updateData
       });
       res.json(warehouse);
     } catch (error: any) {

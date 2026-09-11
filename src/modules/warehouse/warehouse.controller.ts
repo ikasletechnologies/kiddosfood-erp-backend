@@ -63,6 +63,47 @@ export class WarehouseController {
     }
   }
 
+  static async getAllBins(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      let warehouseId = req.query.warehouseId as string | undefined;
+
+      if (franchiseFilter.franchiseId) {
+        const franchise = await prisma.franchise.findUnique({
+          where: { id: franchiseFilter.franchiseId },
+          select: { primaryWarehouseId: true },
+        });
+        if (!franchise?.primaryWarehouseId) {
+          return res.json([]);
+        }
+        warehouseId = franchise.primaryWarehouseId;
+      }
+
+      const bins = await WarehouseService.getAllBins({ warehouseId });
+      res.json(bins);
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async createBinDirect(req: Request, res: Response) {
+    try {
+      const { warehouseId, code, description } = req.body;
+      if (!warehouseId) {
+        return res.status(400).json({ error: 'Warehouse is required' });
+      }
+      if (!code || !code.trim()) {
+        return res.status(400).json({ error: 'Bin code is required' });
+      }
+      await assertWarehouseAccess((req as any).user, warehouseId);
+      const bin = await WarehouseService.createBin(warehouseId, code, description);
+      res.status(201).json(bin);
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
   static async createBin(req: Request, res: Response) {
     try {
       const { warehouseId } = req.params;
