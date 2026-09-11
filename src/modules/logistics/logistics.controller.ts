@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { LogisticsService } from './logistics.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { TransferValidationError } from '../../utils/errors';
 
 export class LogisticsController {
   /**
@@ -61,7 +62,11 @@ export class LogisticsController {
       });
       res.status(201).json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      if (error instanceof TransferValidationError) {
+        res.status(error.statusCode).json({ error: error.message, details: error.details });
+      } else {
+        res.status(400).json({ error: error.message });
+      }
     }
   }
 
@@ -73,7 +78,11 @@ export class LogisticsController {
       );
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      if (error instanceof TransferValidationError) {
+        res.status(error.statusCode).json({ error: error.message, details: error.details });
+      } else {
+        res.status(400).json({ error: error.message });
+      }
     }
   }
 

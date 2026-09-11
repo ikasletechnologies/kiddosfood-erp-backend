@@ -2,6 +2,8 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { TokenPayload } from '../../lib/jwt.util';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { FranchiseService } from '../franchise/franchise.service';
+import { TransferValidationError } from '../../utils/errors';
 
 export class LogisticsService {
   /**
@@ -98,12 +100,68 @@ export class LogisticsService {
       // Soft availability check only — no stock is deducted here. Actual
       // stock can still move between now and dispatch, so this is early
       // user feedback, not the authoritative check (that happens at dispatch).
+      const scopeId = await FranchiseService.toInventoryScopeId(tx, data.fromBranchId);
+      
       for (const item of data.items) {
         const sourceInv = await tx.inventoryItem.findFirst({
-          where: { id: item.inventoryItemId, franchiseId: data.fromBranchId }
+          where: { id: item.inventoryItemId, franchiseId: scopeId },
+          include: { inventoryBatches: { where: { currentQty: { gt: 0 } } } }
         });
-        if (!sourceInv || sourceInv.currentStock < item.quantity) {
-          throw new Error(`Insufficient stock in source branch for ${sourceInv?.name ?? item.inventoryItemId}. Available: ${sourceInv?.currentStock || 0}`);
+
+        if (!sourceInv) {
+          throw new TransferValidationError(
+            `Insufficient stock in source branch for unknown item. Available: 0`,
+            {
+              code: 'INSUFFICIENT_STOCK',
+              itemName: 'Unknown Item',
+              requestedQty: item.quantity,
+              availableQty: 0,
+              unit: 'N/A',
+              sourceBranch: 'Source',
+              reason: 'NO_TRANSFERABLE_STOCK'
+            }
+          );
+        }
+
+        let transferableStock = sourceInv.currentStock;
+        const batches = sourceInv.inventoryBatches || [];
+        if (batches.length > 0) {
+          let eligibleBatchesQty = 0;
+          let blockedQtyAvailable = 0;
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+
+          for (const b of batches) {
+            if (b.status === 'BLOCKED' || b.status === 'RETURNED') {
+              blockedQtyAvailable += Number(b.currentQty);
+            } else if (b.status === 'APPROVED' && (!b.expDate || new Date(b.expDate) >= today)) {
+              eligibleBatchesQty += Number(b.currentQty);
+            }
+          }
+
+          if (blockedQtyAvailable > 0) {
+            transferableStock = Math.min(eligibleBatchesQty, sourceInv.currentStock);
+          } else {
+            const totalTrackedQty = batches.reduce((acc: number, b: any) => acc + Number(b.currentQty), 0);
+            const untrackedQty = Math.max(0, sourceInv.currentStock - totalTrackedQty);
+            transferableStock = Math.min(eligibleBatchesQty + untrackedQty, sourceInv.currentStock);
+          }
+        }
+        transferableStock = Math.max(0, transferableStock);
+
+        if (transferableStock < item.quantity) {
+          throw new TransferValidationError(
+            `Insufficient stock in source branch for ${sourceInv.name}. Available: ${transferableStock}`,
+            {
+              code: 'INSUFFICIENT_STOCK',
+              itemName: sourceInv.name,
+              requestedQty: item.quantity,
+              availableQty: transferableStock,
+              unit: sourceInv.unit || 'PC',
+              sourceBranch: 'Source',
+              reason: 'NO_TRANSFERABLE_STOCK'
+            }
+          );
         }
       }
 
@@ -146,12 +204,41 @@ export class LogisticsService {
         throw new Error(`Only PENDING transfers can be dispatched (current status: ${transfer.status}).`);
       }
 
+      const scopeId = await FranchiseService.toInventoryScopeId(tx, transfer.fromBranchId);
+      
       for (const item of transfer.items) {
         const sourceInv = await tx.inventoryItem.findFirst({
-          where: { id: item.inventoryItemId, franchiseId: transfer.fromBranchId }
+          where: { id: item.inventoryItemId, franchiseId: scopeId }
         });
-        if (!sourceInv || sourceInv.currentStock < item.quantity) {
-          throw new Error(`Insufficient stock in source branch for ${sourceInv?.name ?? item.inventoryItemId}. Available: ${sourceInv?.currentStock || 0}`);
+        
+        if (!sourceInv) {
+          throw new TransferValidationError(
+            `Insufficient stock in source branch for unknown item. Available: 0`,
+            {
+              code: 'INSUFFICIENT_STOCK',
+              itemName: 'Unknown Item',
+              requestedQty: item.quantity,
+              availableQty: 0,
+              unit: 'N/A',
+              sourceBranch: 'Source',
+              reason: 'NO_TRANSFERABLE_STOCK'
+            }
+          );
+        }
+        
+        if (sourceInv.currentStock < item.quantity) {
+          throw new TransferValidationError(
+            `Insufficient stock in source branch for ${sourceInv.name}. Available: ${sourceInv.currentStock}`,
+            {
+              code: 'INSUFFICIENT_STOCK',
+              itemName: sourceInv.name,
+              requestedQty: item.quantity,
+              availableQty: sourceInv.currentStock,
+              unit: sourceInv.unit || 'PC',
+              sourceBranch: 'Source',
+              reason: 'NO_TRANSFERABLE_STOCK'
+            }
+          );
         }
 
         await InventoryService.recordMovement(tx, {

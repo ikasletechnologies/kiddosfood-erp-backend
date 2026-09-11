@@ -200,6 +200,10 @@ export class InventoryService {
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
         vendor: true,
+        inventoryBatches: {
+          where: { currentQty: { gt: 0 } },
+          select: { currentQty: true, status: true, expDate: true }
+        }
       },
       orderBy: { name: 'asc' },
     });
@@ -283,9 +287,34 @@ export class InventoryService {
       const hasPurchaseMovement = item.movements?.some(m => m.movementType === 'PURCHASE_IN');
       const isPurchased = !!item.vendorId || purchasedItemIds.has(item.id) || hasPurchaseMovement || incomingStock > 0;
 
+      let transferableStock = computedStock;
+      // Note: TypeScript might complain if batches isn't explicitly defined on the type, but it is since we included it.
+      const batches = (item as any).inventoryBatches || [];
+      if (batches.length > 0) {
+        let eligibleBatchesQty = 0;
+        let blockedQtyAvailable = 0;
+        for (const b of batches) {
+          if (b.status === 'BLOCKED' || b.status === 'RETURNED') {
+            blockedQtyAvailable += Number(b.currentQty);
+          } else if (b.status === 'APPROVED' && (!b.expDate || new Date(b.expDate) >= today)) {
+            eligibleBatchesQty += Number(b.currentQty);
+          }
+        }
+
+        if (blockedQtyAvailable > 0) {
+          transferableStock = Math.min(eligibleBatchesQty, computedStock);
+        } else {
+          const totalTrackedQty = batches.reduce((acc: number, b: any) => acc + Number(b.currentQty), 0);
+          const untrackedQty = Math.max(0, computedStock - totalTrackedQty);
+          transferableStock = Math.min(eligibleBatchesQty + untrackedQty, computedStock);
+        }
+      }
+      transferableStock = Math.max(0, transferableStock);
+
       return {
         ...item,
         currentStock: computedStock,
+        transferableStock,
         inbound,
         outbound,
         status,
