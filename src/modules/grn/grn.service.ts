@@ -35,11 +35,24 @@ export class GRNService {
     });
   }
 
-  static async getAll(params: { poId?: string; status?: string } = {}) {
+  static async getAll(params: { poId?: string; status?: string; startDate?: string; endDate?: string; fromDate?: string; toDate?: string } = {}) {
+    const from = params.fromDate || params.startDate;
+    const to = params.toDate || params.endDate;
+    const dateFilter: any = {};
+    if (from || to) {
+      dateFilter.receivedAt = {};
+      if (from) dateFilter.receivedAt.gte = new Date(from);
+      if (to) {
+        const toD = new Date(to);
+        toD.setHours(23, 59, 59, 999);
+        dateFilter.receivedAt.lte = toD;
+      }
+    }
     return prisma.goodsReceipt.findMany({
       where: {
         ...(params.poId ? { poId: params.poId } : {}),
-        ...(params.status ? { status: params.status as any } : {})
+        ...(params.status ? { status: params.status as any } : {}),
+        ...dateFilter
       },
       include: {
         procurementOrder: { include: { vendor: true } },
@@ -192,13 +205,11 @@ export class GRNService {
           if (!batchNo) {
             throw new Error(`Batch/Lot number is required for material item "${item.materialId}" before approval.`);
           }
-          if (!item.mfgDate || isNaN(new Date(item.mfgDate).getTime())) {
-            throw new Error(`Valid Manufacturing (MFG) date is required for material item "${item.materialId}" before approval.`);
-          }
+          
           if (!item.expDate || isNaN(new Date(item.expDate).getTime())) {
             throw new Error(`Valid Expiry (EXP) date is required for material item "${item.materialId}" before approval.`);
           }
-          if (new Date(item.expDate).getTime() < new Date(item.mfgDate).getTime()) {
+          if (item.mfgDate && item.expDate && new Date(item.expDate).getTime() < new Date(item.mfgDate).getTime()) {
             throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for material item "${item.materialId}".`);
           }
         }
