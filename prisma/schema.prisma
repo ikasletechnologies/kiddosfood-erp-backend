@@ -290,6 +290,15 @@ model StockMovement {
   warehouseId     String?
   batchId         String?
   unitCost        Float?
+  // Full FIFO consumption breakdown (every InventoryBatch lot + qty +
+  // productBatchId actually drawn from), populated whenever an outbound
+  // movement spans more than one lot — mirrors ProductPackaging.bulkBreakdown
+  // / ProductionItem.batchBreakdown. `batchId` above is left null in that
+  // case (no single lot to report), which used to make multi-lot sales
+  // impossible to trace back to a specific ProductBatch for recall/return
+  // purposes. See RecallService.findRecallForSoldItem, which reads this to
+  // determine whether a customer return traces back to a recalled batch.
+  consumptionBreakdown Json?
   batch           InventoryBatch?   @relation(fields: [batchId], references: [id])
   bin             WarehouseBin?     @relation(fields: [binId], references: [id])
   item            InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
@@ -297,6 +306,9 @@ model StockMovement {
   warehouse       Warehouse?        @relation(fields: [warehouseId], references: [id])
 
   @@index([movementType, createdAt])
+  // RecallService's distributedQty/wastedQty queries filter batchId IN (...)
+  // + quantity < 0 + referenceType IN (...) on every recall step.
+  @@index([batchId, referenceType])
 }
 
 model Vendor {
@@ -666,6 +678,8 @@ model BatchRecall {
   updatedAt         DateTime           @updatedAt
   productBatch      ProductBatch       @relation(fields: [productBatchId], references: [id])
   events            BatchRecallEvent[]
+  returnItems       ReturnItem[]
+  challanReturnItems DeliveryChallanReturnItem[]
 }
 
 model BatchRecallEvent {
@@ -1431,7 +1445,18 @@ model ReturnItem {
   rate        Float
   totalAmount Float
   condition   String?
+  // Set (overriding whatever condition was submitted) when the backend
+  // determines, from the original sale's StockMovement/consumptionBreakdown,
+  // that this returned quantity traces back to a ProductBatch under an
+  // active or completed recall — see RecallService.findRecallForSoldItem /
+  // recordRecallAffectedReturn. Never set by client input; a non-null value
+  // here is what actually kept this quantity out of saleable stock,
+  // regardless of what `condition` says.
+  recallId    String?
+  recall      BatchRecall? @relation(fields: [recallId], references: [id])
   return      ReturnOrder @relation(fields: [returnId], references: [id])
+
+  @@index([recallId])
 }
 
 model DeliveryChallan {
@@ -1508,8 +1533,13 @@ model DeliveryChallanReturnItem {
   quantity      Float
   unit          String                @default("NONE")
   condition     String?
+  // See ReturnItem.recallId — same override mechanism for the DC-return flow.
+  recallId      String?
+  recall        BatchRecall?          @relation(fields: [recallId], references: [id])
   challanItem   DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
   return        DeliveryChallanReturn @relation(fields: [returnId], references: [id])
+
+  @@index([recallId])
 }
 
 model PurchaseReturn {
@@ -1707,6 +1737,14 @@ model InventoryBatch {
   productBatch    ProductBatch?       @relation(fields: [productBatchId], references: [id])
   warehouse       Warehouse?          @relation(fields: [warehouseId], references: [id])
   stockMovements  StockMovement[]
+
+  // Every recall query (getBatchQuantities, locateDistribution,
+  // findCrossBatchAffectedIds' block/unblock updates) filters by
+  // productBatchId; depleteBatchesFIFO's hot path filters by
+  // inventoryItemId + status on every sale/dispatch/production consumption.
+  // Neither had an index before.
+  @@index([productBatchId])
+  @@index([inventoryItemId, status])
 }
 
 model NumberSequence {

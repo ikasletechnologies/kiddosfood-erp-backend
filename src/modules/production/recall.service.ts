@@ -96,6 +96,15 @@ export class RecallService {
     return Array.from(affected);
   }
 
+  // Single formula for "how much of this batch's own approved output is
+  // still sitting in the warehouse right now, in this batch's own unit" —
+  // shared by getBatchQuantities and locateDistribution so the two can never
+  // disagree. See the long comment at its call site in getBatchQuantities
+  // for why this can't be a sum of InventoryBatch.currentQty.
+  private static resolveAvailableQty(approvedQty: number, wastedQty: number, distributedQty: number, returnedQty: number): number {
+    return Math.max(0, approvedQty - wastedQty - distributedQty + returnedQty);
+  }
+
   // Authoritative quantity + unit resolution for a batch. Never defaults to
   // 0/"KG" silently — every figure is read from the same fields
   // production/QC actually wrote (ProductBatch.quantity/approvedQty/
@@ -121,7 +130,6 @@ export class RecallService {
       || inventoryBatches[0]?.inventoryItem?.unit
       || 'KG';
 
-    const availableQty = inventoryBatches.reduce((s, b) => s + b.currentQty, 0);
     // "Left the lot to somewhere a recall can act on" — genuine outbound
     // distribution only (sale, dispatch, franchise transfer), never waste/
     // spoilage or internal bin/adjustment churn. Previously this summed
@@ -150,6 +158,25 @@ export class RecallService {
         })
       : [];
     const wastedQty = wasteMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+
+    const returnedQty = (await prisma.batchRecall.findUnique({ where: { productBatchId }, select: { returnedQty: true } }))?.returnedQty || 0;
+    // Deliberately NOT a sum of InventoryBatch.currentQty across this
+    // batch's lots (that was the old implementation, and the root cause of
+    // a batch showing "Available" figures larger than its own approvedQty —
+    // e.g. 96 KG available against a 48 KG approved batch). The bulk pool is
+    // shared across every ProductBatch of the same recipe with unscoped FIFO
+    // (see findCrossBatchAffectedIds), so this batch's own bulk
+    // InventoryBatch row can sit fully untouched — because packaging drew an
+    // older/cheaper lot belonging to a DIFFERENT batch instead — while a
+    // separate retail InventoryBatch (a different unit: packets, not KG) is
+    // also created and tagged with this same productBatchId once packaging
+    // confirms. Summing both counted the same approved output twice, in two
+    // different units. This batch's own approvedQty, minus what's verifiably
+    // left the building (wastedQty, distributedQty) plus what's verifiably
+    // come back (returnedQty), is the only number that can never exceed what
+    // this batch actually produced, regardless of which physical pooled lot
+    // any of it moved through.
+    const availableQty = this.resolveAvailableQty(batch.approvedQty || 0, wastedQty, distributedQty, returnedQty);
 
     const crossBatchAffectedIds = await this.findCrossBatchAffectedIds(prisma, productBatchId, batch.production?.recipeId);
     const crossBatchAffected = crossBatchAffectedIds.length
@@ -308,7 +335,23 @@ export class RecallService {
       // separate "Block Sales" click to make it non-sellable. depleteBatchesFIFO
       // only ever draws from status: 'APPROVED' lots, so flipping this to
       // BLOCKED is a real, enforced block, not a cosmetic flag.
-      const inventoryBatches = await tx.inventoryBatch.findMany({ where: { productBatchId } });
+      //
+      // Locked (FOR UPDATE), not a plain findMany: depleteBatchesFIFO's own
+      // read of these same rows is now FOR UPDATE too (see its comment), so
+      // whichever of a concurrent sale or this recall reaches the row first
+      // wins the lock and the other waits. Without locking here as well,
+      // this read could return a STALE pre-sale currentQty (e.g. still 20)
+      // even though a concurrent sale is mid-flight and about to commit 0 —
+      // this recall's own updateMany would still correctly end up flipping
+      // status to BLOCKED (Postgres blocks that write until the sale
+      // commits, then re-checks status='APPROVED', which still holds), but
+      // blockedQty computed from the stale read would over-report a
+      // quantity that was actually already sold, corrupting the audit
+      // trail and downstream reconciliation even though the stock itself
+      // stayed correct.
+      const inventoryBatches: Array<{ id: string; status: string; currentQty: number }> = await tx.$queryRaw(
+        Prisma.sql`SELECT id, status, "currentQty" FROM "InventoryBatch" WHERE "productBatchId" = ${productBatchId} FOR UPDATE`
+      );
       const blockable = inventoryBatches.filter((b) => b.status === 'APPROVED');
       if (blockable.length) {
         await tx.inventoryBatch.updateMany({
@@ -328,9 +371,10 @@ export class RecallService {
       const crossBatchAffectedIds = await this.findCrossBatchAffectedIds(tx, productBatchId, batch.production?.recipeId);
       let crossBlockedQty = 0;
       if (crossBatchAffectedIds.length) {
-        const crossInventoryBatches = await tx.inventoryBatch.findMany({
-          where: { productBatchId: { in: crossBatchAffectedIds }, status: 'APPROVED' },
-        });
+        // Same locking rationale as the direct lookup above.
+        const crossInventoryBatches: Array<{ id: string; currentQty: number }> = await tx.$queryRaw(
+          Prisma.sql`SELECT id, "currentQty" FROM "InventoryBatch" WHERE "productBatchId" IN (${Prisma.join(crossBatchAffectedIds)}) AND status = 'APPROVED' FOR UPDATE`
+        );
         if (crossInventoryBatches.length) {
           await tx.inventoryBatch.updateMany({
             where: { id: { in: crossInventoryBatches.map((b: any) => b.id) } },
@@ -391,7 +435,6 @@ export class RecallService {
         include: { warehouse: true },
       });
       const inventoryBatchIds = inventoryBatches.map((b) => b.id);
-      const availableWarehouseQty = inventoryBatches.reduce((s, b) => s + b.currentQty, 0);
 
       // Only outbound movements that trace back to this batch's own
       // InventoryBatch lot(s) — real StockMovement rows, never fabricated —
@@ -416,6 +459,18 @@ export class RecallService {
       // affectedLocations below, so the two can never disagree — this now
       // matches getBatchQuantities()'s definition of "distributed" exactly.
       const distributedQty = movements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+
+      // Same formula as getBatchQuantities — not a sum of
+      // InventoryBatch.currentQty (see resolveAvailableQty / the long
+      // comment in getBatchQuantities for why that double-counted pooled
+      // bulk vs. packaged-retail lots under the same productBatchId).
+      const wasteMovements = inventoryBatchIds.length
+        ? await tx.stockMovement.findMany({
+            where: { batchId: { in: inventoryBatchIds }, quantity: { lt: 0 }, referenceType: 'WASTE' },
+          })
+        : [];
+      const wastedQty = wasteMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
+      const availableWarehouseQty = this.resolveAvailableQty(batch?.approvedQty || 0, wastedQty, distributedQty, recall.returnedQty || 0);
 
       // This batch's bulk output can have been blended into OTHER batches'
       // packaging runs via the shared bulk pool (see
@@ -529,7 +584,12 @@ export class RecallService {
       });
       const unit = batch?.production?.recipe?.yieldUnit || 'KG';
 
-      const inventoryBatches = await tx.inventoryBatch.findMany({ where: { productBatchId } });
+      // Locked (FOR UPDATE) — same rationale as initiateRecall: avoids
+      // reporting a stale pre-sale currentQty if a sale is concurrently
+      // racing this same row.
+      const inventoryBatches: Array<{ id: string; status: string; currentQty: number }> = await tx.$queryRaw(
+        Prisma.sql`SELECT id, status, "currentQty" FROM "InventoryBatch" WHERE "productBatchId" = ${productBatchId} FOR UPDATE`
+      );
       const toBlock = inventoryBatches.filter((b) => b.status === 'APPROVED');
       if (toBlock.length) {
         await tx.inventoryBatch.updateMany({
@@ -730,5 +790,174 @@ export class RecallService {
 
       return updated;
     });
+  }
+
+  // Given the reference a specific sale/dispatch line item was recorded
+  // under (e.g. referenceType 'ORDER' + the POS Order id), determines
+  // whether ANY InventoryBatch lot it actually drew from — via either a
+  // single unambiguous batchId or a multi-lot consumptionBreakdown (see the
+  // StockMovement field comment) — traces back to a ProductBatch under an
+  // active or completed recall. Used by return processing to force a return
+  // into quarantine regardless of the condition an operator submits: per
+  // the business rule, ANY recalled contribution taints the whole retail
+  // unit sold (bulk pooling blends material, it doesn't separate it), so
+  // this deliberately does not try to proportionally split a return between
+  // recalled and non-recalled sources.
+  //
+  // Returns null when no recall involvement is found — including when the
+  // original movement predates consumptionBreakdown and has no single
+  // batchId (an old multi-lot sale with no per-lot record at all). That is
+  // a real, narrower gap than "no protection at all": it only affects
+  // historical multi-lot sales made before this field existed, not new
+  // ones, and not any single-lot sale regardless of age.
+  // Shared by findRecallForSoldItem and resolveSingleSourceProductBatchId:
+  // every distinct ProductBatch a given sale/dispatch reference's outbound
+  // movement(s) for one item can be traced back to, via either a single
+  // unambiguous batchId or a multi-lot consumptionBreakdown.
+  private static async resolveSourceProductBatchIds(tx: any, params: { referenceType: string; referenceId: string; inventoryItemId: string }): Promise<string[]> {
+    const movements = await tx.stockMovement.findMany({
+      where: {
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        itemId: params.inventoryItemId,
+        quantity: { lt: 0 },
+      },
+      select: { batchId: true, consumptionBreakdown: true },
+    });
+    if (!movements.length) return [];
+
+    const candidateProductBatchIds = new Set<string>();
+    const batchIdsToResolve = movements.map((m: any) => m.batchId).filter((id: any): id is string => !!id);
+    if (batchIdsToResolve.length) {
+      const lots = await tx.inventoryBatch.findMany({
+        where: { id: { in: batchIdsToResolve } },
+        select: { productBatchId: true },
+      });
+      for (const lot of lots) if (lot.productBatchId) candidateProductBatchIds.add(lot.productBatchId);
+    }
+    for (const m of movements) {
+      const breakdown: any[] = Array.isArray(m.consumptionBreakdown) ? m.consumptionBreakdown : [];
+      for (const c of breakdown) if (c.productBatchId) candidateProductBatchIds.add(c.productBatchId);
+    }
+    return Array.from(candidateProductBatchIds);
+  }
+
+  // Used when crediting an ordinary (non-recalled) "GOOD" return: if the
+  // originating sale traces back to EXACTLY ONE ProductBatch, that id is
+  // safe to tag the restocked InventoryBatch with, so that a recall
+  // declared LATER on that batch can still find and block it — closing the
+  // gap where a plain currentStock-only restock (no batch identity at all)
+  // would otherwise be permanently invisible to any future recall. Returns
+  // null when the source is ambiguous (multiple distinct batches) or
+  // unknown (no traceable movement) — callers fall back to the existing
+  // untracked restock behavior in that case, unchanged.
+  static async resolveSingleSourceProductBatchId(tx: any, params: { referenceType: string; referenceId: string; inventoryItemId: string }): Promise<string | null> {
+    const ids = await this.resolveSourceProductBatchIds(tx, params);
+    return ids.length === 1 ? ids[0] : null;
+  }
+
+  static async findRecallForSoldItem(tx: any, params: { referenceType: string; referenceId: string; inventoryItemId: string }): Promise<{ recallId: string; productBatchId: string; allRecalledProductBatchIds: string[] } | null> {
+    const candidateProductBatchIds = await this.resolveSourceProductBatchIds(tx, params);
+    if (!candidateProductBatchIds.length) return null;
+
+    const recalls = await tx.batchRecall.findMany({
+      where: { productBatchId: { in: Array.from(candidateProductBatchIds) }, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+    });
+    if (!recalls.length) return null;
+
+    return {
+      recallId: recalls[0].id,
+      productBatchId: recalls[0].productBatchId,
+      allRecalledProductBatchIds: recalls.map((r: any) => r.productBatchId),
+    };
+  }
+
+  // Physically receives a returned unit already known (via
+  // findRecallForSoldItem) to trace back to a recalled ProductBatch.
+  // Credits it as real warehouse stock — the goods ARE physically back,
+  // occupying space, awaiting disposition — but pinned to status RETURNED,
+  // never APPROVED, so depleteBatchesFIFO can never draw from it (same
+  // convention as collectReturn's formal recall-workflow return). Feeds the
+  // SAME BatchRecall.returnedQty counter collectReturn uses so recall
+  // reporting stays consistent no matter which UI a return came through.
+  //
+  // Deliberately does NOT cap returnedQty at distributedQty the way
+  // collectReturn does: a customer walking in with a physical unit must
+  // always be accepted into quarantine, never rejected because of a
+  // bookkeeping mismatch — and works even when recall.status is COMPLETED,
+  // since an organic customer return can arrive at any time, not only
+  // during the structured recall workflow's own step sequence.
+  static async recordRecallAffectedReturn(tx: any, params: {
+    recallId: string;
+    productBatchId: string;
+    inventoryItemId: string;
+    quantity: number;
+    warehouseId?: string | null;
+    userId?: string;
+    source: string;
+    sourceId: string;
+    allRecalledProductBatchIds?: string[];
+    note: string;
+  }) {
+    const qty = Number(params.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) return null;
+
+    const item = await tx.inventoryItem.findUniqueOrThrow({ where: { id: params.inventoryItemId } });
+    const productBatch = await tx.productBatch.findUnique({ where: { id: params.productBatchId }, select: { batchCode: true } });
+
+    const newBatch = await tx.inventoryBatch.create({
+      data: {
+        inventoryItemId: params.inventoryItemId,
+        batchNumber: productBatch?.batchCode ? `${productBatch.batchCode}-RETURN` : `RECALL-RETURN-${Date.now()}`,
+        initialQty: qty,
+        currentQty: qty,
+        unitCost: item.costPrice || 0,
+        productBatchId: params.productBatchId,
+        warehouseId: params.warehouseId || null,
+        status: 'RETURNED',
+      },
+    });
+
+    await tx.inventoryItem.update({
+      where: { id: params.inventoryItemId },
+      data: { currentStock: { increment: qty } },
+    });
+
+    await tx.stockMovement.create({
+      data: {
+        itemId: params.inventoryItemId,
+        movementType: 'RECALL_RETURN_IN',
+        quantity: qty,
+        referenceType: 'RECALL',
+        referenceId: params.recallId,
+        batchId: newBatch.id,
+        note: params.note,
+        createdBy: params.userId,
+        warehouseId: params.warehouseId || null,
+      },
+    });
+
+    await tx.batchRecall.update({
+      where: { id: params.recallId },
+      data: { returnedQty: { increment: qty } },
+    });
+
+    await tx.batchRecallEvent.create({
+      data: {
+        recallId: params.recallId,
+        event: 'RETURN_COLLECTED',
+        status: 'SUCCESS',
+        actor: params.userId || 'system',
+        affectedQty: qty,
+        details: {
+          source: params.source,
+          sourceId: params.sourceId,
+          allRecalledProductBatchIds: params.allRecalledProductBatchIds || [params.productBatchId],
+          message: params.note,
+        } as any,
+      },
+    });
+
+    return newBatch;
   }
 }

@@ -1803,9 +1803,20 @@ export class SalesService {
   static async restoreStockForReturnOrder(tx: any, returnOrder: any, userId: string = 'system') {
     const { FranchiseService } = require('../franchise/franchise.service');
     const { InventoryService } = require('../inventory/inventory.service');
+    const { RecallService } = require('../production/recall.service');
 
     let scopeFranchiseId = returnOrder.franchiseId || returnOrder.posOrder?.franchiseId || null;
     const targetScopeId = await FranchiseService.toInventoryScopeId(tx, scopeFranchiseId);
+
+    // The reference the ORIGINAL sale's outbound StockMovement(s) were
+    // recorded under — needed to look up which InventoryBatch lot(s) this
+    // return actually traces back to. A ReturnOrder with no linked
+    // posOrder/franchiseOrder (e.g. a free-form return) has nothing to look
+    // up here, so recall detection is skipped for it exactly as before this
+    // change — there is no schema link to trace in that case.
+    let saleRef: { referenceType: string; referenceId: string } | null = null;
+    if (returnOrder.posOrderId) saleRef = { referenceType: 'ORDER', referenceId: returnOrder.posOrderId };
+    else if (returnOrder.franchiseOrderId) saleRef = { referenceType: 'FRANCHISE_ORDER', referenceId: returnOrder.franchiseOrderId };
 
     for (const item of returnOrder.items) {
       const cond = (item.condition || 'GOOD').toUpperCase();
@@ -1831,16 +1842,66 @@ export class SalesService {
       }
 
       if (invItem) {
-        if (cond === 'GOOD') {
-          await InventoryService.stockIn({
-            itemId: invItem.id,
+        // Recall override: regardless of what condition was submitted
+        // (including "GOOD"), a return that traces back to a recalled
+        // ProductBatch must never become normal saleable stock. Checked
+        // before the GOOD/non-GOOD branch below so it can never be bypassed
+        // by selecting GOOD.
+        const recallHit = saleRef
+          ? await RecallService.findRecallForSoldItem(tx, { ...saleRef, inventoryItemId: invItem.id })
+          : null;
+
+        if (recallHit) {
+          await RecallService.recordRecallAffectedReturn(tx, {
+            recallId: recallHit.recallId,
+            productBatchId: recallHit.productBatchId,
+            allRecalledProductBatchIds: recallHit.allRecalledProductBatchIds,
+            inventoryItemId: invItem.id,
             quantity: item.quantity,
-            type: 'PURCHASE_IN',
-            referenceType: 'SALES_RETURN',
-            referenceId: returnOrder.id,
-            note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
-            userId
-          }, tx);
+            userId,
+            source: 'SALES_RETURN',
+            sourceId: returnOrder.id,
+            note: `Sales Return ${returnOrder.returnNumber}: ${item.quantity} ${item.productName} traced to a recalled batch — quarantined regardless of submitted condition ("${cond}")`,
+          });
+          await tx.returnItem.update({ where: { id: item.id }, data: { recallId: recallHit.recallId } });
+          continue;
+        }
+
+        if (cond === 'GOOD') {
+          // Tag the restocked lot with its source ProductBatch whenever the
+          // sale it came from traces to exactly one — a plain stockIn (no
+          // batch identity at all) would otherwise make this quantity
+          // permanently invisible to any recall declared on that batch
+          // LATER, after this return already happened.
+          const sourceProductBatchId = saleRef
+            ? await RecallService.resolveSingleSourceProductBatchId(tx, { ...saleRef, inventoryItemId: invItem.id })
+            : null;
+          if (sourceProductBatchId) {
+            await InventoryService.recordMovement(tx, {
+              itemId: invItem.id,
+              type: 'PURCHASE_IN',
+              quantity: item.quantity,
+              referenceType: 'SALES_RETURN',
+              referenceId: returnOrder.id,
+              note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
+              userId,
+              receiveAtCost: {
+                unitCost: invItem.costPrice || 0,
+                batchNumber: `${invItem.sku || invItem.name}-RETURN`,
+                productBatchId: sourceProductBatchId,
+              },
+            });
+          } else {
+            await InventoryService.stockIn({
+              itemId: invItem.id,
+              quantity: item.quantity,
+              type: 'PURCHASE_IN',
+              referenceType: 'SALES_RETURN',
+              referenceId: returnOrder.id,
+              note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
+              userId
+            }, tx);
+          }
         } else {
           await tx.stockMovement.create({
             data: {
@@ -2514,15 +2575,67 @@ export class SalesService {
         const sourceItem = await tx.inventoryItem.findFirst({ where: { franchiseId: sourceId, sku: product.sku } });
         if (!sourceItem) continue;
 
-        if (cond.condition === 'GOOD') {
-          await InventoryService.stockIn({
-            itemId: sourceItem.id,
+        // Recall override: same rule as restoreStockForReturnOrder — a
+        // return that traces back to a recalled ProductBatch must never
+        // become normal saleable stock, regardless of the condition
+        // selected (including "GOOD"). The DC's own dispatch StockMovement
+        // rows are tagged referenceType 'DELIVERY_CHALLAN' / referenceId =
+        // challan id, so that's what this looks up against.
+        const { RecallService } = require('../production/recall.service');
+        const recallHit = await RecallService.findRecallForSoldItem(tx, {
+          referenceType: 'DELIVERY_CHALLAN',
+          referenceId: ret.challan.id,
+          inventoryItemId: sourceItem.id,
+        });
+        if (recallHit) {
+          await RecallService.recordRecallAffectedReturn(tx, {
+            recallId: recallHit.recallId,
+            productBatchId: recallHit.productBatchId,
+            allRecalledProductBatchIds: recallHit.allRecalledProductBatchIds,
+            inventoryItemId: sourceItem.id,
             quantity: item.quantity,
-            referenceType: 'DELIVERY_CHALLAN_RETURN',
-            referenceId: ret.id,
-            note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
-            userId
-          }, tx as any);
+            userId,
+            source: 'DELIVERY_CHALLAN_RETURN',
+            sourceId: ret.id,
+            note: `DC Return ${ret.returnNumber} (DC ${ret.challan.challanNumber}): ${item.quantity} ${item.productName} traced to a recalled batch — quarantined regardless of submitted condition ("${cond.condition}")`,
+          });
+          await tx.deliveryChallanReturnItem.update({ where: { id: item.id }, data: { recallId: recallHit.recallId, condition: 'QUARANTINE' } });
+          continue;
+        }
+
+        if (cond.condition === 'GOOD') {
+          // Same forward-looking tagging as restoreStockForReturnOrder — see
+          // its comment on resolveSingleSourceProductBatchId.
+          const sourceProductBatchId = await RecallService.resolveSingleSourceProductBatchId(tx, {
+            referenceType: 'DELIVERY_CHALLAN',
+            referenceId: ret.challan.id,
+            inventoryItemId: sourceItem.id,
+          });
+          if (sourceProductBatchId) {
+            await InventoryService.recordMovement(tx, {
+              itemId: sourceItem.id,
+              type: 'PURCHASE_IN',
+              quantity: item.quantity,
+              referenceType: 'DELIVERY_CHALLAN_RETURN',
+              referenceId: ret.id,
+              note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
+              userId,
+              receiveAtCost: {
+                unitCost: sourceItem.costPrice || 0,
+                batchNumber: `${sourceItem.sku || sourceItem.name}-RETURN`,
+                productBatchId: sourceProductBatchId,
+              },
+            });
+          } else {
+            await InventoryService.stockIn({
+              itemId: sourceItem.id,
+              quantity: item.quantity,
+              referenceType: 'DELIVERY_CHALLAN_RETURN',
+              referenceId: ret.id,
+              note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
+              userId
+            }, tx as any);
+          }
         } else {
           // Traceable, zero-effect-on-available-stock ledger entry — see
           // the RETURN_QUARANTINE_IN comment on the enum.

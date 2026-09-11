@@ -886,6 +886,17 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
       ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
       quantity: { gt: 0 },
       OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
+      // A batch under an active or completed recall must never be selected
+      // as a FIFO source for a franchise dispatch, even though ProductBatch.
+      // quantity itself is never decremented by recall (only InventoryBatch
+      // status is). Batches with no recall row, or only a CANCELLED one,
+      // remain eligible.
+      AND: [{
+        OR: [
+          { recall: { is: null } },
+          { recall: { status: { notIn: ['IN_PROGRESS', 'COMPLETED'] } } },
+        ],
+      }],
     },
     orderBy: { createdAt: 'asc' }, // FIFO
   });

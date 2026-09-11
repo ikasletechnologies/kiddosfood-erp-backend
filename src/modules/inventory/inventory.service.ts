@@ -1,7 +1,7 @@
 import { FranchiseService } from '../franchise/franchise.service';
 import prisma from
   '../../lib/prisma';
-import { ItemCategory, StockMovementType } from '@prisma/client';
+import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
 
 export interface FifoConsumption {
   batchId: string;
@@ -19,6 +19,13 @@ export interface FifoConsumptionResult {
   consumedFromBatches: number;
   totalCost: number;
   unitCost: number;
+  // Quantity of this item sitting in BLOCKED/RETURNED (recalled/quarantined)
+  // lots that depleteBatchesFIFO deliberately skipped. A shortfall alongside
+  // a nonzero value here means the "missing" stock isn't untracked/legacy —
+  // it's specifically quarantined material, and recordMovement uses this to
+  // refuse the transaction instead of silently falling back to the item's
+  // aggregate currentStock (see recordMovement's blockRecalled check).
+  blockedQtyAvailable: number;
 }
 
 function mapCategoryToDb(category?: string): ItemCategory {
@@ -808,18 +815,39 @@ export class InventoryService {
     let fifo: FifoConsumptionResult | undefined;
     let movementBatchId: string | undefined = data.batchId;
     let movementUnitCost: number | undefined = data.unitCost;
+    let consumptionBreakdown: any[] | undefined;
 
     if (stockChange < 0) {
       fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
-      
-      if (data.strictFIFO && fifo.consumedFromBatches < Math.abs(stockChange)) {
+      const shortfall = Math.abs(stockChange) - fifo.consumedFromBatches;
+
+      if (data.strictFIFO && shortfall > 0.0001) {
         throw new Error('Insufficient approved stock available for dispatch. Stock may be blocked or recalled.');
+      }
+
+      // Always-on, regardless of strictFIFO: a shortfall that exists only
+      // because part of this item's stock is BLOCKED/RETURNED (an active
+      // recall) must never be silently absorbed into the item's aggregate
+      // currentStock — that's exactly how POS/dispatch/transfer sold
+      // recalled inventory before this check existed (the shortfall was
+      // real, but nothing distinguished "no batch tracking exists at all"
+      // from "batches exist and are quarantined"). Untracked/legacy items
+      // with no batches at all still work exactly as before, since
+      // blockedQtyAvailable is 0 for them.
+      if (shortfall > 0.0001 && fifo.blockedQtyAvailable > 0) {
+        throw new Error('Cannot complete: this item has recalled/blocked stock and there is insufficient non-recalled stock to fulfill the requested quantity.');
       }
 
       // Only unambiguous when everything came from a single lot — a
       // movement that spans multiple batches has no single Batch ID to
       // report, so it's left null rather than picking one arbitrarily.
       if (fifo.consumptions.length === 1) movementBatchId = fifo.consumptions[0].batchId;
+      // A movement that spans multiple lots has no single Batch ID (above),
+      // which used to make it impossible to trace which ProductBatch(es) a
+      // sale/dispatch actually drew from — see the field comment on
+      // StockMovement.consumptionBreakdown. Persist the full breakdown in
+      // that case, mirroring bulkBreakdown/batchBreakdown elsewhere.
+      if (fifo.consumptions.length > 1) consumptionBreakdown = fifo.consumptions;
       movementUnitCost = fifo.consumedFromBatches > 0 ? fifo.unitCost : (updatedItem.costPrice || 0);
     } else if (stockChange > 0 && data.receiveAtCost) {
       const priorStock = updatedItem.currentStock - stockChange;
@@ -872,6 +900,7 @@ export class InventoryService {
         warehouseId: data.warehouseId ? (data.warehouseId.trim() || null) : null,
         batchId: movementBatchId || null,
         unitCost: movementUnitCost,
+        consumptionBreakdown: consumptionBreakdown as any,
       },
     });
 
@@ -887,18 +916,31 @@ export class InventoryService {
   // warehouse A can't silently draw from stock that's physically in warehouse B.
   static async depleteBatchesFIFO(tx: any, itemId: string, quantity: number, warehouseId?: string): Promise<FifoConsumptionResult> {
     let remaining = quantity;
-    const batches = await tx.inventoryBatch.findMany({
-      where: {
-        inventoryItemId: itemId,
-        currentQty: { gt: 0 },
-        status: 'APPROVED',
-        AND: [
-          { OR: [{ expDate: null }, { expDate: { gte: new Date() } }] },
-          ...(warehouseId ? [{ OR: [{ warehouseId }, { warehouseId: null }] }] : [])
-        ]
-      },
-      orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }]
-    });
+    // Row-locked (FOR UPDATE), not a plain findMany: without this, a sale
+    // can read a batch as APPROVED, a concurrent recall can commit BLOCKED
+    // on that same row a moment later, and this transaction's later
+    // per-batch `update` below (unconditioned on status, since it only
+    // matches by id) would still go through — selling recalled stock
+    // despite the recall having already committed. FOR UPDATE forces this
+    // transaction and initiateRecall/blockSales's UPDATEs on the same rows
+    // to serialize: whichever acquires the row lock first wins, and Postgres
+    // re-checks this WHERE clause against the row's latest committed state
+    // before returning it, so a row that lost the race and got BLOCKED in
+    // between is correctly excluded here rather than silently consumed.
+    const warehouseFilter = warehouseId
+      ? Prisma.sql`AND ("warehouseId" = ${warehouseId} OR "warehouseId" IS NULL)`
+      : Prisma.sql``;
+    const batches: Array<{ id: string; batchNumber: string; billNumber: string | null; productBatchId: string | null; currentQty: number; unitCost: number | null }> = await tx.$queryRaw(Prisma.sql`
+      SELECT id, "batchNumber", "billNumber", "productBatchId", "currentQty", "unitCost"
+      FROM "InventoryBatch"
+      WHERE "inventoryItemId" = ${itemId}
+        AND "currentQty" > 0
+        AND status = 'APPROVED'
+        AND ("expDate" IS NULL OR "expDate" >= now())
+        ${warehouseFilter}
+      ORDER BY "mfgDate" ASC, "createdAt" ASC
+      FOR UPDATE
+    `);
 
     let totalCost = 0;
     const consumptions: FifoConsumption[] = [];
@@ -928,6 +970,23 @@ export class InventoryService {
     }
 
     const consumedFromBatches = quantity - remaining;
+
+    // Only queried when FIFO didn't fully cover the request — the common
+    // case (fully satisfied from APPROVED stock) skips this entirely.
+    let blockedQtyAvailable = 0;
+    if (remaining > 0.0001) {
+      const blockedBatches = await tx.inventoryBatch.findMany({
+        where: {
+          inventoryItemId: itemId,
+          currentQty: { gt: 0 },
+          status: { in: ['BLOCKED', 'RETURNED'] },
+          ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {}),
+        },
+        select: { currentQty: true },
+      });
+      blockedQtyAvailable = blockedBatches.reduce((s: number, b: any) => s + b.currentQty, 0);
+    }
+
     return {
       consumptions,
       consumedFromBatches,
@@ -936,6 +995,7 @@ export class InventoryService {
       // Untracked remainder (no batch left to draw from) is excluded — callers
       // that need a full-quantity cost should fall back to costPrice for it.
       unitCost: consumedFromBatches > 0 ? totalCost / consumedFromBatches : 0,
+      blockedQtyAvailable,
     };
   }
 
