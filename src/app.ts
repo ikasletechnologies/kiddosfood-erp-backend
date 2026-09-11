@@ -476,6 +476,10 @@ app.post('/api/vendor-invoices/:id/approve', authenticate, authorizeRole(['SUPER
 app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.updateStatus);
 
 // Franchise Management & Logistics
+// Franchise Warehouse Setup (must be before /:id routes)
+app.get('/api/franchise/warehouse/status', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getWarehouseStatus);
+app.post('/api/franchise/warehouse/setup', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.setupWarehouse);
+
 app.get('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getAll);
 app.post('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.create);
 app.get('/api/franchise/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getRequests);

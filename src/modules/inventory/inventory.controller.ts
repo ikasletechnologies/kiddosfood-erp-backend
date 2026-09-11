@@ -280,7 +280,13 @@ export class InventoryController {
 
   static async createWarehouse(req: Request, res: Response) {
     try {
-      const { name, location, type, code, status, franchiseId } = req.body;
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const { name, location, type, code, status } = req.body;
+      let franchiseId = req.body.franchiseId;
+      if (franchiseFilter.franchiseId) {
+        franchiseId = franchiseFilter.franchiseId;
+      }
       const warehouse = await WarehouseService.create({ name, location, type, code, status, franchiseId });
       res.status(201).json(warehouse);
     } catch (error: any) {
