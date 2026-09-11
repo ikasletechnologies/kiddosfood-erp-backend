@@ -1112,7 +1112,7 @@ export class ProcurementService {
           balanceAfterTransaction: nextBalance,
           paymentMode: 'CASH',
           referenceType: 'ADVANCE',
-          referenceId: po.id,
+          referenceId: po.poNumber || po.id,
           note: `Advance Payment for PO #${po.poNumber || po.id.substring(0, 8)}`
         }
       });

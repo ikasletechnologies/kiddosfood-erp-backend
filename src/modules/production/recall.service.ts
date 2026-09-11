@@ -64,6 +64,38 @@ export class RecallService {
     return reasons;
   }
 
+  // A recalled batch's approved bulk output sits in a bulk InventoryItem
+  // pool shared with every other ProductBatch of the same recipe — FIFO in
+  // startPackaging() has no productBatchId scoping (by design, see the
+  // production-costing investigation), so a packaging run nominally "for"
+  // another batch can have actually drawn on THIS batch's bulk lot. That
+  // packaging run's ProductPackaging.bulkBreakdown (recorded at reservation
+  // time) is the only place this cross-batch consumption is recorded — the
+  // resulting retail InventoryBatch is tagged with the OTHER batch's
+  // productBatchId, so a plain `InventoryBatch WHERE productBatchId = X`
+  // lookup can never find it. This walks bulkBreakdown to find every other
+  // ProductBatch whose retail output may therefore contain this batch's
+  // material, so a recall can't silently miss it.
+  private static async findCrossBatchAffectedIds(tx: any, productBatchId: string, recipeId: string | undefined): Promise<string[]> {
+    if (!recipeId) return [];
+    const packagings = await tx.productPackaging.findMany({
+      where: {
+        bulkBreakdown: { not: Prisma.JsonNull },
+        batch: { production: { recipeId } },
+      },
+      select: { batchId: true, bulkBreakdown: true },
+    });
+    const affected = new Set<string>();
+    for (const p of packagings) {
+      if (p.batchId === productBatchId) continue; // its own packaging run, not "cross"
+      const breakdown: any[] = Array.isArray(p.bulkBreakdown) ? p.bulkBreakdown : [];
+      if (breakdown.some((b) => b.productBatchId === productBatchId)) {
+        affected.add(p.batchId);
+      }
+    }
+    return Array.from(affected);
+  }
+
   // Authoritative quantity + unit resolution for a batch. Never defaults to
   // 0/"KG" silently — every figure is read from the same fields
   // production/QC actually wrote (ProductBatch.quantity/approvedQty/
@@ -119,6 +151,14 @@ export class RecallService {
       : [];
     const wastedQty = wasteMovements.reduce((s, m) => s + Math.abs(m.quantity), 0);
 
+    const crossBatchAffectedIds = await this.findCrossBatchAffectedIds(prisma, productBatchId, batch.production?.recipeId);
+    const crossBatchAffected = crossBatchAffectedIds.length
+      ? await prisma.productBatch.findMany({
+          where: { id: { in: crossBatchAffectedIds } },
+          select: { id: true, batchCode: true, qcStatus: true, approvedQty: true, packagedQty: true },
+        })
+      : [];
+
     return {
       batch,
       unit,
@@ -131,6 +171,11 @@ export class RecallService {
       distributedQty,
       wastedQty,
       inventoryBatches,
+      // Other ProductBatches whose packaged output may contain this batch's
+      // material via the shared bulk pool (see findCrossBatchAffectedIds).
+      // Not folded into the figures above — reported separately so it's
+      // never silently conflated with this batch's own direct stock.
+      crossBatchAffected,
     };
   }
 
@@ -273,13 +318,39 @@ export class RecallService {
       }
       const blockedQty = blockable.reduce((s, b) => s + b.currentQty, 0);
 
+      // This batch's bulk output can have been blended into OTHER batches'
+      // packaging runs via the shared bulk pool (see
+      // findCrossBatchAffectedIds) — their retail stock is tagged with THAT
+      // other batch's productBatchId, so it's invisible to the direct
+      // lookup above. Block it too, or a recall could quarantine this
+      // batch's own lots while contaminated material sold under a
+      // different batch's label stays on shelves.
+      const crossBatchAffectedIds = await this.findCrossBatchAffectedIds(tx, productBatchId, batch.production?.recipeId);
+      let crossBlockedQty = 0;
+      if (crossBatchAffectedIds.length) {
+        const crossInventoryBatches = await tx.inventoryBatch.findMany({
+          where: { productBatchId: { in: crossBatchAffectedIds }, status: 'APPROVED' },
+        });
+        if (crossInventoryBatches.length) {
+          await tx.inventoryBatch.updateMany({
+            where: { id: { in: crossInventoryBatches.map((b: any) => b.id) } },
+            data: { status: 'BLOCKED' },
+          });
+          crossBlockedQty = crossInventoryBatches.reduce((s: number, b: any) => s + b.currentQty, 0);
+        }
+      }
+
       // Explicit about what this figure is (and isn't): only the stock still
       // sitting in warehouse right now. Anything already dispatched before the
       // recall started isn't in currentQty any more — that portion shows up
       // separately as "distributed" once locateDistribution runs, and the two
       // numbers are deliberately not meant to be summed with this one.
-      const message = blockedQty > 0
-        ? `${blockedQty} ${unit} of remaining warehouse stock quarantined (blocked from sale/dispatch). Any quantity already dispatched before this recall is tracked separately as distributed.`
+      const message = blockedQty > 0 || crossBlockedQty > 0
+        ? `${blockedQty} ${unit} of remaining warehouse stock quarantined directly (blocked from sale/dispatch)`
+          + (crossBlockedQty > 0
+            ? `, plus ${crossBlockedQty} ${unit} quarantined from ${crossBatchAffectedIds.length} other batch(es) whose packaging drew on this batch's shared bulk pool.`
+            : '.')
+          + ' Any quantity already dispatched before this recall is tracked separately as distributed.'
         : 'No warehouse stock remained for this batch — nothing available to quarantine.';
 
       await tx.batchRecallEvent.create({
@@ -288,8 +359,15 @@ export class RecallService {
           event: 'RECALL_INITIATED',
           status: 'SUCCESS',
           actor: data.userId || 'system',
-          affectedQty: blockedQty,
-          details: { reason: data.reason, reasonNotes: data.reasonNotes || null, blockedInventoryBatchIds: blockable.map((b) => b.id), message },
+          affectedQty: blockedQty + crossBlockedQty,
+          details: {
+            reason: data.reason,
+            reasonNotes: data.reasonNotes || null,
+            blockedInventoryBatchIds: blockable.map((b) => b.id),
+            crossBatchAffectedProductBatchIds: crossBatchAffectedIds,
+            crossBlockedQty,
+            message,
+          },
         },
       });
 
@@ -339,8 +417,29 @@ export class RecallService {
       // matches getBatchQuantities()'s definition of "distributed" exactly.
       const distributedQty = movements.reduce((s, m) => s + Math.abs(m.quantity), 0);
 
-      const orderIds = Array.from(new Set(movements.filter((m) => m.referenceType === 'ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
-      const franchiseOrderIds = Array.from(new Set(movements.filter((m) => m.referenceType === 'FRANCHISE_ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
+      // This batch's bulk output can have been blended into OTHER batches'
+      // packaging runs via the shared bulk pool (see
+      // findCrossBatchAffectedIds) — that stock is tagged with the OTHER
+      // batch's productBatchId and dispatched under its own StockMovement
+      // rows, so it's entirely invisible to the direct query above. Trace
+      // it separately so the recall report doesn't understate where
+      // potentially-affected material actually went.
+      const crossBatchAffectedIds = await this.findCrossBatchAffectedIds(tx, productBatchId, batch?.production?.recipeId);
+      const crossInventoryBatches = crossBatchAffectedIds.length
+        ? await tx.inventoryBatch.findMany({ where: { productBatchId: { in: crossBatchAffectedIds } } })
+        : [];
+      const crossInventoryBatchIds = crossInventoryBatches.map((b: any) => b.id);
+      const crossMovements = crossInventoryBatchIds.length
+        ? await tx.stockMovement.findMany({
+            where: { batchId: { in: crossInventoryBatchIds }, quantity: { lt: 0 }, referenceType: { in: GENUINE_DISTRIBUTION_REFERENCE_TYPES } },
+            include: { warehouse: true },
+          })
+        : [];
+      const crossDistributedQty = crossMovements.reduce((s: number, m: any) => s + Math.abs(m.quantity), 0);
+
+      const allMovements = [...movements, ...crossMovements];
+      const orderIds = Array.from(new Set(allMovements.filter((m) => m.referenceType === 'ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
+      const franchiseOrderIds = Array.from(new Set(allMovements.filter((m) => m.referenceType === 'FRANCHISE_ORDER').map((m) => m.referenceId).filter((id): id is string => !!id)));
 
       const orders = orderIds.length
         ? await tx.order.findMany({ where: { id: { in: orderIds } }, select: { id: true, invoiceNum: true, franchise: { select: { name: true } } } })
@@ -349,8 +448,10 @@ export class RecallService {
         ? await tx.franchiseOrder.findMany({ where: { id: { in: franchiseOrderIds } }, select: { id: true, orderNumber: true, franchiseId: true, franchise: { select: { name: true } } } })
         : [];
 
-      const locations = new Map<string, { type: string; label: string; qty: number }>();
-      for (const m of movements) {
+      const crossMovementIds = new Set(crossMovements.map((m: any) => m.id));
+      const locations = new Map<string, { type: string; label: string; qty: number; crossBatch: boolean }>();
+      for (const m of allMovements) {
+        const isCross = crossMovementIds.has(m.id);
         const qty = Math.abs(m.quantity);
         let key: string;
         let type: string;
@@ -373,8 +474,13 @@ export class RecallService {
             ? `${(m.referenceType || 'Movement').replace(/_/g, ' ')} — ${m.warehouse.name}`
             : (m.referenceType || 'Other Movement').replace(/_/g, ' ');
         }
+        // Cross-batch and direct dispatches to the same nominal location are
+        // kept as separate rows (never merged into one qty) — the whole
+        // point is to not understate or blur which portion is only
+        // suspected via the shared bulk pool versus this batch's own lot.
+        if (isCross) key = `CROSS:${key}`;
 
-        const existing = locations.get(key) || { type, label, qty: 0 };
+        const existing = locations.get(key) || { type, label: isCross ? `(Cross-batch pool) ${label}` : label, qty: 0, crossBatch: isCross };
         existing.qty += qty;
         locations.set(key, existing);
       }
@@ -391,6 +497,9 @@ export class RecallService {
       // at RECALL_INITIATED.
       const message = affectedLocations.length
         ? `${distributedQty} ${unit} already dispatched before this recall, traced to ${affectedLocations.length} location(s).`
+          + (crossDistributedQty > 0
+            ? ` An additional ${crossDistributedQty} ${unit} was dispatched from ${crossBatchAffectedIds.length} other batch(es) whose packaging drew on this batch's shared bulk pool — treat as suspect pending further review.`
+            : '')
         : 'No stock had left the warehouse for this batch before the recall — nothing to trace.';
 
       await tx.batchRecallEvent.create({
@@ -399,12 +508,12 @@ export class RecallService {
           event: 'DISTRIBUTION_LOCATED',
           status: 'SUCCESS',
           actor: userId || 'system',
-          affectedQty: distributedQty,
-          details: { affectedLocations, availableWarehouseQty, message } as any,
+          affectedQty: distributedQty + crossDistributedQty,
+          details: { affectedLocations, availableWarehouseQty, crossDistributedQty, crossBatchAffectedProductBatchIds: crossBatchAffectedIds, message } as any,
         },
       });
 
-      return { affectedLocations, distributedQty, availableWarehouseQty, message };
+      return { affectedLocations, distributedQty, crossDistributedQty, availableWarehouseQty, message };
     });
   }
 

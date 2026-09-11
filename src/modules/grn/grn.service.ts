@@ -249,6 +249,10 @@ export class GRNService {
             inventoryItemId: item.materialId!,
             batchNumber: batchRef,
             lotNumber: item.lotNumber,
+            // Always the real Purchase Bill reference, independent of
+            // whichever value batchNumber ended up prioritizing above — the
+            // business-facing consumption screens read this, not batchNumber.
+            billNumber,
             mfgDate: item.mfgDate,
             expDate: item.expDate,
             initialQty: canonicalQty,

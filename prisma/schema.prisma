@@ -712,6 +712,14 @@ model ProductPackaging {
   spoiledQty      Int?
   confirmedAt     DateTime?
   createdAt       DateTime           @default(now())
+  // FIFO consumption snapshot of the bulk InventoryBatch lot(s) actually
+  // drawn from at startPackaging() time — same shape/purpose as
+  // ProductionItem.batchBreakdown for raw materials: [{ batchId,
+  // productBatchId, billNumber, qty, unitCost, totalCost }]. This is the
+  // authoritative source for confirmPackaging()'s allocatedBulkCost, since
+  // the bulk pool can be shared across multiple ProductBatches at different
+  // costs and FIFO may not select the batch open on screen.
+  bulkBreakdown   Json?
   batch           ProductBatch       @relation(fields: [batchId], references: [id], onDelete: Cascade)
   wasteEntries    WasteEntry[]
 }
@@ -1677,6 +1685,14 @@ model InventoryBatch {
   inventoryItemId String
   batchNumber     String
   lotNumber       String?
+  // The actual Purchase Bill reference (BILL-<PO>-<seq>), always populated
+  // at GRN approval regardless of whether a lot/vendor-batch number was also
+  // entered. batchNumber prioritizes the lot code for internal traceability,
+  // but the business-facing reference for raw-material consumption should be
+  // this field. Left null for production/QC/packaging-created batches (bulk
+  // and retail lots), which already carry the correct reference in
+  // batchNumber (= ProductBatch.batchCode).
+  billNumber      String?
   mfgDate         DateTime?
   expDate         DateTime?
   initialQty      Float

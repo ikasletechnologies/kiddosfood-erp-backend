@@ -746,7 +746,7 @@ export class ProductionService {
       // Reserve the required bulk stock immediately against this run.
       // This ensures it cannot be consumed by other concurrent packaging runs
       // and acts as the transactional deduction.
-      await InventoryService.recordMovement(tx, {
+      const { fifo } = await InventoryService.recordMovement(tx, {
         itemId: bulkItem.id,
         type: 'PRODUCTION_OUT',
         quantity: -totalWeightNeeded,
@@ -755,6 +755,27 @@ export class ProductionService {
         note: `Packaging started: Reserved bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
         userId: data.userId,
       });
+
+      // The bulk pool is shared across every ProductBatch of this recipe —
+      // FIFO can draw from an older/cheaper (or newer/pricier) batch than
+      // the one being packaged here. Record exactly which lot(s) it actually
+      // consumed so confirmPackaging() can cost this run from the real
+      // consumption instead of just this ProductBatch's own unitCost, and so
+      // recall traceability can follow material across batch boundaries.
+      const bulkBreakdown = fifo?.consumptions?.map(c => ({
+        batchId: c.batchId,
+        productBatchId: c.productBatchId,
+        billNumber: c.billNumber,
+        qty: c.qty,
+        unitCost: c.unitCost,
+        totalCost: c.totalCost,
+      })) ?? [];
+      if (bulkBreakdown.length) {
+        await tx.productPackaging.update({
+          where: { id: packaging.id },
+          data: { bulkBreakdown },
+        });
+      }
 
       return { packaging };
     });
@@ -957,8 +978,18 @@ export class ProductionService {
         });
       }
 
-      // Total bulk cost allocated to this packaging run
-      const allocatedBulkCost = totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
+      // Total bulk cost allocated to this packaging run. The bulk pool is
+      // shared across every ProductBatch of this recipe, so FIFO in
+      // startPackaging() may have drawn from a different batch's lot than
+      // the one being packaged here (see bulkBreakdown, recorded there at
+      // reservation time). Cost this run from what was ACTUALLY consumed,
+      // not from this ProductBatch's own unitCost — otherwise the physical
+      // lot consumed and the cost charged to it can silently diverge.
+      const bulkBreakdown: any[] = Array.isArray(packaging.bulkBreakdown) ? packaging.bulkBreakdown : [];
+      const allocatedBulkCost = bulkBreakdown.length
+        ? bulkBreakdown.reduce((s, b) => s + (b.totalCost || 0), 0)
+        // Fallback for packaging tickets created before bulkBreakdown existed.
+        : totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
       // Effective unit cost per good packet (allocated bulk cost absorbed by good packets)
       const effectiveRetailUnitCost = good > 0
         ? Number((allocatedBulkCost / good).toFixed(4))

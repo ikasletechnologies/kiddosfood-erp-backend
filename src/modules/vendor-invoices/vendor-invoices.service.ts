@@ -416,7 +416,7 @@ export class VendorInvoiceService {
         balanceAfterTransaction: nextBalance,
         sourceModule: 'FINANCE',
         referenceType: 'PURCHASE',
-        referenceId: invoice.id,
+        referenceId: invoice.invoiceNumber,
         invoiceId: invoice.id,
         paymentMode: 'CASH',
         note: `Purchase Bill #${invoice.invoiceNumber} — Liability Recognized`

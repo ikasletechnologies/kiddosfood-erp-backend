@@ -915,7 +915,11 @@ export class InventoryService {
       remaining -= consumeQty;
       consumptions.push({
         batchId: batch.id,
-        billNumber: batch.batchNumber,
+        // Real Purchase Bill reference when this lot came from a GRN;
+        // falls back to batchNumber for production/QC/packaging-created
+        // bulk & retail lots (which have no purchase bill) and for older
+        // rows recorded before billNumber existed.
+        billNumber: batch.billNumber || batch.batchNumber,
         productBatchId: batch.productBatchId,
         qty: consumeQty,
         unitCost,
