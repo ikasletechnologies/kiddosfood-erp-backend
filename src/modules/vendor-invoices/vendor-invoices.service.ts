@@ -40,6 +40,7 @@ export class VendorInvoiceService {
 
     const { Decimal } = Prisma;
     let acceptedSubtotal = new Decimal(0);
+    let acceptedValueAtPoPrice = new Decimal(0);
     let cgst = new Decimal(0);
     let sgst = new Decimal(0);
     let igst = new Decimal(0);
@@ -50,7 +51,7 @@ export class VendorInvoiceService {
       if (!gi.acceptedQty || gi.acceptedQty <= 0) continue;
       const poItem = po.poItems.find(p => p.inventoryItemId === gi.materialId);
       const gstRate = new Decimal(poItem?.gstRate ?? 0);
-      
+
       const lineSubtotal = new Decimal(gi.acceptedQty).times(gi.price);
       const lineTax = lineSubtotal.times(gstRate).dividedBy(100);
       const lineSplit = splitGstAmount(lineTax.toNumber(), buyerState, sellerState);
@@ -60,16 +61,24 @@ export class VendorInvoiceService {
       sgst = sgst.plus(lineSplit.sgst);
       igst = igst.plus(lineSplit.igst);
 
+      // Fulfillment ratio (below) must reflect how much of the ORDER was
+      // received, not how much the price happened to change at receipt —
+      // pricing it at the PO's own agreed price (not gi.price, which may be
+      // an operator override) keeps a price change from itself inflating or
+      // deflating the pro-rated discount/freight.
+      const poPrice = poItem ? new Decimal(poItem.price) : new Decimal(gi.price);
+      acceptedValueAtPoPrice = acceptedValueAtPoPrice.plus(new Decimal(gi.acceptedQty).times(poPrice));
+
       if (!warehouseId && gi.warehouseId) warehouseId = gi.warehouseId;
     }
 
-    // 2. Pro-rata PO Discount and Freight based on accepted value
+    // 2. Pro-rata PO Discount and Freight based on quantity fulfillment
     const poSubtotal = new Decimal(po.subtotal || 1); // Avoid div by 0
-    const fulfillmentRatio = acceptedSubtotal.dividedBy(poSubtotal);
-    
+    const fulfillmentRatio = acceptedValueAtPoPrice.dividedBy(poSubtotal);
+
     const poDiscount = new Decimal(po.discountAmount || 0);
     const poFreight = new Decimal(po.freightCost || 0);
-    
+
     const proRataDiscount = poDiscount.times(fulfillmentRatio);
     const proRataFreight = poFreight.times(fulfillmentRatio);
 
@@ -227,6 +236,22 @@ export class VendorInvoiceService {
         commercials = this.computeCommercialsFromPO(po, grn?.items, po.vendor?.state, sellerState);
       }
 
+      // Discount and freight are the operator's own call on this specific
+      // bill (e.g. a negotiated adjustment) — not a fact the server can derive
+      // the way GST is, so an explicit value from the caller (the reviewed
+      // "New Purchase Bill" form) wins over the PO's pro-rata default computed
+      // into `commercials` above. Subtotal/tax stay server-derived regardless
+      // (see the comment above `commercials = this.computeCommercialsFromPO`)
+      // to avoid reopening the GST-vanishing bug that server-side derivation
+      // was built to fix — the final amount is then recomputed from those plus
+      // whichever discount/freight actually wins, so the two stay consistent
+      // instead of the total silently reflecting a discount that was overridden.
+      const finalSubtotal = commercials?.subtotal ?? data.subtotal ?? 0;
+      const finalTaxAmount = commercials?.taxAmount ?? data.taxAmount ?? 0;
+      const finalDiscountAmount = data.discountAmount ?? commercials?.discountAmount ?? 0;
+      const finalFreightCost = data.freightCost ?? commercials?.freightCost ?? 0;
+      const finalAmount = Number((finalSubtotal - finalDiscountAmount + finalTaxAmount + finalFreightCost).toFixed(2));
+
       let invoiceId: string;
 
       if (data.grnId) {
@@ -256,14 +281,14 @@ export class VendorInvoiceService {
               vendorId: data.vendorId,
               poId: actualPoId || targetInvoice.poId,
               invoiceNumber: data.invoiceNumber || targetInvoice.invoiceNumber,
-              amount: commercials?.amount ?? data.amount,
-              subtotal: commercials?.subtotal ?? data.subtotal,
-              taxAmount: commercials?.taxAmount ?? data.taxAmount,
+              amount: finalAmount,
+              subtotal: finalSubtotal,
+              taxAmount: finalTaxAmount,
               cgst: commercials?.cgst,
               sgst: commercials?.sgst,
               igst: commercials?.igst,
-              discountAmount: commercials?.discountAmount ?? data.discountAmount ?? 0,
-              freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
+              discountAmount: finalDiscountAmount,
+              freightCost: finalFreightCost,
               warehouseId: commercials?.warehouseId,
               billDate: data.billDate ? new Date(data.billDate) : undefined,
               // Preserve the existing value when the caller doesn't send one
@@ -283,14 +308,14 @@ export class VendorInvoiceService {
             poId: actualPoId,
             grnId: data.grnId || null,
             invoiceNumber: data.invoiceNumber || `BILL-${Date.now().toString().slice(-6)}`,
-            amount: commercials?.amount ?? data.amount,
-            subtotal: commercials?.subtotal ?? data.subtotal,
-            taxAmount: commercials?.taxAmount ?? data.taxAmount,
+            amount: finalAmount,
+            subtotal: finalSubtotal,
+            taxAmount: finalTaxAmount,
             cgst: commercials?.cgst,
             sgst: commercials?.sgst,
             igst: commercials?.igst,
-            discountAmount: commercials?.discountAmount ?? data.discountAmount ?? 0,
-            freightCost: commercials?.freightCost ?? data.freightCost ?? 0,
+            discountAmount: finalDiscountAmount,
+            freightCost: finalFreightCost,
             warehouseId: commercials?.warehouseId,
             status: 'PENDING',
             billDate: data.billDate ? new Date(data.billDate) : new Date(),

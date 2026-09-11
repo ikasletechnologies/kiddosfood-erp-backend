@@ -116,6 +116,7 @@ export class RecipeService {
 
   static async getRecipes() {
     const recipes = await prisma.recipe.findMany({
+      orderBy: { createdAt: 'desc' },
       include: {
         product: true,
         recipeItems: { include: { inventoryItem: true } },

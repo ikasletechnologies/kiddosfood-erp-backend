@@ -2189,3 +2189,22 @@ enum InventoryStockState {
   EXPIRED
   RETURNED
 }
+
+// Cache of GSTIN lookups so we only pay the GSTVerify per-call fee once per
+// GSTIN; subsequent lookups (any user, any franchise) are served from here.
+model GstinCache {
+  id               String   @id @default(uuid())
+  gstin            String   @unique
+  legalName        String?
+  tradeName        String?
+  status           String?
+  constitution     String?
+  taxpayerType     String?
+  registrationDate String?
+  pan              String?
+  address          String?
+  state            String?
+  natureOfBusiness Json?
+  raw              Json?
+  fetchedAt        DateTime @default(now())
+}
