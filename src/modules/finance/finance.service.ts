@@ -1,3 +1,7 @@
+function formatReferenceType(ref: string): string {
+  if (!ref) return '—';
+  return ref.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
@@ -3138,26 +3142,59 @@ export class FinanceService {
   static async getPartyStatement(filters: {
     franchiseId?: string;
     customerId?: string;
+    vendorId?: string;
+    dealerId?: string;
+    partyId?: string;
+    partyType?: 'CUSTOMER' | 'DEALER' | 'VENDOR';
+    partyName?: string;
     startDate?: Date;
     endDate?: Date;
   }) {
-    const { franchiseId, customerId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate } = filters;
+    const targetPartyId = (filters.partyId || filters.customerId || '').trim();
+    const targetPartyName = (filters.partyName || '').trim();
     const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch all customers and vendors for current franchise to populate dropdown
-    const customersList = await prisma.customer.findMany({
-      where: { franchiseId },
-      select: { id: true, name: true, phone: true }
-    });
-    const vendorsList = await prisma.vendor.findMany({
-      select: { id: true, name: true, contact: true }
-    });
+    // Fetch all customers, dealers, and vendors to populate dropdown & identify requested party
+    const [customersList, dealersList, vendorsList] = await Promise.all([
+      prisma.customer.findMany({
+        where: franchiseId ? { franchiseId } : {},
+        select: { id: true, name: true, phone: true }
+      }),
+      prisma.dealer.findMany({
+        where: franchiseId ? { franchiseId } : {},
+        select: { id: true, name: true, phone: true }
+      }),
+      prisma.vendor.findMany({
+        select: { id: true, name: true, contact: true }
+      })
+    ]);
+
     const combinedParties = [
-      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone })),
-      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact }))
+      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' })),
+      ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' })),
+      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' }))
     ];
 
-    if (!customerId) {
+    // Determine target party
+    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR' } | null = null;
+
+    if (targetPartyId) {
+      const match = combinedParties.find(p => p.id === targetPartyId);
+      if (match) {
+        resolvedParty = match as any;
+      }
+    }
+
+    if (!resolvedParty && targetPartyName) {
+      const nameMatch = combinedParties.find(p => p.name.toLowerCase() === targetPartyName.toLowerCase())
+        || combinedParties.find(p => p.name.toLowerCase().includes(targetPartyName.toLowerCase()));
+      if (nameMatch) {
+        resolvedParty = nameMatch as any;
+      }
+    }
+
+    if (!resolvedParty) {
       return {
         customers: combinedParties,
         transactions: [],
@@ -3173,68 +3210,369 @@ export class FinanceService {
       };
     }
 
-    // Fetch customer or vendor ledgers
-    const isCustomer = customersList.some(c => c.id === customerId);
-    let ledgers: any[] = [];
-    if (isCustomer) {
-      ledgers = await prisma.customerLedger.findMany({
-        where: {
-          customerId,
-          createdAt: {
-            ...(start ? { gte: start } : {}),
-            ...(end ? { lte: end } : {})
-          }
-        },
-        orderBy: { createdAt: 'asc' }
+    const { id: partyId, partyType } = resolvedParty;
+
+    // --- 1. DEALER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
+    if (partyType === 'DEALER') {
+      const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
+      const openingBal = Number(dealer?.openingBalance) || 0;
+      let runningBalance = openingBal;
+
+      const [orders, payments, challans] = await Promise.all([
+        prisma.order.findMany({
+          where: {
+            partyType: 'DEALER',
+            partyId,
+            status: { not: 'CANCELLED' },
+            createdAt: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          },
+          include: {
+            payments: { where: { isCancelled: false } }
+          },
+          orderBy: { createdAt: 'asc' }
+        }),
+        prisma.payment.findMany({
+          where: {
+            entityType: 'DEALER',
+            entityId: partyId,
+            isCancelled: false,
+            status: 'SUCCESS',
+            orderId: null, // Avoid double counting payments directly on orders
+            createdAt: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          },
+          orderBy: { createdAt: 'asc' }
+        }),
+        prisma.deliveryChallan.findMany({
+          where: {
+            dealerId: partyId,
+            challanDate: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          },
+          orderBy: { challanDate: 'asc' }
+        })
+      ]);
+
+      type RawTxn = {
+        date: Date;
+        txnType: string;
+        refNo: string;
+        paymentType: string;
+        debit: number;
+        credit: number;
+        total: number;
+        note?: string;
+      };
+
+      const rawTxns: RawTxn[] = [];
+
+      // Opening balance entry if within range or as first row
+      if (openingBal !== 0 && (!start || (dealer?.asOfDate && new Date(dealer.asOfDate) >= start))) {
+        rawTxns.push({
+          date: dealer?.asOfDate ? new Date(dealer.asOfDate) : (dealer?.createdAt || new Date()),
+          txnType: 'Opening Balance',
+          refNo: 'OB-0001',
+          paymentType: '—',
+          debit: openingBal > 0 ? openingBal : 0,
+          credit: openingBal < 0 ? Math.abs(openingBal) : 0,
+          total: Math.abs(openingBal),
+          note: 'Dealer Opening Balance'
+        });
+      }
+
+      for (const o of orders) {
+        rawTxns.push({
+          date: o.createdAt,
+          txnType: 'POS Sale',
+          refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+          paymentType: o.paymentType || 'CASH',
+          debit: o.totalAmount,
+          credit: 0,
+          total: o.totalAmount
+        });
+
+        for (const p of o.payments) {
+          rawTxns.push({
+            date: p.createdAt,
+            txnType: 'Payment-In',
+            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+            paymentType: p.paymentMode || 'CASH',
+            debit: 0,
+            credit: p.paidAmount,
+            total: p.paidAmount
+          });
+        }
+      }
+
+      for (const p of payments) {
+        rawTxns.push({
+          date: p.createdAt,
+          txnType: 'Payment-In',
+          refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+          paymentType: p.paymentMode || 'CASH',
+          debit: 0,
+          credit: p.paidAmount,
+          total: p.paidAmount
+        });
+      }
+
+      for (const c of challans) {
+        rawTxns.push({
+          date: c.challanDate,
+          txnType: 'Delivery Challan',
+          refNo: c.challanNumber || c.id.slice(0, 8).toUpperCase(),
+          paymentType: '—',
+          debit: 0,
+          credit: 0,
+          total: c.totalAmount
+        });
+      }
+
+      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      let totalSale = 0;
+      let totalMoneyIn = 0;
+      runningBalance = 0;
+
+      const transactions = rawTxns.map(t => {
+        totalSale += t.debit;
+        totalMoneyIn += t.credit;
+        // Receivable increases with debits (sales), decreases with credits (payments)
+        runningBalance += t.debit - t.credit;
+
+        return {
+          date: new Date(t.date).toISOString().split('T')[0],
+          txnType: t.txnType,
+          refNo: t.refNo,
+          paymentType: t.paymentType,
+          total: t.total,
+          debit: t.debit,
+          credit: t.credit,
+          receivedPaid: t.credit > 0 ? t.credit : t.debit,
+          txnBalance: t.total,
+          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
+          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+          runningBalance
+        };
       });
-    } else {
-      ledgers = await prisma.vendorLedger.findMany({
-        where: {
-          vendorId: customerId,
-          createdAt: {
-            ...(start ? { gte: start } : {}),
-            ...(end ? { lte: end } : {})
-          }
-        },
-        orderBy: { createdAt: 'asc' }
-      });
+
+      return {
+        customers: combinedParties,
+        partyType: 'DEALER',
+        partyName: resolvedParty.name,
+        accountingType: 'RECEIVABLE',
+        transactions,
+        summary: {
+          totalSale,
+          totalPurchase: 0,
+          totalExpense: 0,
+          totalMoneyIn,
+          totalMoneyOut: 0,
+          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
+          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
+        }
+      };
     }
 
-    // Format transaction rows
-    let runningBalance = 0;
-    const transactions = ledgers.map(entry => {
-      const isDebit = entry.type === 'DEBIT';
-      runningBalance += isDebit ? entry.amount : -entry.amount;
+    // --- 2. CUSTOMER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
+    if (partyType === 'CUSTOMER') {
+      const customer = await prisma.customer.findUnique({ where: { id: partyId } });
+      const openingBal = Number(customer?.openingBalance) || 0;
+
+      const [ledgers, orders] = await Promise.all([
+        prisma.customerLedger.findMany({
+          where: {
+            customerId: partyId,
+            createdAt: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          },
+          orderBy: { createdAt: 'asc' }
+        }),
+        prisma.order.findMany({
+          where: {
+            customerId: partyId,
+            status: { not: 'CANCELLED' },
+            createdAt: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {})
+            }
+          },
+          include: {
+            payments: { where: { isCancelled: false } }
+          },
+          orderBy: { createdAt: 'asc' }
+        })
+      ]);
+
+      let rawTxns: Array<{
+        date: Date;
+        txnType: string;
+        refNo: string;
+        paymentType: string;
+        debit: number;
+        credit: number;
+        total: number;
+      }> = [];
+
+      if (ledgers.length > 0) {
+        rawTxns = ledgers.map(l => ({
+          date: l.createdAt,
+          txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
+          refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
+          paymentType: l.paymentMode || '—',
+          debit: l.type === 'DEBIT' ? l.amount : 0,
+          credit: l.type === 'CREDIT' ? l.amount : 0,
+          total: l.amount
+        }));
+      } else {
+        // Synthesize from orders & payments & opening balance
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: customer?.asOfDate ? new Date(customer.asOfDate) : (customer?.createdAt || new Date()),
+            txnType: 'Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal > 0 ? openingBal : 0,
+            credit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            total: Math.abs(openingBal)
+          });
+        }
+
+        for (const o of orders) {
+          rawTxns.push({
+            date: o.createdAt,
+            txnType: 'Sale',
+            refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+            paymentType: o.paymentType || 'CASH',
+            debit: o.totalAmount,
+            credit: 0,
+            total: o.totalAmount
+          });
+
+          for (const p of o.payments) {
+            rawTxns.push({
+              date: p.createdAt,
+              txnType: 'Payment-In',
+              refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+              paymentType: p.paymentMode || 'CASH',
+              debit: 0,
+              credit: p.paidAmount,
+              total: p.paidAmount
+            });
+          }
+        }
+      }
+
+      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      let totalSale = 0;
+      let totalMoneyIn = 0;
+      let runningBalance = 0;
+
+      const transactions = rawTxns.map(t => {
+        totalSale += t.debit;
+        totalMoneyIn += t.credit;
+        runningBalance += t.debit - t.credit;
+
+        return {
+          date: new Date(t.date).toISOString().split('T')[0],
+          txnType: t.txnType,
+          refNo: t.refNo,
+          paymentType: t.paymentType,
+          total: t.total,
+          debit: t.debit,
+          credit: t.credit,
+          receivedPaid: t.credit > 0 ? t.credit : t.debit,
+          txnBalance: t.total,
+          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
+          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+          runningBalance
+        };
+      });
+
+      return {
+        customers: combinedParties,
+        partyType: 'CUSTOMER',
+        partyName: resolvedParty.name,
+        accountingType: 'RECEIVABLE',
+        transactions,
+        summary: {
+          totalSale,
+          totalPurchase: 0,
+          totalExpense: 0,
+          totalMoneyIn,
+          totalMoneyOut: 0,
+          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
+          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
+        }
+      };
+    }
+
+    // --- 3. VENDOR (PAYABLE: Credits increase payable, Debits decrease payable) ---
+    const vendorLedgers = await prisma.vendorLedger.findMany({
+      where: {
+        vendorId: partyId,
+        createdAt: {
+          ...(start ? { gte: start } : {}),
+          ...(end ? { lte: end } : {})
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    let totalPurchase = 0;
+    let totalMoneyOut = 0;
+    let runningPayable = 0;
+
+    const transactions = vendorLedgers.map(entry => {
+      const isCredit = entry.type === 'CREDIT'; // Purchase Bill / Invoice increases payable
+      const isDebit = entry.type === 'DEBIT';   // Payment Out / Purchase Return decreases payable
+      const amount = Number(entry.amount) || 0;
+
+      if (isCredit) totalPurchase += amount;
+      if (isDebit) totalMoneyOut += amount;
+
+      runningPayable += isCredit ? amount : -amount;
+
       return {
         date: entry.createdAt.toISOString().split('T')[0],
-        txnType: entry.referenceType || 'Payment',
+        txnType: entry.referenceType ? formatReferenceType(entry.referenceType) : 'Payment Out',
         refNo: entry.referenceId ? entry.referenceId.slice(0, 8).toUpperCase() : '—',
         paymentType: entry.paymentMode || '—',
-        total: entry.amount,
-        receivedPaid: isDebit ? 0 : entry.amount,
-        txnBalance: entry.amount,
-        receivableBalance: runningBalance >= 0 ? runningBalance : 0,
-        payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+        total: amount,
+        debit: isDebit ? amount : 0,
+        credit: isCredit ? amount : 0,
+        receivedPaid: isDebit ? amount : 0,
+        txnBalance: amount,
+        receivableBalance: runningPayable < 0 ? Math.abs(runningPayable) : 0,
+        payableBalance: runningPayable >= 0 ? runningPayable : 0,
+        runningBalance: runningPayable
       };
     });
 
-    // Compute summaries
-    const totalSale = isCustomer ? ledgers.filter(l => l.referenceType === 'SALE').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalPurchase = !isCustomer ? ledgers.filter(l => l.referenceType === 'PURCHASE' || l.referenceType === 'PURCHASE_BILL').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalMoneyIn = isCustomer ? ledgers.filter(l => l.type === 'CREDIT').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalMoneyOut = !isCustomer ? ledgers.filter(l => l.type === 'DEBIT').reduce((s, l) => s + l.amount, 0) : 0;
-
     return {
       customers: combinedParties,
+      partyType: 'VENDOR',
+      partyName: resolvedParty.name,
+      accountingType: 'PAYABLE',
       transactions,
       summary: {
-        totalSale,
+        totalSale: 0,
         totalPurchase,
         totalExpense: 0,
-        totalMoneyIn,
+        totalMoneyIn: 0,
         totalMoneyOut,
-        totalReceivable: isCustomer && runningBalance >= 0 ? runningBalance : 0,
-        totalPayable: (!isCustomer && runningBalance < 0) ? Math.abs(runningBalance) : 0
+        totalReceivable: runningPayable < 0 ? Math.abs(runningPayable) : 0,
+        totalPayable: runningPayable >= 0 ? runningPayable : 0
       }
     };
   }

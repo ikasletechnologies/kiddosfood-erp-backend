@@ -93,6 +93,17 @@ model Dealer {
   phone            String?           @unique
   email            String?           @unique
   address          String?
+  state            String?
+  district         String?
+  city             String?
+  pincode          String?
+  shippingAddress  String?
+  gstNumber        String?
+  gstType          String?
+  openingBalance   Float             @default(0)
+  openingBalanceType String?
+  asOfDate         DateTime?
+  creditLimit      Float?
   status           String            @default("ACTIVE")
   franchiseId      String
   createdAt        DateTime          @default(now())
@@ -236,6 +247,8 @@ model InventoryItem {
   franchisePrice       Float?                 @default(0)
   dealerPrice          Float?                 @default(0)
   customerPrice        Float?                 @default(0)
+  discountType         String?
+  discountValue        Float?                 @default(0)
   baseUnitId           String?
   grnItems             GoodsReceiptItem[]
   inventoryBatches     InventoryBatch[]
@@ -541,6 +554,8 @@ model Product {
   updatedAt       DateTime             @updatedAt
   hsnCode         String?
   sacCode         String?
+  discountType    String?
+  discountValue   Float?               @default(0)
   productType     ProductType          @default(FINISHED_GOOD)
   shelfLifeDays   Int?
   franchiseOrders FranchiseOrderItem[]

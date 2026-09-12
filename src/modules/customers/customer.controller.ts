@@ -124,4 +124,20 @@ export class CustomerController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getItemHistory(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string | undefined)
+        : ownFranchiseId;
+      const history = await CustomerService.getItemHistory(req.params.id, franchiseId);
+      res.json(history);
+    } catch (error: any) {
+      const status = error.message === 'Customer not found' ? 404 : 500;
+      res.status(status).json({ error: error.message });
+    }
+  }
+
 }
