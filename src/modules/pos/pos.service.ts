@@ -412,6 +412,13 @@ export class POSService {
     taxAmount: number,
     discountAmount: number,
     totalAmount: number,
+    // Cashier-entered ad-hoc discount, separate from the per-item "Customer
+    // Retail Discount" — there's nothing in the item master to validate this
+    // against, so it's trusted, but only up to what's left on the bill after
+    // the (server-recomputed) product discount. See the price/discount
+    // resolution below for why `discountAmount`/`totalAmount` above are no
+    // longer used to determine what's actually charged.
+    manualDiscount?: number,
     paymentMode: string
   }) {
     // Validate prices first before proceeding
@@ -468,6 +475,72 @@ export class POSService {
 
     const result = await prisma.$transaction(async (tx) => {
       const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
+
+      // Server-side price/discount trust boundary. The frontend already
+      // resolves the right channel price for display, but a client can send
+      // anything in item.price/unitPrice or discountAmount — this re-derives
+      // every line's price, tax rate, and "Customer Retail Discount" (a
+      // customer-channel-only modifier — see the edit page's UI label) from
+      // the same InventoryItem/Product record used for the stock-deduction
+      // lookup further below, scoped the same way, so a forged Dealer
+      // unitPrice of ₹1 (when the configured Dealer price is ₹40) — or a
+      // Customer discount smuggled into a Dealer/Franchise sale — can never
+      // reach the invoice.
+      const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
+      const resolvedLines = await Promise.all(data.items.map(async (item: any) => {
+        const productId = item.productId || item.id;
+        const product = await tx.product.findUnique({ where: { id: productId } });
+        if (!product) throw new Error(`Product ${productId} not found`);
+
+        const inv = product.sku
+          ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+          : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+
+        // Channel prices default to 0 in the schema (unconfigured, not
+        // "genuinely free") — only a positive value counts as configured;
+        // otherwise fall back to the generic base price like before these
+        // channel-specific fields existed on most items.
+        const channelPrice =
+          resolvedPartyType === 'DEALER' ? inv?.dealerPrice :
+          resolvedPartyType === 'FRANCHISE' ? inv?.franchisePrice :
+          inv?.customerPrice;
+        const unitPrice = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product.basePrice || 0);
+        if (unitPrice <= 0) {
+          throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
+        }
+
+        const discountValue = resolvedPartyType === 'CUSTOMER' ? (inv?.discountValue ?? product.discountValue ?? 0) : 0;
+        const discountType = inv?.discountType || product.discountType || 'PERCENT';
+        const itemDiscountPerUnit = discountValue > 0
+          ? (discountType === 'PERCENT' ? unitPrice * (discountValue / 100) : discountValue)
+          : 0;
+
+        // Real per-product tax rate, sourced server-side rather than trusting
+        // item.taxPercent from the client (BUG 3 previously desynced this
+        // from the order-level GST; trusting the client for it was a second,
+        // separate hole).
+        const taxPct = inv?.gstRate ?? product.taxPercent ?? 5;
+        const quantity = Number(item.quantity) || 0;
+        const lineTotal = Number((unitPrice * quantity).toFixed(2));
+        const lineTax = Number((lineTotal * (taxPct / 100)).toFixed(2));
+        const lineDiscount = Number((itemDiscountPerUnit * quantity).toFixed(2));
+
+        return { productId, quantity, unitPrice, lineTotal, lineTax, lineDiscount };
+      }));
+
+      const serverSubtotal = Number(resolvedLines.reduce((s, l) => s + l.lineTotal, 0).toFixed(2));
+      const serverTax = Number(resolvedLines.reduce((s, l) => s + l.lineTax, 0).toFixed(2));
+      const serverProductDiscount = Number(resolvedLines.reduce((s, l) => s + l.lineDiscount, 0).toFixed(2));
+      // A cashier-entered ad-hoc discount has nothing in the item master to
+      // validate it against, so it's trusted — but only up to what's
+      // actually left on the bill, so a forged discountAmount/manualDiscount
+      // can never flip the total negative or exceed the real subtotal+tax.
+      const requestedManualDiscount = Math.max(0, Number(data.manualDiscount) || 0);
+      const manualDiscountCap = Math.max(0, serverSubtotal + serverTax - serverProductDiscount);
+      const manualDiscount = Math.min(requestedManualDiscount, manualDiscountCap);
+      const finalDiscountAmount = Number((serverProductDiscount + manualDiscount).toFixed(2));
+      const finalTotalAmount = Number(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount).toFixed(2));
+
       const order = await tx.order.create({
         data: {
           invoiceNum,
@@ -477,32 +550,20 @@ export class POSService {
           partyId: resolvedPartyId || null,
           customerName: data.customerName || null,
           orderType: 'TAX_INVOICE',
-          subTotal: data.subTotal || (data as any).subtotal || 0,
-          taxAmount: data.taxAmount,
-          discountAmount: data.discountAmount,
-          totalAmount: data.totalAmount,
+          subTotal: serverSubtotal,
+          taxAmount: serverTax,
+          discountAmount: finalDiscountAmount,
+          totalAmount: finalTotalAmount,
           status: 'COMPLETED',
           paymentStatus: 'PAID',
           orderItems: {
-            create: data.items.map((item: any) => {
-              const unitPrice = item.price || item.unitPrice || 0;
-              const lineTotal = Number((unitPrice * item.quantity).toFixed(2));
-              // Real per-product tax rate, scaled by quantity — this was
-              // hardcoded to 5% of unit price only (ignoring quantity and
-              // the product's actual taxPercent), which desynced this
-              // per-line figure from the order-level GST already computed
-              // correctly by the frontend (BUG 3).
-              const taxPct = (item.taxPercent !== undefined && item.taxPercent !== null)
-                ? Number(item.taxPercent)
-                : 5;
-              return {
-                productId: item.productId || item.id,
-                quantity: item.quantity,
-                price: unitPrice,
-                taxAmount: Number((lineTotal * (taxPct / 100)).toFixed(2)),
-                totalAmount: lineTotal
-              };
-            })
+            create: resolvedLines.map(l => ({
+              productId: l.productId,
+              quantity: l.quantity,
+              price: l.unitPrice,
+              taxAmount: l.lineTax,
+              totalAmount: l.lineTotal
+            }))
           },
         },
         include: { orderItems: true, customer: true }
@@ -544,7 +605,7 @@ export class POSService {
       
       await FinanceService.createPayment({
         tx,
-        amount: data.totalAmount,
+        amount: finalTotalAmount,
         flow: 'IN',
         status: 'PAID',
         sourceAccount: finalAccountId, 
@@ -570,7 +631,7 @@ export class POSService {
           data: {
             customerId: data.customerId,
             type: 'CREDIT',
-            amount: data.totalAmount,
+            amount: finalTotalAmount,
             paymentMode: (data.paymentMode as any) || 'CASH',
             referenceType: 'PAYMENT',
             referenceId: order.id,

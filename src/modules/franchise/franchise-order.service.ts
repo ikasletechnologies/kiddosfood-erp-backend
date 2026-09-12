@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, FranchiseOrderFulfillment, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
+import { InventoryReservationService } from '../inventory/inventory-reservation.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
 import { InventoryService } from '../inventory/inventory.service';
@@ -585,6 +586,71 @@ export class FranchiseOrderService {
       if (status === FranchiseOrderStatus.IN_PRODUCTION && !fulfillment.materialsReady) {
         throw new Error('Cannot start production: raw materials are insufficient (or no recipe is configured) for this order.');
       }
+      
+      // If order is newly APPROVED and we are fulfilling from STOCK, reserve physical FIFO layers now.
+      if (status === FranchiseOrderStatus.APPROVED && order.status === FranchiseOrderStatus.PENDING) {
+        if (fulfillment.fulfillmentPath === FranchiseOrderFulfillment.STOCK) {
+          const hq = await FranchiseService.getHqFranchiseOrNull(prisma as any);
+          const fullOrder = await prisma.franchiseOrder.findUnique({
+            where: { id },
+            include: { items: { include: { product: true } } },
+          });
+          const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
+          for (const item of fullOrder!.items) {
+            if (item.productType === ProductType.FINISHED_GOOD) {
+              const product = item.product;
+              const invItem = product.sku
+                ? await prisma.inventoryItem.findFirst({
+                    where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], sku: product.sku },
+                  })
+                : await prisma.inventoryItem.findFirst({
+                    where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], name: { equals: product.name, mode: 'insensitive' } },
+                  });
+              if (invItem) {
+                itemsToReserve.push({ productId: product.id, inventoryItemId: invItem.id, quantity: item.quantity });
+              } else {
+                throw new Error(`HQ Inventory item not found for product ${product.name}`);
+              }
+            }
+          }
+          
+          const updatedOrder = await prisma.$transaction(async tx => {
+            if (itemsToReserve.length > 0) {
+              await InventoryReservationService.reserveStock(tx, id, itemsToReserve, hq?.id);
+            }
+            return await tx.franchiseOrder.update({
+              where: { id },
+              data: updateData,
+              include: { items: { include: { product: true } }, franchise: true },
+            });
+          });
+
+          try {
+            SocketService.io.emit('franchise-order-updated', updatedOrder);
+          } catch (err) {
+            console.error('[Socket] Failed to emit franchise-order-updated', err);
+          }
+          return updatedOrder;
+        }
+      }
+    }
+
+    if (status === FranchiseOrderStatus.CANCELLED) {
+      const updatedOrder = await prisma.$transaction(async tx => {
+        await InventoryReservationService.releaseReservation(tx, id);
+        return await tx.franchiseOrder.update({
+          where: { id },
+          data: updateData,
+          include: { items: { include: { product: true } }, franchise: true },
+        });
+      });
+
+      try {
+        SocketService.io.emit('franchise-order-updated', updatedOrder);
+      } catch (err) {
+        console.error('[Socket] Failed to emit franchise-order-updated', err);
+      }
+      return updatedOrder;
     }
 
     if (status === FranchiseOrderStatus.DISPATCHED) {
@@ -607,9 +673,45 @@ export class FranchiseOrderService {
           include: { items: true },
         });
         const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+        
+        let hasActiveReservation = false;
+        const existingReservation = await tx.inventoryReservation.findUnique({ where: { franchiseOrderId: id } });
+        if (existingReservation && existingReservation.status === 'ACTIVE') {
+          hasActiveReservation = true;
+        }
+
+        if (!hasActiveReservation) {
+          // If the order jumped straight to dispatch or was IN_PRODUCTION, reserve it now before consumption
+          const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
+          for (const item of fullOrder!.items) {
+            if (item.productType === ProductType.FINISHED_GOOD) {
+              const product = await tx.product.findUnique({ where: { id: item.productId } });
+              if (product) {
+                const invItem = product.sku
+                  ? await tx.inventoryItem.findFirst({ where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], sku: product.sku } })
+                  : await tx.inventoryItem.findFirst({ where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], name: { equals: product.name, mode: 'insensitive' } } });
+                if (invItem) itemsToReserve.push({ productId: product.id, inventoryItemId: invItem.id, quantity: item.quantity });
+              }
+            }
+          }
+          if (itemsToReserve.length > 0) {
+            await InventoryReservationService.reserveStock(tx, id, itemsToReserve, hq?.id);
+          }
+        }
+        
+        const fifoResultByItem = await InventoryReservationService.consumeReservation(tx, id);
+        
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            await deductBatchStock(tx, item.productId, item.quantity, hq?.id, id, fullOrder!.orderNumber);
+            const product = await tx.product.findUnique({ where: { id: item.productId } });
+            if (product) {
+              const invItem = product.sku
+                ? await tx.inventoryItem.findFirst({ where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], sku: product.sku } })
+                : await tx.inventoryItem.findFirst({ where: { OR: [{ franchiseId: hq?.id }, { franchiseId: null }], name: { equals: product.name, mode: 'insensitive' } } });
+              
+              const precalculatedFifo = invItem ? fifoResultByItem.get(invItem.id) : undefined;
+              await deductBatchStock(tx, item.productId, item.quantity, hq?.id, id, fullOrder!.orderNumber, precalculatedFifo);
+            }
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -635,6 +737,11 @@ export class FranchiseOrderService {
           throw new Error(`Cannot mark order as DELIVERED: order is currently "${fullOrder!.status}", not "DISPATCHED". This receipt may have already been processed.`);
         }
 
+        const reservation = await tx.inventoryReservation.findUnique({
+          where: { franchiseOrderId: id },
+          include: { allocations: { include: { inventoryBatch: true } } }
+        });
+
         // Loop through all order items to fulfill inventory updates
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
@@ -658,25 +765,12 @@ export class FranchiseOrderService {
                   },
                 });
 
-            if (invItem) {
-              // Every stock change must leave a ledger trail — record receiveAtCost so
-              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
-              await InventoryService.recordMovement(tx, {
-                itemId: invItem.id,
-                type: 'TRANSFER_IN',
-                quantity: item.quantity,
-                referenceType: 'FRANCHISE_ORDER',
-                referenceId: id,
-                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
-                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
-              });
-            } else {
+            let targetInvItem = invItem;
+            if (!targetInvItem) {
               // Create new inventory item for the franchise if it doesn't exist.
-              // InventoryItem is scoped per franchise (@@unique([sku, franchiseId])),
-              // so the franchise row preserves the exact Product SKU.
               let sku = product.sku || `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
-              const newInvItem = await tx.inventoryItem.create({
+              targetInvItem = await tx.inventoryItem.create({
                 data: {
                   name: product.name,
                   sku,
@@ -689,30 +783,73 @@ export class FranchiseOrderService {
                   isActive: true
                 }
               });
-
-              // Opening balance for this branch item goes through the ledger
-              // with the exact wholesale acquisition price (item.unitPrice).
-              await InventoryService.recordMovement(tx, {
-                itemId: newInvItem.id,
-                type: 'TRANSFER_IN',
-                quantity: item.quantity,
-                referenceType: 'FRANCHISE_ORDER',
-                referenceId: id,
-                note: `Initial stock received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
-                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
-              });
             }
 
-            // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
-            await tx.productBatch.create({
-              data: {
-                productId: item.productId,
-                franchiseId: order.franchiseId,
-                quantity: item.quantity,
-                batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
-                expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 7 days for now
+            // Find HQ's inventory item for this product to map allocations
+            const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+            const hqInvItem = await findHqStockItem(tx, hq?.id || null, product);
+            
+            let totalProcessedQty = 0;
+
+            if (reservation && hqInvItem) {
+              const itemAllocs = reservation.allocations.filter(a => a.inventoryItemId === hqInvItem.id && a.consumedQty > 0);
+              for (const alloc of itemAllocs) {
+                if (totalProcessedQty >= item.quantity) break;
+                
+                const receiptQty = Math.min(alloc.consumedQty, item.quantity - totalProcessedQty);
+                const trueUnitCost = alloc.inventoryBatch.unitCost || item.unitPrice;
+                const batchNum = alloc.inventoryBatch.batchNumber;
+
+                await InventoryService.recordMovement(tx, {
+                  itemId: targetInvItem.id,
+                  type: 'TRANSFER_IN',
+                  quantity: receiptQty,
+                  referenceType: 'FRANCHISE_ORDER',
+                  referenceId: id,
+                  note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber} Batch ${batchNum})`,
+                  receiveAtCost: { unitCost: trueUnitCost, batchNumber: batchNum }
+                });
+                
+                // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
+                await tx.productBatch.create({
+                  data: {
+                    productId: item.productId,
+                    franchiseId: order.franchiseId,
+                    quantity: receiptQty,
+                    batchCode: batchNum,
+                    expiryDate: alloc.inventoryBatch.expDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+                  }
+                });
+
+                totalProcessedQty += receiptQty;
               }
-            });
+            }
+
+            if (totalProcessedQty < item.quantity) {
+              const fallbackQty = item.quantity - totalProcessedQty;
+              // Every stock change must leave a ledger trail — record receiveAtCost so
+              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
+              await InventoryService.recordMovement(tx, {
+                itemId: targetInvItem.id,
+                type: 'TRANSFER_IN',
+                quantity: fallbackQty,
+                referenceType: 'FRANCHISE_ORDER',
+                referenceId: id,
+                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
+                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
+              });
+
+              // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
+              await tx.productBatch.create({
+                data: {
+                  productId: item.productId,
+                  franchiseId: order.franchiseId,
+                  quantity: fallbackQty,
+                  batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
+                  expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 7 days for now
+                }
+              });
+            }
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -879,37 +1016,50 @@ export class FranchiseOrderService {
   }}
 
 // FIFO batch deduction
-async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string) {
-  const batches = await tx.productBatch.findMany({
-    where: {
-      productId,
-      ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
-      quantity: { gt: 0 },
-      OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
-      // A batch under an active or completed recall must never be selected
-      // as a FIFO source for a franchise dispatch, even though ProductBatch.
-      // quantity itself is never decremented by recall (only InventoryBatch
-      // status is). Batches with no recall row, or only a CANCELLED one,
-      // remain eligible.
-      AND: [{
-        OR: [
-          { recall: { is: null } },
-          { recall: { status: { notIn: ['IN_PROGRESS', 'COMPLETED'] } } },
-        ],
-      }],
-    },
-    orderBy: { createdAt: 'asc' }, // FIFO
-  });
-
-  let remaining = quantityNeeded;
-  for (const batch of batches) {
-    if (remaining <= 0) break;
-    const deduct = Math.min(batch.quantity, remaining);
-    await tx.productBatch.update({
-      where: { id: batch.id },
-      data: { quantity: { decrement: deduct } },
+async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string, precalculatedFifo?: any) {
+  if (precalculatedFifo && precalculatedFifo.consumptions && precalculatedFifo.consumptions.length > 0) {
+    // Explicit synchronization contract: deduct exactly the same physical batches reserved by InventoryBatch
+    for (const cons of precalculatedFifo.consumptions) {
+      const invBatch = await tx.inventoryBatch.findUnique({ where: { id: cons.batchId } });
+      if (invBatch && invBatch.productBatchId) {
+        await tx.productBatch.update({
+          where: { id: invBatch.productBatchId },
+          data: { quantity: { decrement: cons.qty } },
+        });
+      }
+    }
+  } else {
+    const batches = await tx.productBatch.findMany({
+      where: {
+        productId,
+        ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
+        quantity: { gt: 0 },
+        OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
+        // A batch under an active or completed recall must never be selected
+        // as a FIFO source for a franchise dispatch, even though ProductBatch.
+        // quantity itself is never decremented by recall (only InventoryBatch
+        // status is). Batches with no recall row, or only a CANCELLED one,
+        // remain eligible.
+        AND: [{
+          OR: [
+            { recall: { is: null } },
+            { recall: { status: { notIn: ['IN_PROGRESS', 'COMPLETED'] } } },
+          ],
+        }],
+      },
+      orderBy: { createdAt: 'asc' }, // FIFO
     });
-    remaining -= deduct;
+
+    let remaining = quantityNeeded;
+    for (const batch of batches) {
+      if (remaining <= 0) break;
+      const deduct = Math.min(batch.quantity, remaining);
+      await tx.productBatch.update({
+        where: { id: batch.id },
+        data: { quantity: { decrement: deduct } },
+      });
+      remaining -= deduct;
+    }
   }
 
   // Synchronize with Master InventoryItem at HQ
@@ -929,6 +1079,7 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
         referenceType: 'FRANCHISE_ORDER',
         referenceId: orderId,
         note: orderNumber ? `Dispatched to franchise (Order ${orderNumber})` : 'Dispatched to franchise',
+        precalculatedFifo: precalculatedFifo
       });
     }
   }

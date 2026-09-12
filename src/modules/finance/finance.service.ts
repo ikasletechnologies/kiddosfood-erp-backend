@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
+import { FranchiseService } from '../franchise/franchise.service';
 import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
@@ -1743,16 +1744,94 @@ export class FinanceService {
         batchNumber: string | null;
       }[] = [];
 
+      // Trust boundary: this was the least-guarded financially-significant
+      // endpoint in the system — it accepted item.rate/gst verbatim from
+      // the request body with zero lookup of InventoryItem/Product master
+      // data. For every line with a resolvable product, re-derive the
+      // authoritative channel price and GST rate here, mirroring
+      // POSService.checkout's price/tax resolution. A line with no
+      // resolvable product (a hand-typed custom line) keeps whatever the
+      // client sent, since there's nothing authoritative to check it
+      // against. Discount is left as the pre-existing, legitimate
+      // manual/negotiated value — this chain has never had a separate
+      // InventoryItem-configured "Customer Retail Discount" wired in, and
+      // this fix does not introduce one.
+      const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, data.franchiseId);
+      const resolvedInvoicePartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
+        data.partyType === 'DEALER' ? 'DEALER' : data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
+
       for (const item of data.items) {
         const qty = Number(item.qty ?? item.quantity ?? 0);
-        const rate = Number(item.rate ?? item.price ?? 0);
-        const gst = Number(item.gst ?? item.taxPercent ?? 0);
-        const discountPct = Number(item.discount ?? item.discountPct ?? 0);
+        let rate = Number(item.rate ?? item.price ?? 0);
+        let gst = Number(item.gst ?? item.taxPercent ?? 0);
+        // "Customer Retail Discount" default — CUSTOMER channel only, and
+        // only used below if the client sent no explicit discount at all.
+        let autoDiscountType = 'PERCENT';
+        let autoDiscountValue = 0;
+
+        if (item.productId) {
+          let product = await tx.product.findUnique({ where: { id: item.productId } });
+          let inv: any = null;
+          if (product) {
+            inv = product.sku
+              ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+              : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+          } else {
+            // Some callers reference an InventoryItem.id directly rather
+            // than a Product.id (e.g. picked from the raw InventoryItem
+            // catalog) — resolve that identity too.
+            inv = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
+          }
+          if (!product && !inv) {
+            // A productId was supplied but resolves to nothing — accepting
+            // the client-submitted rate here would silently reopen the
+            // exact trust hole this resolver exists to close (a real
+            // Dealer price of ₹40 with a resolution failure otherwise
+            // accepting a submitted ₹1). Reject instead of guessing.
+            throw new Error(`Cannot price line item "${item.productName || item.productId}" — productId "${item.productId}" does not match any known Product or InventoryItem. Remove the reference to use a free-text price, or fix the id.`);
+          }
+          const channelPrice =
+            resolvedInvoicePartyType === 'DEALER' ? inv?.dealerPrice :
+            resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
+            inv?.customerPrice;
+          rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+          gst = inv?.gstRate ?? product?.taxPercent ?? 0;
+          if (resolvedInvoicePartyType === 'CUSTOMER') {
+            autoDiscountType = inv?.discountType || product?.discountType || 'PERCENT';
+            autoDiscountValue = Number(inv?.discountValue ?? product?.discountValue ?? 0);
+          }
+        }
+
+        // A negotiated discount is legitimate but can never exceed the
+        // line/document it's discounting, and never be negative — that's
+        // what keeps this a "manual discount" rather than a way to
+        // fabricate a negative or inflated invoice total.
+        const hasExplicitDiscount = item.discountAmount !== undefined || item.discount !== undefined || item.discountPct !== undefined;
+        let discountPct = Number(item.discount ?? item.discountPct ?? 0);
+        discountPct = Math.max(0, Math.min(discountPct, 100));
 
         const itemSubtotal = qty * rate;
-        const itemDiscount = item.discountAmount !== undefined
-          ? Number(item.discountAmount)
-          : (itemSubtotal * discountPct / 100);
+        let itemDiscount: number;
+        if (item.discountAmount !== undefined) {
+          itemDiscount = Number(item.discountAmount);
+        } else if (hasExplicitDiscount) {
+          itemDiscount = itemSubtotal * discountPct / 100;
+        } else if (autoDiscountValue > 0) {
+          // No explicit discount sent at all — fall back to the Item
+          // Master's Customer Retail Discount (already gated to CUSTOMER
+          // above; stays 0 for Dealer/Franchise).
+          itemDiscount = autoDiscountType === 'FLAT'
+            ? autoDiscountValue * qty
+            : itemSubtotal * autoDiscountValue / 100;
+        } else {
+          itemDiscount = 0;
+        }
+        itemDiscount = Math.max(0, Math.min(itemDiscount, itemSubtotal));
+        // Reflect whatever discount actually got applied (including the
+        // Customer Retail Discount auto-fill above) in the stored percent,
+        // not just an explicitly-submitted one — keeps OrderItem.discountPct
+        // consistent with the dollar amount for record-keeping.
+        discountPct = itemSubtotal > 0 ? (itemDiscount / itemSubtotal) * 100 : 0;
         const itemTaxableAmount = Math.max(0, itemSubtotal - itemDiscount);
         const itemTax = itemTaxableAmount * (gst / 100);
 
@@ -1769,13 +1848,18 @@ export class FinanceService {
           price: rate,
           discountPct: discountPct,
           taxAmount: itemTax,
-          totalAmount: itemSubtotal - itemDiscount + itemTax,
+          totalAmount: itemTaxableAmount + itemTax,
           batchNumber: item.batchNumber || null
         });
       }
 
       const deliveryCharge = Number(data.deliveryCharge ?? data.deliveryCharges ?? 0);
-      const totalAmount = subTotal + totalTax - totalDiscount + deliveryCharge;
+      // Bound the aggregate discount (whether an explicit data.discountAmount
+      // or the summed item discounts above) to what's actually on the bill,
+      // and floor the final total at zero — the same clamp POSService.checkout
+      // applies to its manualDiscount, closing the equivalent hole here.
+      totalDiscount = Math.max(0, Math.min(totalDiscount, subTotal + totalTax));
+      const totalAmount = Math.max(0, subTotal + totalTax - totalDiscount + deliveryCharge);
       const year = new Date().getFullYear();
       // Atomic sequence (same NumberSequence pattern as payment/GRN numbers)
       // instead of COUNT()-based generation, which two invoices saved in the

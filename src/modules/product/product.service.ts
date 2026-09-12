@@ -197,6 +197,13 @@ export class ProductService {
           inventoryFranchiseId: inv.franchiseId || (franchiseId || null),
           inventoryBasePrice: inv.basePrice,
           inventoryCostPrice: inv.costPrice,
+          // Channel-specific prices live only on InventoryItem, never on
+          // Product — without this, POS's getPrice(p, partyType) always
+          // fell through to the generic base/franchise price for every
+          // channel (the ₹35-shown-for-Dealer bug).
+          franchisePrice: inv.franchisePrice,
+          dealerPrice: inv.dealerPrice,
+          customerPrice: inv.customerPrice,
           baseUnit: inv.baseUnit,
           conversions: inv.conversions,
           packSize

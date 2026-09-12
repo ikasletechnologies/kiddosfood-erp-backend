@@ -7,6 +7,7 @@ const router = Router();
 router.use(authenticate);
 
 // Bin management (placed before /:warehouseId to avoid param collision)
+router.get('/preview-code', WarehouseController.previewCode);
 router.get('/bins', WarehouseController.getAllBins);
 router.post('/bins', WarehouseController.createBinDirect);
 router.put('/bins/:binId', WarehouseController.updateBin);

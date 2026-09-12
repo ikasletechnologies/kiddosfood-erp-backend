@@ -215,43 +215,46 @@ model Cheque {
 }
 
 model InventoryItem {
-  id                   String                 @id @default(uuid())
-  name                 String
-  sku                  String
-  category             ItemCategory
-  currentStock         Float
-  unit                 String
-  minimumStock         Float                  @default(10)
-  batchNo              String?
-  expiryDate           DateTime?
-  franchiseId          String?
-  vendorId             String?
-  createdAt            DateTime               @default(now())
-  updatedAt            DateTime               @updatedAt
-  gstRate              Float                  @default(5)
-  hsnCode              String?
-  isActive             Boolean                @default(true)
-  basePrice            Float?                 @default(0)
-  costPrice            Float?                 @default(0)
-  franchisePrice       Float?                 @default(0)
-  dealerPrice          Float?                 @default(0)
-  customerPrice        Float?                 @default(0)
-  baseUnitId           String?
-  grnItems             GoodsReceiptItem[]
-  inventoryBatches     InventoryBatch[]
-  baseUnit             Unit?                  @relation(fields: [baseUnitId], references: [id])
-  franchise            Franchise?             @relation(fields: [franchiseId], references: [id])
-  vendor               Vendor?                @relation(fields: [vendorId], references: [id])
-  conversions          ItemUnitConversion[]
-  poItems              ProcurementOrderItem[]
-  productionItems      ProductionItem[]
-  purchaseRequestItems PurchaseRequestItem[]
-  recipeItems          RecipeItem[]
-  movements            StockMovement[]
-  requestItems         StockRequestItem[]
-  transferItems        StockTransferItem[]
-  vendors              VendorMaterial[]
-  wasteEntries         WasteEntry[]
+  id                              String                           @id @default(uuid())
+  name                            String
+  sku                             String
+  category                        ItemCategory
+  currentStock                    Float
+  unit                            String
+  minimumStock                    Float                            @default(10)
+  batchNo                         String?
+  expiryDate                      DateTime?
+  franchiseId                     String?
+  vendorId                        String?
+  createdAt                       DateTime                         @default(now())
+  updatedAt                       DateTime                         @updatedAt
+  gstRate                         Float                            @default(5)
+  hsnCode                         String?
+  isActive                        Boolean                          @default(true)
+  basePrice                       Float?                           @default(0)
+  costPrice                       Float?                           @default(0)
+  franchisePrice                  Float?                           @default(0)
+  dealerPrice                     Float?                           @default(0)
+  customerPrice                   Float?                           @default(0)
+  discountType                    String?                          @default("PERCENT")
+  discountValue                   Float?                           @default(0)
+  baseUnitId                      String?
+  grnItems                        GoodsReceiptItem[]
+  inventoryBatches                InventoryBatch[]
+  baseUnit                        Unit?                            @relation(fields: [baseUnitId], references: [id])
+  franchise                       Franchise?                       @relation(fields: [franchiseId], references: [id])
+  vendor                          Vendor?                          @relation(fields: [vendorId], references: [id])
+  conversions                     ItemUnitConversion[]
+  poItems                         ProcurementOrderItem[]
+  productionItems                 ProductionItem[]
+  purchaseRequestItems            PurchaseRequestItem[]
+  recipeItems                     RecipeItem[]
+  movements                       StockMovement[]
+  requestItems                    StockRequestItem[]
+  transferItems                   StockTransferItem[]
+  vendors                         VendorMaterial[]
+  wasteEntries                    WasteEntry[]
+  inventoryReservationAllocations InventoryReservationAllocation[]
 
   @@unique([sku, franchiseId])
 }
@@ -274,22 +277,22 @@ model WasteEntry {
 }
 
 model StockMovement {
-  id              String            @id @default(uuid())
-  itemId          String
-  movementType    StockMovementType
-  quantity        Float
-  baseQty         Float?
-  transactionUnit String?
-  unitId          String?
-  referenceType   String?
-  referenceId     String?
-  note            String?
-  createdBy       String?
-  createdAt       DateTime          @default(now())
-  binId           String?
-  warehouseId     String?
-  batchId         String?
-  unitCost        Float?
+  id                   String            @id @default(uuid())
+  itemId               String
+  movementType         StockMovementType
+  quantity             Float
+  baseQty              Float?
+  transactionUnit      String?
+  unitId               String?
+  referenceType        String?
+  referenceId          String?
+  note                 String?
+  createdBy            String?
+  createdAt            DateTime          @default(now())
+  binId                String?
+  warehouseId          String?
+  batchId              String?
+  unitCost             Float?
   // Full FIFO consumption breakdown (every InventoryBatch lot + qty +
   // productBatchId actually drawn from), populated whenever an outbound
   // movement spans more than one lot — mirrors ProductPackaging.bulkBreakdown
@@ -299,11 +302,11 @@ model StockMovement {
   // purposes. See RecallService.findRecallForSoldItem, which reads this to
   // determine whether a customer return traces back to a recalled batch.
   consumptionBreakdown Json?
-  batch           InventoryBatch?   @relation(fields: [batchId], references: [id])
-  bin             WarehouseBin?     @relation(fields: [binId], references: [id])
-  item            InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  unit            Unit?             @relation(fields: [unitId], references: [id])
-  warehouse       Warehouse?        @relation(fields: [warehouseId], references: [id])
+  batch                InventoryBatch?   @relation(fields: [batchId], references: [id])
+  bin                  WarehouseBin?     @relation(fields: [binId], references: [id])
+  item                 InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  unit                 Unit?             @relation(fields: [unitId], references: [id])
+  warehouse            Warehouse?        @relation(fields: [warehouseId], references: [id])
 
   @@index([movementType, createdAt])
   // RecallService's distributedQty/wastedQty queries filter batchId IN (...)
@@ -541,6 +544,8 @@ model Product {
   updatedAt       DateTime             @updatedAt
   hsnCode         String?
   sacCode         String?
+  discountType    String?              @default("PERCENT")
+  discountValue   Float?               @default(0)
   productType     ProductType          @default(FINISHED_GOOD)
   shelfLifeDays   Int?
   franchiseOrders FranchiseOrderItem[]
@@ -661,24 +666,24 @@ model ProductBatch {
 }
 
 model BatchRecall {
-  id                String             @id @default(uuid())
-  productBatchId    String             @unique
-  status            RecallStatus       @default(IN_PROGRESS)
-  step              RecallStep         @default(INITIATED)
-  reason            String
-  reasonNotes       String?
-  distributedQty    Float              @default(0)
-  returnedQty       Float              @default(0)
-  affectedLocations Json?
-  reportData        Json?
-  initiatedBy       String?
-  initiatedAt       DateTime           @default(now())
-  completedAt       DateTime?
-  cancelledAt       DateTime?
-  updatedAt         DateTime           @updatedAt
-  productBatch      ProductBatch       @relation(fields: [productBatchId], references: [id])
-  events            BatchRecallEvent[]
-  returnItems       ReturnItem[]
+  id                 String                      @id @default(uuid())
+  productBatchId     String                      @unique
+  status             RecallStatus                @default(IN_PROGRESS)
+  step               RecallStep                  @default(INITIATED)
+  reason             String
+  reasonNotes        String?
+  distributedQty     Float                       @default(0)
+  returnedQty        Float                       @default(0)
+  affectedLocations  Json?
+  reportData         Json?
+  initiatedBy        String?
+  initiatedAt        DateTime                    @default(now())
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  updatedAt          DateTime                    @updatedAt
+  productBatch       ProductBatch                @relation(fields: [productBatchId], references: [id])
+  events             BatchRecallEvent[]
+  returnItems        ReturnItem[]
   challanReturnItems DeliveryChallanReturnItem[]
 }
 
@@ -763,6 +768,7 @@ model FranchiseOrder {
   franchise            Franchise                  @relation(fields: [franchiseId], references: [id])
   items                FranchiseOrderItem[]
   returnOrders         ReturnOrder[]
+  reservation          InventoryReservation?
 
   @@index([franchiseId, createdAt])
   @@index([createdAt])
@@ -1437,7 +1443,7 @@ model ReturnOrder {
 }
 
 model ReturnItem {
-  id          String      @id @default(uuid())
+  id          String       @id @default(uuid())
   returnId    String
   productId   String?
   productName String
@@ -1454,7 +1460,7 @@ model ReturnItem {
   // regardless of what `condition` says.
   recallId    String?
   recall      BatchRecall? @relation(fields: [recallId], references: [id])
-  return      ReturnOrder @relation(fields: [returnId], references: [id])
+  return      ReturnOrder  @relation(fields: [returnId], references: [id])
 
   @@index([recallId])
 }
@@ -1711,10 +1717,10 @@ model WarehouseBin {
 }
 
 model InventoryBatch {
-  id              String              @id @default(uuid())
-  inventoryItemId String
-  batchNumber     String
-  lotNumber       String?
+  id                              String                           @id @default(uuid())
+  inventoryItemId                 String
+  batchNumber                     String
+  lotNumber                       String?
   // The actual Purchase Bill reference (BILL-<PO>-<seq>), always populated
   // at GRN approval regardless of whether a lot/vendor-batch number was also
   // entered. batchNumber prioritizes the lot code for internal traceability,
@@ -1722,21 +1728,22 @@ model InventoryBatch {
   // this field. Left null for production/QC/packaging-created batches (bulk
   // and retail lots), which already carry the correct reference in
   // batchNumber (= ProductBatch.batchCode).
-  billNumber      String?
-  mfgDate         DateTime?
-  expDate         DateTime?
-  initialQty      Float
-  currentQty      Float
-  unitCost        Float?
-  productBatchId  String?
-  warehouseId     String?
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
-  status          InventoryStockState @default(QC_HOLD)
-  inventoryItem   InventoryItem       @relation(fields: [inventoryItemId], references: [id])
-  productBatch    ProductBatch?       @relation(fields: [productBatchId], references: [id])
-  warehouse       Warehouse?          @relation(fields: [warehouseId], references: [id])
-  stockMovements  StockMovement[]
+  billNumber                      String?
+  mfgDate                         DateTime?
+  expDate                         DateTime?
+  initialQty                      Float
+  currentQty                      Float
+  unitCost                        Float?
+  productBatchId                  String?
+  warehouseId                     String?
+  createdAt                       DateTime                         @default(now())
+  updatedAt                       DateTime                         @updatedAt
+  status                          InventoryStockState              @default(QC_HOLD)
+  inventoryItem                   InventoryItem                    @relation(fields: [inventoryItemId], references: [id])
+  productBatch                    ProductBatch?                    @relation(fields: [productBatchId], references: [id])
+  warehouse                       Warehouse?                       @relation(fields: [warehouseId], references: [id])
+  stockMovements                  StockMovement[]
+  inventoryReservationAllocations InventoryReservationAllocation[]
 
   // Every recall query (getBatchQuantities, locateDistribution,
   // findCrossBatchAffectedIds' block/unblock updates) filters by
@@ -2242,6 +2249,43 @@ enum InventoryStockState {
   BLOCKED
   EXPIRED
   RETURNED
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CONSUMED
+  RELEASED
+  PARTIAL
+}
+
+model InventoryReservation {
+  id               String            @id @default(uuid())
+  franchiseOrderId String            @unique
+  status           ReservationStatus @default(ACTIVE)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  releasedAt       DateTime?
+
+  order       FranchiseOrder                   @relation(fields: [franchiseOrderId], references: [id])
+  allocations InventoryReservationAllocation[]
+}
+
+model InventoryReservationAllocation {
+  id               String @id @default(uuid())
+  reservationId    String
+  inventoryBatchId String
+  inventoryItemId  String
+  reservedQty      Float
+  consumedQty      Float  @default(0)
+  releasedQty      Float  @default(0)
+
+  reservation    InventoryReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  inventoryBatch InventoryBatch       @relation(fields: [inventoryBatchId], references: [id])
+  inventoryItem  InventoryItem        @relation(fields: [inventoryItemId], references: [id])
+
+  @@index([reservationId])
+  @@index([inventoryBatchId])
+  @@index([inventoryItemId])
 }
 
 // Cache of GSTIN lookups so we only pay the GSTVerify per-call fee once per

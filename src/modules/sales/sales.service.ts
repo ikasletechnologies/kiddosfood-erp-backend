@@ -55,6 +55,13 @@ function calculateTotals<T extends {
 
   const validItems = items || [];
   const totalGross = validItems.reduce((sum, item) => sum + (item.quantity || 0) * (item.rate || 0), 0);
+  // A negotiated discount is a legitimate, cashier/salesperson-entered
+  // value with no configured ceiling to check it against — but it can
+  // never exceed the value actually being sold, and never be negative.
+  // Clamping here (rather than removing the feature) is what keeps this a
+  // "manual discount" and not a way to fabricate a negative or inflated
+  // bill.
+  const clampedDocumentDiscount = Math.max(0, Math.min(documentDiscountAmount || 0, totalGross));
   const hasExplicitItemDiscounts = validItems.some((item) =>
     (item.discountAmount !== undefined && item.discountAmount > 0) ||
     (item.discount !== undefined && item.discount > 0) ||
@@ -67,19 +74,24 @@ function calculateTotals<T extends {
     let discAmt = (item.discountAmount !== undefined && item.discountAmount > 0)
       ? item.discountAmount
       : ((item.discount !== undefined && item.discount > 0) ? item.discount : 0);
+    discAmt = Math.max(0, Math.min(discAmt, gross));
 
     let discPct = (item.discountPercent !== undefined && item.discountPercent > 0)
       ? item.discountPercent
       : ((item.discountPct !== undefined && item.discountPct > 0) ? item.discountPct : 0);
+    discPct = Math.max(0, Math.min(discPct, 100));
 
-    if (!hasExplicitItemDiscounts && documentDiscountAmount > 0 && totalGross > 0) {
-      discAmt = Math.round((documentDiscountAmount * (gross / totalGross)) * 100) / 100;
+    if (!hasExplicitItemDiscounts && clampedDocumentDiscount > 0 && totalGross > 0) {
+      discAmt = Math.round((clampedDocumentDiscount * (gross / totalGross)) * 100) / 100;
       discPct = gross > 0 ? Math.round(((discAmt / gross) * 100) * 100) / 100 : 0;
     } else if (!discAmt && discPct > 0) {
       discAmt = Math.round((gross * discPct / 100) * 100) / 100;
     } else if (!discPct && gross > 0 && discAmt > 0) {
       discPct = Math.round(((discAmt / gross) * 100) * 100) / 100;
     }
+    // Re-clamp: the derivations above can only move discAmt within
+    // [0, gross] mathematically, but this is the actual enforcement point.
+    discAmt = Math.max(0, Math.min(discAmt, gross));
 
     const taxable = Math.max(0, Math.round((gross - discAmt) * 100) / 100);
     const lineTax = Math.round((taxable * (item.taxPercent || 0) / 100) * 100) / 100;
@@ -102,9 +114,133 @@ function calculateTotals<T extends {
   subTotal = Math.round(subTotal * 100) / 100;
   taxAmount = Math.round(taxAmount * 100) / 100;
   totalDiscount = Math.round(totalDiscount * 100) / 100;
-  const grandTotal = Math.round((subTotal + taxAmount) * 100) / 100;
+  const grandTotal = Math.max(0, Math.round((subTotal + taxAmount) * 100) / 100);
 
   return { computed, subTotal, taxAmount, totalDiscount, totalAmount: grandTotal };
+}
+
+// Resolve the authoritative channel price + GST rate + "Customer Retail
+// Discount" for one line from InventoryItem/Product — mirrors
+// POSService.checkout's price/tax/discount resolution, so a document's
+// rate/taxPercent are never blindly trusted from the client. Only a
+// positive channel price counts as "configured" (these fields default to
+// 0, not null); otherwise falls back to the generic base price, same as
+// before channel prices existed.
+//
+// discountType/discountValue is the Item Master's "Customer Retail
+// Discount" — CUSTOMER channel only, never Dealer/Franchise (see
+// POSService.checkout's getItemDiscount). It is returned here only as a
+// DEFAULT for applyAuthoritativePricing to fill in when the client sent no
+// explicit discount at all — an existing manual/negotiated discount the
+// client did supply is never overwritten by it (see applyAuthoritativePricing).
+//
+// A line with NO productId at all (a genuine free-text/custom line, e.g.
+// a one-off service charge) has nothing authoritative to check against
+// and keeps whatever price the client sent. But a line that DOES supply a
+// productId and still fails to resolve must reject the whole document —
+// silently falling back to the client-submitted price there would mean a
+// scope/mapping failure (or a forged id) quietly reopens the exact trust
+// hole this resolver exists to close (e.g. a real Dealer price of ₹40
+// with a resolution failure otherwise accepting a submitted ₹1).
+async function resolveItemChannelPricing(
+  tx: any,
+  productId: string | undefined,
+  productName: string | undefined,
+  scopeFranchiseId: string | null,
+  partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE'
+): Promise<{ rate: number; taxPercent: number; discountType: string; discountValue: number } | null> {
+  if (!productId) return null;
+
+  let product = await tx.product.findUnique({ where: { id: productId } });
+  let inv: any = null;
+
+  if (product) {
+    inv = product.sku
+      ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+      : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+  } else {
+    // Estimate/Proforma/Delivery Challan let the operator pick straight
+    // from the InventoryItem catalog (see convertProformaToInvoice's
+    // "Proforma items carry an InventoryItem ID, not a Product ID"
+    // comment) — item.productId is often an InventoryItem.id, not a
+    // Product.id.
+    inv = await tx.inventoryItem.findUnique({ where: { id: productId } });
+    if (!inv) {
+      throw new Error(`Cannot price line item "${productName || productId}" — productId "${productId}" does not match any known Product or InventoryItem. Remove the reference to use a free-text price, or fix the id.`);
+    }
+  }
+
+  const channelPrice =
+    partyType === 'DEALER' ? inv?.dealerPrice :
+    partyType === 'FRANCHISE' ? inv?.franchisePrice :
+    inv?.customerPrice;
+  const rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+  const taxPercent = inv?.gstRate ?? product?.taxPercent ?? 5;
+  const discountType = inv?.discountType || product?.discountType || 'PERCENT';
+  const discountValue = partyType === 'CUSTOMER' ? Number(inv?.discountValue ?? product?.discountValue ?? 0) : 0;
+
+  return { rate, taxPercent, discountType, discountValue };
+}
+
+// Overrides rate/taxPercent in place for every line with a resolvable
+// productId; a hand-typed custom line with no master-data link (no
+// productId at all) keeps whatever the client sent, since there's nothing
+// authoritative to check it against. A line that supplies a productId but
+// fails to resolve throws (see resolveItemChannelPricing).
+//
+// If the client sent no explicit discount at all for a resolvable line,
+// the Customer Retail Discount (CUSTOMER channel only) is filled in as the
+// default so the discount isn't silently lost when a client forgets to
+// send it — but a discount the client DID explicitly supply (whether the
+// frontend's own auto-fill or a manually negotiated adjustment) is never
+// overwritten; calculateTotals' existing bounds ([0, gross]) still apply
+// to it either way.
+async function applyAuthoritativePricing<T extends {
+  productId?: string;
+  productName?: string;
+  rate: number;
+  taxPercent?: number;
+  quantity: number;
+  discountAmount?: number;
+  discount?: number;
+  discountPercent?: number;
+  discountPct?: number;
+}>(
+  tx: any,
+  items: T[],
+  scopeFranchiseId: string | null,
+  partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE',
+  // Delivery Challan is a logistics/dispatch document with no discount
+  // concept at all (DeliveryChallanItem has no discount column) — the
+  // Customer Retail Discount must not be invented there. Every other
+  // document (Estimate, Proforma, Sales Order) supports discounts and
+  // defaults to applying it.
+  applyDiscount: boolean = true
+): Promise<T[]> {
+  return Promise.all(items.map(async (item) => {
+    const resolved = await resolveItemChannelPricing(tx, item.productId, item.productName, scopeFranchiseId, partyType);
+    if (!resolved) return item;
+    if (!applyDiscount) return { ...item, rate: resolved.rate, taxPercent: resolved.taxPercent };
+
+    const hasExplicitDiscount =
+      (item.discountAmount !== undefined && item.discountAmount > 0) ||
+      (item.discount !== undefined && item.discount > 0) ||
+      (item.discountPercent !== undefined && item.discountPercent > 0) ||
+      (item.discountPct !== undefined && item.discountPct > 0);
+
+    const updated: T = { ...item, rate: resolved.rate, taxPercent: resolved.taxPercent };
+    if (!hasExplicitDiscount && resolved.discountValue > 0) {
+      if (resolved.discountType === 'FLAT') {
+        // discountValue is a per-unit flat amount (matches POSService's
+        // getItemDiscount) — scale by quantity, capped at the line's gross.
+        const gross = resolved.rate * (item.quantity || 0);
+        (updated as any).discountAmount = Math.min(resolved.discountValue * (item.quantity || 0), gross);
+      } else {
+        (updated as any).discountPercent = Math.min(100, resolved.discountValue);
+      }
+    }
+    return updated;
+  }));
 }
 
 export class SalesService {
@@ -232,9 +368,13 @@ export class SalesService {
     status?: string;
   }) {
     const discount = data.discountAmount || 0;
-    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discount);
-    const roundOff = data.roundOffAmount || 0;
     const partyType = data.partyType || 'CUSTOMER';
+    // Quotation has no franchise scope of its own (it's an HQ-level
+    // document — franchise scoping only enters at Delivery Challan), so
+    // channel prices resolve against HQ-scoped InventoryItems.
+    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, partyType);
+    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(pricedItems, discount);
+    const roundOff = data.roundOffAmount || 0;
     // The `customer` relation/customerId only ever means a real Customer
     // record — a Dealer or Franchise party has no such row, so customerId
     // must stay null for those (partyId carries the id for every type).
@@ -255,8 +395,18 @@ export class SalesService {
         status: (data.status as any) || undefined,
         subTotal,
         taxAmount,
-        discountAmount: discount || totalDiscount,
-        totalAmount: data.totalAmount !== undefined ? data.totalAmount : (totalAmount + roundOff),
+        // Store the server-computed (clamped, per-line-distributed) figure,
+        // not the raw client-submitted discount — calculateTotals already
+        // bounds this to [0, totalGross], but the stored field should
+        // reflect what was actually applied, not an unclamped claim.
+        discountAmount: totalDiscount,
+        // data.totalAmount is trusted only as a small nearest-rupee rounding
+        // adjustment (see comment above) — bounded to ±₹2 of the
+        // server-computed total so a forged totalAmount can't understate
+        // (or inflate) what the resolved rate/tax actually add up to.
+        totalAmount: (data.totalAmount !== undefined && Math.abs(data.totalAmount - (totalAmount + roundOff)) <= 2)
+          ? data.totalAmount
+          : (totalAmount + roundOff),
         termsConditions: data.termsConditions,
         notes: data.notes,
         createdBy: data.createdBy,
@@ -340,13 +490,21 @@ export class SalesService {
       if (data.items) {
         const discountInput = data.discountAmount !== undefined ? data.discountAmount : 0;
         const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discountInput);
-        const discount = data.discountAmount !== undefined ? data.discountAmount : totalDiscount;
         const roundOff = data.roundOffAmount || 0;
+        const computedTotal = totalAmount + roundOff;
 
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
-        updateData.discountAmount = discount;
-        updateData.totalAmount = (data as any).totalAmount !== undefined ? (data as any).totalAmount : (totalAmount + roundOff);
+        // Store the server-computed (clamped) discount, not the raw
+        // client-submitted figure — mirrors createQuotation.
+        updateData.discountAmount = totalDiscount;
+        // Same ±₹2 rounding-adjustment tolerance as createQuotation — a
+        // forged totalAmount can't understate or inflate what the resolved
+        // rate/tax/discount actually add up to.
+        const clientTotal = (data as any).totalAmount;
+        updateData.totalAmount = (clientTotal !== undefined && Math.abs(clientTotal - computedTotal) <= 2)
+          ? clientTotal
+          : computedTotal;
 
         // Delete old items
         await tx.quotationItem.deleteMany({ where: { quotationId: id } });
@@ -523,49 +681,53 @@ export class SalesService {
           franchiseId = hq?.id || '';
         }
         if (!franchiseId) {
-          const firstFranchise = await tx.franchise.findFirst();
-          franchiseId = firstFranchise?.id || '';
-        }
-        if (!franchiseId) {
-          throw new Error('A branch/franchise must be configured to convert an estimate to a Sale/Invoice.');
+          // No arbitrary franchise may stand in for HQ (see
+          // convertProformaToInvoice's stricter check) — an unconfigured
+          // HQ must fail loudly, not silently attribute the sale to
+          // whichever franchise happens to be first in the table.
+          throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise before converting an estimate to a Sale/Invoice.');
         }
 
         const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
 
         // Resolve a valid Product.id for each OrderItem (FK constraint on OrderItem.productId)
         const allProducts = await tx.product.findMany();
-        const fallbackProduct = allProducts[0];
         const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
 
         for (const item of quotation.items) {
           let validProductId = item.productId || '';
-          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
-          
+          // Id/SKU only — a name-based match (or "just grab any product")
+          // can silently attach the wrong size variant (e.g. APPAM 450g
+          // resolving to APPAM 900g) or an unrelated product entirely.
+          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId));
+
           if (productMatch) {
             validProductId = productMatch.id;
           } else if (item.productId) {
             const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
-            if (invItem) {
-              const matchedBySkuOrName = allProducts.find(p => (invItem.sku && p.sku === invItem.sku) || p.name.toLowerCase() === invItem.name.toLowerCase());
-              if (matchedBySkuOrName) {
-                validProductId = matchedBySkuOrName.id;
-              }
+            const matchedBySku = invItem?.sku ? allProducts.find(p => p.sku === invItem.sku) : undefined;
+            if (matchedBySku) {
+              validProductId = matchedBySku.id;
+            } else {
+              // The client referenced a specific productId that resolves to
+              // neither a real Product nor a matching InventoryItem SKU —
+              // erroring here is safer than silently billing a different
+              // product than what was actually quoted.
+              throw new Error(`Cannot convert: line item "${item.productName}" references productId "${item.productId}", which does not match any known Product or InventoryItem SKU.`);
             }
           }
 
-          if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
-            if (fallbackProduct) {
-              validProductId = fallbackProduct.id;
-            } else {
-              const newProd = await tx.product.create({
-                data: {
-                  name: item.productName || 'General Item',
-                  basePrice: item.rate,
-                  taxPercent: item.taxPercent || 0,
-                }
-              });
-              validProductId = newProd.id;
-            }
+          if (!validProductId) {
+            // No productId was ever provided — a genuine free-text/custom
+            // line (e.g. a one-off service charge) with nothing to link to.
+            const newProd = await tx.product.create({
+              data: {
+                name: item.productName || 'General Item',
+                basePrice: item.rate,
+                taxPercent: item.taxPercent || 0,
+              }
+            });
+            validProductId = newProd.id;
           }
 
           orderItemsData.push({
@@ -673,34 +835,38 @@ export class SalesService {
           franchiseId = hq?.id || '';
         }
         if (!franchiseId) {
-          const firstFranchise = await tx.franchise.findFirst();
-          franchiseId = firstFranchise?.id || '';
+          // No arbitrary franchise may stand in for HQ (see
+          // convertProformaToInvoice's stricter check) — an unconfigured
+          // HQ must fail loudly, not silently attribute the sale to
+          // whichever franchise happens to be first in the table.
+          throw new Error('No HQ franchise is configured (Franchise.isHQ). Set isHQ=true on exactly one franchise before converting a Sales Order to a Sale/Invoice.');
         }
 
         const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
         const allProducts = await tx.product.findMany();
-        const fallbackProduct = allProducts[0];
         const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
 
         for (const item of salesOrder.items) {
           let validProductId = item.productId || '';
-          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
+          // Id/SKU only — see convertQuotationToSale for why a name-based
+          // or "first product" fallback is a variant-cross-contamination
+          // risk (e.g. APPAM 450g silently resolving to APPAM 900g).
+          const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId));
           if (productMatch) {
             validProductId = productMatch.id;
+          } else if (item.productId) {
+            throw new Error(`Cannot convert: line item "${item.productName}" references productId "${item.productId}", which does not match any known Product/SKU.`);
           }
-          if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
-            if (fallbackProduct) {
-              validProductId = fallbackProduct.id;
-            } else {
-              const newProd = await tx.product.create({
-                data: {
-                  name: item.productName || 'General Item',
-                  basePrice: item.rate,
-                  taxPercent: item.taxPercent || 0,
-                }
-              });
-              validProductId = newProd.id;
-            }
+          if (!validProductId) {
+            // No productId was ever provided — a genuine free-text/custom line.
+            const newProd = await tx.product.create({
+              data: {
+                name: item.productName || 'General Item',
+                basePrice: item.rate,
+                taxPercent: item.taxPercent || 0,
+              }
+            });
+            validProductId = newProd.id;
           }
 
           orderItemsData.push({
@@ -902,12 +1068,20 @@ export class SalesService {
           }
           existingProduct = await tx.product.findUnique({ where: { sku: invItem.sku } });
           if (!existingProduct) {
+            // Seed from the channel this Proforma was actually priced
+            // under, not unconditionally the customer price — a
+            // Dealer/Franchise Proforma converting here would otherwise
+            // seed a brand-new Product's basePrice from the wrong channel.
+            const channelBasePrice =
+              proforma.partyType === 'DEALER' ? invItem.dealerPrice :
+              proforma.partyType === 'FRANCHISE' ? invItem.franchisePrice :
+              invItem.customerPrice;
             existingProduct = await tx.product.create({
               data: {
                 id: invItem.id, // Keep exact same ID so the FK succeeds
                 name: invItem.name,
                 sku: invItem.sku,
-                basePrice: invItem.customerPrice || invItem.basePrice || 0,
+                basePrice: (channelBasePrice && channelBasePrice > 0) ? channelBasePrice : (invItem.basePrice || 0),
                 productType: 'FINISHED_GOOD',
                 category: invItem.category,
                 taxPercent: invItem.gstRate || 5,
@@ -1075,8 +1249,11 @@ export class SalesService {
     status?: any;
   }) {
     const discount = data.discountAmount || 0;
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
     const partyType = data.partyType || 'CUSTOMER';
+    // ProformaInvoice, like Quotation, has no franchise scope of its own —
+    // resolve against HQ-scoped InventoryItems.
+    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, partyType);
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
     const customerId = partyType === 'CUSTOMER' ? data.customerId : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId, data.customerName) : (data.customerName || undefined);
 
@@ -1092,8 +1269,13 @@ export class SalesService {
         status: data.status || 'DRAFT',
         subTotal,
         taxAmount,
-        discountAmount: discount,
-        totalAmount: totalAmount - discount,
+        // A forged/negative document discount can't exceed the bill or
+        // drive the total negative — same clamp as calculateTotals' own
+        // per-line bound, applied here since this document-level discount
+        // is layered on top of calculateTotals' result rather than fed
+        // through it.
+        discountAmount: Math.max(0, Math.min(discount, totalAmount)),
+        totalAmount: Math.max(0, totalAmount - Math.max(0, Math.min(discount, totalAmount))),
         paymentTerms: data.paymentTerms,
         notes: data.notes,
         createdBy: data.createdBy,
@@ -1164,8 +1346,8 @@ export class SalesService {
           status: data.status || existing.status,
           subTotal,
           taxAmount,
-          discountAmount: discount,
-          totalAmount: totalAmount - discount,
+          discountAmount: Math.max(0, Math.min(discount, totalAmount)),
+          totalAmount: Math.max(0, totalAmount - Math.max(0, Math.min(discount, totalAmount))),
           paymentTerms: data.paymentTerms !== undefined ? data.paymentTerms : existing.paymentTerms,
           stateOfSupply: data.stateOfSupply !== undefined ? (data.stateOfSupply || null) : (existing as any).stateOfSupply,
           notes: data.notes !== undefined ? data.notes : existing.notes,
@@ -1435,7 +1617,13 @@ export class SalesService {
     }
 
     const discount = data.discountAmount || 0;
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
+    // Direct Sales Order creation has no Dealer/Franchise selector in the
+    // UI today (only conversion from Estimate/Proforma carries partyType)
+    // — resolve against the Customer channel only, matching current
+    // capability rather than inventing a party mechanism that doesn't
+    // exist here.
+    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, 'CUSTOMER');
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
 
     try {
       return await prisma.$transaction(async (tx) => tx.salesOrder.create({
@@ -1448,8 +1636,8 @@ export class SalesService {
         stateOfSupply: data.stateOfSupply || undefined,
         subTotal,
         taxAmount,
-        discountAmount: discount,
-        totalAmount: totalAmount - discount,
+        discountAmount: Math.max(0, Math.min(discount, totalAmount)),
+        totalAmount: Math.max(0, totalAmount - Math.max(0, Math.min(discount, totalAmount))),
         orderDate: data.orderDate ? new Date(data.orderDate) : new Date(),
         dueDate: data.dueDate ? new Date(data.dueDate) : undefined,
         deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : undefined,
@@ -1513,6 +1701,11 @@ export class SalesService {
       ...safeData
     } = data;
 
+    // subTotal/taxAmount/discountAmount/totalAmount are deliberately NOT
+    // whitelisted here — a bare PATCH with no `items` must never be able to
+    // overwrite the stored financial totals directly. They're only ever
+    // set below, as a byproduct of recomputing from `items` via
+    // calculateTotals.
     const validKeys = [
       'orderNumber',
       'quotationId',
@@ -1523,10 +1716,6 @@ export class SalesService {
       'customerName',
       'customerPhone',
       'status',
-      'subTotal',
-      'taxAmount',
-      'discountAmount',
-      'totalAmount',
       'orderDate',
       'dueDate',
       'stateOfSupply',
@@ -1557,11 +1746,12 @@ export class SalesService {
     return prisma.$transaction(async (tx) => {
       if (items) {
         const discount = data.discountAmount || 0;
-        const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(items as any[], discount);
+        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(items as any[], discount);
 
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
-        updateData.discountAmount = discount;
+        // Server-computed (clamped) discount, not the raw client figure.
+        updateData.discountAmount = totalDiscount;
         updateData.totalAmount = totalAmount;
 
         // Same replace-all-items pattern as updateQuotation/updateProformaInvoice:
@@ -2172,9 +2362,23 @@ export class SalesService {
       }
     }
 
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(
-      data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 }))
+    // DC's destination is mutually exclusive (assertSingleDestination
+    // above) and directly determines the channel — no separate partyType
+    // field needed here, unlike the abstract-party documents.
+    const dcPartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
+      data.dealerId ? 'DEALER' : data.franchiseId ? 'FRANCHISE' : 'CUSTOMER';
+    const resolvedSourceFranchiseId = data.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id || null;
+    const dcScopeFranchiseId = resolvedSourceFranchiseId
+      ? await FranchiseService.toInventoryScopeId(prisma, resolvedSourceFranchiseId)
+      : null;
+    const pricedDcItems = await applyAuthoritativePricing(
+      prisma,
+      data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
+      dcScopeFranchiseId,
+      dcPartyType,
+      false // Delivery Challan has no discount concept — see applyAuthoritativePricing
     );
+    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedDcItems);
 
     try {
       return await prisma.$transaction(async (tx) => {
@@ -2716,23 +2920,29 @@ export class SalesService {
 
       for (const compItem of computed) {
         const item = (compItem as any).originalItem;
-        
+
         let validProductId = item.productId || '';
-        const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId) || p.name.toLowerCase() === item.productName?.toLowerCase());
-        
+        // Id/SKU only — a name-based match (or "grab any product") is a
+        // variant-cross-contamination risk (e.g. APPAM 450g silently
+        // resolving to APPAM 900g); erroring is safer than guessing.
+        const productMatch = allProducts.find(p => p.id === validProductId || (p.sku && p.sku === item.productId));
+
         if (productMatch) {
           validProductId = productMatch.id;
         } else if (item.productId) {
           const invItem = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
-          if (invItem) {
-            const matchedBySkuOrName = allProducts.find(p => (invItem.sku && p.sku === invItem.sku) || p.name.toLowerCase() === invItem.name.toLowerCase());
-            if (matchedBySkuOrName) {
-              validProductId = matchedBySkuOrName.id;
-            }
+          const matchedBySku = invItem?.sku ? allProducts.find(p => p.sku === invItem.sku) : undefined;
+          if (matchedBySku) {
+            validProductId = matchedBySku.id;
+          } else {
+            throw new Error(`Cannot convert: line item "${item.productName}" references productId "${item.productId}", which does not match any known Product or InventoryItem SKU.`);
           }
         }
 
-        if (!validProductId || !allProducts.some(p => p.id === validProductId)) {
+        if (!validProductId) {
+          // No productId was ever provided — a genuine free-text/custom
+          // line — reuse the existing "General Item" product if one
+          // exists, otherwise create a dedicated one for this line.
           if (fallbackProduct) {
             validProductId = fallbackProduct.id;
           } else {

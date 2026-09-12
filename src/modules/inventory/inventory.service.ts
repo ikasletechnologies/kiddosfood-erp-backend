@@ -50,7 +50,7 @@ function mapCategoryToDb(category?: string): ItemCategory {
 // the same product name, which the bulk-import flow explicitly creates as
 // two distinct SKUs). Without that scope, a name match could try to
 // overwrite an unrelated product's SKU and hit its unique constraint.
-async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory; hsnCode?: string | null; sacCode?: string | null; gstRate?: number | null }) {
+async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory; hsnCode?: string | null; sacCode?: string | null; gstRate?: number | null; discountType?: string | null; discountValue?: number | null }) {
   const existingProduct = await tx.product.findFirst({ where: { sku: item.sku } })
     ?? await tx.product.findFirst({ where: { name: { equals: item.name, mode: 'insensitive' }, sku: null } });
 
@@ -65,6 +65,8 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
         taxPercent,
         hsnCode: item.hsnCode || null,
         sacCode: item.sacCode || null,
+        discountType: item.discountType || "PERCENT",
+        discountValue: item.discountValue || 0,
         isActive: true,
         productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
         category: 'Automated Sync'
@@ -80,7 +82,9 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
         basePrice: item.basePrice || 0,
         taxPercent: item.gstRate !== undefined && item.gstRate !== null ? item.gstRate : existingProduct.taxPercent,
         hsnCode: item.hsnCode !== undefined ? item.hsnCode : existingProduct.hsnCode,
-        sacCode: item.sacCode !== undefined ? item.sacCode : existingProduct.sacCode
+        sacCode: item.sacCode !== undefined ? item.sacCode : existingProduct.sacCode,
+        discountType: item.discountType !== undefined ? item.discountType : existingProduct.discountType,
+        discountValue: item.discountValue !== undefined ? item.discountValue : existingProduct.discountValue
       }
     });
     console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
@@ -425,6 +429,8 @@ export class InventoryService {
       if (data.franchisePrice !== undefined) createData.franchisePrice = Number(data.franchisePrice) || 0;
       if (data.dealerPrice !== undefined) createData.dealerPrice = Number(data.dealerPrice) || 0;
       if (data.customerPrice !== undefined) createData.customerPrice = Number(data.customerPrice) || 0;
+      if (data.discountType !== undefined) createData.discountType = data.discountType;
+      if (data.discountValue !== undefined) createData.discountValue = Number(data.discountValue) || 0;
 
       // Inherit an existing Product's price when the caller didn't supply
       // one — without this, creating the (missing) InventoryItem for an
@@ -516,13 +522,14 @@ export class InventoryService {
     const validFields = [
       'name', 'sku', 'category', 'unit', 'minimumStock', 'batchNo', 
       'expiryDate', 'franchiseId', 'vendorId', 'gstRate', 'hsnCode', 
-      'isActive', 'basePrice', 'costPrice', 'franchisePrice', 'dealerPrice', 'customerPrice'
+      'isActive', 'basePrice', 'costPrice', 'franchisePrice', 'dealerPrice', 'customerPrice',
+      'discountType', 'discountValue'
     ];
 
     const updatePayload: any = {};
     for (const key of validFields) {
       if (safeData[key] !== undefined) {
-        if (key === 'gstRate' || key === 'minimumStock') {
+        if (key === 'gstRate' || key === 'minimumStock' || key === 'discountValue') {
           updatePayload[key] = Number(safeData[key]) || 0;
         } else if (key === 'basePrice' || key === 'costPrice' || key === 'franchisePrice' || key === 'dealerPrice' || key === 'customerPrice') {
           updatePayload[key] = safeData[key] === null ? null : (Number(safeData[key]) || 0);
@@ -805,6 +812,7 @@ export class InventoryService {
       batchId?: string;
       unitCost?: number;
       strictFIFO?: boolean;
+      precalculatedFifo?: FifoConsumptionResult;
     }
   ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
     const itemBefore = await tx.inventoryItem.findUnique({ where: { id: data.itemId } });
@@ -847,7 +855,11 @@ export class InventoryService {
     let consumptionBreakdown: any[] | undefined;
 
     if (stockChange < 0) {
-      fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+      if (data.precalculatedFifo) {
+        fifo = data.precalculatedFifo;
+      } else {
+        fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+      }
       const shortfall = Math.abs(stockChange) - fifo.consumedFromBatches;
 
       if (data.strictFIFO && shortfall > 0.0001) {

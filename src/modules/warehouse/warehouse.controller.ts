@@ -18,6 +18,15 @@ async function assertWarehouseAccess(user: any, warehouseId: string) {
 }
 
 export class WarehouseController {
+  static async previewCode(req: Request, res: Response) {
+    try {
+      const code = await WarehouseService.previewNextWarehouseCode();
+      res.json({ code });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   // FRANCHISE_ADMIN is always resolved to their own franchiseId regardless
   // of what the query string asks for — never trust a client-supplied
   // franchiseId to look up another franchise's warehouse.
