@@ -8,8 +8,9 @@ export class CustomerService {
         ...(search && {
           OR: [
             { name: { contains: search, mode: 'insensitive' } },
-            { phone: { contains: search } },
-            { email: { contains: search, mode: 'insensitive' } }
+            { phone: { contains: search, mode: 'insensitive' } },
+            { email: { contains: search, mode: 'insensitive' } },
+            { gstNumber: { contains: search, mode: 'insensitive' } }
           ]
         })
       },
@@ -265,5 +266,77 @@ export class CustomerService {
       where: { id: customerId },
       data: { loyaltyPoints: { decrement: points } }
     });
+  }
+
+  static async getItemHistory(customerId: string, franchiseId?: string) {
+    if (franchiseId) {
+      const owned = await prisma.customer.findFirst({ where: { id: customerId, franchiseId } });
+      if (!owned) throw new Error('Customer not found');
+    }
+
+    const orders = await prisma.order.findMany({
+      where: {
+        customerId,
+        status: { notIn: ['CANCELLED', 'REFUNDED'] }
+      },
+      include: {
+        orderItems: {
+          include: {
+            product: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const productMap = new Map<string, {
+      productId: string;
+      name: string;
+      sku: string;
+      category?: string;
+      unit?: string;
+      quantitySold: number;
+      totalValue: number;
+      lastPurchased: Date;
+      orderCount: number;
+    }>();
+
+    for (const order of orders as any[]) {
+      for (const item of order.orderItems || []) {
+        if (!item.productId && !item.product) continue;
+        const prodId = item.productId || item.product?.id || 'unknown';
+        const prodName = item.product?.name || item.productName || 'Product';
+        const sku = item.product?.sku || '—';
+        const category = item.product?.category || '—';
+        const unit = item.product?.unit || item.unit || 'PCS';
+        const qty = Number(item.quantity) || 0;
+        const val = Number(item.totalAmount || (item.price * item.quantity)) || 0;
+        const dt = new Date(order.createdAt);
+
+        if (!productMap.has(prodId)) {
+          productMap.set(prodId, {
+            productId: prodId,
+            name: prodName,
+            sku,
+            category,
+            unit,
+            quantitySold: qty,
+            totalValue: val,
+            lastPurchased: dt,
+            orderCount: 1
+          });
+        } else {
+          const p = productMap.get(prodId)!;
+          p.quantitySold += qty;
+          p.totalValue += val;
+          p.orderCount += 1;
+          if (dt > p.lastPurchased) p.lastPurchased = dt;
+        }
+      }
+    }
+
+    return Array.from(productMap.values()).sort(
+      (a, b) => b.lastPurchased.getTime() - a.lastPurchased.getTime()
+    );
   }
 }

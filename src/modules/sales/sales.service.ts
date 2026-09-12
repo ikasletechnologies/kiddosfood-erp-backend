@@ -2345,6 +2345,9 @@ export class SalesService {
     if (data.dealerId) {
       const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
       if (!dealer) throw new Error('Selected dealer not found.');
+      if (dealer.status === 'INACTIVE') {
+        throw new Error('Dealer is inactive. This operation is not allowed.');
+      }
     }
 
     // Invoice Qty vs Dispatch Qty: only enforced going IN_TRANSIT (a DRAFT
@@ -2468,6 +2471,9 @@ export class SalesService {
         if (data.dealerId) {
           const dealer = await tx.dealer.findUnique({ where: { id: data.dealerId } });
           if (!dealer) throw new Error('Selected dealer not found.');
+          if (dealer.status === 'INACTIVE') {
+            throw new Error('Dealer is inactive. This operation is not allowed.');
+          }
         }
       }
 

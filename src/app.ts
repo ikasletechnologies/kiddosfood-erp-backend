@@ -529,6 +529,7 @@ app.get('/api/customers/ledger-summary', authenticate, authorizeRole(['FRANCHISE
 app.get('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getOne);
 app.patch('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.update);
 app.get('/api/customers/:id/history', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getHistory);
+app.get('/api/customers/:id/items', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getItemHistory);
 app.delete('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.delete);
 
 // Dealers & Business Partners

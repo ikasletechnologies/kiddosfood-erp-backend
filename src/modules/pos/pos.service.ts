@@ -455,6 +455,14 @@ export class POSService {
     const hasRealParty = resolvedPartyType !== 'CUSTOMER' && !!data.partyId;
     const resolvedPartyId = hasRealParty ? data.partyId : undefined;
     const resolvedEntityId = hasRealCustomer ? data.customerId : resolvedPartyId;
+
+    if (resolvedPartyType === 'DEALER' && resolvedPartyId) {
+      const dealer = await prisma.dealer.findUnique({ where: { id: resolvedPartyId } });
+      if (!dealer) throw new Error('Selected dealer not found.');
+      if (dealer.status === 'INACTIVE') {
+        throw new Error('Dealer is inactive. This operation is not allowed.');
+      }
+    }
     // Fallback label used only when there's no real master-table id to
     // resolve a display name from — flows into Payment.transactionRef so
     // FinanceService.getPayments shows it instead of falling through to the

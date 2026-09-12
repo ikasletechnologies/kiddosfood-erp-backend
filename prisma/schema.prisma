@@ -93,6 +93,17 @@ model Dealer {
   phone            String?           @unique
   email            String?           @unique
   address          String?
+  state            String?
+  district         String?
+  city             String?
+  pincode          String?
+  shippingAddress  String?
+  gstNumber        String?
+  gstType          String?
+  openingBalance   Float             @default(0)
+  openingBalanceType String?
+  asOfDate         DateTime?
+  creditLimit      Float?
   status           String            @default("ACTIVE")
   franchiseId      String
   createdAt        DateTime          @default(now())
