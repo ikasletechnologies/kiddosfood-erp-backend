@@ -2026,6 +2026,7 @@ enum VendorLedgerReferenceType {
   OPENING_BALANCE
   RETURN
   PURCHASE
+  REFUND
 }
 
 enum PaymentSourceModule {
@@ -2054,6 +2055,7 @@ enum AccountingPaymentType {
   DIRECT
   REVERSAL
   INTERNAL_TRANSFER
+  REFUND
 }
 
 enum LedgerType {

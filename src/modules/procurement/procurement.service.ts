@@ -1609,7 +1609,7 @@ export class ProcurementService {
   }
 
   static async recordPayment(vendorId: string, data: {
-    amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE';
+    amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE' | 'REFUND';
     paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string;
     idempotencyKey?: string; allowOverpayment?: boolean; date?: string;
   }) {
@@ -1653,7 +1653,17 @@ export class ProcurementService {
       // previously recorded valid payments. Reject anything beyond that
       // unless the caller explicitly opted into overpayment (which should
       // be recorded as a fresh vendor advance, not silently absorbed here).
-      if (!allowOverpayment) {
+      if (type === 'REFUND') {
+        const v = await this.getVendorById(vendorId);
+        if (!v) throw new Error("Vendor not found");
+        if (v.balance >= 0) {
+          throw new Error(`Cannot record refund. Vendor does not have a receivable balance (Current balance: ₹${v.balance}).`);
+        }
+        const receivable = Math.abs(v.balance);
+        if (amount > receivable + 0.01) {
+          throw new Error(`Refund amount of ₹${amount} exceeds the vendor's receivable balance of ₹${receivable.toFixed(2)}.`);
+        }
+      } else if (!allowOverpayment) {
         let outstanding: number | null = null;
         if (vendorInvoiceId) {
           const inv = await tx.vendorInvoice.findUnique({ where: { id: vendorInvoiceId } });
@@ -1681,13 +1691,13 @@ export class ProcurementService {
       const payment = await FinanceService.createPayment({
         tx,
         amount,
-        type: type === 'ADVANCE' ? 'ADVANCE' : 'INVOICE_LINKED',
-        flow: 'OUT',
+        type: type === 'ADVANCE' ? 'ADVANCE' : (type === 'REFUND' ? 'REFUND' : 'INVOICE_LINKED'),
+        flow: type === 'REFUND' ? 'IN' : 'OUT',
         status: 'PAID',
         sourceAccount: accountId,
         method: resolvedMode,
         sourceModule: 'PROCUREMENT',
-        linkedDocType: vendorInvoiceId ? 'INVOICE' : (targetPoId ? 'PO' : 'DIRECT'),
+        linkedDocType: type === 'REFUND' ? 'DIRECT' : (vendorInvoiceId ? 'INVOICE' : (targetPoId ? 'PO' : 'DIRECT')),
         linkedDocId: vendorInvoiceId || targetPoId,
         vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',

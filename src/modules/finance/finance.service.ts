@@ -1488,7 +1488,7 @@ export class FinanceService {
               amount: amount,
               balanceAfterTransaction: isOutflow ? currentBalance - amount : currentBalance + amount,
               sourceModule: sourceModule as any,
-              referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
+              referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : (data.type === 'REFUND' ? 'REFUND' : 'PAYMENT'),
               referenceId: payment.id,
               invoiceId: data.vendorInvoiceId,
               accountId: account?.id,
