@@ -1150,7 +1150,7 @@ export class InventoryService {
       where: { id: itemId },
       include: { baseUnit: true, conversions: { include: { unit: true } } }
     });
-    
+
     if (!item) throw new Error("Item not found");
     
     // If no unit requested, assume base quantity

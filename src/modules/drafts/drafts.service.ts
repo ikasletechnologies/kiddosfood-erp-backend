@@ -23,7 +23,10 @@ export class DraftsService {
     });
   }
 
-  static async deleteDraft(id: string) {
-    return prisma.draft.deleteMany({ where: { id } });
+  static async deleteDraft(id: string, userId: string) {
+    // Scoped by userId too — getDrafts already only ever returns a user's
+    // own drafts, so delete must match that ownership instead of trusting
+    // a client-supplied id alone.
+    return prisma.draft.deleteMany({ where: { id, userId } });
   }
 }

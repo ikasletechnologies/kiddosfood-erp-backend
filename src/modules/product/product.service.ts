@@ -169,7 +169,22 @@ export class ProductService {
                    inventory.find(i => i.name.trim().toLowerCase() === pName);
         
         const packSize = parseSkuPackSize(p.sku);
-        const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || 'PC';
+        // `unit` must be a real, transactable measurement unit — the one
+        // InventoryService.convertUnitToBase actually knows how to resolve
+        // against InventoryItem.unit/baseUnit/conversions. packSize (e.g.
+        // "450G" parsed off the SKU) describes how much product is in ONE
+        // sold unit — a label, not a unit itself — and stays available as
+        // its own `packSize` field below for display (see POS/franchise-
+        // orders, which already show it that way). Folding
+        // `${qty}${unit}` into `unit` here made every sale of a pack-size
+        // SKU send a synthetic string like "450G" through the whole sales
+        // pipeline, which InventoryService.convertUnitToBase — correctly —
+        // can never resolve, since nothing in the unit/conversion system
+        // was ever meant to represent "450G" as a real unit. Bare
+        // packSize.unit (e.g. "G") IS a real unit code per SKU_SIZE_RE, so
+        // it stays as a last-resort fallback when the item truly has no
+        // configured unit at all.
+        const resolvedUnit = inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || packSize?.unit || 'PC';
 
         if (!inv) {
           // If resolving for a branch franchise (non-HQ), exclude products
@@ -213,7 +228,9 @@ export class ProductService {
 
     return products.map(p => {
       const packSize = parseSkuPackSize(p.sku);
-      const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || p.recipe?.yieldUnit || 'PC';
+      // Same fix as above — packSize describes pack content, not a
+      // transactable unit; see the comment on the franchise-scoped branch.
+      const resolvedUnit = p.recipe?.yieldUnit || packSize?.unit || 'PC';
       return {
         ...p,
         unit: resolvedUnit,

@@ -261,6 +261,46 @@ export class FinanceService {
       }
     }
 
+    // 1b. Return reversals — a completed return must reduce both revenue and
+    // COGS for the period it happened in, or P&L silently overstates both
+    // (and everything downstream: Balance Sheet net income, Dashboard Net
+    // Profit). Two return-financial fields already exist for exactly this,
+    // computed once at return-creation time and never re-derived here:
+    //   - ReturnItem.taxableValue: tax-EXCLUSIVE reversal, the same basis as
+    //     the tax-exclusive `subTotalRevenue` accumulated above — NOT
+    //     refundAmount/totalAmount, which are tax-INCLUSIVE (what's actually
+    //     paid back to the customer, a different figure).
+    //   - ReturnItem.costReversal: the exact historical FIFO cost being
+    //     reversed (proven to sum to the original sale's full COGS across
+    //     disjoint partial returns) — NOT re-derived from any StockMovement
+    //     or InventoryItem.costPrice.
+    // Scope: only APPROVED/COMPLETED returns count (matches the existing
+    // GST/credit-note aggregation convention and the financial-integrity
+    // test) — PENDING (not yet approved) and REJECTED must not move P&L.
+    // Period: filtered on the RETURN's own createdAt (like Expenses above
+    // are filtered on Expense.date, independent of some other event's
+    // date) — a return is booked in the period it actually happened in, not
+    // retroactively reopening the original sale's period.
+    // costReversal can be null (Case C / PROVENANCE_UNAVAILABLE — no
+    // original outbound stock movement could be traced, e.g. a
+    // Quotation/SalesOrder/Proforma conversion with no real inventory
+    // deduction); Prisma's _sum simply skips nulls, so COGS is only reduced
+    // by what's genuinely known, never fabricated.
+    const returnReversals = await prisma.returnItem.aggregate({
+      where: {
+        return: {
+          status: { in: ['APPROVED', 'COMPLETED'] },
+          ...(start || end ? { createdAt: dateQuery } : {}),
+          ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {})
+        }
+      },
+      _sum: { taxableValue: true, costReversal: true }
+    });
+    const totalReturnRevenue = returnReversals._sum.taxableValue || 0;
+    const totalReturnCOGS = returnReversals._sum.costReversal || 0;
+    totalRevenue -= totalReturnRevenue;
+    totalCOGS -= totalReturnCOGS;
+
     // 2. Purchases — the actually recognized liability (VendorInvoice),
     // whose amount/cgst/sgst/igst are derived from the GRN's actual price
     // via VendorInvoiceService.computeCommercialsFromPO + recognizeLiability
@@ -298,6 +338,10 @@ export class FinanceService {
     return {
       revenue: totalRevenue,
       cogs: totalCOGS,
+      // Informational only — already netted into revenue/cogs above, not an
+      // additional adjustment a caller needs to apply.
+      returnRevenue: totalReturnRevenue,
+      returnCOGS: totalReturnCOGS,
       purchase: totalPurchases,
       taxPayable: totalOutputTax,
       taxReceivable: totalInputTax,
