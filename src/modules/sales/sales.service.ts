@@ -1815,14 +1815,17 @@ export class SalesService {
 
   // ─── Return Orders (RMA) ─────────────────────────────────────────────────────
 
-  static async getReturnOrders(filters: { status?: string; customerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'BUSINESS' | 'POS'; search?: string }) {
+  static async getReturnOrders(filters: { status?: string; customerId?: string; dealerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'DEALER' | 'BUSINESS' | 'POS'; search?: string }) {
     const where: any = {};
     if (filters.status) where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
+    if (filters.dealerId) where.dealerId = filters.dealerId;
     if (filters.franchiseId) where.franchiseId = filters.franchiseId;
 
     if (filters.source === 'FRANCHISE') {
       where.franchiseId = { not: null };
+    } else if (filters.source === 'DEALER') {
+      where.dealerId = { not: null };
     } else if (filters.source === 'BUSINESS') {
       where.customerId = { not: null };
     } else if (filters.source === 'POS') {
@@ -1837,9 +1840,263 @@ export class SalesService {
     }
     return prisma.returnOrder.findMany({
       where,
-      include: { customer: true, salesOrder: true, franchise: true, franchiseOrder: true, posOrder: true, items: true },
+      include: { customer: true, dealer: true, salesOrder: true, franchise: true, franchiseOrder: true, posOrder: true, items: true },
       orderBy: { createdAt: 'desc' }
     });
+  }
+
+  // ── Phase 3 helpers: inventory-cost reversal for Sales/POS Returns ───────
+  // These are the only new pieces of state-derivation this phase needs — no
+  // second FIFO ledger. The original sale's own StockMovement rows (written
+  // by InventoryService.recordMovement/depleteBatchesFIFO — untouched,
+  // authoritative) already carry exact layer provenance; these helpers only
+  // ever REPLAY that existing ordering, never reimplement or reorder it.
+
+  // Serializes concurrent createReturnOrder calls against the SAME original
+  // document. Without this, two concurrent requests can both read the same
+  // "already returned" total (the pre-existing over-return guard AND this
+  // phase's FIFO-layer skip-count both depend on it) before either commits
+  // its own ReturnItem rows, letting combined returns exceed what was
+  // actually sold/dispatched/transferred. Mirrors depleteBatchesFIFO's own
+  // SELECT ... FOR UPDATE precedent (inventory.service.ts) and
+  // recordRefund's existing `SELECT id FROM "ReturnOrder" ... FOR UPDATE`
+  // pattern in this same file.
+  private static async _lockOriginalDocumentForReturn(tx: any, data: { posOrderId?: string; salesOrderId?: string; franchiseOrderId?: string }) {
+    if (data.posOrderId) {
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${data.posOrderId} FOR UPDATE`;
+    } else if (data.salesOrderId) {
+      await tx.$queryRaw`SELECT id FROM "SalesOrder" WHERE id = ${data.salesOrderId} FOR UPDATE`;
+    } else if (data.franchiseOrderId) {
+      await tx.$queryRaw`SELECT id FROM "FranchiseOrder" WHERE id = ${data.franchiseOrderId} FOR UPDATE`;
+    }
+  }
+
+  // Phase 3A: the Delivery-Challan-return equivalent of
+  // _lockOriginalDocumentForReturn above — a completely separate model
+  // (DeliveryChallan, not Order/SalesOrder/FranchiseOrder), so kept as its
+  // own small helper rather than overloading that one. Serializes concurrent
+  // createDeliveryChallanReturn calls against the SAME challan: without
+  // this, two concurrent requests can both read the same "previously
+  // returned" total for a challan line (see previouslyReturned below) before
+  // either commits its own DeliveryChallanReturnItem rows, letting combined
+  // returns exceed what was actually dispatched on that line.
+  private static async _lockDeliveryChallanForReturn(tx: any, challanId: string) {
+    await tx.$queryRaw`SELECT id FROM "DeliveryChallan" WHERE id = ${challanId} FOR UPDATE`;
+  }
+
+  // Resolves WHERE the original sale's real FIFO consumption (if any) was
+  // recorded: the referenceType/referenceId StockMovement rows were written
+  // under, and the franchise scope (a real Franchise.id, or null meaning
+  // none/HQ-not-applicable) whose InventoryItem to look them up against.
+  //   - posOrderId  -> referenceType 'ORDER' (POS checkout AND any Group-B
+  //     conversion-created Order alike — a conversion Order simply has no
+  //     matching rows, which correctly falls out as Case C below, without
+  //     needing to special-case document sub-type here).
+  //   - franchiseOrderId -> referenceType 'FRANCHISE_ORDER' (the TRANSFER_IN
+  //     side, landed directly on the receiving franchise's own InventoryItem
+  //     — same scope the return itself restores into, see
+  //     restoreStockForReturnOrder).
+  //   - salesOrderId -> a SalesOrder itself never deducts inventory (Group
+  //     B — convertSalesOrderToSale calls zero inventory functions), but a
+  //     DeliveryChallan dispatched FOR this SalesOrder (DeliveryChallan.
+  //     salesOrderId) does, under referenceType 'DELIVERY_CHALLAN' /
+  //     referenceId = that challan's id, scoped to the challan's own
+  //     sourceFranchiseId (the dispatching warehouse) — see
+  //     dispatchChallanStock. A SalesOrder with no linked DC (the Group-B
+  //     conversion path) naturally resolves to no refs at all -> Case C.
+  // NOTE on the returned scope value: this is the FINAL, ready-to-use
+  // InventoryItem.franchiseId filter value — NOT necessarily a raw
+  // Franchise.id needing a further FranchiseService.toInventoryScopeId
+  // conversion. Each branch below matches whatever convention the REAL
+  // deduction code for that document type actually used when it wrote the
+  // InventoryItem row being looked up, which is not uniform across the
+  // codebase:
+  //   - POS checkout (pos.service.ts) converts via toInventoryScopeId
+  //     (HQ -> null) before resolving its InventoryItem, so this does too.
+  //   - franchise-order.service.ts's TRANSFER_IN resolves its InventoryItem
+  //     by the RAW `order.franchiseId` (no conversion) — harmless in
+  //     practice since a FranchiseOrder's franchise is always a real
+  //     (non-HQ) franchise, where toInventoryScopeId is a no-op anyway, but
+  //     matched exactly here rather than assumed.
+  //   - dispatchChallanStock resolves its InventoryItem by the RAW
+  //     `challan.sourceFranchiseId || HQ.id` — critically NOT converted, so
+  //     an HQ-sourced DC's stock actually lives under `franchiseId: hq.id`,
+  //     NOT `franchiseId: null`. Converting here would silently look up the
+  //     wrong (or no) InventoryItem for every HQ-dispatched DC.
+  private static async _resolveReturnProvenanceRefs(tx: any, data: { posOrderId?: string; salesOrderId?: string; franchiseOrderId?: string }): Promise<{ refs: Array<{ referenceType: string; referenceId: string }>; scopeFranchiseId: string | null }> {
+    if (data.posOrderId) {
+      const po = await tx.order.findUnique({ where: { id: data.posOrderId }, select: { franchiseId: true } });
+      const scopeFranchiseId = po?.franchiseId ? await FranchiseService.toInventoryScopeId(tx, po.franchiseId) : null;
+      return { refs: [{ referenceType: 'ORDER', referenceId: data.posOrderId }], scopeFranchiseId };
+    }
+    if (data.franchiseOrderId) {
+      const fo = await tx.franchiseOrder.findUnique({ where: { id: data.franchiseOrderId }, select: { franchiseId: true } });
+      return { refs: [{ referenceType: 'FRANCHISE_ORDER', referenceId: data.franchiseOrderId }], scopeFranchiseId: fo?.franchiseId || null };
+    }
+    if (data.salesOrderId) {
+      const challans = await tx.deliveryChallan.findMany({ where: { salesOrderId: data.salesOrderId }, select: { id: true, sourceFranchiseId: true } });
+      if (!challans.length) return { refs: [], scopeFranchiseId: null };
+      const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+      return {
+        refs: challans.map((c: any) => ({ referenceType: 'DELIVERY_CHALLAN', referenceId: c.id })),
+        scopeFranchiseId: challans[0].sourceFranchiseId || hq?.id || null,
+      };
+    }
+    return { refs: [], scopeFranchiseId: null };
+  }
+
+  // Item resolution for a return line, given the scope to look inside —
+  // identical matching precedence (SKU, then name) used by
+  // restoreStockForReturnOrder for the actual physical restock, factored
+  // out so provenance-lookup (creation time) and restoration (approval
+  // time) can never resolve to two different InventoryItem rows for the
+  // same line.
+  private static async _resolveInventoryItemForReturnLine(tx: any, scopeFranchiseId: string | null, item: { productId?: string | null; productName?: string | null }): Promise<any> {
+    let invItem: any = null;
+    if (item.productId) {
+      const product = await tx.product.findUnique({ where: { id: item.productId } });
+      if (product?.sku) {
+        invItem = await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } });
+      }
+      if (!invItem && product?.name) {
+        invItem = await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+      }
+    }
+    if (!invItem && item.productName) {
+      invItem = await tx.inventoryItem.findFirst({ where: { name: { equals: item.productName, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+    }
+    return invItem;
+  }
+
+  // The restoration-side scope fallback (franchiseId party -> posOrder's
+  // operating branch -> Customer's/Dealer's own home franchise) — factored
+  // out of restoreStockForReturnOrder so it stays in exactly one place.
+  private static async _resolveReturnRestoreScopeFranchiseId(tx: any, returnOrder: any): Promise<string | null> {
+    let scopeFranchiseId = returnOrder.franchiseId || returnOrder.posOrder?.franchiseId || null;
+    if (!scopeFranchiseId && returnOrder.customerId) {
+      const cust = await tx.customer.findUnique({ where: { id: returnOrder.customerId }, select: { franchiseId: true } });
+      scopeFranchiseId = cust?.franchiseId || null;
+    }
+    if (!scopeFranchiseId && returnOrder.dealerId) {
+      const deal = await tx.dealer.findUnique({ where: { id: returnOrder.dealerId }, select: { franchiseId: true } });
+      scopeFranchiseId = deal?.franchiseId || null;
+    }
+    return scopeFranchiseId;
+  }
+
+  // The core FIFO-return-allocation algorithm (design doc step 1-5): given
+  // the original sale's StockMovement rows for this exact item+reference,
+  // reconstruct their ordered layer list exactly as depleteBatchesFIFO
+  // wrote it, skip whatever prior returns on this line already consumed
+  // (cumulatively, in the same order — a deterministic replay that needs no
+  // separate "remaining" ledger), then allocate THIS return's quantity to
+  // the next layers in order.
+  private static async _computeReturnFifoAllocation(tx: any, params: {
+    itemId: string;
+    refs: Array<{ referenceType: string; referenceId: string }>;
+    alreadyReturnedQty: number;
+    returnQty: number;
+  }): Promise<{ provenance: 'EXACT' | 'RECONSTRUCTED' | 'PROVENANCE_UNAVAILABLE'; allocation: Array<{ batchId: string | null; qty: number; unitCost: number; totalCost: number }> | null; costReversal: number | null }> {
+    if (!params.refs.length) {
+      return { provenance: 'PROVENANCE_UNAVAILABLE', allocation: null, costReversal: null };
+    }
+
+    // Every matching outbound (or, for FRANCHISE_ORDER, inbound TRANSFER_IN)
+    // movement for this exact item+reference, oldest first — depleteBatchesFIFO
+    // itself only ever runs within ONE recordMovement call, but a single
+    // logical sale/dispatch/transfer can span several recordMovement calls
+    // (e.g. HQ->Franchise TRANSFER_IN is written once per source lot) — this
+    // concatenates all of them, in the order they were actually written.
+    const movements = await tx.stockMovement.findMany({
+      where: {
+        itemId: params.itemId,
+        OR: params.refs.map(r => ({ referenceType: r.referenceType, referenceId: r.referenceId })),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (!movements.length) {
+      return { provenance: 'PROVENANCE_UNAVAILABLE', allocation: null, costReversal: null };
+    }
+
+    type Layer = { batchId: string | null; qty: number; unitCost: number; exact: boolean };
+    const layers: Layer[] = [];
+
+    for (const mv of movements) {
+      const qty = Math.abs(mv.quantity || 0);
+      if (qty <= 0.0000001) continue;
+
+      const breakdown = Array.isArray(mv.consumptionBreakdown) ? (mv.consumptionBreakdown as any[]) : null;
+      if (breakdown && breakdown.length) {
+        // Multi-lot movement — already FIFO-ordered by depleteBatchesFIFO.
+        let covered = 0;
+        for (const b of breakdown) {
+          const bQty = Number(b.qty) || 0;
+          if (bQty <= 0) continue;
+          layers.push({ batchId: b.batchId || null, qty: bQty, unitCost: Number(b.unitCost) || 0, exact: true });
+          covered += bQty;
+        }
+        const shortfall = qty - covered;
+        if (shortfall > 0.0001) {
+          // The movement covered more than its recorded breakdown accounts
+          // for (a legacy/partial-tracking gap) — the remainder still has
+          // SOME historical unit cost on the row itself, just not a real
+          // batch to reattribute it to. Reconstructed, not fabricated.
+          layers.push({ batchId: null, qty: shortfall, unitCost: Number(mv.unitCost) || 0, exact: false });
+        }
+      } else if (mv.batchId) {
+        // Single-lot movement (outbound with exactly one batch consumed, or
+        // an inbound TRANSFER_IN's own receiveAtCost lot).
+        layers.push({ batchId: mv.batchId, qty, unitCost: Number(mv.unitCost) || 0, exact: true });
+      } else if (mv.unitCost != null) {
+        // No batch identity at all (e.g. the item had zero tracked batches
+        // at sale time, so recordMovement fell back to the item's
+        // moving-average costPrice AS IT WAS AT THAT MOMENT — still a real
+        // historical figure, just not layer-exact).
+        layers.push({ batchId: null, qty, unitCost: Number(mv.unitCost) || 0, exact: false });
+      }
+      // A row with neither batchId nor consumptionBreakdown nor unitCost
+      // contributes no usable layer at all — genuinely pre-existing/
+      // malformed legacy data; simply skipped (does not fabricate a cost).
+    }
+
+    if (!layers.length) {
+      return { provenance: 'PROVENANCE_UNAVAILABLE', allocation: null, costReversal: null };
+    }
+
+    let toSkip = params.alreadyReturnedQty;
+    let toTake = params.returnQty;
+    const allocation: Array<{ batchId: string | null; qty: number; unitCost: number; totalCost: number }> = [];
+    let anyInexact = false;
+
+    for (const layer of layers) {
+      if (toTake <= 0.0000001) break;
+      let layerQty = layer.qty;
+      if (toSkip > 0.0000001) {
+        const skipHere = Math.min(toSkip, layerQty);
+        layerQty -= skipHere;
+        toSkip -= skipHere;
+      }
+      if (layerQty <= 0.0000001) continue;
+      const takeHere = Math.min(layerQty, toTake);
+      if (takeHere > 0.0000001) {
+        allocation.push({ batchId: layer.batchId, qty: takeHere, unitCost: layer.unitCost, totalCost: Math.round(takeHere * layer.unitCost * 100) / 100 });
+        if (!layer.exact) anyInexact = true;
+        toTake -= takeHere;
+      }
+    }
+
+    if (!allocation.length) {
+      return { provenance: 'PROVENANCE_UNAVAILABLE', allocation: null, costReversal: null };
+    }
+
+    const costReversal = Math.round(allocation.reduce((s, a) => s + a.totalCost, 0) * 100) / 100;
+    // toTake > 0 here means even the tracked layers ran out before covering
+    // the full return quantity (a historical shortfall) — still record
+    // whatever WAS traceable rather than fabricating the rest.
+    const provenance: 'EXACT' | 'RECONSTRUCTED' = (anyInexact || toTake > 0.0001) ? 'RECONSTRUCTED' : 'EXACT';
+
+    return { provenance, allocation, costReversal };
   }
 
   static async createReturnOrder(data: {
@@ -1847,48 +2104,56 @@ export class SalesService {
     franchiseOrderId?: string;
     posOrderId?: string;
     customerId?: string;
+    dealerId?: string;
     franchiseId?: string;
     reason: string;
     status?: 'PENDING' | 'APPROVED' | 'COMPLETED' | 'REJECTED';
-    items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string; discountAmount?: number; taxAmount?: number }>;
     refundMethod?: string;
     idempotencyKey?: string;
   }) {
     if (data.idempotencyKey) {
       const existing = await prisma.returnOrder.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
-        include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+        include: { customer: true, dealer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
       });
       if (existing) return existing;
     }
 
     return await prisma.$transaction(async (tx) => {
-      // 1. Resolve Authoritative Party & Relationships from the linked order
+      // 1. Resolve Authoritative Party & Relationships from the linked order.
+      // Party identity (who the return is FOR: Customer/Dealer/Franchise)
+      // must never be confused with Order.franchiseId, which is the
+      // OPERATING branch that processed the sale — nearly every Order has
+      // one regardless of who bought it, so blindly copying it here used to
+      // mislabel every POS-sourced Customer/Dealer return as a Franchise
+      // return. The correct party signal is Order.partyType/partyId.
       let resolvedCustomerId: string | null = null;
+      let resolvedDealerId: string | null = null;
       let resolvedFranchiseId: string | null = data.franchiseId || null;
 
       if (data.posOrderId) {
         const po = await tx.order.findUnique({ where: { id: data.posOrderId } });
         if (po) {
-          if (po.customerId && !/walk[-_ ]?in/i.test(po.customerId)) {
+          if (po.partyType === 'DEALER' && po.partyId) {
+            resolvedDealerId = po.partyId;
+          } else if (po.partyType === 'FRANCHISE' && po.partyId) {
+            resolvedFranchiseId = po.partyId;
+          } else if (po.customerId && !/walk[-_ ]?in/i.test(po.customerId)) {
             const cust = await tx.customer.findUnique({ where: { id: po.customerId } });
             resolvedCustomerId = cust ? cust.id : null;
-          }
-          if (po.franchiseId) {
-            resolvedFranchiseId = po.franchiseId;
           }
         }
       } else if (data.salesOrderId) {
         const so = await tx.salesOrder.findUnique({ where: { id: data.salesOrderId } });
         if (so) {
-          if (so.customerId) {
-            const cust = await tx.customer.findUnique({ where: { id: so.customerId } });
-            resolvedCustomerId = cust ? cust.id : null;
-          }
-          if ((so as any).franchiseId) {
-            resolvedFranchiseId = (so as any).franchiseId;
+          if (so.partyType === 'DEALER' && so.partyId) {
+            resolvedDealerId = so.partyId;
           } else if (so.partyType === 'FRANCHISE' && so.partyId) {
             resolvedFranchiseId = so.partyId;
+          } else if (so.customerId) {
+            const cust = await tx.customer.findUnique({ where: { id: so.customerId } });
+            resolvedCustomerId = cust ? cust.id : null;
           }
         }
       } else if (data.franchiseOrderId) {
@@ -1896,13 +2161,59 @@ export class SalesService {
         if (fo && fo.franchiseId) {
           resolvedFranchiseId = fo.franchiseId;
         }
+      } else if (data.dealerId) {
+        const dealer = await tx.dealer.findUnique({ where: { id: data.dealerId } });
+        resolvedDealerId = dealer ? dealer.id : null;
       } else if (data.customerId && !/walk[-_ ]?in/i.test(data.customerId)) {
         const cust = await tx.customer.findUnique({ where: { id: data.customerId } });
         resolvedCustomerId = cust ? cust.id : null;
       }
 
-      // 2. Validate return quantities against original order and prior returns
+      // 2. Resolve the original sale line-by-line (server-side, never trusting
+      // data.items[].rate) and validate return quantities against the
+      // original order + prior returns. originalLineMap carries everything
+      // needed to reverse discount/GST for each returned line using the
+      // unified formula below — it deliberately does NOT need to know
+      // whether the source Order came from POS checkout (tax computed on
+      // gross) or a Sales-chain conversion (tax computed on taxable): it
+      // only ever scales the ORIGINAL persisted tax amount proportionally,
+      // never recomputes it from today's rates.
+      type OriginalLine = {
+        price: number;    // gross unit rate actually charged on the original line
+        quantity: number; // original quantity sold on this line
+        discountPct: number; // % discount already recorded on this line (0 for FranchiseOrderItem, which has no discount concept)
+        taxAmountFull: number; // actual persisted tax charged for the FULL original line (0 for FranchiseOrderItem lines, apportioned instead — see apportionedTax)
+        apportionedLeftoverDiscount?: number; // POS-only: full-line share of the order-level "leftover" (manual/ad-hoc) discount not captured by discountPct
+        apportionedTax?: number; // FranchiseOrder-only: full-line share of FranchiseOrder.taxAmount, apportioned by gross-value weight
+      };
+      const originalLineMap = new Map<string, OriginalLine>();
+      let buyerState: string | null = null;
+      let sellerFranchiseIdForGst: string | null = resolvedFranchiseId;
+      // Phase 3 (inventory-cost reversal — completely independent of the
+      // refund/GST fields computed below): how much of each line was
+      // already returned by PRIOR non-rejected returns against this same
+      // original document, and which original StockMovement reference(s)
+      // this document's real FIFO consumption (if any) was recorded under.
+      // Populated inside the block below (when there IS a linked document),
+      // left empty/null otherwise — a standalone/manual return has no
+      // original consumption to trace, so every line on it is Case C.
+      let previouslyReturned: Record<string, number> = {};
+      let provenanceRefs: Array<{ referenceType: string; referenceId: string }> = [];
+      let provenanceScopeFranchiseId: string | null = null;
+
       if (data.posOrderId || data.salesOrderId || data.franchiseOrderId) {
+        // Phase 3: lock the original document FIRST, before reading any
+        // prior-returns total — see _lockOriginalDocumentForReturn. This is
+        // what actually makes concurrent partial returns against the same
+        // sale safe (both the pre-existing over-return guard below AND the
+        // new FIFO cost-allocation skip-count depend on seeing every
+        // already-committed prior return, never a stale concurrent read).
+        await SalesService._lockOriginalDocumentForReturn(tx, data);
+
+        const provenance = await SalesService._resolveReturnProvenanceRefs(tx, data);
+        provenanceRefs = provenance.refs;
+        provenanceScopeFranchiseId = provenance.scopeFranchiseId;
+
         const priorReturns = await tx.returnOrder.findMany({
           where: {
             ...(data.posOrderId ? { posOrderId: data.posOrderId } : {}),
@@ -1913,7 +2224,6 @@ export class SalesService {
           include: { items: true }
         });
 
-        const previouslyReturned: Record<string, number> = {};
         for (const pr of priorReturns) {
           for (const it of pr.items) {
             const key = it.productId || it.productName;
@@ -1922,15 +2232,83 @@ export class SalesService {
         }
 
         let originalItems: Array<{ productId?: string; productName?: string; quantity: number }> = [];
+
         if (data.posOrderId) {
           const po = await tx.order.findUnique({ where: { id: data.posOrderId }, include: { orderItems: { include: { product: true } } } });
-          if (po) originalItems = po.orderItems.map((oi: any) => ({ productId: oi.productId, productName: oi.product?.name, quantity: oi.quantity }));
+          if (po) {
+            originalItems = po.orderItems.map((oi: any) => ({ productId: oi.productId, productName: oi.product?.name, quantity: oi.quantity }));
+            buyerState = po.stateOfSupply || null;
+            sellerFranchiseIdForGst = resolvedFranchiseId || po.franchiseId || null;
+
+            // Leftover bill-level discount: the cashier's ad-hoc manualDiscount
+            // (see pos.service.ts checkout()) has no per-line home in the
+            // schema — it only survives in Order.discountAmount, blended with
+            // the per-line channel discount that DOES now populate
+            // OrderItem.discountPct. Whatever of Order.discountAmount isn't
+            // already accounted for by summing discountPct*price*quantity
+            // across lines is that ad-hoc portion; apportion it by gross-value
+            // weight, mirroring calculateTotals()'s identical apportionment
+            // pattern for document-level discounts.
+            const orderTotalGross = po.orderItems.reduce((s: number, oi: any) => s + (oi.price || 0) * (oi.quantity || 0), 0);
+            const sumLineLevelDiscount = po.orderItems.reduce((s: number, oi: any) => s + (oi.price || 0) * (oi.quantity || 0) * ((oi.discountPct || 0) / 100), 0);
+            const leftoverDiscount = Math.max(0, (po.discountAmount || 0) - sumLineLevelDiscount);
+
+            for (const oi of po.orderItems) {
+              const key = oi.productId || oi.product?.name;
+              if (!key) continue;
+              const lineGross = (oi.price || 0) * (oi.quantity || 0);
+              const apportionedLeftoverDiscount = orderTotalGross > 0 ? leftoverDiscount * (lineGross / orderTotalGross) : 0;
+              originalLineMap.set(String(key), {
+                price: oi.price || 0,
+                quantity: oi.quantity || 0,
+                discountPct: oi.discountPct || 0,
+                taxAmountFull: oi.taxAmount || 0,
+                apportionedLeftoverDiscount
+              });
+            }
+          }
         } else if (data.salesOrderId) {
           const so = await tx.salesOrder.findUnique({ where: { id: data.salesOrderId }, include: { items: true } });
-          if (so) originalItems = so.items.map((si: any) => ({ productId: si.productId, productName: si.productName, quantity: si.quantity }));
+          if (so) {
+            originalItems = so.items.map((si: any) => ({ productId: si.productId, productName: si.productName, quantity: si.quantity }));
+            buyerState = so.stateOfSupply || null;
+            for (const si of so.items) {
+              const key = si.productId || si.productName;
+              if (!key) continue;
+              originalLineMap.set(String(key), {
+                price: si.rate || 0,
+                quantity: si.quantity || 0,
+                discountPct: si.discountPercent || 0,
+                taxAmountFull: si.taxAmount || 0
+              });
+            }
+          }
         } else if (data.franchiseOrderId) {
           const fo = await tx.franchiseOrder.findUnique({ where: { id: data.franchiseOrderId }, include: { items: { include: { product: true } } } });
-          if (fo) originalItems = fo.items.map((fi: any) => ({ productId: fi.productId, productName: fi.product?.name, quantity: fi.quantity }));
+          if (fo) {
+            originalItems = fo.items.map((fi: any) => ({ productId: fi.productId, productName: fi.product?.name, quantity: fi.quantity }));
+            sellerFranchiseIdForGst = resolvedFranchiseId || fo.franchiseId || null;
+            // FranchiseOrder has no discount concept and no per-line tax
+            // field — apportion the order-level taxAmount across lines by
+            // gross-value weight, same pattern as the POS leftover-discount
+            // apportionment above.
+            const orderSubtotal = fo.subtotal && fo.subtotal > 0
+              ? fo.subtotal
+              : fo.items.reduce((s: number, fi: any) => s + (fi.unitPrice || 0) * (fi.quantity || 0), 0);
+            for (const fi of fo.items) {
+              const key = fi.productId || fi.product?.name;
+              if (!key) continue;
+              const lineGross = (fi.unitPrice || 0) * (fi.quantity || 0);
+              const apportionedTax = orderSubtotal > 0 ? (fo.taxAmount || 0) * (lineGross / orderSubtotal) : 0;
+              originalLineMap.set(String(key), {
+                price: fi.unitPrice || 0,
+                quantity: fi.quantity || 0,
+                discountPct: 0,
+                taxAmountFull: 0,
+                apportionedTax
+              });
+            }
+          }
         }
 
         for (const item of data.items) {
@@ -1949,7 +2327,148 @@ export class SalesService {
         }
       }
 
-      const refundAmount = data.items.reduce((sum, item) => sum + item.quantity * item.rate, 0);
+      // 3. Apply the unified per-line reversal formula. For every returned
+      // line that matches a resolved original line (by productId, falling
+      // back to productName — the SAME matching used for quantity validation
+      // above), the client-submitted `rate` is ignored entirely and every
+      // figure is derived from the ORIGINAL persisted price/discount/tax —
+      // this is the P0 fix: no client-forged rate, discount, or GST can ever
+      // reach refundAmount or the GSTR-1 credit-note figures.
+      //   grossReversal    = price * q
+      //   discountReversal = grossReversal * (discountPct/100)  [+ apportioned leftover/manual discount, POS only]
+      //   taxReversal      = taxAmountFull * (q/quantity)        [or apportioned FranchiseOrder tax * (q/quantity)]
+      //   taxableReversal  = grossReversal - discountReversal
+      //   totalReversal    = taxableReversal + taxReversal
+      // A line with no resolvable original (no linked order at all, OR this
+      // product genuinely isn't on the linked order — e.g. a free-text
+      // return) falls back to the pre-existing manual behavior: the client's
+      // rate is trusted for gross only, and discount/tax reversal is 0
+      // unless the client explicitly supplies them. This path is for
+      // standalone/manual returns not tied to a recorded sale and is
+      // intentionally out of scope for the P0 fix.
+      const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
+
+      // Phase 3: the InventoryItem provenance-lookup scope, already resolved
+      // to its final ready-to-filter-with value by
+      // _resolveReturnProvenanceRefs (see that method's own comment — the
+      // conversion convention differs by document type and is NOT uniform,
+      // so it is applied there, per-branch, not here). This is the SALE-SIDE
+      // scope (where the original outbound movement was actually recorded),
+      // which is NOT always the same as the return's own restoration scope
+      // (see restoreStockForReturnOrder's franchiseId/customer/dealer
+      // fallback chain) — e.g. a franchise-party POS sale processed at HQ
+      // deducts HQ's own InventoryItem, while the return restores into the
+      // franchise's. InventoryService.restoreToBatches handles that
+      // divergence safely at restore time; this is only for FINDING the
+      // right original StockMovement rows to replay.
+      const provenanceInvScopeId = provenanceScopeFranchiseId;
+
+      let refundAmount = 0;
+      let totalTaxableValue = 0;
+      let totalTaxAmount = 0;
+      const returnItemsData: any[] = [];
+      for (const item of data.items) {
+        const key = item.productId || item.productName;
+        const orig = key ? originalLineMap.get(String(key)) : undefined;
+
+        let rate: number;
+        let discountReversal = 0;
+        let taxReversal = 0;
+
+        if (orig) {
+          // Defensive only — should not normally happen given the matching
+          // above already resolved this same record; a missing price/
+          // quantity here would mean a data-integrity problem on the linked
+          // order, not a legitimate return scenario, so this rejects rather
+          // than silently falling back to the client's numbers.
+          if (orig.price == null || !(orig.quantity > 0)) {
+            throw new Error(`Unable to resolve original sale pricing for "${item.productName}" — data integrity issue on the linked order.`);
+          }
+          rate = orig.price;
+          const fraction = item.quantity / orig.quantity;
+          const grossReversal = rate * item.quantity;
+          discountReversal = grossReversal * (orig.discountPct / 100);
+          if (orig.apportionedLeftoverDiscount) {
+            discountReversal += orig.apportionedLeftoverDiscount * fraction;
+          }
+          taxReversal = orig.apportionedTax !== undefined
+            ? orig.apportionedTax * fraction
+            : orig.taxAmountFull * fraction;
+        } else {
+          rate = item.rate;
+          discountReversal = Math.max(0, Number(item.discountAmount) || 0);
+          taxReversal = Math.max(0, Number(item.taxAmount) || 0);
+        }
+
+        const grossReversal = rate * item.quantity;
+        discountReversal = Math.max(0, Math.min(discountReversal, grossReversal));
+        const taxableReversal = Math.round((grossReversal - discountReversal) * 100) / 100;
+        taxReversal = Math.round(Math.max(0, taxReversal) * 100) / 100;
+        const totalReversal = Math.round((taxableReversal + taxReversal) * 100) / 100;
+        const gstRateForItem = taxableReversal > 0 ? Number(((taxReversal / taxableReversal) * 100).toFixed(2)) : 0;
+
+        refundAmount += totalReversal;
+        totalTaxableValue += taxableReversal;
+        totalTaxAmount += taxReversal;
+
+        // Phase 3: cost-reversal computation — completely independent of
+        // every refund/GST figure computed above (different source: the
+        // ORIGINAL StockMovement's own FIFO provenance, never
+        // refundAmount/rate/discount/tax). Computed exactly ONCE, here at
+        // creation time, never re-derived on approval (see updateReturnOrder
+        // / restoreStockForReturnOrder, which only ever READ what's
+        // persisted below). Client-submitted cost/batch fields (if any were
+        // sent) are never read anywhere in this block — only item.quantity
+        // (already validated above) and item.productId/productName feed in.
+        let costAllocation: any = null;
+        let costReversal: number | null = null;
+        let costProvenance: string = 'PROVENANCE_UNAVAILABLE';
+
+        if (provenanceRefs.length) {
+          const provInvItem = await SalesService._resolveInventoryItemForReturnLine(tx, provenanceInvScopeId, item);
+          if (provInvItem) {
+            const alreadyReturnedForLine = previouslyReturned[key || ''] || 0;
+            const result = await SalesService._computeReturnFifoAllocation(tx, {
+              itemId: provInvItem.id,
+              refs: provenanceRefs,
+              alreadyReturnedQty: alreadyReturnedForLine,
+              returnQty: item.quantity,
+            });
+            costProvenance = result.provenance;
+            costAllocation = result.allocation;
+            costReversal = result.costReversal;
+          }
+        }
+
+        returnItemsData.push({
+          productId: item.productId || null,
+          productName: item.productName,
+          quantity: item.quantity,
+          rate,
+          discountAmount: Math.round(discountReversal * 100) / 100,
+          taxableValue: taxableReversal,
+          gstRate: gstRateForItem,
+          taxAmount: taxReversal,
+          totalAmount: totalReversal,
+          condition: item.condition,
+          costAllocation,
+          costReversal,
+          costProvenance
+        });
+      }
+
+      refundAmount = Math.round(refundAmount * 100) / 100;
+      totalTaxableValue = Math.round(totalTaxableValue * 100) / 100;
+      totalTaxAmount = Math.round(totalTaxAmount * 100) / 100;
+      const overallGstRate = totalTaxableValue > 0 ? Number(((totalTaxAmount / totalTaxableValue) * 100).toFixed(2)) : 0;
+
+      // GST split (CGST/SGST vs IGST) is established HERE, at creation, and
+      // never recalculated later — PENDING -> APPROVED must not change the
+      // financial basis. Uses the same resolveSellerState/buyer-state
+      // resolution that used to live in updateReturnOrder's backfill.
+      const sellerState = await resolveSellerState(sellerFranchiseIdForGst);
+      const gstSplit = splitGstAmount(totalTaxAmount, buyerState, sellerState);
+
       const returnNumber = await generateReturnNumber();
       const initialStatus = data.status || 'PENDING';
 
@@ -1960,24 +2479,22 @@ export class SalesService {
           franchiseOrderId: data.franchiseOrderId || null,
           posOrderId: data.posOrderId || null,
           customerId: resolvedCustomerId,
+          dealerId: resolvedDealerId,
           franchiseId: resolvedFranchiseId,
           reason: data.reason,
           refundAmount,
+          taxableValue: totalTaxableValue,
+          gstRate: overallGstRate,
+          cgst: gstSplit.cgst,
+          sgst: gstSplit.sgst,
+          igst: gstSplit.igst,
+          taxAmount: totalTaxAmount,
           refundMethod: data.refundMethod,
           status: initialStatus as any,
           idempotencyKey: data.idempotencyKey || undefined,
-          items: {
-            create: data.items.map((item) => ({
-              productId: item.productId || null,
-              productName: item.productName,
-              quantity: item.quantity,
-              rate: item.rate,
-              totalAmount: item.quantity * item.rate,
-              condition: item.condition
-            }))
-          }
+          items: { create: returnItemsData }
         },
-        include: { customer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
+        include: { customer: true, dealer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
       });
 
       // If created directly in APPROVED or COMPLETED status, restore stock immediately
@@ -1995,7 +2512,39 @@ export class SalesService {
     const { InventoryService } = require('../inventory/inventory.service');
     const { RecallService } = require('../production/recall.service');
 
-    let scopeFranchiseId = returnOrder.franchiseId || returnOrder.posOrder?.franchiseId || null;
+    // Phase 3 idempotency guard: this must physically restore stock/reverse
+    // cost exactly ONCE per ReturnOrder, no matter how many times this
+    // function (or updateReturnOrder, which calls it) is invoked — a
+    // duplicate/retried approval call must be a safe no-op, not a second
+    // restock. updateReturnOrder's own PENDING-only status guard already
+    // prevents this in normal API use, but this function is the actual
+    // safety boundary: it must hold even when called directly twice.
+    // Two independent first-call signals, because a recall-affected line
+    // (see recordRecallAffectedReturn below) writes its StockMovement under
+    // referenceType 'RECALL' + the recall's own id — NOT 'SALES_RETURN' +
+    // this returnOrder's id — so a return whose lines are ALL recall hits
+    // would otherwise leave no 'SALES_RETURN'-referenced row for the first
+    // check to find. ReturnItem.recallId (set on first call, right below)
+    // covers that case without touching recordRecallAffectedReturn itself.
+    const alreadyRestored = await tx.stockMovement.findFirst({
+      where: { referenceType: 'SALES_RETURN', referenceId: returnOrder.id },
+      select: { id: true }
+    });
+    const alreadyRecallProcessed = Array.isArray(returnOrder.items) && returnOrder.items.some((it: any) => it.recallId);
+    if (alreadyRestored || alreadyRecallProcessed) return;
+
+    // Fallback chain: franchiseId party -> posOrder's operating branch -> the
+    // Customer's/Dealer's own home franchise. A ReturnOrder sourced only
+    // from a SalesOrder (salesOrderId set, no posOrderId, no franchiseId
+    // party) has NEITHER of the first two — SalesOrder itself carries no
+    // franchiseId column at all (confirmed: prisma/schema.prisma SalesOrder
+    // model) — so without this fallback FranchiseService.toInventoryScopeId
+    // below was called with a null id and threw. Customer/Dealer both carry
+    // a direct, authoritative franchiseId (their home branch), and
+    // returnOrder.customerId/dealerId are already resolved correctly by the
+    // party-classification logic in createReturnOrder above — safe to use
+    // directly here.
+    const scopeFranchiseId = await SalesService._resolveReturnRestoreScopeFranchiseId(tx, returnOrder);
     const targetScopeId = await FranchiseService.toInventoryScopeId(tx, scopeFranchiseId);
 
     // The reference the ORIGINAL sale's outbound StockMovement(s) were
@@ -2058,39 +2607,65 @@ export class SalesService {
         }
 
         if (cond === 'GOOD') {
-          // Tag the restocked lot with its source ProductBatch whenever the
-          // sale it came from traces to exactly one — a plain stockIn (no
-          // batch identity at all) would otherwise make this quantity
-          // permanently invisible to any recall declared on that batch
-          // LATER, after this return already happened.
-          const sourceProductBatchId = saleRef
-            ? await RecallService.resolveSingleSourceProductBatchId(tx, { ...saleRef, inventoryItemId: invItem.id })
-            : null;
-          if (sourceProductBatchId) {
-            await InventoryService.recordMovement(tx, {
+          // Phase 3: Case A/B lines (item.costProvenance EXACT/RECONSTRUCTED,
+          // computed ONCE at createReturnOrder time — see
+          // SalesService._computeReturnFifoAllocation) restore at the
+          // ORIGINAL FIFO layer cost(s) persisted on item.costAllocation,
+          // crediting back into the SAME original InventoryBatch row(s) by
+          // id when they still exist (InventoryService.restoreToBatches
+          // handles the id-based increment / genuinely-gone fallback).
+          // Never the item's CURRENT costPrice.
+          const hasFifoAllocation = (item.costProvenance === 'EXACT' || item.costProvenance === 'RECONSTRUCTED')
+            && Array.isArray(item.costAllocation) && item.costAllocation.length > 0;
+
+          if (hasFifoAllocation) {
+            await InventoryService.restoreToBatches(tx, {
               itemId: invItem.id,
-              type: 'PURCHASE_IN',
-              quantity: item.quantity,
+              allocation: item.costAllocation,
+              movementType: 'SALES_RETURN_IN',
               referenceType: 'SALES_RETURN',
               referenceId: returnOrder.id,
-              note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
+              note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName} (FIFO cost restored: ₹${item.costReversal ?? 0}, provenance ${item.costProvenance})`,
               userId,
-              receiveAtCost: {
-                unitCost: invItem.costPrice || 0,
-                batchNumber: `${invItem.sku || invItem.name}-RETURN`,
-                productBatchId: sourceProductBatchId,
-              },
             });
           } else {
-            await InventoryService.stockIn({
-              itemId: invItem.id,
-              quantity: item.quantity,
-              type: 'PURCHASE_IN',
-              referenceType: 'SALES_RETURN',
-              referenceId: returnOrder.id,
-              note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName}`,
-              userId
-            }, tx);
+            // Case C (or a Case A/B line with, unexpectedly, no InventoryItem
+            // resolvable at restore time) — no historical layer cost to
+            // restore into. Falls back to today's pre-existing behavior
+            // (new batch at the item's CURRENT costPrice via receiveAtCost,
+            // or a plain stockIn with no batch at all), just relabeled
+            // SALES_RETURN_IN instead of PURCHASE_IN for consistency. The
+            // Case C marker itself (item.costProvenance) is what makes this
+            // auditable — never silent.
+            const sourceProductBatchId = saleRef
+              ? await RecallService.resolveSingleSourceProductBatchId(tx, { ...saleRef, inventoryItemId: invItem.id })
+              : null;
+            if (sourceProductBatchId) {
+              await InventoryService.recordMovement(tx, {
+                itemId: invItem.id,
+                type: 'SALES_RETURN_IN',
+                quantity: item.quantity,
+                referenceType: 'SALES_RETURN',
+                referenceId: returnOrder.id,
+                note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName} (cost provenance unavailable — restored at current cost)`,
+                userId,
+                receiveAtCost: {
+                  unitCost: invItem.costPrice || 0,
+                  batchNumber: `${invItem.sku || invItem.name}-RETURN`,
+                  productBatchId: sourceProductBatchId,
+                },
+              });
+            } else {
+              await InventoryService.stockIn({
+                itemId: invItem.id,
+                quantity: item.quantity,
+                type: 'SALES_RETURN_IN',
+                referenceType: 'SALES_RETURN',
+                referenceId: returnOrder.id,
+                note: `Sales Return ${returnOrder.returnNumber}: +${item.quantity} ${item.productName} (cost provenance unavailable — restored at current cost)`,
+                userId
+              }, tx);
+            }
           }
         } else {
           await tx.stockMovement.create({
@@ -2130,41 +2705,17 @@ export class SalesService {
         approvedAt: data.status === 'APPROVED' ? new Date() : undefined
       };
 
-      // When transitioning from PENDING to APPROVED or COMPLETED, restore stock
+      // When transitioning from PENDING to APPROVED or COMPLETED, restore stock.
+      // The financial basis (refundAmount/taxableValue/gstRate/cgst/sgst/
+      // igst/taxAmount) is established once, at createReturnOrder time, from
+      // the original sale's persisted figures — it must never be
+      // recalculated here from today's Product Master tax rate. The GST
+      // backfill that used to live in this block (taxableValue =
+      // existing.refundAmount, a flat 5%-or-today's-taxPercent guess) has
+      // been removed for exactly that reason: PENDING -> APPROVED must not
+      // change the financial basis.
       if ((data.status === 'APPROVED' || data.status === 'COMPLETED') && existing.status !== 'APPROVED' && existing.status !== 'COMPLETED') {
         await SalesService.restoreStockForReturnOrder(tx, existing, data.approvedBy || 'SYSTEM');
-
-        // Backfill GST breakdown
-        const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
-        const buyerState = existing.posOrder?.stateOfSupply || existing.salesOrder?.stateOfSupply || null;
-        const franchiseId = existing.franchiseId || existing.posOrder?.franchiseId || null;
-        const sellerState = await resolveSellerState(franchiseId);
-
-        const productIds = existing.items.map((i) => i.productId).filter(Boolean) as string[];
-        const products = productIds.length
-          ? await tx.product.findMany({ where: { id: { in: productIds } }, select: { id: true, taxPercent: true } })
-          : [];
-        const rateMap = new Map(products.map((p) => [p.id, p.taxPercent]));
-
-        const taxableValue = existing.refundAmount || 0;
-        let weightedRateSum = 0;
-        let weightTotal = 0;
-        for (const item of existing.items) {
-          const rate = item.productId && rateMap.has(item.productId) ? (rateMap.get(item.productId) as number) : 5;
-          const lineValue = item.totalAmount || item.quantity * item.rate;
-          weightedRateSum += rate * lineValue;
-          weightTotal += lineValue;
-        }
-        const gstRate = weightTotal > 0 ? Number((weightedRateSum / weightTotal).toFixed(2)) : 0;
-        const taxAmount = Number(((taxableValue * gstRate) / 100).toFixed(2));
-        const split = splitGstAmount(taxAmount, buyerState, sellerState);
-
-        updateData.taxableValue = taxableValue;
-        updateData.gstRate = gstRate;
-        updateData.cgst = split.cgst;
-        updateData.sgst = split.sgst;
-        updateData.igst = split.igst;
-        updateData.taxAmount = taxAmount;
       }
 
       return tx.returnOrder.update({
@@ -2175,36 +2726,295 @@ export class SalesService {
     });
   }
 
-  static async recordRefund(returnId: string, data: { accountId: string; method: string; createdBy?: string }) {
+  // Computes the same "due" figure FinanceService.getPartyReceivables uses
+  // (Order.totalAmount - Σ non-cancelled Payment.paidAmount, including
+  // multi-invoice PaymentAllocation rows) for ONE specific Order — reuses
+  // FinanceService's own private summing helper (bracket-access: TS
+  // `private` is compile-time only) rather than re-deriving the formula, so
+  // this can never silently drift from what getPartyReceivables reports as
+  // outstanding.
+  static async _computeOrderDue(tx: any, orderId: string): Promise<{ due: number; order: any }> {
+    const { FinanceService } = require('../finance/finance.service');
+    const order = await tx.order.findUnique({
+      where: { id: orderId },
+      select: {
+        totalAmount: true,
+        payments: { select: { id: true, paidAmount: true, isCancelled: true, status: true } },
+        invoice: { select: { allocations: { select: { amount: true, payment: { select: { id: true, invoiceId: true, status: true, isCancelled: true } } } } } }
+      }
+    });
+    if (!order) return { due: 0, order: null };
+    const paid = (FinanceService as any).sumOrderPaidWithAllocations(
+      order.payments,
+      order.invoice?.allocations,
+      (p: any) => !p.isCancelled && p.status !== 'CANCELLED'
+    );
+    const due = Math.max(0, (order.totalAmount || 0) - paid);
+    return { due, order };
+  }
+
+  // Credit Ledger refund for a Customer party. Always writes exactly one
+  // CustomerLedger CREDIT row (referenceType RETURN, full refundAmount) —
+  // this is the durable "customer was credited" record regardless of
+  // whether any of it could be applied to a real outstanding balance.
+  //
+  // IF the return traces to a genuinely unpaid/partially-paid original
+  // Order (only posOrderId-linked returns can — SalesOrder has no Payment/
+  // Invoice relation in the schema at all, so a salesOrderId-only return has
+  // no due to apply against and always takes the ledger-only branch), we
+  // ALSO create a Payment (flow IN) against that Order so
+  // FinanceService.getPartyReceivables' live due calculation actually
+  // reflects the reduced balance, per the architecture doc's explicit
+  // warning that outstanding is NOT ledger-sourced.
+  //
+  // That applied Payment is deliberately created with status: 'SUCCESS'
+  // rather than 'PAID', and WITHOUT entityType: 'CUSTOMER'. Two reasons,
+  // both verified against createPayment's actual code (finance.service.ts):
+  //   1. createPayment moves the linked Account's REAL balance for ANY
+  //      status:'PAID' payment regardless of flow (see the unconditional
+  //      `if (account && status === 'PAID') AccountService.adjustBalance`
+  //      step). A Credit Ledger refund involves NO real cash — using
+  //      status:'PAID' here would silently inflate a real Cash/Bank
+  //      account's balance for money that never moved. status:'SUCCESS' is
+  //      not invented for this purpose — it's already an equally-valid
+  //      "not cancelled" Payment status elsewhere in this codebase (see
+  //      finance.service.ts's own getDealerLedger-equivalent filter
+  //      `status === 'PAID' || status === 'SUCCESS'`, and
+  //      franchise-order.service.ts's direct tx.payment.create calls), and
+  //      getPartyReceivables' isValid filter is `status !== 'CANCELLED'`
+  //      (not `=== 'PAID'`), so this Payment is correctly counted as
+  //      reducing due without moving real money.
+  //   2. Omitting entityType: 'CUSTOMER' on THIS call skips createPayment's
+  //      own automatic CustomerLedger write (section 5a) — without this we
+  //      would get a SECOND CustomerLedger row (referenceType PAYMENT) for
+  //      the same refund event, double-counting the credit. Our single
+  //      manual 'RETURN' row below is the only ledger entry for this event.
+  // Known gap (documented, not silently glossed over): because the applied
+  // Payment is intentionally not status:'PAID', it does not flip
+  // Invoice.status/Order.paymentStatus to PAID/PARTIAL the way a real cash
+  // receipt would (that recompute is itself gated on status==='PAID').
+  // Every current POS checkout pays in full at checkout (pos.service.ts),
+  // so a genuinely-unpaid linked Order is already an edge case; this is
+  // flagged as a Phase 3 follow-up rather than solved here by inventing a
+  // second payment-creation path, which is explicitly out of scope.
+  static async _applyCustomerCreditLedgerRefund(tx: any, ret: any, createdBy?: string) {
+    const { FinanceService } = require('../finance/finance.service');
+
+    let appliedAmount = 0;
+    let appliedPayment: any = null;
+
+    if (ret.posOrderId) {
+      const { due } = await SalesService._computeOrderDue(tx, ret.posOrderId);
+      appliedAmount = Math.round(Math.min(ret.refundAmount, due) * 100) / 100;
+      if (appliedAmount > 0.01) {
+        appliedPayment = await FinanceService.createPayment({
+          tx,
+          amount: appliedAmount,
+          flow: 'IN',
+          status: 'SUCCESS', // non-cash credit application — see comment above
+          sourceModule: 'POS',
+          linkedDocType: 'DIRECT',
+          linkedDocId: ret.id,
+          orderId: ret.posOrderId,
+          entityId: ret.customerId,
+          entity: 'Customer Credit Ledger (return applied to unpaid order)',
+          method: 'CASH',
+          franchiseId: ret.posOrder?.franchiseId || undefined,
+          idempotencyKey: `RETURN_REFUND_${ret.id}_APPLY`,
+          createdBy
+        });
+      }
+    }
+    // ret.salesOrderId-only returns: SalesOrder has no Payment/Invoice
+    // relation in the schema, so there is no "unpaid order" this credit can
+    // be applied against — always ledger-only for that case (see class
+    // comment above).
+
+    const note = appliedAmount > 0.01
+      ? `Return #${ret.returnNumber} credited to customer ledger (₹${appliedAmount.toFixed(2)} of ₹${ret.refundAmount.toFixed(2)} applied to reduce the outstanding balance on the original order)`
+      : `Return #${ret.returnNumber} credited to customer ledger`;
+
+    const ledgerEntry = await tx.customerLedger.create({
+      data: {
+        customerId: ret.customerId,
+        type: 'CREDIT',
+        amount: ret.refundAmount,
+        paymentMode: 'CASH',
+        referenceType: 'RETURN',
+        referenceId: ret.id,
+        note
+      }
+    });
+
+    return { ledgerEntry, appliedPayment, appliedToOutstanding: appliedAmount };
+  }
+
+  // Dealer Credit Ledger refund. Dealer has NO ledger table and NO
+  // outstandingAmount column in the schema (confirmed: prisma/schema.prisma
+  // Dealer model only has openingBalance/creditLimit) — the ONLY existing
+  // mechanism that can represent "this dealer was credited" is applying a
+  // Payment against a genuinely unpaid original Order, exactly like the
+  // Customer path above. If there is no such unpaid order, there is
+  // nothing to record this against — reject clearly rather than silently
+  // doing nothing or inventing a new ledger.
+  static async _applyDealerCreditLedgerRefund(tx: any, ret: any, createdBy?: string) {
+    const { FinanceService } = require('../finance/finance.service');
+
+    if (!ret.posOrderId) {
+      throw new Error('Credit Ledger refund is not supported for this Dealer return: there is no linked order to apply the credit to, and Dealers have no standalone ledger/outstanding-balance mechanism in this system.');
+    }
+    const { due } = await SalesService._computeOrderDue(tx, ret.posOrderId);
+    const appliedAmount = Math.round(Math.min(ret.refundAmount, due) * 100) / 100;
+    if (appliedAmount <= 0.01) {
+      throw new Error('Credit Ledger refund is not supported for this Dealer return: the original order has no outstanding balance to apply the credit to, and Dealers have no standalone ledger/outstanding-balance mechanism in this system.');
+    }
+
+    const appliedPayment = await FinanceService.createPayment({
+      tx,
+      amount: appliedAmount,
+      flow: 'IN',
+      status: 'SUCCESS', // non-cash credit application — see Customer path comment above
+      sourceModule: 'POS',
+      linkedDocType: 'DIRECT',
+      linkedDocId: ret.id,
+      orderId: ret.posOrderId,
+      entityType: 'DEALER',
+      entityId: ret.dealerId,
+      entity: 'Dealer Credit Ledger (return applied to unpaid order)',
+      method: 'CASH',
+      franchiseId: ret.posOrder?.franchiseId || undefined,
+      idempotencyKey: `RETURN_REFUND_${ret.id}_APPLY`,
+      createdBy
+    });
+
+    return { ledgerEntry: null, appliedPayment, appliedToOutstanding: appliedAmount };
+  }
+
+  // Franchise Credit Ledger refund. Franchise DOES have a direct
+  // outstandingAmount column + FranchiseLedger table, unlike Dealer — mirror
+  // finance.service.ts's own CREDIT-reduces-outstanding pattern exactly
+  // (e.g. the "Payment to HQ" block in franchise-order.service.ts): CREDIT
+  // type, amount = refundAmount, newOutstanding = outstandingAmount -
+  // refundAmount, floored at 0 (a return can't put a franchise into a
+  // negative "owes less than zero" state via this path), balanceAfter
+  // written alongside the Franchise.outstandingAmount update in the same
+  // transaction. FranchiseLedgerRefType.RETURN exists in the schema
+  // specifically for this.
+  static async _applyFranchiseCreditLedgerRefund(tx: any, ret: any) {
+    const franchise = await tx.franchise.findUnique({ where: { id: ret.franchiseId }, select: { outstandingAmount: true } });
+    const currentOutstanding = franchise?.outstandingAmount || 0;
+    const newOutstanding = Math.max(0, currentOutstanding - ret.refundAmount);
+
+    const ledgerEntry = await tx.franchiseLedger.create({
+      data: {
+        franchiseId: ret.franchiseId,
+        type: 'CREDIT',
+        amount: ret.refundAmount,
+        balanceAfter: newOutstanding,
+        referenceType: 'RETURN',
+        referenceId: ret.id,
+        note: `Return #${ret.returnNumber} credited to franchise ledger`
+      }
+    });
+
+    await tx.franchise.update({
+      where: { id: ret.franchiseId },
+      data: { outstandingAmount: newOutstanding }
+    });
+
+    return { ledgerEntry, appliedPayment: null, appliedToOutstanding: ret.refundAmount };
+  }
+
+  // Phase 2: the single entry point that actually moves money/ledger/state
+  // for an approved return, reading ONLY ret.refundAmount (already correct,
+  // computed once at createReturnOrder time by Phase 1 — never recomputed,
+  // never client-trusted here). Wrapped in one transaction so a failure
+  // anywhere (insufficient funds, an unsupported Dealer Credit Ledger
+  // request, etc.) leaves NO Payment/ledger row and the ReturnOrder still
+  // APPROVED, never a half-applied refund.
+  static async recordRefund(returnId: string, data: { refundMethod?: string; accountId?: string; method?: string; createdBy?: string }) {
     const { FinanceService } = require('../finance/finance.service');
 
     return prisma.$transaction(async (tx) => {
-      const ret = await tx.returnOrder.findUnique({ where: { id: returnId } });
-      if (!ret) throw new Error('Return Order not found');
-      if (ret.status !== 'APPROVED') throw new Error('Only approved returns can be refunded');
+      // Row-level lock FIRST, before any read of `status` — this is what
+      // actually makes two concurrent refund requests for the same return
+      // safe, not just the idempotencyKey below. A second concurrent
+      // transaction's SELECT ... FOR UPDATE blocks here until the first
+      // transaction commits or rolls back, so by the time it proceeds it is
+      // guaranteed to see the FIRST transaction's final status (COMPLETED
+      // on success), never a stale APPROVED read. The idempotencyKey passed
+      // to createPayment below is a second, independent backstop
+      // specifically for the cash/bank path (a unique-constraint collision
+      // if this lock were ever bypassed, e.g. a raw SQL update elsewhere).
+      await tx.$queryRaw`SELECT id FROM "ReturnOrder" WHERE id = ${returnId} FOR UPDATE`;
 
-      const entity = ret.customerId ? 'Customer Refund' : (ret.franchiseId ? 'Franchise Refund' : 'Sales Refund');
-
-      const payment = await FinanceService.createPayment({
-        tx,
-        amount: ret.refundAmount,
-        flow: 'OUT',
-        status: 'PAID',
-        sourceAccount: data.accountId,
-        method: data.method,
-        sourceModule: 'POS',
-        linkedDocType: 'DIRECT',
-        linkedDocId: ret.id,
-        entity,
-        createdBy: data.createdBy
-      });
-
-      await tx.returnOrder.update({
+      const ret = await tx.returnOrder.findUnique({
         where: { id: returnId },
-        data: { status: 'COMPLETED' }
+        include: { items: true, customer: true, dealer: true, franchise: true, posOrder: true, salesOrder: true }
+      });
+      if (!ret) throw new Error('Return Order not found');
+      if (ret.status === 'COMPLETED') throw new Error('This return has already been refunded.');
+      if (ret.status !== 'APPROVED') throw new Error(`Only approved returns can be refunded (current status: ${ret.status}).`);
+
+      const idempotencyKey = `RETURN_REFUND_${returnId}`;
+      const refundMethod = (data.refundMethod || ret.refundMethod || '').trim();
+      const isCreditLedger = refundMethod === 'Credit Ledger';
+
+      const partyLabel = ret.customerId ? 'Customer Refund' : ret.dealerId ? 'Dealer Refund' : ret.franchiseId ? 'Franchise Refund' : 'Sales Refund';
+      const entityType = ret.customerId ? 'CUSTOMER' : ret.dealerId ? 'DEALER' : ret.franchiseId ? 'FRANCHISE' : undefined;
+      const entityId = ret.customerId || ret.dealerId || ret.franchiseId || undefined;
+
+      let payment: any = null;
+      let ledger: any = null;
+
+      if (isCreditLedger) {
+        // Credit Ledger path — see the three _apply*CreditLedgerRefund
+        // helpers above for the per-party design (Customer/Dealer apply
+        // against a genuinely unpaid original order where one exists;
+        // Franchise always reduces outstandingAmount directly; Dealer with
+        // no applicable order is rejected — no DealerLedger exists).
+        if (ret.customerId) {
+          ledger = await SalesService._applyCustomerCreditLedgerRefund(tx, ret, data.createdBy);
+        } else if (ret.dealerId) {
+          ledger = await SalesService._applyDealerCreditLedgerRefund(tx, ret, data.createdBy);
+        } else if (ret.franchiseId) {
+          ledger = await SalesService._applyFranchiseCreditLedgerRefund(tx, ret);
+        } else {
+          throw new Error('Credit Ledger refund requires a Customer, Dealer, or Franchise party on this return.');
+        }
+      } else {
+        // Cash / Bank / UPI path ("Original Method", "Cash Voucher",
+        // "Cheque / UPI", or unrecognized/missing — same implicit default
+        // as before this change). The client-supplied amount/rate/discount/
+        // gst are never read here — amount is ALWAYS ret.refundAmount.
+        if (!data.accountId) {
+          throw new Error('An account (accountId) is required to process a cash/bank/UPI refund.');
+        }
+        payment = await FinanceService.createPayment({
+          tx,
+          amount: ret.refundAmount,
+          flow: 'OUT',
+          status: 'PAID',
+          sourceAccount: data.accountId,
+          method: data.method || 'CASH',
+          sourceModule: 'POS',
+          linkedDocType: 'DIRECT',
+          linkedDocId: ret.id,
+          entityType,
+          entityId,
+          entity: partyLabel,
+          idempotencyKey,
+          createdBy: data.createdBy
+        });
+      }
+
+      const updated = await tx.returnOrder.update({
+        where: { id: returnId },
+        data: { status: 'COMPLETED' },
+        include: { items: true, customer: true, dealer: true, franchise: true }
       });
 
-      return payment;
+      return { returnOrder: updated, payment, ledger };
     });
   }
 
@@ -2701,41 +3511,98 @@ export class SalesService {
       const existing = await prisma.deliveryChallanReturn.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { items: true } });
       if (existing) return existing;
     }
-
-    const challan = await prisma.deliveryChallan.findUnique({ where: { id: data.challanId }, include: { items: true } });
-    if (!challan) throw new Error('Delivery challan not found.');
-    const status = challan.status === 'OPEN' ? 'IN_TRANSIT' : challan.status;
-    if (status !== 'IN_TRANSIT' && status !== 'CLOSED') {
-      throw new Error(`Cannot return goods from a challan that hasn't dispatched yet (current status: ${status}).`);
-    }
     if (!data.items.length) throw new Error('Select at least one item to return.');
 
-    // Returnable = dispatched - sum of all previously returned qty for that
-    // exact challan line (across every prior return, PENDING or RECEIVED —
-    // a return already claims the qty the moment it's raised).
-    const priorReturnItems = await prisma.deliveryChallanReturnItem.findMany({
-      where: { challanItemId: { in: data.items.map(i => i.challanItemId) } }
-    });
-    const previouslyReturned: Record<string, number> = {};
-    for (const ri of priorReturnItems) {
-      previouslyReturned[ri.challanItemId] = (previouslyReturned[ri.challanItemId] || 0) + ri.quantity;
-    }
-
-    const itemsToCreate: Array<{ challanItemId: string; productId: string | null; productName: string; quantity: number; unit: string }> = [];
-    for (const reqItem of data.items) {
-      const dcItem = challan.items.find(i => i.id === reqItem.challanItemId);
-      if (!dcItem) throw new Error('Return line does not match any item on this delivery challan.');
-      const already = previouslyReturned[dcItem.id] || 0;
-      const returnable = dcItem.quantity - already;
-      if (reqItem.quantity <= 0) throw new Error(`Return quantity for "${dcItem.productName}" must be greater than zero.`);
-      if (reqItem.quantity > returnable + 0.001) {
-        throw new Error(`Cannot return ${reqItem.quantity} of "${dcItem.productName}" — Dispatched ${dcItem.quantity}, already returned ${already}, returnable ${returnable}.`);
-      }
-      itemsToCreate.push({ challanItemId: dcItem.id, productId: dcItem.productId, productName: dcItem.productName, quantity: reqItem.quantity, unit: dcItem.unit });
-    }
-
     try {
+      // Phase 3A concurrency fix: the read (challan status + previouslyReturned)
+      // -> validate -> create sequence now all happens INSIDE one transaction,
+      // behind a row lock on the parent DeliveryChallan
+      // (_lockDeliveryChallanForReturn). Previously only the final `create`
+      // was transactional — two concurrent calls could both read the same
+      // previouslyReturned snapshot before either committed, both pass
+      // validation, and together exceed the dispatched quantity.
       return await prisma.$transaction(async (tx) => {
+        await SalesService._lockDeliveryChallanForReturn(tx, data.challanId);
+
+        const challan = await tx.deliveryChallan.findUnique({ where: { id: data.challanId }, include: { items: true } });
+        if (!challan) throw new Error('Delivery challan not found.');
+        const status = challan.status === 'OPEN' ? 'IN_TRANSIT' : challan.status;
+        if (status !== 'IN_TRANSIT' && status !== 'CLOSED') {
+          throw new Error(`Cannot return goods from a challan that hasn't dispatched yet (current status: ${status}).`);
+        }
+
+        // Returnable = dispatched - sum of all previously returned qty for
+        // that exact challan line (across every prior return, PENDING or
+        // RECEIVED — a return already claims the qty the moment it's
+        // raised). Now read under the DeliveryChallan row lock above.
+        const priorReturnItems = await tx.deliveryChallanReturnItem.findMany({
+          where: { challanItemId: { in: data.items.map(i => i.challanItemId) } }
+        });
+        const previouslyReturned: Record<string, number> = {};
+        for (const ri of priorReturnItems) {
+          previouslyReturned[ri.challanItemId] = (previouslyReturned[ri.challanItemId] || 0) + ri.quantity;
+        }
+
+        // Phase 3A: FIFO cost-reversal provenance scope — the exact same
+        // sourceId convention dispatchChallanStock used when it wrote the
+        // original outbound StockMovement rows this replays (see
+        // dispatchChallanStock: RAW challan.sourceFranchiseId, or HQ's raw
+        // id if null — never run through toInventoryScopeId).
+        const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
+
+        const itemsToCreate: Array<{
+          challanItemId: string; productId: string | null; productName: string; quantity: number; unit: string;
+          costAllocation: any; costReversal: number | null; costProvenance: string;
+        }> = [];
+        for (const reqItem of data.items) {
+          const dcItem = challan.items.find(i => i.id === reqItem.challanItemId);
+          if (!dcItem) throw new Error('Return line does not match any item on this delivery challan.');
+          const already = previouslyReturned[dcItem.id] || 0;
+          const returnable = dcItem.quantity - already;
+          if (reqItem.quantity <= 0) throw new Error(`Return quantity for "${dcItem.productName}" must be greater than zero.`);
+          if (reqItem.quantity > returnable + 0.001) {
+            throw new Error(`Cannot return ${reqItem.quantity} of "${dcItem.productName}" — Dispatched ${dcItem.quantity}, already returned ${already}, returnable ${returnable}.`);
+          }
+
+          // Phase 3A: compute the FIFO cost-reversal allocation exactly ONCE,
+          // here, at the point that actually claims the quantity (mirrors
+          // createReturnOrder's Phase 3 pattern — see that method's own
+          // comment) — never recomputed at receive time. Computing it here,
+          // under the same DeliveryChallan row lock used for the quantity
+          // validation above, also means the FIFO layer skip-count can never
+          // race the way it would if deferred to receive time (a separate,
+          // later transaction with no lock over sibling returns on this same
+          // line). Only dcItem.productId/reqItem.quantity (already validated
+          // above) feed in — this endpoint doesn't even accept a client cost
+          // field, so nothing forged can reach costAllocation/costReversal.
+          let costAllocation: any = null;
+          let costReversal: number | null = null;
+          let costProvenance: string = 'PROVENANCE_UNAVAILABLE';
+          if (sourceId && dcItem.productId) {
+            const product = await tx.product.findUnique({ where: { id: dcItem.productId } });
+            if (product?.sku) {
+              const sourceItem = await tx.inventoryItem.findFirst({ where: { franchiseId: sourceId, sku: product.sku } });
+              if (sourceItem) {
+                const result = await SalesService._computeReturnFifoAllocation(tx, {
+                  itemId: sourceItem.id,
+                  refs: [{ referenceType: 'DELIVERY_CHALLAN', referenceId: challan.id }],
+                  alreadyReturnedQty: already,
+                  returnQty: reqItem.quantity,
+                });
+                costProvenance = result.provenance;
+                costAllocation = result.allocation;
+                costReversal = result.costReversal;
+              }
+            }
+          }
+
+          itemsToCreate.push({
+            challanItemId: dcItem.id, productId: dcItem.productId, productName: dcItem.productName,
+            quantity: reqItem.quantity, unit: dcItem.unit,
+            costAllocation, costReversal, costProvenance
+          });
+        }
+
         const returnNumber = await nextDocumentNumber(tx, 'DCR', 'DCR');
         return tx.deliveryChallanReturn.create({
           data: {
@@ -2750,7 +3617,7 @@ export class SalesService {
           },
           include: { items: true }
         });
-      });
+      }, { timeout: 20000 });
     } catch (err: any) {
       if (data.idempotencyKey && err?.code === 'P2002') {
         const winner = await prisma.deliveryChallanReturn.findUnique({ where: { idempotencyKey: data.idempotencyKey }, include: { items: true } });
@@ -2768,6 +3635,14 @@ export class SalesService {
   // by unusable goods.
   static async receiveDeliveryChallanReturn(returnId: string, itemConditions: Array<{ returnItemId: string; condition: 'GOOD' | 'DAMAGED' | 'EXPIRED' | 'REJECTED' | 'QUARANTINE' }>, userId: string = 'system') {
     return prisma.$transaction(async (tx) => {
+      // Phase 3A concurrency fix: lock this DeliveryChallanReturn row BEFORE
+      // the idempotency status check below. Without this, two concurrent
+      // (or duplicate/retried) receive calls for the SAME return could both
+      // observe status still PENDING before either commits its own `status:
+      // 'RECEIVED'` update, and both loop over itemConditions restoring
+      // stock — double-applying the restock/cost-reversal.
+      await tx.$queryRaw`SELECT id FROM "DeliveryChallanReturn" WHERE id = ${returnId} FOR UPDATE`;
+
       const ret = await tx.deliveryChallanReturn.findUnique({ where: { id: returnId }, include: { items: true, challan: true } });
       if (!ret) throw new Error('Return not found.');
       if (ret.status === 'RECEIVED') return tx.deliveryChallanReturn.findUnique({ where: { id: returnId }, include: { items: true } }); // idempotent no-op
@@ -2814,37 +3689,67 @@ export class SalesService {
         }
 
         if (cond.condition === 'GOOD') {
-          // Same forward-looking tagging as restoreStockForReturnOrder — see
-          // its comment on resolveSingleSourceProductBatchId.
-          const sourceProductBatchId = await RecallService.resolveSingleSourceProductBatchId(tx, {
-            referenceType: 'DELIVERY_CHALLAN',
-            referenceId: ret.challan.id,
-            inventoryItemId: sourceItem.id,
-          });
-          if (sourceProductBatchId) {
-            await InventoryService.recordMovement(tx, {
+          // Phase 3A: restore at the ORIGINAL FIFO layer cost persisted on
+          // this item at createDeliveryChallanReturn time (item.costAllocation
+          // / item.costProvenance / item.costReversal) — never recomputed
+          // here, and never the item's CURRENT costPrice. Exactly mirrors
+          // restoreStockForReturnOrder's Case A/B, reusing the same shared
+          // helper (InventoryService.restoreToBatches) so returned quantity
+          // credits back into the SAME original InventoryBatch row(s) by id
+          // when they still exist. Replaces the old PURCHASE_IN-at-current-
+          // cost mislabeling for this one restock path.
+          const hasFifoAllocation = (item.costProvenance === 'EXACT' || item.costProvenance === 'RECONSTRUCTED')
+            && Array.isArray(item.costAllocation) && (item.costAllocation as any[]).length > 0;
+
+          if (hasFifoAllocation) {
+            await InventoryService.restoreToBatches(tx, {
               itemId: sourceItem.id,
-              type: 'PURCHASE_IN',
-              quantity: item.quantity,
+              allocation: item.costAllocation as any,
+              movementType: 'SALES_RETURN_IN',
               referenceType: 'DELIVERY_CHALLAN_RETURN',
               referenceId: ret.id,
-              note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
+              note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber}) — FIFO cost restored: ₹${item.costReversal ?? 0}, provenance ${item.costProvenance}`,
               userId,
-              receiveAtCost: {
-                unitCost: sourceItem.costPrice || 0,
-                batchNumber: `${sourceItem.sku || sourceItem.name}-RETURN`,
-                productBatchId: sourceProductBatchId,
-              },
             });
           } else {
-            await InventoryService.stockIn({
-              itemId: sourceItem.id,
-              quantity: item.quantity,
-              referenceType: 'DELIVERY_CHALLAN_RETURN',
-              referenceId: ret.id,
-              note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber})`,
-              userId
-            }, tx as any);
+            // PROVENANCE_UNAVAILABLE fallback (e.g. historical/legacy DC
+            // dispatch with no matching outbound StockMovement, or one with
+            // neither batchId nor consumptionBreakdown nor unitCost) — no
+            // historical layer cost to restore into. Same pre-existing
+            // behavior (new batch/plain stockIn at current cost), just
+            // relabeled SALES_RETURN_IN instead of PURCHASE_IN so it's never
+            // confused with a real purchase, and never fabricates a cost.
+            const sourceProductBatchId = await RecallService.resolveSingleSourceProductBatchId(tx, {
+              referenceType: 'DELIVERY_CHALLAN',
+              referenceId: ret.challan.id,
+              inventoryItemId: sourceItem.id,
+            });
+            if (sourceProductBatchId) {
+              await InventoryService.recordMovement(tx, {
+                itemId: sourceItem.id,
+                type: 'SALES_RETURN_IN',
+                quantity: item.quantity,
+                referenceType: 'DELIVERY_CHALLAN_RETURN',
+                referenceId: ret.id,
+                note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber}) — cost provenance unavailable, restored at current cost`,
+                userId,
+                receiveAtCost: {
+                  unitCost: sourceItem.costPrice || 0,
+                  batchNumber: `${sourceItem.sku || sourceItem.name}-RETURN`,
+                  productBatchId: sourceProductBatchId,
+                },
+              });
+            } else {
+              await InventoryService.stockIn({
+                itemId: sourceItem.id,
+                quantity: item.quantity,
+                type: 'SALES_RETURN_IN',
+                referenceType: 'DELIVERY_CHALLAN_RETURN',
+                referenceId: ret.id,
+                note: `Received GOOD condition return ${ret.returnNumber} (DC ${ret.challan.challanNumber}) — cost provenance unavailable, restored at current cost`,
+                userId
+              }, tx as any);
+            }
           }
         } else {
           // Traceable, zero-effect-on-available-stock ledger entry — see

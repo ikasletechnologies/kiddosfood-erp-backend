@@ -243,6 +243,7 @@ export class SalesController {
       const returns = await SalesService.getReturnOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
+        dealerId: req.query.dealerId as string,
         franchiseId,
         source: req.query.source as any,
         search: req.query.search as string
@@ -267,6 +268,26 @@ export class SalesController {
       const approverId = (req as any).user?.userId;
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  // Phase 2: actually moves money/ledger/state for an approved return.
+  // Only refundMethod/accountId/method are read from the body — amount/
+  // rate/discount/gst are never accepted here; SalesService.recordRefund
+  // reads the refund amount exclusively from the already-correct
+  // ReturnOrder.refundAmount established at createReturnOrder time.
+  static async refundReturnOrder(req: Request, res: Response) {
+    try {
+      const createdBy = (req as any).user?.userId;
+      const result = await SalesService.recordRefund(req.params.id, {
+        refundMethod: req.body?.refundMethod,
+        accountId: req.body?.accountId,
+        method: req.body?.method,
+        createdBy
+      });
+      res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
     }

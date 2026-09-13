@@ -119,7 +119,7 @@ async function run() {
     const itemAfterSale = await prisma.inventoryItem.findUniqueOrThrow({ where: { id: retailItemId } });
     check('All 10 packets sold, currentStock = 0', itemAfterSale.currentStock === 0, `got ${itemAfterSale.currentStock}`);
 
-    console.log('\n3️⃣ Return #1 (BEFORE recall): customer returns 4 packets, condition GOOD — must restock normally, AND get tagged with Batch A for forward-looking recall protection...');
+    console.log('\n3️⃣ Return #1 (BEFORE recall): customer returns 4 packets, condition GOOD — must restock normally. Phase 3 update: a Case A return (exact FIFO provenance found on the original SALES_OUT movement) now restores into the SAME original InventoryBatch row by id — the one packaging already tagged productBatchId=Batch A — instead of fabricating a new "...RETURN" lot, so it inherits the Batch A tag rather than needing a fresh one...');
     const returnOrder1 = await SalesService.createReturnOrder({
       posOrderId: order.id, reason: 'Customer changed mind', status: 'APPROVED',
       items: [{ productId: retailProduct.id, productName: retailProduct.name, quantity: 4, rate: 10, condition: 'GOOD' }],
@@ -129,8 +129,9 @@ async function run() {
     check('Return #1 restocked normally: currentStock = 4', itemAfterReturn1.currentStock === 4, `got ${itemAfterReturn1.currentStock}`);
     const returnItem1 = await prisma.returnItem.findFirstOrThrow({ where: { returnId: returnOrder1.id } });
     check('Return #1 is NOT recall-flagged (recallId null)', returnItem1.recallId === null);
-    const returnedBatch1 = await prisma.inventoryBatch.findFirst({ where: { inventoryItemId: retailItemId, productBatchId: batchA.id, status: 'APPROVED', batchNumber: { contains: 'RETURN' } } });
-    check('Return #1 created a batch-tracked APPROVED lot tagged to Batch A (not untracked)', !!returnedBatch1 && returnedBatch1.currentQty === 4, `found=${!!returnedBatch1}, qty=${returnedBatch1?.currentQty}`);
+    check('Return #1 computed an EXACT Phase 3 cost allocation (real FIFO provenance on the original sale)', returnItem1.costProvenance === 'EXACT', `costProvenance=${returnItem1.costProvenance}`);
+    const returnedBatch1 = await prisma.inventoryBatch.findFirst({ where: { inventoryItemId: retailItemId, productBatchId: batchA.id, status: 'APPROVED' } });
+    check('Return #1 restored into the SAME original batch-tracked APPROVED lot tagged to Batch A (not untracked, not a fabricated new lot)', !!returnedBatch1 && returnedBatch1.currentQty === 4, `found=${!!returnedBatch1}, qty=${returnedBatch1?.currentQty}`);
 
     console.log('\n4️⃣ Control resale BEFORE recall: sell 2 of those returned packets — must succeed (no regression)...');
     const saleOfReturned = await InventoryService.recordMovement(prisma, {

@@ -661,6 +661,7 @@ app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_A
 app.get('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getReturnOrders);
 app.post('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createReturnOrder);
 app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateReturnOrder);
+app.post('/api/sales/returns/:id/refund', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.refundReturnOrder);
 
 app.get('/api/sales/analytics', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getAnalytics);
 

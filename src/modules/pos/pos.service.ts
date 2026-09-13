@@ -569,6 +569,18 @@ export class POSService {
               productId: l.productId,
               quantity: l.quantity,
               price: l.unitPrice,
+              // Additive population of an already-existing, previously-unused
+              // schema field: the per-line channel/"Customer Retail Discount"
+              // as a percentage of gross, derived from the already-computed
+              // lineDiscount/unitPrice/quantity. Does not change price,
+              // taxAmount, or totalAmount, and does not affect any POS
+              // calculation, total, or receipt — it only makes this line's
+              // discount reconstructable later (e.g. for Sales Return
+              // reversal), which was previously lost outside the order-level
+              // discountAmount aggregate.
+              discountPct: l.unitPrice > 0 && l.quantity > 0
+                ? Number(((l.lineDiscount / (l.unitPrice * l.quantity)) * 100).toFixed(4))
+                : 0,
               taxAmount: l.lineTax,
               totalAmount: l.lineTotal
             }))

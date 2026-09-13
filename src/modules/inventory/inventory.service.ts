@@ -1040,6 +1040,110 @@ export class InventoryService {
     };
   }
 
+  // Phase 3 (Sales/POS Return cost reversal): the inbound counterpart to
+  // depleteBatchesFIFO — given a pre-computed layer allocation (batchId +
+  // qty + unitCost per layer, already resolved by the caller by replaying
+  // the ORIGINAL sale's own FIFO consumption order — see
+  // SalesService._computeReturnFifoAllocation), credits each layer back to
+  // its own originating InventoryBatch row by id (preserving that batch's
+  // own recorded cost/expiry/lot identity exactly), incrementing
+  // currentStock once for the total, and writing ONE StockMovement summarizing
+  // the restock at the historical allocated cost(s) — never the item's
+  // current moving-average costPrice.
+  //
+  // `itemId` is the TARGET InventoryItem this stock is landing on (the
+  // return's own franchise/HQ scope, per FranchiseService.toInventoryScopeId
+  // — untouched by this method). A layer's batchId is only reused when that
+  // batch genuinely belongs to `itemId` — in the rare case a return's
+  // franchise scope differs from the original sale's operating-branch scope
+  // (e.g. a franchise-party POS sale processed at HQ), the original batch
+  // physically belongs to a DIFFERENT InventoryItem and must never be
+  // mutated on this item's behalf; a new batch is created instead, still at
+  // the historical allocated unitCost (never current cost). This is the
+  // same "batch row genuinely no longer exists" fallback the spec
+  // describes, generalized to also cover "exists, but not on this item."
+  static async restoreToBatches(tx: any, data: {
+    itemId: string;
+    allocation: Array<{ batchId: string | null; qty: number; unitCost: number }>;
+    movementType: string;
+    referenceType?: string;
+    referenceId?: string;
+    note?: string;
+    userId?: string;
+    warehouseId?: string | null;
+  }): Promise<{ item: any; movement: any } | null> {
+    const layers = (data.allocation || []).filter(l => l && l.qty > 0.0000001);
+    if (!layers.length) return null;
+
+    let totalQty = 0;
+    let totalCost = 0;
+    const appliedLayers: Array<{ batchId: string | null; qty: number; unitCost: number; totalCost: number }> = [];
+
+    for (const layer of layers) {
+      const unitCost = layer.unitCost || 0;
+      let restoredToBatchId: string | null = null;
+
+      if (layer.batchId) {
+        const updated = await tx.inventoryBatch.updateMany({
+          where: { id: layer.batchId, inventoryItemId: data.itemId },
+          data: { currentQty: { increment: layer.qty } },
+        });
+        if (updated.count > 0) restoredToBatchId = layer.batchId;
+      }
+
+      if (!restoredToBatchId) {
+        // Original batch row genuinely gone, or belongs to a different
+        // InventoryItem (cross-scope return) — create a fresh lot at the
+        // historical allocated cost, never at this item's current costPrice.
+        const newBatch = await tx.inventoryBatch.create({
+          data: {
+            inventoryItemId: data.itemId,
+            batchNumber: `RETURN-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`,
+            initialQty: layer.qty,
+            currentQty: layer.qty,
+            unitCost,
+            warehouseId: data.warehouseId || null,
+            status: 'APPROVED',
+          },
+        });
+        restoredToBatchId = newBatch.id;
+      }
+
+      totalQty += layer.qty;
+      totalCost += layer.qty * unitCost;
+      appliedLayers.push({ batchId: restoredToBatchId, qty: layer.qty, unitCost, totalCost: Math.round(layer.qty * unitCost * 100) / 100 });
+    }
+
+    if (totalQty <= 0.0000001) return null;
+
+    const item = await tx.inventoryItem.update({
+      where: { id: data.itemId },
+      data: { currentStock: { increment: totalQty } },
+    });
+
+    const blendedUnitCost = totalQty > 0 ? totalCost / totalQty : 0;
+    const singleLayer = appliedLayers.length === 1;
+
+    const movement = await tx.stockMovement.create({
+      data: {
+        itemId: data.itemId,
+        movementType: data.movementType as any,
+        quantity: totalQty,
+        baseQty: totalQty,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId,
+        note: data.note,
+        createdBy: data.userId,
+        warehouseId: data.warehouseId || null,
+        batchId: singleLayer ? appliedLayers[0].batchId : null,
+        unitCost: blendedUnitCost,
+        consumptionBreakdown: appliedLayers.length > 1 ? (appliedLayers as any) : null,
+      },
+    });
+
+    return { item, movement };
+  }
+
   // New helper for unit conversion engine
   static async convertUnitToBase(itemId: string, unitIdOrName: string, enteredQty: number, tx: any = prisma): Promise<{ requiredBaseQty: number; unitId?: string }> {
     const item = await tx.inventoryItem.findUnique({

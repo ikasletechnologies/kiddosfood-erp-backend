@@ -110,6 +110,7 @@ model Dealer {
   updatedAt        DateTime          @updatedAt
   franchise        Franchise         @relation(fields: [franchiseId], references: [id])
   deliveryChallans DeliveryChallan[]
+  returnOrders     ReturnOrder[]
 
   @@index([franchiseId])
 }
@@ -1424,6 +1425,7 @@ model ReturnOrder {
   returnNumber     String          @unique
   salesOrderId     String?
   customerId       String?
+  dealerId         String?
   reason           String
   status           ReturnStatus    @default(PENDING)
   refundAmount     Float
@@ -1444,6 +1446,7 @@ model ReturnOrder {
   idempotencyKey   String?         @unique
   items            ReturnItem[]
   customer         Customer?       @relation(fields: [customerId], references: [id])
+  dealer           Dealer?         @relation(fields: [dealerId], references: [id])
   franchise        Franchise?      @relation(fields: [franchiseId], references: [id])
   franchiseOrder   FranchiseOrder? @relation(fields: [franchiseOrderId], references: [id])
   posOrder         Order?          @relation(fields: [posOrderId], references: [id])
@@ -1459,8 +1462,55 @@ model ReturnItem {
   productId   String?
   productName String
   quantity    Float
+  // Original persisted gross unit price of the resolved source line (POS
+  // OrderItem.price / SalesOrderItem.rate / FranchiseOrderItem.unitPrice) —
+  // never the client-submitted rate when an original line was resolved. See
+  // createReturnOrder's per-line reversal formula.
   rate        Float
+  // Per-line discount reversed for this return quantity (channel discount +
+  // apportioned bill-level/manual discount for POS-sourced lines). Null only
+  // for pre-fix historical rows.
+  discountAmount Float?
+  // Taxable value reversed for this return quantity: (rate*quantity) minus
+  // discountAmount above.
+  taxableValue   Float?
+  // Informational per-item effective GST rate derived from taxAmount/
+  // taxableValue — NOT re-derived from today's Product Master tax rate.
+  gstRate        Float?
+  // Actual tax reversed for this return quantity — a proportional slice of
+  // the ORIGINAL line's persisted tax amount, never recomputed from today's
+  // rate. CGST/SGST/IGST split is only kept at the ReturnOrder aggregate
+  // level (see splitGstAmount), not duplicated per item.
+  taxAmount      Float?
+  // Final refund total for this line = taxableValue + taxAmount (discount-
+  // and-tax-aware). Pre-fix semantics were the gross quantity*rate; this is
+  // the actual credited value.
   totalAmount Float
+  // ── Phase 3: inventory-cost reversal (completely independent of the
+  // refund/GST fields above — never read/written together with them). ──
+  // The exact per-layer FIFO allocation THIS return reversed, replaying the
+  // original sale's own StockMovement.consumptionBreakdown/batchId+unitCost
+  // ordering and skipping whatever prior (non-rejected) returns on this same
+  // line already consumed. Shape: [{batchId, qty, unitCost, totalCost}, ...].
+  // Null when costProvenance is PROVENANCE_UNAVAILABLE (Case C — no original
+  // FIFO consumption could be traced) or when this line has no linked
+  // original sale at all (standalone/manual return).
+  costAllocation Json?
+  // Sum of costAllocation[].totalCost — the actual historical COGS being
+  // reversed for this line. Null for Case C. Never derived from
+  // InventoryItem.costPrice (current moving-average) or any Product Master
+  // price field.
+  costReversal   Float?
+  // 'EXACT' — every reversed unit traced to a real original batch/lot cost.
+  // 'RECONSTRUCTED' — a usable but non-layer-exact historical cost was
+  // available (e.g. a single blended unitCost on the original movement with
+  // no per-batch breakdown, or a partial shortfall in tracked layers).
+  // 'PROVENANCE_UNAVAILABLE' — no original outbound StockMovement could be
+  // found for this line at all (e.g. a Quotation/SalesOrder/Proforma
+  // conversion, which performs no real inventory deduction today) — cost/
+  // COGS reversal is skipped rather than fabricated; physical quantity
+  // still restores via the existing (unrelated) stock-movement logic.
+  costProvenance String?
   condition   String?
   // Set (overriding whatever condition was submitted) when the backend
   // determines, from the original sale's StockMovement/consumptionBreakdown,
@@ -1550,6 +1600,23 @@ model DeliveryChallanReturnItem {
   quantity      Float
   unit          String                @default("NONE")
   condition     String?
+  // Phase 3A (DC-return inventory-cost reversal — same shape/purpose as
+  // ReturnItem.costAllocation/costReversal/costProvenance above): the exact
+  // per-layer FIFO allocation THIS return reversed, replaying the original
+  // DC dispatch's own StockMovement.consumptionBreakdown/batchId+unitCost
+  // ordering (see SalesService._computeReturnFifoAllocation), computed ONCE
+  // at createDeliveryChallanReturn time (the point that claims the
+  // quantity) and only ever READ (never recomputed) at receive time. Shape:
+  // [{batchId, qty, unitCost, totalCost}, ...]. Null when costProvenance is
+  // PROVENANCE_UNAVAILABLE.
+  costAllocation Json?
+  // Sum of costAllocation[].totalCost — the actual historical COGS being
+  // reversed for this line. Null for PROVENANCE_UNAVAILABLE. Never derived
+  // from InventoryItem.costPrice (current moving-average).
+  costReversal   Float?
+  // 'EXACT' | 'RECONSTRUCTED' | 'PROVENANCE_UNAVAILABLE' — see
+  // ReturnItem.costProvenance for the exact meaning of each value.
+  costProvenance String?
   // See ReturnItem.recallId — same override mechanism for the DC-return flow.
   recallId      String?
   recall        BatchRecall?          @relation(fields: [recallId], references: [id])
@@ -2029,6 +2096,15 @@ enum StockMovementType {
   RETURN_OUT
   RECALL_RETURN_IN
   RETURN_QUARANTINE_IN
+  // Phase 3 (Sales/POS Return inventory-cost reversal): a GOOD-condition
+  // sales return restocked at its ORIGINAL FIFO layer cost — either into
+  // the same original InventoryBatch row(s) (by id, when they still exist)
+  // or, only when they don't / the sale had no exact provenance, a new
+  // batch created at the best available historical cost. Replaces the old
+  // PURCHASE_IN mislabeling (which also fabricated cost from the item's
+  // CURRENT moving-average costPrice) for this one restock path. See
+  // SalesService.restoreStockForReturnOrder / InventoryService.restoreToBatches.
+  SALES_RETURN_IN
 }
 
 enum GRNStatus {
