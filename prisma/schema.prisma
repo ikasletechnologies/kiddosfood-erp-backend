@@ -88,29 +88,29 @@ model Customer {
 }
 
 model Dealer {
-  id               String            @id @default(uuid())
-  name             String
-  phone            String?           @unique
-  email            String?           @unique
-  address          String?
-  state            String?
-  district         String?
-  city             String?
-  pincode          String?
-  shippingAddress  String?
-  gstNumber        String?
-  gstType          String?
-  openingBalance   Float             @default(0)
+  id                 String            @id @default(uuid())
+  name               String
+  phone              String?           @unique
+  email              String?           @unique
+  address            String?
+  state              String?
+  district           String?
+  city               String?
+  pincode            String?
+  shippingAddress    String?
+  gstNumber          String?
+  gstType            String?
+  openingBalance     Float             @default(0)
   openingBalanceType String?
-  asOfDate         DateTime?
-  creditLimit      Float?
-  status           String            @default("ACTIVE")
-  franchiseId      String
-  createdAt        DateTime          @default(now())
-  updatedAt        DateTime          @updatedAt
-  franchise        Franchise         @relation(fields: [franchiseId], references: [id])
-  deliveryChallans DeliveryChallan[]
-  returnOrders     ReturnOrder[]
+  asOfDate           DateTime?
+  creditLimit        Float?
+  status             String            @default("ACTIVE")
+  franchiseId        String
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  franchise          Franchise         @relation(fields: [franchiseId], references: [id])
+  deliveryChallans   DeliveryChallan[]
+  returnOrders       ReturnOrder[]
 
   @@index([franchiseId])
 }
@@ -1457,16 +1457,16 @@ model ReturnOrder {
 }
 
 model ReturnItem {
-  id          String       @id @default(uuid())
-  returnId    String
-  productId   String?
-  productName String
-  quantity    Float
+  id             String       @id @default(uuid())
+  returnId       String
+  productId      String?
+  productName    String
+  quantity       Float
   // Original persisted gross unit price of the resolved source line (POS
   // OrderItem.price / SalesOrderItem.rate / FranchiseOrderItem.unitPrice) —
   // never the client-submitted rate when an original line was resolved. See
   // createReturnOrder's per-line reversal formula.
-  rate        Float
+  rate           Float
   // Per-line discount reversed for this return quantity (channel discount +
   // apportioned bill-level/manual discount for POS-sourced lines). Null only
   // for pre-fix historical rows.
@@ -1485,7 +1485,7 @@ model ReturnItem {
   // Final refund total for this line = taxableValue + taxAmount (discount-
   // and-tax-aware). Pre-fix semantics were the gross quantity*rate; this is
   // the actual credited value.
-  totalAmount Float
+  totalAmount    Float
   // ── Phase 3: inventory-cost reversal (completely independent of the
   // refund/GST fields above — never read/written together with them). ──
   // The exact per-layer FIFO allocation THIS return reversed, replaying the
@@ -1511,7 +1511,7 @@ model ReturnItem {
   // COGS reversal is skipped rather than fabricated; physical quantity
   // still restores via the existing (unrelated) stock-movement logic.
   costProvenance String?
-  condition   String?
+  condition      String?
   // Set (overriding whatever condition was submitted) when the backend
   // determines, from the original sale's StockMovement/consumptionBreakdown,
   // that this returned quantity traces back to a ProductBatch under an
@@ -1519,9 +1519,9 @@ model ReturnItem {
   // recordRecallAffectedReturn. Never set by client input; a non-null value
   // here is what actually kept this quantity out of saleable stock,
   // regardless of what `condition` says.
-  recallId    String?
-  recall      BatchRecall? @relation(fields: [recallId], references: [id])
-  return      ReturnOrder  @relation(fields: [returnId], references: [id])
+  recallId       String?
+  recall         BatchRecall? @relation(fields: [recallId], references: [id])
+  return         ReturnOrder  @relation(fields: [returnId], references: [id])
 
   @@index([recallId])
 }
@@ -1592,14 +1592,14 @@ model DeliveryChallanReturn {
 }
 
 model DeliveryChallanReturnItem {
-  id            String                @id @default(uuid())
-  returnId      String
-  challanItemId String
-  productId     String?
-  productName   String
-  quantity      Float
-  unit          String                @default("NONE")
-  condition     String?
+  id             String                @id @default(uuid())
+  returnId       String
+  challanItemId  String
+  productId      String?
+  productName    String
+  quantity       Float
+  unit           String                @default("NONE")
+  condition      String?
   // Phase 3A (DC-return inventory-cost reversal — same shape/purpose as
   // ReturnItem.costAllocation/costReversal/costProvenance above): the exact
   // per-layer FIFO allocation THIS return reversed, replaying the original
@@ -1618,10 +1618,10 @@ model DeliveryChallanReturnItem {
   // ReturnItem.costProvenance for the exact meaning of each value.
   costProvenance String?
   // See ReturnItem.recallId — same override mechanism for the DC-return flow.
-  recallId      String?
-  recall        BatchRecall?          @relation(fields: [recallId], references: [id])
-  challanItem   DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
-  return        DeliveryChallanReturn @relation(fields: [returnId], references: [id])
+  recallId       String?
+  recall         BatchRecall?          @relation(fields: [recallId], references: [id])
+  challanItem    DeliveryChallanItem   @relation(fields: [challanItemId], references: [id])
+  return         DeliveryChallanReturn @relation(fields: [returnId], references: [id])
 
   @@index([recallId])
 }

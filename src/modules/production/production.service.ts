@@ -651,6 +651,7 @@ export class ProductionService {
     packetSize: string;
     quantityPackets: number;
     productId?: string;
+    newProduct?: { name: string; sku?: string; basePrice: number };
     userId?: string;
   }) {
     return prisma.$transaction(async tx => {
@@ -671,8 +672,33 @@ export class ProductionService {
         throw new Error('Packaging blocked — batch is under recall.');
       }
 
-      if (data.productId) {
-        const chosen = await tx.product.findUnique({ where: { id: data.productId } });
+      let targetProductId = data.productId;
+
+      if (data.newProduct) {
+        if (data.newProduct.sku) {
+          const existing = await tx.product.findUnique({ where: { sku: data.newProduct.sku } });
+          if (existing) {
+            throw new Error(`A product with SKU "${data.newProduct.sku}" already exists`);
+          }
+        }
+        
+        const createdProduct = await tx.product.create({
+          data: {
+            name: data.newProduct.name,
+            sku: data.newProduct.sku || undefined,
+            basePrice: data.newProduct.basePrice || 0,
+            category: 'FINISHED_GOOD',
+            productType: 'FINISHED_GOOD',
+            is_menu_item: true,
+            isVeg: true,
+            isActive: true,
+          }
+        });
+        targetProductId = createdProduct.id;
+      }
+
+      if (targetProductId) {
+        const chosen = await tx.product.findUnique({ where: { id: targetProductId } });
         if (chosen) {
           await tx.productBatch.update({
             where: { id: batch.id },
