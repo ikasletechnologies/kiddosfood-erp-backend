@@ -31,6 +31,15 @@ export class GRNController {
     }
   }
 
+  static async getRemainingQuantities(req: Request, res: Response) {
+    try {
+      const data = await GRNService.getRemainingQuantities(req.params.poId);
+      res.json(data);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async createFromPO(req: Request, res: Response) {
     try {
       const user = (req as any).user;

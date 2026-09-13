@@ -460,6 +460,7 @@ app.get('/api/grn', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN
 // getById with id="generate-lot-number" instead.
 app.get('/api/grn/generate-lot-number', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.generateLotNumber);
 app.get('/api/grn/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getById);
+app.get('/api/grn/po/:poId/remaining', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getRemainingQuantities);
 app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.createFromPO);
 app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.approve);
 app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.cancel);
