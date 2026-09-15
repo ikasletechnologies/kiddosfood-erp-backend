@@ -1,9 +1,9 @@
 import prisma from "./src/lib/prisma";
 async function main() {
-  const po = await prisma.procurementOrder.findUnique({
-    where: { poNumber: "PO-2026-0003" }
+  const order = await prisma.order.findFirst({
+    where: { invoiceNum: "INV-2026-00093" },
+    include: { orderItems: { include: { product: true } } }
   });
-  console.log("PO-2026-0003 Discount:", po?.discountAmount);
-  console.log("PO-2026-0003 Total:", po?.totalAmount);
+  console.log("Order items:", JSON.stringify(order?.orderItems, null, 2));
 }
 main();

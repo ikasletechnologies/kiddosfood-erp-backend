@@ -75,12 +75,14 @@ export class FranchiseOrderController {
         return res.status(403).json({ error: 'Forbidden: You can only pay for your own orders' });
       }
 
+      const isHqAdmin = user.role !== 'FRANCHISE_ADMIN' && user.role !== 'FRANCHISE';
       const { amount, accountId } = req.body;
       const updated = await FranchiseOrderService.recordPayment(
         req.params.id, 
         amount, 
         accountId,
-        user?.fullName || user?.email || 'System'
+        user?.fullName || user?.email || (isHqAdmin ? 'HQ Admin' : 'Franchise User'),
+        isHqAdmin
       );
       res.json(updated);
     } catch (e: any) {

@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import prisma from '../../lib/prisma';
 import { SalesService } from './sales.service';
 
 export class SalesController {
@@ -237,14 +238,13 @@ export class SalesController {
   static async getReturnOrders(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = user.role === 'SUPER_ADMIN'
-        ? (req.query.franchiseId as string | undefined)
-        : user.franchiseId;
+      const isSuperAdmin = user?.role === 'SUPER_ADMIN';
       const returns = await SalesService.getReturnOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
         dealerId: req.query.dealerId as string,
-        franchiseId,
+        franchiseId: isSuperAdmin ? (req.query.franchiseId as string | undefined) : undefined,
+        operatingFranchiseId: !isSuperAdmin ? user?.franchiseId : (req.query.operatingFranchiseId as string | undefined),
         source: req.query.source as any,
         search: req.query.search as string
       });
@@ -256,20 +256,80 @@ export class SalesController {
 
   static async createReturnOrder(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+
+      if (!isSuperAdmin) {
+        if (!user?.franchiseId) {
+          return res.status(403).json({ error: 'Franchise context required to create return' });
+        }
+        if (!req.body.posOrderId) {
+          return res.status(400).json({ error: 'A valid sales invoice reference (posOrderId) is required to create a return' });
+        }
+
+        const sourceOrder = await prisma.order.findUnique({
+          where: { id: req.body.posOrderId },
+          include: { customer: true }
+        });
+
+        if (!sourceOrder) {
+          return res.status(404).json({ error: 'Sale invoice not found' });
+        }
+
+        if (sourceOrder.franchiseId !== user.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Invoice does not belong to your franchise' });
+        }
+
+        if (sourceOrder.partyType === 'FRANCHISE') {
+          return res.status(400).json({ error: 'Cannot create a sales return against an HQ procurement invoice' });
+        }
+
+        if (sourceOrder.status === 'CANCELLED') {
+          return res.status(400).json({ error: 'Cannot create a return against a cancelled invoice' });
+        }
+
+        // Sanitize: remove any forged party/order IDs
+        delete req.body.franchiseId;
+        delete req.body.franchiseOrderId;
+        delete req.body.salesOrderId;
+
+        if (sourceOrder.partyType === 'DEALER') {
+          req.body.dealerId = sourceOrder.partyId || req.body.dealerId;
+        } else if (sourceOrder.partyType === 'CUSTOMER') {
+          req.body.customerId = sourceOrder.customerId || req.body.customerId;
+        }
+      }
+
       const returnOrder = await SalesService.createReturnOrder(req.body);
       res.status(201).json(returnOrder);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to create return order';
+      const isBusinessError = /cannot return|maximum returnable|greater than zero|already returned|not found|integrity/i.test(msg);
+      res.status(isBusinessError ? 400 : 500).json({ error: msg });
     }
   }
 
   static async updateReturnOrder(req: Request, res: Response) {
     try {
-      const approverId = (req as any).user?.userId;
+      const user = (req as any).user;
+      const approverId = user?.userId;
+
+      if (user?.role !== 'SUPER_ADMIN') {
+        const existing = await prisma.returnOrder.findUnique({
+          where: { id: req.params.id },
+          include: { posOrder: true }
+        });
+        if (!existing) return res.status(404).json({ error: 'Return order not found' });
+        if (existing.posOrder?.franchiseId !== user?.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Return order does not belong to your franchise' });
+        }
+      }
+
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to update return order';
+      res.status(400).json({ error: msg });
     }
   }
 
@@ -280,7 +340,27 @@ export class SalesController {
   // ReturnOrder.refundAmount established at createReturnOrder time.
   static async refundReturnOrder(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.userId;
+      const user = (req as any).user;
+      const createdBy = user?.userId;
+
+      if (user?.role !== 'SUPER_ADMIN') {
+        const existing = await prisma.returnOrder.findUnique({
+          where: { id: req.params.id },
+          include: { posOrder: true }
+        });
+        if (!existing) return res.status(404).json({ error: 'Return order not found' });
+        if (existing.posOrder?.franchiseId !== user?.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Return order does not belong to your franchise' });
+        }
+
+        if (req.body?.accountId) {
+          const account = await prisma.account.findUnique({ where: { id: req.body.accountId } });
+          if (account && account.franchiseId !== user?.franchiseId) {
+            return res.status(403).json({ error: 'Access denied: Account does not belong to your franchise' });
+          }
+        }
+      }
+
       const result = await SalesService.recordRefund(req.params.id, {
         refundMethod: req.body?.refundMethod,
         accountId: req.body?.accountId,
@@ -288,8 +368,9 @@ export class SalesController {
         createdBy
       });
       res.json(result);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to process refund';
+      res.status(400).json({ error: msg });
     }
   }
 

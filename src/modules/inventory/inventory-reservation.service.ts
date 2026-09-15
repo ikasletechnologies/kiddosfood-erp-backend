@@ -82,6 +82,65 @@ export class InventoryReservationService {
       }
 
       if (remaining > 0.0001) {
+        // Check if the item has unbatched stock in InventoryItem (e.g. from Opening Stock / initial balance)
+        const invItem = await tx.inventoryItem.findUnique({
+          where: { id: item.inventoryItemId }
+        });
+
+        if (invItem && invItem.currentStock > 0) {
+          const totalBatchQtyResult: Array<{ total: number }> = await tx.$queryRaw(Prisma.sql`
+            SELECT COALESCE(SUM("currentQty"), 0) AS total
+            FROM "InventoryBatch"
+            WHERE "inventoryItemId" = ${item.inventoryItemId}
+              AND status = 'APPROVED'
+              ${warehouseFilter}
+          `);
+          const totalBatchQty = Number(totalBatchQtyResult[0]?.total) || 0;
+          const unbatchedQty = Math.max(0, invItem.currentStock - totalBatchQty);
+
+          if (unbatchedQty > 0.0001) {
+            // Find a warehouse if available from last movement or default
+            const lastMovement = await tx.stockMovement.findFirst({
+              where: { itemId: item.inventoryItemId, warehouseId: { not: null } },
+              orderBy: { createdAt: 'desc' }
+            });
+
+            let targetWarehouseId = lastMovement?.warehouseId || warehouseId || null;
+            if (!targetWarehouseId) {
+              const defaultWh = await tx.warehouse.findFirst({
+                orderBy: { createdAt: 'asc' }
+              });
+              targetWarehouseId = defaultWh?.id || null;
+            }
+
+            const newBatch = await tx.inventoryBatch.create({
+              data: {
+                inventoryItemId: item.inventoryItemId,
+                batchNumber: `LOT-OPENING-${Date.now()}`,
+                initialQty: unbatchedQty,
+                currentQty: unbatchedQty,
+                unitCost: invItem.costPrice || 0,
+                warehouseId: targetWarehouseId,
+                status: 'APPROVED',
+              }
+            });
+
+            const allocateQty = Math.min(unbatchedQty, remaining);
+            await tx.inventoryReservationAllocation.create({
+              data: {
+                reservationId: reservation.id,
+                inventoryBatchId: newBatch.id,
+                inventoryItemId: item.inventoryItemId,
+                reservedQty: allocateQty,
+              }
+            });
+
+            remaining -= allocateQty;
+          }
+        }
+      }
+
+      if (remaining > 0.0001) {
         throw new Error(`Insufficient available stock to reserve ${item.quantity} units for item ${item.inventoryItemId}. Shortfall: ${remaining}`);
       }
     }
