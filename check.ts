@@ -1,9 +1,7 @@
 import prisma from "./src/lib/prisma";
 async function main() {
-  const order = await prisma.order.findFirst({
-    where: { invoiceNum: "INV-2026-00093" },
-    include: { orderItems: { include: { product: true } } }
-  });
-  console.log("Order items:", JSON.stringify(order?.orderItems, null, 2));
+  // Health check
+  const count = await prisma.returnOrder.count();
+  console.log("Return order count:", count);
 }
 main();
