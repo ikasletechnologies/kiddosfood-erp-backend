@@ -491,7 +491,19 @@ export class FinanceService {
     const opts = typeof filters === 'string' ? { franchiseId: filters } : (filters || {});
     const where: any = {};
     if (opts.franchiseId) {
-      where.order = { franchiseId: opts.franchiseId };
+      const targetFranchise = await prisma.franchise.findUnique({
+        where: { id: opts.franchiseId },
+        select: { id: true, isHQ: true }
+      });
+      if (targetFranchise && !targetFranchise.isHQ) {
+        // A branch franchise's Sale Invoices are strictly sales to local CUSTOMER and DEALER parties
+        where.order = {
+          franchiseId: opts.franchiseId,
+          partyType: { in: ['CUSTOMER', 'DEALER'] }
+        };
+      } else {
+        where.order = { franchiseId: opts.franchiseId };
+      }
     }
     if (opts.startDate || opts.endDate) {
       where.createdAt = {};
@@ -532,6 +544,33 @@ export class FinanceService {
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    const dealerIds = [...new Set(invoices.map(i => i.order?.partyType === 'DEALER' ? i.order?.partyId : null).filter(Boolean))] as string[];
+    if (dealerIds.length > 0) {
+      const dealers = await prisma.dealer.findMany({
+        where: { id: { in: dealerIds } }
+      });
+      const dealerMap = new Map(dealers.map(d => [d.id, d]));
+      for (const inv of invoices) {
+        if (inv.order?.partyType === 'DEALER' && inv.order?.partyId && dealerMap.has(inv.order.partyId)) {
+          (inv.order as any).dealer = dealerMap.get(inv.order.partyId);
+        }
+      }
+    }
+
+    const buyerFranchiseIds = [...new Set(invoices.map(i => i.order?.partyType === 'FRANCHISE' ? i.order?.partyId : null).filter(Boolean))] as string[];
+    if (buyerFranchiseIds.length > 0) {
+      const buyerFranchises = await prisma.franchise.findMany({
+        where: { id: { in: buyerFranchiseIds } }
+      });
+      const franchiseMap = new Map(buyerFranchises.map(f => [f.id, f]));
+      for (const inv of invoices) {
+        if (inv.order?.partyType === 'FRANCHISE' && inv.order?.partyId && franchiseMap.has(inv.order.partyId)) {
+          (inv.order as any).buyerFranchise = franchiseMap.get(inv.order.partyId);
+        }
+      }
+    }
+
     return invoices.map((inv) => this.mergeAllocationsIntoPayments(inv));
   }
 
@@ -559,6 +598,26 @@ export class FinanceService {
         allocations: { include: { payment: true } }
       }
     });
+    if (!invoice) return null;
+
+    if (invoice.order && invoice.order.partyType === 'DEALER' && invoice.order.partyId) {
+      const dealer = await prisma.dealer.findUnique({
+        where: { id: invoice.order.partyId }
+      });
+      if (dealer) {
+        (invoice.order as any).dealer = dealer;
+      }
+    }
+
+    if (invoice.order && invoice.order.partyType === 'FRANCHISE' && invoice.order.partyId) {
+      const buyerFranchise = await prisma.franchise.findUnique({
+        where: { id: invoice.order.partyId }
+      });
+      if (buyerFranchise) {
+        (invoice.order as any).buyerFranchise = buyerFranchise;
+      }
+    }
+
     return this.mergeAllocationsIntoPayments(invoice);
   }
 
@@ -1937,15 +1996,26 @@ export class FinanceService {
         if (cust) resolvedCustomerName = cust.name;
       }
 
+      // Resolve seller franchise identity:
+      // When goods are billed to a Franchise (HQ selling finished products to Franchise),
+      // the SELLER franchise is HQ (isHQ: true), and the BUYER is data.partyId (the Franchise).
+      let sellerFranchiseId = data.franchiseId;
+      if (data.partyType === 'FRANCHISE' || data.sourceFranchiseOrderId) {
+        const hq = await tx.franchise.findFirst({ where: { isHQ: true } });
+        if (hq) {
+          sellerFranchiseId = hq.id;
+        }
+      }
+
       const order = await tx.order.create({
         data: {
           invoiceNum,
           sourceQuotationId: data.sourceFranchiseOrderId || (data as any).sourceQuotationId || null,
           partyType: (data.partyType || 'CUSTOMER') as any,
-          partyId: data.partyId,
-          customerId: data.customerId,
+          partyId: data.partyId || (data.partyType === 'CUSTOMER' ? data.customerId : null),
+          customerId: data.partyType === 'CUSTOMER' ? (data.customerId || data.partyId) : null,
           customerName: resolvedCustomerName,
-          franchiseId: data.franchiseId,
+          franchiseId: sellerFranchiseId,
           orderType: 'DINE_IN',
           status: 'COMPLETED',
           subTotal,

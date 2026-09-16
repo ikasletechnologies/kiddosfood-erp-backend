@@ -100,6 +100,11 @@ export class POSController {
       const filters: any = { ...franchiseFilter };
       if (req.query.franchiseId && user.role === 'SUPER_ADMIN') filters.franchiseId = req.query.franchiseId as string;
       if (req.query.status) filters.status = req.query.status as string;
+      if (req.query.search) filters.search = req.query.search as string;
+      if (req.query.invoiceNum) filters.invoiceNum = req.query.invoiceNum as string;
+      if (user.role !== 'SUPER_ADMIN') {
+        filters.partyType = { not: 'FRANCHISE' };
+      }
 
       const orders = await POSService.getAllOrders(filters);
       res.json(orders);

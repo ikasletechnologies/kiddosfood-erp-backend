@@ -1815,12 +1815,27 @@ export class SalesService {
 
   // ─── Return Orders (RMA) ─────────────────────────────────────────────────────
 
-  static async getReturnOrders(filters: { status?: string; customerId?: string; dealerId?: string; franchiseId?: string; source?: 'FRANCHISE' | 'DEALER' | 'BUSINESS' | 'POS'; search?: string }) {
+  static async getReturnOrders(filters: {
+    status?: string;
+    customerId?: string;
+    dealerId?: string;
+    franchiseId?: string;
+    operatingFranchiseId?: string;
+    source?: 'FRANCHISE' | 'DEALER' | 'BUSINESS' | 'POS';
+    search?: string;
+  }) {
     const where: any = {};
     if (filters.status) where.status = filters.status;
     if (filters.customerId) where.customerId = filters.customerId;
     if (filters.dealerId) where.dealerId = filters.dealerId;
     if (filters.franchiseId) where.franchiseId = filters.franchiseId;
+
+    if (filters.operatingFranchiseId) {
+      where.posOrder = {
+        franchiseId: filters.operatingFranchiseId,
+        NOT: { partyType: 'FRANCHISE' }
+      };
+    }
 
     if (filters.source === 'FRANCHISE') {
       where.franchiseId = { not: null };
@@ -1835,12 +1850,30 @@ export class SalesService {
     if (filters.search) {
       where.OR = [
         { returnNumber: { contains: filters.search, mode: 'insensitive' } },
-        { reason: { contains: filters.search, mode: 'insensitive' } }
+        { reason: { contains: filters.search, mode: 'insensitive' } },
+        { posOrder: { invoiceNum: { contains: filters.search, mode: 'insensitive' } } },
+        { posOrder: { customerName: { contains: filters.search, mode: 'insensitive' } } },
+        { customer: { name: { contains: filters.search, mode: 'insensitive' } } },
+        { dealer: { name: { contains: filters.search, mode: 'insensitive' } } }
       ];
     }
     return prisma.returnOrder.findMany({
       where,
-      include: { customer: true, dealer: true, salesOrder: true, franchise: true, franchiseOrder: true, posOrder: true, items: true },
+      include: {
+        customer: true,
+        dealer: true,
+        salesOrder: true,
+        franchise: true,
+        franchiseOrder: true,
+        posOrder: {
+          include: {
+            orderItems: { include: { product: true } },
+            customer: true,
+            franchise: true
+          }
+        },
+        items: true
+      },
       orderBy: { createdAt: 'desc' }
     });
   }
@@ -1972,7 +2005,7 @@ export class SalesService {
   // operating branch -> Customer's/Dealer's own home franchise) — factored
   // out of restoreStockForReturnOrder so it stays in exactly one place.
   private static async _resolveReturnRestoreScopeFranchiseId(tx: any, returnOrder: any): Promise<string | null> {
-    let scopeFranchiseId = returnOrder.franchiseId || returnOrder.posOrder?.franchiseId || null;
+    let scopeFranchiseId = returnOrder.posOrder?.franchiseId || returnOrder.franchiseId || null;
     if (!scopeFranchiseId && returnOrder.customerId) {
       const cust = await tx.customer.findUnique({ where: { id: returnOrder.customerId }, select: { franchiseId: true } });
       scopeFranchiseId = cust?.franchiseId || null;
@@ -2950,14 +2983,30 @@ export class SalesService {
 
       const ret = await tx.returnOrder.findUnique({
         where: { id: returnId },
-        include: { items: true, customer: true, dealer: true, franchise: true, posOrder: true, salesOrder: true }
+        include: { 
+          items: true, 
+          customer: true, 
+          dealer: true, 
+          franchise: true, 
+          posOrder: { include: { payments: true } }, 
+          salesOrder: true, 
+          franchiseOrder: true 
+        }
       });
       if (!ret) throw new Error('Return Order not found');
       if (ret.status === 'COMPLETED') throw new Error('This return has already been refunded.');
       if (ret.status !== 'APPROVED') throw new Error(`Only approved returns can be refunded (current status: ${ret.status}).`);
 
+      // Ensure refundAmount strictly includes GST from the original sale invoice
+      let finalRefundAmount = Number(ret.refundAmount) || 0;
+      const taxable = Number(ret.taxableValue) || 0;
+      const tax = Number(ret.taxAmount) || 0;
+      if (tax > 0 && Math.abs(finalRefundAmount - taxable) < 0.01) {
+        finalRefundAmount = Math.round((taxable + tax) * 100) / 100;
+      }
+
       const idempotencyKey = `RETURN_REFUND_${returnId}`;
-      const refundMethod = (data.refundMethod || ret.refundMethod || '').trim();
+      const refundMethod = (data.refundMethod || ret.refundMethod || 'Original Method').trim();
       const isCreditLedger = refundMethod === 'Credit Ledger';
 
       const partyLabel = ret.customerId ? 'Customer Refund' : ret.dealerId ? 'Dealer Refund' : ret.franchiseId ? 'Franchise Refund' : 'Sales Refund';
@@ -2968,35 +3017,74 @@ export class SalesService {
       let ledger: any = null;
 
       if (isCreditLedger) {
-        // Credit Ledger path — see the three _apply*CreditLedgerRefund
-        // helpers above for the per-party design (Customer/Dealer apply
-        // against a genuinely unpaid original order where one exists;
-        // Franchise always reduces outstandingAmount directly; Dealer with
-        // no applicable order is rejected — no DealerLedger exists).
+        // Credit Ledger path — see the three _apply*CreditLedgerRefund helpers above
+        const retForCredit = { ...ret, refundAmount: finalRefundAmount };
         if (ret.customerId) {
-          ledger = await SalesService._applyCustomerCreditLedgerRefund(tx, ret, data.createdBy);
+          ledger = await SalesService._applyCustomerCreditLedgerRefund(tx, retForCredit, data.createdBy);
         } else if (ret.dealerId) {
-          ledger = await SalesService._applyDealerCreditLedgerRefund(tx, ret, data.createdBy);
+          ledger = await SalesService._applyDealerCreditLedgerRefund(tx, retForCredit, data.createdBy);
         } else if (ret.franchiseId) {
-          ledger = await SalesService._applyFranchiseCreditLedgerRefund(tx, ret);
+          ledger = await SalesService._applyFranchiseCreditLedgerRefund(tx, retForCredit);
         } else {
           throw new Error('Credit Ledger refund requires a Customer, Dealer, or Franchise party on this return.');
         }
       } else {
-        // Cash / Bank / UPI path ("Original Method", "Cash Voucher",
-        // "Cheque / UPI", or unrecognized/missing — same implicit default
-        // as before this change). The client-supplied amount/rate/discount/
-        // gst are never read here — amount is ALWAYS ret.refundAmount.
-        if (!data.accountId) {
-          throw new Error('An account (accountId) is required to process a cash/bank/UPI refund.');
+        // Cash / Bank / UPI path:
+        // Settlement method was decided earlier in the sales/return flow.
+        // Auto-resolve account and payment method if not explicitly passed by UI.
+        let resolvedAccountId: string | undefined = data.accountId || undefined;
+        let resolvedMethod: string | undefined = data.method || undefined;
+
+        if (!resolvedAccountId) {
+          // 1. Try to find the original payment account from the linked POS order
+          const origPayment = ret.posOrder?.payments?.find((p: any) => p.accountId && p.status === 'PAID');
+          if (origPayment && origPayment.accountId) {
+            resolvedAccountId = origPayment.accountId;
+            if (!resolvedMethod && origPayment.paymentMode) resolvedMethod = origPayment.paymentMode;
+          }
         }
+
+        // 2. If still no account, resolve the operating franchise's primary CASH or operating account
+        const targetFranchiseId = ret.posOrder?.franchiseId || ret.franchiseId;
+        if (!resolvedAccountId && targetFranchiseId) {
+          const cashAcc = await tx.account.findFirst({
+            where: { franchiseId: targetFranchiseId, type: 'CASH' }
+          });
+          if (cashAcc) {
+            resolvedAccountId = cashAcc.id;
+          } else {
+            const anyAcc = await tx.account.findFirst({
+              where: { franchiseId: targetFranchiseId }
+            });
+            if (anyAcc) resolvedAccountId = anyAcc.id;
+          }
+        }
+
+        // 3. Fallback for Super Admin / HQ return
+        if (!resolvedAccountId) {
+          const hqCash = await tx.account.findFirst({
+            where: { franchiseId: null, type: 'CASH' }
+          }) || await tx.account.findFirst({
+            where: { franchiseId: null }
+          });
+          if (hqCash) resolvedAccountId = hqCash.id;
+        }
+
+        if (!resolvedAccountId) {
+          throw new Error('Unable to resolve a settlement account for this refund. Please ensure a payment account exists for your branch.');
+        }
+
+        if (!resolvedMethod) {
+          resolvedMethod = ret.posOrder?.paymentType || 'CASH';
+        }
+
         payment = await FinanceService.createPayment({
           tx,
-          amount: ret.refundAmount,
+          amount: finalRefundAmount,
           flow: 'OUT',
           status: 'PAID',
-          sourceAccount: data.accountId,
-          method: data.method || 'CASH',
+          sourceAccount: resolvedAccountId,
+          method: resolvedMethod,
           sourceModule: 'POS',
           linkedDocType: 'DIRECT',
           linkedDocId: ret.id,
@@ -3010,7 +3098,10 @@ export class SalesService {
 
       const updated = await tx.returnOrder.update({
         where: { id: returnId },
-        data: { status: 'COMPLETED' },
+        data: { 
+          status: 'COMPLETED',
+          refundAmount: finalRefundAmount
+        },
         include: { items: true, customer: true, dealer: true, franchise: true }
       });
 

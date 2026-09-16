@@ -55,10 +55,12 @@ export class ProductController {
       
       console.log(`📦 [ProductAPI] Fetching products for Franchise: ${franchiseId || 'NONE'}`);
       
+      const includeAll = req.query.includeAll === 'true' || req.query.allProducts === 'true';
       const category = req.query.category as string;
       const products = await ProductService.getAll(
         category ? { category } : {},
-        franchiseId
+        franchiseId,
+        includeAll
       );
       res.json(products);
     } catch (error) {
