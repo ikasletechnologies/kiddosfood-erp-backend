@@ -82,8 +82,8 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
   // matching is only correct for the legacy case of a product with no SKU.
   const existing = await tx.inventoryItem.findFirst({
     where: product.sku
-      ? { sku: product.sku }
-      : { name: { equals: product.name, mode: 'insensitive' } },
+      ? { sku: product.sku, franchiseId: hqFranchiseId }
+      : { name: { equals: product.name, mode: 'insensitive' }, franchiseId: hqFranchiseId },
   });
 
   if (existing) {
@@ -118,7 +118,7 @@ export class ProductService {
   /**
    * Fetch all products
    */
-  static async getAll(filters: any = {}, franchiseId?: string) {
+  static async getAll(filters: any = {}, franchiseId?: string, includeAll: boolean = false) {
     const products = await prisma.product.findMany({
       where: filters,
       include: { 
@@ -131,7 +131,14 @@ export class ProductService {
 
     if (franchiseId) {
       const skus = products.map(p => p.sku).filter(Boolean) as string[];
-      const names = products.map(p => p.name);
+      const namesWithoutSku = products.filter(p => !p.sku).map(p => p.name);
+      const inventoryWhere: any[] = [];
+      if (skus.length > 0) {
+        inventoryWhere.push({ sku: { in: skus } });
+      }
+      if (namesWithoutSku.length > 0) {
+        inventoryWhere.push({ name: { in: namesWithoutSku, mode: 'insensitive' } });
+      }
 
       // A null-franchiseId InventoryItem is the established "HQ-scoped"
       // convention used elsewhere (see InventoryService.createItem and
@@ -155,7 +162,7 @@ export class ProductService {
         where: {
           AND: [
             scopeFilter,
-            { OR: [{ sku: { in: skus } }, { name: { in: names, mode: 'insensitive' } }] }
+            inventoryWhere.length > 0 ? { OR: inventoryWhere } : {}
           ]
         },
         include: { baseUnit: true, conversions: { include: { unit: true } } }
@@ -164,9 +171,12 @@ export class ProductService {
       
       return products.map(p => {
         const pName = p.name.trim().toLowerCase();
-        // Match by SKU first, then fallback to Name (case-insensitive + trimmed)
-        const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
-                   inventory.find(i => i.name.trim().toLowerCase() === pName);
+        // Match by SKU strictly when product has a SKU — NEVER fall back to name,
+        // which would cause different size/weight variants sharing a name (e.g. APPAM 450G/900G)
+        // to collapse onto a single inventory row. Name matching is only valid for legacy SKU-less products.
+        const inv = p.sku
+          ? inventory.find(i => i.sku && i.sku.trim().toUpperCase() === p.sku!.trim().toUpperCase())
+          : inventory.find(i => i.name.trim().toLowerCase() === pName);
         
         const packSize = parseSkuPackSize(p.sku);
         // `unit` must be a real, transactable measurement unit — the one
@@ -189,7 +199,7 @@ export class ProductService {
         if (!inv) {
           // If resolving for a branch franchise (non-HQ), exclude products
           // that have not yet been transferred/inwarded into this franchise's inventory.
-          if (!resolvingHQStock) {
+          if (!resolvingHQStock && !includeAll) {
             return null;
           }
           return {

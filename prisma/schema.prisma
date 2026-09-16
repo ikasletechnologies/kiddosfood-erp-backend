@@ -878,6 +878,7 @@ model Order {
   inventory_deducted      Boolean       @default(false)
   sourceQuotationId       String?
   sourceProformaInvoiceId String?
+  sourceSalesOrderId      String?       @unique
   createdAt               DateTime      @default(now())
   delivery                Delivery?
   invoice                 Invoice?
@@ -1355,6 +1356,7 @@ model SalesOrder {
   courierName       String?
   notes             String?
   createdBy         String?
+  convertedInvoiceId String?
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
   paymentStatus     String           @default("UNPAID")

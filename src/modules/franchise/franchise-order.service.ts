@@ -27,7 +27,7 @@ async function findHqStockItem(tx: any, hqId: string | null | undefined, product
     : { franchiseId: null };
 
   if (product.sku) {
-    const itemBySku = await tx.inventoryItem.findFirst({
+    return tx.inventoryItem.findFirst({
       where: {
         AND: [
           scopeFilter,
@@ -35,9 +35,9 @@ async function findHqStockItem(tx: any, hqId: string | null | undefined, product
         ]
       }
     });
-    if (itemBySku) return itemBySku;
   }
 
+  // Legacy fallback for products without a SKU only
   return tx.inventoryItem.findFirst({
     where: {
       AND: [
@@ -154,8 +154,9 @@ function computeFulfillmentForOrderSync(order: any, hqInventoryMap: { bySku: Map
     if (!product) continue;
     const requestedQty = Number(item.quantity || 0);
 
-    const hqItem = (product.sku && hqInventoryMap.bySku.get(product.sku.toUpperCase()))
-      || hqInventoryMap.byName.get(product.name.toUpperCase());
+    const hqItem = product.sku
+      ? hqInventoryMap.bySku.get(product.sku.toUpperCase())
+      : hqInventoryMap.byName.get(product.name.toUpperCase());
 
     const availableHqStock = Math.max(0, Number(hqItem?.currentStock || 0));
     const neededFromProduction = Math.max(0, requestedQty - availableHqStock);

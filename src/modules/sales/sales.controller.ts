@@ -32,7 +32,11 @@ export class SalesController {
 
   static async createQuotation(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.userId;
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create estimates for Customers and Dealers.' });
+      }
+      const createdBy = user?.userId;
       const quotation = await SalesService.createQuotation({ ...req.body, createdBy });
       res.status(201).json(quotation);
     } catch (error) {
@@ -42,6 +46,10 @@ export class SalesController {
 
   static async updateQuotation(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create estimates for Customers and Dealers.' });
+      }
       const quotation = await SalesService.updateQuotation(req.params.id, req.body);
       res.json(quotation);
     } catch (error) {
@@ -196,7 +204,11 @@ export class SalesController {
 
   static async createProformaInvoice(req: Request, res: Response) {
     try {
-      const data = { ...req.body, createdBy: (req as any).user?.userId };
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create proforma invoices for Customers and Dealers.' });
+      }
+      const data = { ...req.body, createdBy: user?.userId };
       const proforma = await SalesService.createProformaInvoice(data);
       res.status(201).json(proforma);
     } catch (error) {
@@ -206,6 +218,10 @@ export class SalesController {
 
   static async updateProformaInvoice(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create proforma invoices for Customers and Dealers.' });
+      }
       const proforma = await SalesService.updateProformaInvoice(req.params.id, req.body);
       res.json(proforma);
     } catch (error) {
