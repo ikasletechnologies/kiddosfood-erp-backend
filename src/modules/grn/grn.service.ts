@@ -22,17 +22,17 @@ export class GRNService {
   }
 
   /**
-   * On-demand unique lot/batch number for the "Auto Batch" control on the
-   * New GRN form — called before the GRN itself is even saved, so the user
-   * sees the generated value immediately instead of a blank field.
+   * Preview lot number for the "Auto Batch" control on the New GRN form.
+   * Reads the current sequence state without consuming/incrementing it.
    */
   static async generateLotNumber(): Promise<string> {
-    return prisma.$transaction(async (tx) => {
-      const seq = await this.nextSequence(tx, 'GRN_LOT');
-      const now = new Date();
-      const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-      return `LOT-${ymd}-${String(seq).padStart(5, '0')}`;
+    const seq = await prisma.numberSequence.findUnique({
+      where: { key: 'GRN_LOT' }
     });
+    const nextVal = (seq?.value || 0) + 1;
+    const now = new Date();
+    const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+    return `LOT-${ymd}-${String(nextVal).padStart(5, '0')}`;
   }
 
   static async getAll(params: { poId?: string; status?: string; startDate?: string; endDate?: string; fromDate?: string; toDate?: string } = {}) {
@@ -129,6 +129,51 @@ export class GRNService {
     });
   }
 
+  /**
+   * Authoritative backend scope validation for GRN warehouse assignments.
+   * Ensures HQ users cannot receive goods into Franchise warehouses, and
+   * Franchise users can only receive goods into their own assigned franchise warehouse.
+   */
+  private static async validateWarehouseScope(tx: any, warehouseId: string, user?: any): Promise<void> {
+    if (!warehouseId) return;
+
+    const warehouse = await tx.warehouse.findUnique({
+      where: { id: warehouseId },
+      include: {
+        primaryForFranchises: { select: { id: true, name: true, isHQ: true } }
+      }
+    });
+
+    if (!warehouse) {
+      throw new Error(`Warehouse with ID "${warehouseId}" not found`);
+    }
+
+    if (warehouse.status !== 'ACTIVE') {
+      throw new Error(`Warehouse "${warehouse.name}" is inactive`);
+    }
+
+    if (!user) return; // Defensive fallback if call has no user payload
+
+    const userRole = (user.role?.name || user.role || '').toUpperCase();
+    const userFranchiseId = user.franchiseId;
+
+    const nonHqOwners = (warehouse.primaryForFranchises || []).filter((f: any) => !f.isHQ);
+
+    if (userRole === 'SUPER_ADMIN' || !userFranchiseId) {
+      // HQ User Scope: Must NOT select a Franchise warehouse
+      if (nonHqOwners.length > 0) {
+        const ownerName = nonHqOwners[0].name;
+        throw new Error(`HQ users cannot receive goods into Franchise warehouse "${warehouse.name}" (belonging to ${ownerName}). Please select an HQ warehouse.`);
+      }
+    } else {
+      // Franchise User Scope: Must select their OWN franchise warehouse
+      const isOwner = nonHqOwners.some((f: any) => f.id === userFranchiseId);
+      if (!isOwner) {
+        throw new Error(`Franchise users cannot receive goods into warehouse "${warehouse.name}". You can only receive goods into your own assigned franchise warehouse.`);
+      }
+    }
+  }
+
   static async createFromPO(
     poId: string,
     data: {
@@ -136,6 +181,7 @@ export class GRNService {
       freightCost?: number;
       unloadingCost?: number;
       performedBy?: string;
+      user?: any;
       items: Array<{
         materialId: string;
         orderedQty: number;
@@ -177,72 +223,106 @@ export class GRNService {
       // persisted GoodsReceiptItem rows — never trusted from the client.
       const receivedMap = await this.getCumulativeReceived(tx, poId);
 
-      const itemsData = data.items.map((item) => {
-            const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
-            if (!poItem) throw new Error(`Item ${item.materialId} does not belong to Purchase Order ${po.poNumber || poId}`);
+      const itemsData: any[] = [];
+      for (const item of data.items) {
+        const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
+        if (!poItem) throw new Error(`Item ${item.materialId} does not belong to Purchase Order ${po.poNumber || poId}`);
 
-            const qty = Number(item.orderedQty ?? poItem.quantity ?? 0);
-            const poPrice = Number(poItem.price ?? 0);
-            const price = Number(item.price ?? poPrice);
-            const received = Number(item.receivedQty ?? 0);
-            const rejected = Number(item.rejectedQty ?? 0);
-            const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected));
+        if (item.warehouseId) {
+          await this.validateWarehouseScope(tx, item.warehouseId, data.user);
+        }
 
-            if (price < 0) throw new Error(`Actual unit price for ${poItem.inventoryItemId} cannot be negative`);
-            if (received < 0) throw new Error(`Received quantity for ${poItem.inventoryItemId} cannot be negative`);
-            if (rejected < 0 || rejected > received) throw new Error(`Rejected quantity for ${poItem.inventoryItemId} must be between 0 and received quantity`);
+        const qty = Number(item.orderedQty ?? poItem.quantity ?? 0);
+        const poPrice = Number(poItem.price ?? 0);
+        const price = Number(item.price ?? poPrice);
+        const received = Number(item.receivedQty ?? 0);
+        const rejected = Number(item.rejectedQty ?? 0);
+        const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected));
 
-            const alreadyReceived = receivedMap.get(item.materialId) || 0;
-            const remaining = Math.max(0, poItem.quantity - alreadyReceived);
-            if (received > remaining + 0.0001) {
+        if (price < 0) throw new Error(`Actual unit price for ${poItem.inventoryItemId} cannot be negative`);
+        if (received < 0) throw new Error(`Received quantity for ${poItem.inventoryItemId} cannot be negative`);
+        if (rejected < 0 || rejected > received) throw new Error(`Rejected quantity for ${poItem.inventoryItemId} must be between 0 and received quantity`);
+
+        const alreadyReceived = receivedMap.get(item.materialId) || 0;
+        const remaining = Math.max(0, poItem.quantity - alreadyReceived);
+        if (received > remaining + 0.0001) {
+          const label = poItem.itemName || item.materialId;
+          throw new Error(`Cannot receive ${received} ${poItem.unit} of "${label}" — only ${remaining} ${poItem.unit} remains on this Purchase Order (ordered ${poItem.quantity}, already received ${alreadyReceived}).`);
+        }
+
+        const priceOverridden = Math.abs(price - poPrice) > 0.001;
+        if (priceOverridden && !(item.priceOverrideReason || '').trim()) {
+          throw new Error(`Actual unit price for ${poItem.inventoryItemId} differs from PO price (₹${poPrice}) — an override reason is required`);
+        }
+
+        const mfgDate = item.mfgDate ? new Date(item.mfgDate) : null;
+        const expDate = item.expDate ? new Date(item.expDate) : null;
+
+        if (mfgDate && isNaN(mfgDate.getTime())) {
+          throw new Error(`Invalid Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
+        }
+        if (expDate && isNaN(expDate.getTime())) {
+          throw new Error(`Invalid Expiry (EXP) date for ${poItem.inventoryItemId}`);
+        }
+        if (mfgDate && expDate && expDate.getTime() < mfgDate.getTime()) {
+          throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
+        }
+
+        let assignedLotNumber: string | null = null;
+        const rawLot = (item.lotNumber || '').trim();
+        const isAutoLot = !rawLot || rawLot === '[AUTO]' || rawLot.toUpperCase().endsWith('-[AUTO]') || rawLot.toUpperCase() === 'AUTO' || rawLot === 'Auto-Generated on Save' || /^LOT-\d{8}-\d{5}$/i.test(rawLot);
+
+        if (accepted > 0) {
+          if (isAutoLot) {
+            const seq = await this.nextSequence(tx, 'GRN_LOT');
+            const now = new Date();
+            const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+            assignedLotNumber = `LOT-${ymd}-${String(seq).padStart(5, '0')}`;
+          } else {
+            // Validate manual lot number for duplicates against existing non-cancelled GRN items & Inventory Batches
+            const manualLot = rawLot;
+            const existingGrnItem = await tx.goodsReceiptItem.findFirst({
+              where: {
+                lotNumber: manualLot,
+                grn: { status: { not: 'CANCELLED' } }
+              }
+            });
+            const existingBatch = await tx.inventoryBatch.findFirst({
+              where: { lotNumber: manualLot }
+            });
+
+            if (existingGrnItem || existingBatch) {
               const label = poItem.itemName || item.materialId;
-              throw new Error(`Cannot receive ${received} ${poItem.unit} of "${label}" — only ${remaining} ${poItem.unit} remains on this Purchase Order (ordered ${poItem.quantity}, already received ${alreadyReceived}).`);
+              throw new Error(`Batch/Lot Number "${manualLot}" already exists for item "${label}". Manual lot numbers must be unique.`);
             }
+            assignedLotNumber = manualLot;
+          }
+        } else {
+          assignedLotNumber = isAutoLot ? null : rawLot;
+        }
 
-            // Actual price is the received-value source of truth (feeds
-            // computeCommercialsFromPO → VendorInvoice → VendorLedger). The
-            // PO's own price/totalAmount is never touched — poPrice here is
-            // kept purely as the audit-trail reference point.
-            const priceOverridden = Math.abs(price - poPrice) > 0.001;
-            if (priceOverridden && !(item.priceOverrideReason || '').trim()) {
-              throw new Error(`Actual unit price for ${poItem.inventoryItemId} differs from PO price (₹${poPrice}) — an override reason is required`);
-            }
-
-            const mfgDate = item.mfgDate ? new Date(item.mfgDate) : null;
-            const expDate = item.expDate ? new Date(item.expDate) : null;
-
-            if (mfgDate && isNaN(mfgDate.getTime())) {
-              throw new Error(`Invalid Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
-            }
-            if (expDate && isNaN(expDate.getTime())) {
-              throw new Error(`Invalid Expiry (EXP) date for ${poItem.inventoryItemId}`);
-            }
-            if (mfgDate && expDate && expDate.getTime() < mfgDate.getTime()) {
-              throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
-            }
-
-            return {
-              materialId: item.materialId,
-              quantity: qty,
-              receivedQty: received,
-              acceptedQty: accepted,
-              rejectedQty: rejected,
-              price: price,
-              poPrice: poPrice,
-              priceOverridden,
-              priceOverrideReason: priceOverridden ? item.priceOverrideReason!.trim() : null,
-              priceOverrideBy: priceOverridden ? (data.performedBy || null) : null,
-              priceOverrideAt: priceOverridden ? new Date() : null,
-              unit: poItem?.unit || 'UNIT',
-              qcStatus: (item.qcStatus as any) || 'PENDING',
-              vendorBatchNo: item.vendorBatchNo ? item.vendorBatchNo.trim() : null,
-              mfgDate,
-              expDate,
-              lotNumber: item.lotNumber ? item.lotNumber.trim() : null,
-              warehouseId: item.warehouseId,
-              binId: item.binId
-            };
-          });
+        itemsData.push({
+          materialId: item.materialId,
+          quantity: qty,
+          receivedQty: received,
+          acceptedQty: accepted,
+          rejectedQty: rejected,
+          price: price,
+          poPrice: poPrice,
+          priceOverridden,
+          priceOverrideReason: priceOverridden ? item.priceOverrideReason!.trim() : null,
+          priceOverrideBy: priceOverridden ? (data.performedBy || null) : null,
+          priceOverrideAt: priceOverridden ? new Date() : null,
+          unit: poItem?.unit || 'UNIT',
+          qcStatus: (item.qcStatus as any) || 'PENDING',
+          vendorBatchNo: item.vendorBatchNo ? item.vendorBatchNo.trim() : null,
+          mfgDate,
+          expDate,
+          lotNumber: assignedLotNumber,
+          warehouseId: item.warehouseId,
+          binId: item.binId
+        });
+      }
 
       return tx.goodsReceipt.create({
         data: {
@@ -261,7 +341,7 @@ export class GRNService {
     });
   }
 
-  static async approve(grnId: string) {
+  static async approve(grnId: string, user?: any) {
     return prisma.$transaction(async (tx) => {
       const grn = await tx.goodsReceipt.findUnique({
         where: { id: grnId },
@@ -308,6 +388,9 @@ export class GRNService {
           throw new Error(`Item ${item.materialId} has a price override with no reason recorded - cannot approve`);
         }
         if (item.acceptedQty > 0) {
+          if (item.warehouseId) {
+            await this.validateWarehouseScope(tx, item.warehouseId, user);
+          }
           const batchNo = (item.lotNumber || item.vendorBatchNo || '').trim();
           if (!batchNo) {
             throw new Error(`Batch/Lot number is required for material item "${item.materialId}" before approval.`);

@@ -236,24 +236,39 @@ export class InventoryController {
       const warehouses = await prisma.warehouse.findMany({
         where: statusCondition,
         include: {
-          primaryForFranchises: { select: { id: true, name: true } },
+          primaryForFranchises: { select: { id: true, name: true, isHQ: true } },
           bins: { select: { id: true } },
           _count: { select: { inventoryBatches: true, movements: true } }
         },
         orderBy: { createdAt: 'desc' }
       });
-      const result = warehouses.map((w: any) => {
-        const { primaryForFranchises, bins, _count, ...rest } = w;
-        const owner = primaryForFranchises?.[0];
-        return {
-          ...rest,
-          binsCount: bins?.length || 0,
-          batchCount: _count?.inventoryBatches || 0,
-          movementsCount: _count?.movements || 0,
-          franchiseId: owner?.id ?? null,
-          franchiseName: owner?.name ?? null
-        };
-      });
+
+      const scope = (req.query.scope as string || '').toUpperCase();
+      const forGRN = req.query.forGRN === 'true';
+
+      const result = warehouses
+        .map((w: any) => {
+          const { primaryForFranchises, bins, _count, ...rest } = w;
+          const nonHqOwner = primaryForFranchises?.find((f: any) => !f.isHQ);
+          const hqOwner = primaryForFranchises?.find((f: any) => f.isHQ);
+          const owner = nonHqOwner || hqOwner;
+          return {
+            ...rest,
+            binsCount: bins?.length || 0,
+            batchCount: _count?.inventoryBatches || 0,
+            movementsCount: _count?.movements || 0,
+            franchiseId: owner?.id ?? null,
+            franchiseName: owner?.name ?? null,
+            isFranchise: !!nonHqOwner
+          };
+        })
+        .filter((w: any) => {
+          if (forGRN || scope === 'HQ') {
+            return !w.isFranchise;
+          }
+          return true;
+        });
+
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

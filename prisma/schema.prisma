@@ -185,6 +185,7 @@ model Franchise {
   users              User[]
   wasteEntries       WasteEntry[]
   workflowRequests   WorkflowRequest[]
+  alerts             Alert[]
 }
 
 model DailySettlement {
@@ -2397,3 +2398,47 @@ model GstinCache {
   raw              Json?
   fetchedAt        DateTime @default(now())
 }
+
+enum AlertType {
+  INVENTORY
+  ORDER
+  PAYMENT
+  DISPATCH
+  SYSTEM
+}
+
+enum AlertSeverity {
+  CRITICAL
+  WARNING
+  INFO
+}
+
+enum AlertStatus {
+  ACTIVE
+  RESOLVED
+}
+
+model Alert {
+  id           String        @id @default(uuid())
+  dedupeKey    String        @unique
+  type         AlertType
+  severity     AlertSeverity
+  status       AlertStatus   @default(ACTIVE)
+  title        String
+  message      String
+  isRead       Boolean       @default(false)
+  entityId     String?
+  entityType   String?
+  franchiseId  String?
+  metadata     Json?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  resolvedAt   DateTime?
+
+  franchise    Franchise?    @relation(fields: [franchiseId], references: [id], onDelete: Cascade)
+
+  @@index([franchiseId, status, isRead])
+  @@index([franchiseId, status, type])
+  @@index([type, severity])
+}
+

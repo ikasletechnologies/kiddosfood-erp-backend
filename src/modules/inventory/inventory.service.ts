@@ -1,4 +1,5 @@
 import { FranchiseService } from '../franchise/franchise.service';
+import { AlertService } from '../alerts/alert.service';
 import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
@@ -1141,6 +1142,12 @@ export class InventoryService {
       },
     });
 
+    try {
+      await AlertService.reconcileInventoryAlert(data.itemId, tx);
+    } catch (e) {
+      console.error('[AlertService] Failed to reconcile item alert:', e);
+    }
+
     return { item, movement };
   }
 
@@ -1330,26 +1337,49 @@ export class InventoryService {
           ...(franchiseId ? { franchiseId } : {}),
           ...(category === 'ALL' ? {} : { category: category || ItemCategory.RAW_MATERIAL })
         },
+        movementType: { in: ['PRODUCTION_OUT', 'WASTE_OUT', 'ADJUSTMENT'] },
         quantity: { lt: 0 },
         ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {}),
         ...(startDate || endDate ? { createdAt: createdAtFilter } : {})
       },
       include: {
-        item: true
+        item: true,
+        batch: { select: { id: true, batchNumber: true, lotNumber: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    const productionIds = Array.from(
+      new Set(
+        movements
+          .filter(m => m.movementType === 'PRODUCTION_OUT' && m.referenceType === 'PRODUCTION' && m.referenceId)
+          .map(m => m.referenceId as string)
+      )
+    );
+
+    const productBatches = productionIds.length
+      ? await prisma.productBatch.findMany({
+          where: { productionId: { in: productionIds } },
+          select: { productionId: true, batchCode: true }
+        })
+      : [];
+    const batchCodeByProductionId = new Map(
+      productBatches.filter(pb => pb.productionId).map(pb => [pb.productionId!, pb.batchCode])
+    );
 
     return movements.map(m => {
       let consumptionType = 'Production Consumption';
       if (m.movementType === 'WASTE_OUT' && m.note?.toLowerCase().includes('expire')) {
         consumptionType = 'Expiry';
-      } else if (m.movementType === 'WASTE_OUT' && (m.note?.toLowerCase().includes('damage') || m.note === 'WASTE_DAMAGED')) {
+      } else if (m.movementType === 'WASTE_OUT') {
         consumptionType = 'Damage';
+      } else if (m.movementType === 'ADJUSTMENT') {
+        consumptionType = 'Manual Adjustment';
       }
 
       const qty = Math.abs(m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity);
       const value = qty * (m.item.costPrice || 0);
+      const batchCode = (m.referenceId && batchCodeByProductionId.get(m.referenceId)) || m.batch?.batchNumber || undefined;
 
       return {
         id: m.id,
@@ -1359,6 +1389,7 @@ export class InventoryService {
         unit: m.item.unit,
         quantity: qty,
         consumptionType,
+        batchCode,
         value,
         notes: m.note || ''
       };

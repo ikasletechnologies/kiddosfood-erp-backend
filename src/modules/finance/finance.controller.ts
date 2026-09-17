@@ -535,7 +535,7 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { partyId, partyType, customerId, vendorId, dealerId, startDate, endDate } = req.query;
+      const { partyId, partyType, customerId, vendorId, dealerId, partyName, startDate, endDate, search, page, limit } = req.query;
       const report = await FinanceService.getPartyStatement({
         franchiseId,
         partyId: (partyId || customerId || vendorId || dealerId) as string,
@@ -543,9 +543,23 @@ export class FinanceController {
         customerId: customerId as string,
         vendorId: vendorId as string,
         dealerId: dealerId as string,
+        partyName: partyName as string,
         startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        search: search as string,
+        page: page ? Number(page) : undefined,
+        limit: limit ? Number(limit) : undefined
       });
+
+      if ((report as any).status === 'BAD_PARTY_TYPE') {
+        return res.status(400).json({ error: 'Invalid partyType. Must be CUSTOMER, DEALER, or VENDOR.' });
+      }
+      if ((report as any).status === 'NOT_FOUND') {
+        return res.status(404).json({ error: 'Party not found.' });
+      }
+      if ((report as any).status === 'FORBIDDEN') {
+        return res.status(403).json({ error: 'You do not have access to this party.' });
+      }
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

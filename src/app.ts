@@ -49,6 +49,7 @@ import { DraftsController } from './modules/drafts/drafts.controller';
 import { WorkflowApprovalsController } from './modules/workflow-approvals/workflow-approvals.controller';
 import WarehouseRoutes from './modules/warehouse/warehouse.routes';
 import SetupRoutes from './modules/setup/setup.routes';
+import AlertRoutes from './modules/alerts/alert.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -548,8 +549,9 @@ app.get('/api/waste/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANC
 app.get('/api/waste/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.getOne);
 app.post('/api/waste', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.create);
 
-// Stock Alerts
-app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']), InventoryController.getAlerts);
+// Alerts System
+app.use('/api/alerts', AlertRoutes);
+app.get('/api/inventory/alerts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getAlerts);
 
 // Warehouse
 app.use('/api/warehouse', WarehouseRoutes);

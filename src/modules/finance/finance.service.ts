@@ -2,6 +2,21 @@ function formatReferenceType(ref: string): string {
   if (!ref) return '—';
   return ref.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Only shorten a reference when it's a raw internal id (a UUID). A real business
+// reference (invoice/bill/return number, already human-readable) must pass through
+// unmodified — slicing it truncates the number itself (e.g. "PR-2026-00003" -> "PR-2026-").
+function formatVoucherRef(referenceId?: string | null): string {
+  if (!referenceId) return '—';
+  return UUID_PATTERN.test(referenceId) ? referenceId.slice(0, 8).toUpperCase() : referenceId;
+}
+
+function applyStatementSearch<T extends { particular: string; voucherNo: string }>(entries: T[], search?: string): T[] {
+  if (!search || !search.trim()) return entries;
+  const q = search.trim().toLowerCase();
+  return entries.filter(e => e.particular.toLowerCase().includes(q) || e.voucherNo.toLowerCase().includes(q));
+}
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
@@ -414,11 +429,11 @@ export class FinanceService {
       }),
       // 2. Total Collected (Cash)
       prisma.payment.aggregate({
-        where: { 
-          entityType: 'CUSTOMER', 
-          status: 'PAID', 
-          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
-          order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined 
+        where: {
+          entityType: 'CUSTOMER',
+          status: 'PAID',
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+          order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined
         },
         _sum: { paidAmount: true }
       }),
@@ -430,10 +445,10 @@ export class FinanceService {
       }),
       // 4. Total Expense Paid (Cash)
       prisma.payment.aggregate({
-        where: { 
-          sourceModule: 'EXPENSE', 
-          status: 'PAID', 
-          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
+        where: {
+          sourceModule: 'EXPENSE',
+          status: 'PAID',
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
           // Linkage check (optional if sourceModule is enough)
         },
         _sum: { paidAmount: true }
@@ -660,7 +675,7 @@ export class FinanceService {
       const status = data.isPaidImmediately ? "PAID" : "UNPAID";
 
       // 2. Create Expense
-      const expense = await tx.expense.create({ 
+      const expense = await tx.expense.create({
         data: {
           expenseNumber,
           franchiseId: data.franchiseId,
@@ -674,7 +689,7 @@ export class FinanceService {
           status: status,
           accountId: data.accountId,
           paymentMode: data.paymentMode || 'CASH'
-        } 
+        }
       });
 
       // 3. If PAID immediately and account provided, hit the ledger
@@ -1214,16 +1229,16 @@ export class FinanceService {
         _sum: { paidAmount: true },
       }),
       tx.paymentAllocation.aggregate({
-        where: { 
-          invoiceId, 
-          payment: { 
-            status: 'PAID', 
+        where: {
+          invoiceId,
+          payment: {
+            status: 'PAID',
             isCancelled: false,
             OR: [
               { invoiceId: null },
               { invoiceId: { not: invoiceId } }
             ]
-          } 
+          }
         },
         _sum: { amount: true },
       }),
@@ -1266,16 +1281,16 @@ export class FinanceService {
   }
 
   static async createPayment(data: any) {
-    const amount    = parseFloat(data.amount);
+    const amount = parseFloat(data.amount);
     // Server-side backstop for the ₹0/negative payment guard — the frontend
     // already checks this, but this is the only place that must actually
     // enforce it, since a client-supplied amount can never be trusted.
     if (!(amount > 0)) {
       throw new Error('Invalid payment amount: must be greater than zero.');
     }
-    const flow      = data.flow as 'IN' | 'OUT';
-    const status    = (data.status || 'PAID') as string;
-    const sourceId = data.sourceAccount as string;    
+    const flow = data.flow as 'IN' | 'OUT';
+    const status = (data.status || 'PAID') as string;
+    const sourceId = data.sourceAccount as string;
     const sourceModule = (data.sourceModule || 'MANUAL');
     const linkedDocType = data.linkedDocType || 'DIRECT';
     const linkedDocId = data.linkedDocId;
@@ -1296,7 +1311,7 @@ export class FinanceService {
     const accountTypeMap: Record<string, string> = {
       CASH_ACCOUNT: 'CASH',
       BANK_ACCOUNT: 'BANK',
-      UPI_WALLET:   'UPI',
+      UPI_WALLET: 'UPI',
       CASH: 'CASH',
       BANK: 'BANK',
       UPI: 'UPI',
@@ -1487,26 +1502,26 @@ export class FinanceService {
       const payment = await tx.payment.create({
         data: {
           paymentNumber,
-          paidAmount:     amount,
-          type:           paymentType as any,
-          sourceModule:   sourceModule as any,
-          linkedDocType:  linkedDocType as any,
-          linkedDocId:    linkedDocId,
+          paidAmount: amount,
+          type: paymentType as any,
+          sourceModule: sourceModule as any,
+          linkedDocType: linkedDocType as any,
+          linkedDocId: linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
           // A multi-invoice receipt (isMultiInvoice) doesn't belong to one
           // Invoice/Order, so both stay null here — its per-invoice
           // attribution lives in the PaymentAllocation rows created below.
-          invoiceId:      !isMultiInvoice ? (singleInvoiceId || undefined) : undefined,
-          orderId:        !isMultiInvoice ? (data.orderId || orderIdForInvoice || undefined) : undefined,
-          entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
-          entityId:       entityId,
-          paymentMode:    resolvedPaymentMode as any,
+          invoiceId: !isMultiInvoice ? (singleInvoiceId || undefined) : undefined,
+          orderId: !isMultiInvoice ? (data.orderId || orderIdForInvoice || undefined) : undefined,
+          entityType: data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
+          entityId: entityId,
+          paymentMode: resolvedPaymentMode as any,
           transactionRef: data.reference || data.note || undefined,
           status,
-          accountId:      account?.id ?? undefined,
-          createdBy:      data.createdBy,
+          accountId: account?.id ?? undefined,
+          createdBy: data.createdBy,
           idempotencyKey: data.idempotencyKey || undefined,
-          createdAt:      data.createdAt ? new Date(data.createdAt) : undefined,
+          createdAt: data.createdAt ? new Date(data.createdAt) : undefined,
         },
       });
 
@@ -1538,7 +1553,7 @@ export class FinanceService {
             orderBy: { createdAt: 'desc' }
           });
           const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-          
+
           const isOutflow = flow === 'OUT';
           await tx.vendorLedger.create({
             data: {
@@ -1559,25 +1574,25 @@ export class FinanceService {
 
           // Update Invoice Status if linked
           if (data.vendorInvoiceId) {
-             const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
-             if (inv) {
-                // Check if fully paid: cash/bank payments PLUS whatever advance
-                // was already applied to this invoice must cover the gross
-                // amount — advance settles the invoice too, it just isn't a
-                // Payment row, so leaving it out of this sum under-counted
-                // how much of the invoice was actually settled.
-                const totalPaid = await tx.payment.aggregate({
-                   where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
-                   _sum: { paidAmount: true }
+            const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
+            if (inv) {
+              // Check if fully paid: cash/bank payments PLUS whatever advance
+              // was already applied to this invoice must cover the gross
+              // amount — advance settles the invoice too, it just isn't a
+              // Payment row, so leaving it out of this sum under-counted
+              // how much of the invoice was actually settled.
+              const totalPaid = await tx.payment.aggregate({
+                where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
+                _sum: { paidAmount: true }
+              });
+              const total = (totalPaid._sum.paidAmount || 0) + (inv.advanceApplied || 0);
+              if (total >= inv.amount - 0.01) {
+                await tx.vendorInvoice.update({
+                  where: { id: data.vendorInvoiceId },
+                  data: { status: 'PAID' }
                 });
-                const total = (totalPaid._sum.paidAmount || 0) + (inv.advanceApplied || 0);
-                if (total >= inv.amount - 0.01) {
-                   await tx.vendorInvoice.update({
-                      where: { id: data.vendorInvoiceId },
-                      data: { status: 'PAID' }
-                   });
-                }
-             }
+              }
+            }
           }
         }
       }
@@ -1630,8 +1645,8 @@ export class FinanceService {
           const newStatus = paidSoFar >= invoiceRow.finalAmount - 0.01
             ? 'PAID'
             : paidSoFar > 0
-            ? 'PARTIAL'
-            : 'UNPAID';
+              ? 'PARTIAL'
+              : 'UNPAID';
           await tx.invoice.update({ where: { id: invId }, data: { status: newStatus } });
           await tx.order.update({ where: { id: invoiceRow.orderId }, data: { paymentStatus: newStatus } });
         }
@@ -1640,9 +1655,9 @@ export class FinanceService {
       // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
         await AccountService.adjustBalance(
-          tx, 
-          account.id, 
-          amount, 
+          tx,
+          account.id,
+          amount,
           flow === 'IN' ? 'INFLOW' : 'OUTFLOW'
         );
       }
@@ -1732,7 +1747,7 @@ export class FinanceService {
    */
   static async cancelPayment(paymentId: string, cancelledBy?: string) {
     return prisma.$transaction(async (tx) => {
-      const original = await tx.payment.findUnique({ 
+      const original = await tx.payment.findUnique({
         where: { id: paymentId },
         include: { account: true }
       });
@@ -1752,7 +1767,7 @@ export class FinanceService {
         const reversalAmount = original.paidAmount;
 
         const pNum = await this.generatePaymentNumber(tx);
-        
+
         await tx.payment.create({
           data: {
             paymentNumber: pNum,
@@ -1776,7 +1791,7 @@ export class FinanceService {
         // If original was OUT (decreased balance) -> Inflow (increase balance)
         // If original was IN (increased balance) -> Outflow (decrease balance)
         const isOriginalOutflow = (original.entityType === 'VENDOR' || original.type === 'EXPENSE');
-        
+
         await tx.account.update({
           where: { id: original.accountId },
           data: {
@@ -1899,8 +1914,8 @@ export class FinanceService {
           }
           const channelPrice =
             resolvedInvoicePartyType === 'DEALER' ? inv?.dealerPrice :
-            resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
-            inv?.customerPrice;
+              resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
+                inv?.customerPrice;
           rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
           gst = inv?.gstRate ?? product?.taxPercent ?? 0;
           if (resolvedInvoicePartyType === 'CUSTOMER') {
@@ -2735,10 +2750,10 @@ export class FinanceService {
       const orderTotal = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
       const paidForOrder = p.order?.payments?.length
         ? this.sumOrderPaidWithAllocations(
-            p.order.payments,
-            (p.order as any).invoice?.allocations,
-            (x) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')
-          )
+          p.order.payments,
+          (p.order as any).invoice?.allocations,
+          (x) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')
+        )
         : Number(p.paidAmount);
       const receivableAmount = Number(p.paidAmount);
       const balanceAmount = Math.max(0, orderTotal - paidForOrder);
@@ -3347,234 +3362,258 @@ export class FinanceService {
     partyName?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
+    page?: number;
+    limit?: number;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
-    const targetPartyId = (filters.partyId || filters.customerId || '').trim();
+    const { franchiseId, startDate, endDate, search } = filters;
+    const targetPartyId = (filters.partyId || filters.customerId || filters.vendorId || filters.dealerId || '').trim();
     const targetPartyName = (filters.partyName || '').trim();
+    const explicitPartyType = filters.partyType;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    const page = Math.max(1, Number(filters.page) || 1);
+    const limit = Math.max(1, Number(filters.limit) || 50);
 
-    // Fetch all customers, dealers, and vendors to populate dropdown & identify requested party
-    const [customersList, dealersList, vendorsList] = await Promise.all([
-      prisma.customer.findMany({
-        where: franchiseId ? { franchiseId } : {},
-        select: { id: true, name: true, phone: true }
-      }),
-      prisma.dealer.findMany({
-        where: franchiseId ? { franchiseId } : {},
-        select: { id: true, name: true, phone: true }
-      }),
-      prisma.vendor.findMany({
-        select: { id: true, name: true, contact: true }
-      })
-    ]);
+    if (explicitPartyType && !['CUSTOMER', 'DEALER', 'VENDOR'].includes(explicitPartyType)) {
+      return { status: 'BAD_PARTY_TYPE' as const };
+    }
 
-    const combinedParties = [
-      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' })),
-      ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' })),
-      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' }))
-    ];
+    const fetchPartyPicker = async () => {
+      const [customersList, dealersList, vendorsList] = await Promise.all([
+        prisma.customer.findMany({
+          where: franchiseId ? { franchiseId } : {},
+          select: { id: true, name: true, phone: true }
+        }),
+        prisma.dealer.findMany({
+          where: franchiseId ? { franchiseId } : {},
+          select: { id: true, name: true, phone: true }
+        }),
+        prisma.vendor.findMany({
+          select: { id: true, name: true, contact: true }
+        })
+      ]);
+      return [
+        ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' as const })),
+        ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' as const })),
+        ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' as const }))
+      ];
+    };
 
-    // Determine target party
-    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR' } | null = null;
+    // No party specified: this is a valid "browse" request (powers the party picker),
+    // not a failed lookup — never conflate the two.
+    if (!targetPartyId && !targetPartyName) {
+      const customers = await fetchPartyPicker();
+      return { status: 'NO_PARTY' as const, resolvedParty: false, customers };
+    }
+
+    // Resolve directly by id + type instead of loading every customer/dealer/vendor
+    // into memory and scanning — only the picker path (above) needs the full list.
+    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR'; franchiseId?: string | null } | null = null;
 
     if (targetPartyId) {
-      const match = combinedParties.find(p => p.id === targetPartyId);
-      if (match) {
-        resolvedParty = match as any;
+      const tryTypes: Array<'CUSTOMER' | 'DEALER' | 'VENDOR'> = explicitPartyType
+        ? [explicitPartyType]
+        : filters.customerId ? ['CUSTOMER']
+        : filters.dealerId ? ['DEALER']
+        : filters.vendorId ? ['VENDOR']
+        : ['CUSTOMER', 'DEALER', 'VENDOR'];
+
+      for (const t of tryTypes) {
+        if (t === 'CUSTOMER') {
+          const c = await prisma.customer.findUnique({ where: { id: targetPartyId } });
+          if (c) { resolvedParty = { id: c.id, name: c.name, partyType: 'CUSTOMER', franchiseId: c.franchiseId }; break; }
+        } else if (t === 'DEALER') {
+          const d = await prisma.dealer.findUnique({ where: { id: targetPartyId } });
+          if (d) { resolvedParty = { id: d.id, name: d.name, partyType: 'DEALER', franchiseId: d.franchiseId }; break; }
+        } else {
+          const v = await prisma.vendor.findUnique({ where: { id: targetPartyId } });
+          if (v) { resolvedParty = { id: v.id, name: v.name, partyType: 'VENDOR', franchiseId: null }; break; }
+        }
       }
     }
 
+    // Legacy name-matching fallback, kept for backward compatibility only.
     if (!resolvedParty && targetPartyName) {
+      const combinedParties = await fetchPartyPicker();
       const nameMatch = combinedParties.find(p => p.name.toLowerCase() === targetPartyName.toLowerCase())
         || combinedParties.find(p => p.name.toLowerCase().includes(targetPartyName.toLowerCase()));
       if (nameMatch) {
-        resolvedParty = nameMatch as any;
+        resolvedParty = { ...nameMatch, franchiseId: undefined };
       }
     }
 
     if (!resolvedParty) {
-      return {
-        customers: combinedParties,
-        transactions: [],
-        summary: {
-          totalSale: 0,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn: 0,
-          totalMoneyOut: 0,
-          totalReceivable: 0,
-          totalPayable: 0
-        }
-      };
+      return { status: 'NOT_FOUND' as const };
+    }
+
+    // Franchise scope: Customer/Dealer belong to a franchise; Vendor is company-wide by design.
+    if (franchiseId && (resolvedParty.partyType === 'CUSTOMER' || resolvedParty.partyType === 'DEALER')) {
+      if (resolvedParty.franchiseId !== franchiseId) {
+        return { status: 'FORBIDDEN' as const };
+      }
     }
 
     const { id: partyId, partyType } = resolvedParty;
 
-    // --- 1. DEALER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
-    if (partyType === 'DEALER') {
-      const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
-      const openingBal = Number(dealer?.openingBalance) || 0;
-      let runningBalance = openingBal;
+    type RawTxn = {
+      date: Date;
+      txnType: string;
+      refNo: string;
+      paymentType: string;
+      debit: number;
+      credit: number;
+      total: number;
+      seq: number;
+      referenceType?: string;
+      referenceId?: string;
+    };
 
-      const [orders, payments, challans] = await Promise.all([
-        prisma.order.findMany({
-          where: {
-            partyType: 'DEALER',
-            partyId,
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          include: {
-            payments: { where: { isCancelled: false } }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.payment.findMany({
-          where: {
-            entityType: 'DEALER',
-            entityId: partyId,
-            isCancelled: false,
-            status: 'SUCCESS',
-            orderId: null, // Avoid double counting payments directly on orders
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.deliveryChallan.findMany({
-          where: {
-            dealerId: partyId,
-            challanDate: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { challanDate: 'asc' }
-        })
-      ]);
+    // direction controls which side of the ledger increases the running balance:
+    // RECEIVABLE (Customer/Dealer) -> debit increases it; PAYABLE (Vendor) -> credit increases it.
+    const buildEntries = (rawTxns: RawTxn[], openingBalance: number, direction: 'RECEIVABLE' | 'PAYABLE' = 'RECEIVABLE') => {
+      const sorted = [...rawTxns].sort((a, b) => {
+        const d = new Date(a.date).getTime() - new Date(b.date).getTime();
+        return d !== 0 ? d : a.seq - b.seq;
+      });
 
-      type RawTxn = {
-        date: Date;
-        txnType: string;
-        refNo: string;
-        paymentType: string;
-        debit: number;
-        credit: number;
-        total: number;
-        note?: string;
-      };
+      let runningBalance = openingBalance;
+      let totalDebit = 0;
+      let totalCredit = 0;
 
-      const rawTxns: RawTxn[] = [];
-
-      // Opening balance entry if within range or as first row
-      if (openingBal !== 0 && (!start || (dealer?.asOfDate && new Date(dealer.asOfDate) >= start))) {
-        rawTxns.push({
-          date: dealer?.asOfDate ? new Date(dealer.asOfDate) : (dealer?.createdAt || new Date()),
-          txnType: 'Opening Balance',
-          refNo: 'OB-0001',
-          paymentType: '—',
-          debit: openingBal > 0 ? openingBal : 0,
-          credit: openingBal < 0 ? Math.abs(openingBal) : 0,
-          total: Math.abs(openingBal),
-          note: 'Dealer Opening Balance'
-        });
-      }
-
-      for (const o of orders) {
-        rawTxns.push({
-          date: o.createdAt,
-          txnType: 'POS Sale',
-          refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
-          paymentType: o.paymentType || 'CASH',
-          debit: o.totalAmount,
-          credit: 0,
-          total: o.totalAmount
-        });
-
-        for (const p of o.payments) {
-          rawTxns.push({
-            date: p.createdAt,
-            txnType: 'Payment-In',
-            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
-            paymentType: p.paymentMode || 'CASH',
-            debit: 0,
-            credit: p.paidAmount,
-            total: p.paidAmount
-          });
-        }
-      }
-
-      for (const p of payments) {
-        rawTxns.push({
-          date: p.createdAt,
-          txnType: 'Payment-In',
-          refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
-          paymentType: p.paymentMode || 'CASH',
-          debit: 0,
-          credit: p.paidAmount,
-          total: p.paidAmount
-        });
-      }
-
-      for (const c of challans) {
-        rawTxns.push({
-          date: c.challanDate,
-          txnType: 'Delivery Challan',
-          refNo: c.challanNumber || c.id.slice(0, 8).toUpperCase(),
-          paymentType: '—',
-          debit: 0,
-          credit: 0,
-          total: c.totalAmount
-        });
-      }
-
-      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-      let totalSale = 0;
-      let totalMoneyIn = 0;
-      runningBalance = 0;
-
-      const transactions = rawTxns.map(t => {
-        totalSale += t.debit;
-        totalMoneyIn += t.credit;
-        // Receivable increases with debits (sales), decreases with credits (payments)
-        runningBalance += t.debit - t.credit;
+      const allEntries = sorted.map(t => {
+        totalDebit += t.debit;
+        totalCredit += t.credit;
+        runningBalance += direction === 'RECEIVABLE' ? (t.debit - t.credit) : (t.credit - t.debit);
 
         return {
           date: new Date(t.date).toISOString().split('T')[0],
           txnType: t.txnType,
+          particular: t.txnType,
           refNo: t.refNo,
+          voucherNo: t.refNo,
+          referenceType: t.referenceType,
+          referenceId: t.referenceId,
           paymentType: t.paymentType,
           total: t.total,
           debit: t.debit,
           credit: t.credit,
           receivedPaid: t.credit > 0 ? t.credit : t.debit,
           txnBalance: t.total,
-          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
-          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
-          runningBalance
+          receivableBalance: direction === 'RECEIVABLE'
+            ? (runningBalance >= 0 ? runningBalance : 0)
+            : (runningBalance < 0 ? Math.abs(runningBalance) : 0),
+          payableBalance: direction === 'RECEIVABLE'
+            ? (runningBalance < 0 ? Math.abs(runningBalance) : 0)
+            : (runningBalance >= 0 ? runningBalance : 0),
+          runningBalance,
+          balance: runningBalance
         };
       });
 
+      return { allEntries, totalDebit, totalCredit, closingBalance: runningBalance };
+    };
+
+    const paginate = (search: string | undefined, allEntries: ReturnType<typeof buildEntries>['allEntries']) => {
+      const filtered = applyStatementSearch(allEntries, search);
+      const totalEntries = filtered.length;
+      const pageEntries = filtered.slice((page - 1) * limit, page * limit);
+      return { pageEntries, totalEntries };
+    };
+
+    // --- 1. DEALER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
+    if (partyType === 'DEALER') {
+      const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
+      const staticOpeningBal = Number(dealer?.openingBalance) || 0;
+
+      const [ordersInRange, paymentsInRange, challansInRange, ordersBefore, paymentsBefore] = await Promise.all([
+        prisma.order.findMany({
+          where: {
+            partyType: 'DEALER', partyId, status: { not: 'CANCELLED' },
+            createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) }
+          },
+          include: { payments: { where: { isCancelled: false } } },
+          orderBy: { createdAt: 'asc' }
+        }),
+        prisma.payment.findMany({
+          where: {
+            entityType: 'DEALER', entityId: partyId, isCancelled: false, status: 'SUCCESS', orderId: null,
+            createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) }
+          },
+          orderBy: { createdAt: 'asc' }
+        }),
+        prisma.deliveryChallan.findMany({
+          where: { dealerId: partyId, challanDate: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } },
+          orderBy: { challanDate: 'asc' }
+        }),
+        start
+          ? prisma.order.findMany({
+              where: { partyType: 'DEALER', partyId, status: { not: 'CANCELLED' }, createdAt: { lt: start } },
+              include: { payments: { where: { isCancelled: false } } }
+            })
+          : Promise.resolve([]),
+        start
+          ? prisma.payment.findMany({
+              where: { entityType: 'DEALER', entityId: partyId, isCancelled: false, status: 'SUCCESS', orderId: null, createdAt: { lt: start } }
+            })
+          : Promise.resolve([])
+      ]);
+
+      // Opening balance = static balance + every debit/credit movement that happened before `start`,
+      // independent of whether any transactions fall inside the requested period.
+      let openingBalance = staticOpeningBal;
+      for (const o of ordersBefore) {
+        openingBalance += o.totalAmount;
+        for (const p of o.payments) openingBalance -= p.paidAmount;
+      }
+      for (const p of paymentsBefore) openingBalance -= p.paidAmount;
+
+      let seq = 0;
+      const rawTxns: RawTxn[] = [];
+
+      for (const o of ordersInRange) {
+        rawTxns.push({
+          date: o.createdAt, txnType: 'POS Sale', refNo: o.invoiceNum || formatVoucherRef(o.id),
+          paymentType: o.paymentType || 'CASH', debit: o.totalAmount, credit: 0, total: o.totalAmount,
+          referenceId: o.id, seq: seq++
+        });
+        for (const p of o.payments) {
+          rawTxns.push({
+            date: p.createdAt, txnType: 'Payment-In', refNo: p.paymentNumber || p.transactionRef || formatVoucherRef(p.id),
+            paymentType: p.paymentMode || 'CASH', debit: 0, credit: p.paidAmount, total: p.paidAmount,
+            referenceId: p.id, seq: seq++
+          });
+        }
+      }
+      for (const p of paymentsInRange) {
+        rawTxns.push({
+          date: p.createdAt, txnType: 'Payment-In', refNo: p.paymentNumber || p.transactionRef || formatVoucherRef(p.id),
+          paymentType: p.paymentMode || 'CASH', debit: 0, credit: p.paidAmount, total: p.paidAmount,
+          referenceId: p.id, seq: seq++
+        });
+      }
+      for (const c of challansInRange) {
+        rawTxns.push({
+          date: c.challanDate, txnType: 'Delivery Challan', refNo: c.challanNumber || formatVoucherRef(c.id),
+          paymentType: '—', debit: 0, credit: 0, total: c.totalAmount, referenceId: c.id, seq: seq++
+        });
+      }
+
+      const { allEntries, totalDebit, totalCredit, closingBalance } = buildEntries(rawTxns, openingBalance);
+      const { pageEntries, totalEntries } = paginate(search, allEntries);
+
       return {
-        customers: combinedParties,
-        partyType: 'DEALER',
-        partyName: resolvedParty.name,
+        status: 'OK' as const,
+        resolvedParty: true,
+        partyId, partyType: 'DEALER', partyName: resolvedParty.name,
         accountingType: 'RECEIVABLE',
-        transactions,
+        openingBalance, closingBalance,
+        totalDebit, totalCredit,
+        entries: pageEntries, transactions: pageEntries, totalEntries, page, limit,
         summary: {
-          totalSale,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn,
-          totalMoneyOut: 0,
-          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
-          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
+          totalSale: totalDebit, totalPurchase: 0, totalExpense: 0,
+          totalMoneyIn: totalCredit, totalMoneyOut: 0,
+          totalReceivable: closingBalance >= 0 ? closingBalance : 0,
+          totalPayable: closingBalance < 0 ? Math.abs(closingBalance) : 0
         }
       };
     }
@@ -3582,195 +3621,141 @@ export class FinanceService {
     // --- 2. CUSTOMER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
     if (partyType === 'CUSTOMER') {
       const customer = await prisma.customer.findUnique({ where: { id: partyId } });
-      const openingBal = Number(customer?.openingBalance) || 0;
+      const staticOpeningBal = Number(customer?.openingBalance) || 0;
+      const hasAnyLedgerEver = (await prisma.customerLedger.count({ where: { customerId: partyId } })) > 0;
 
-      const [ledgers, orders] = await Promise.all([
-        prisma.customerLedger.findMany({
-          where: {
-            customerId: partyId,
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.order.findMany({
-          where: {
-            customerId: partyId,
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          include: {
-            payments: { where: { isCancelled: false } }
-          },
-          orderBy: { createdAt: 'asc' }
-        })
-      ]);
+      let openingBalance = staticOpeningBal;
+      let seq = 0;
+      const rawTxns: RawTxn[] = [];
 
-      let rawTxns: Array<{
-        date: Date;
-        txnType: string;
-        refNo: string;
-        paymentType: string;
-        debit: number;
-        credit: number;
-        total: number;
-      }> = [];
+      if (hasAnyLedgerEver) {
+        const [ledgersInRange, ledgersBefore] = await Promise.all([
+          prisma.customerLedger.findMany({
+            where: { customerId: partyId, createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          start
+            ? prisma.customerLedger.findMany({ where: { customerId: partyId, createdAt: { lt: start } } })
+            : Promise.resolve([])
+        ]);
 
-      if (ledgers.length > 0) {
-        rawTxns = ledgers.map(l => ({
-          date: l.createdAt,
-          txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
-          refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
-          paymentType: l.paymentMode || '—',
-          debit: l.type === 'DEBIT' ? l.amount : 0,
-          credit: l.type === 'CREDIT' ? l.amount : 0,
-          total: l.amount
-        }));
-      } else {
-        // Synthesize from orders & payments & opening balance
-        if (openingBal !== 0) {
+        for (const l of ledgersBefore) {
+          openingBalance += (l.type === 'DEBIT' ? l.amount : 0) - (l.type === 'CREDIT' ? l.amount : 0);
+        }
+        for (const l of ledgersInRange) {
           rawTxns.push({
-            date: customer?.asOfDate ? new Date(customer.asOfDate) : (customer?.createdAt || new Date()),
-            txnType: 'Opening Balance',
-            refNo: 'OB-0001',
-            paymentType: '—',
-            debit: openingBal > 0 ? openingBal : 0,
-            credit: openingBal < 0 ? Math.abs(openingBal) : 0,
-            total: Math.abs(openingBal)
+            date: l.createdAt,
+            txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
+            refNo: formatVoucherRef(l.referenceId),
+            paymentType: l.paymentMode || '—',
+            debit: l.type === 'DEBIT' ? l.amount : 0,
+            credit: l.type === 'CREDIT' ? l.amount : 0,
+            total: l.amount,
+            referenceType: l.referenceType, referenceId: l.referenceId || undefined,
+            seq: seq++
           });
         }
+      } else {
+        // No CustomerLedger rows exist at all for this customer — synthesize from orders/payments.
+        const [ordersInRange, ordersBefore] = await Promise.all([
+          prisma.order.findMany({
+            where: { customerId: partyId, status: { not: 'CANCELLED' }, createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } },
+            include: { payments: { where: { isCancelled: false } } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          start
+            ? prisma.order.findMany({
+                where: { customerId: partyId, status: { not: 'CANCELLED' }, createdAt: { lt: start } },
+                include: { payments: { where: { isCancelled: false } } }
+              })
+            : Promise.resolve([])
+        ]);
 
-        for (const o of orders) {
+        for (const o of ordersBefore) {
+          openingBalance += o.totalAmount;
+          for (const p of o.payments) openingBalance -= p.paidAmount;
+        }
+        for (const o of ordersInRange) {
           rawTxns.push({
-            date: o.createdAt,
-            txnType: 'Sale',
-            refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
-            paymentType: o.paymentType || 'CASH',
-            debit: o.totalAmount,
-            credit: 0,
-            total: o.totalAmount
+            date: o.createdAt, txnType: 'Sale', refNo: o.invoiceNum || formatVoucherRef(o.id),
+            paymentType: o.paymentType || 'CASH', debit: o.totalAmount, credit: 0, total: o.totalAmount,
+            referenceId: o.id, seq: seq++
           });
-
           for (const p of o.payments) {
             rawTxns.push({
-              date: p.createdAt,
-              txnType: 'Payment-In',
-              refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
-              paymentType: p.paymentMode || 'CASH',
-              debit: 0,
-              credit: p.paidAmount,
-              total: p.paidAmount
+              date: p.createdAt, txnType: 'Payment-In', refNo: p.paymentNumber || p.transactionRef || formatVoucherRef(p.id),
+              paymentType: p.paymentMode || 'CASH', debit: 0, credit: p.paidAmount, total: p.paidAmount,
+              referenceId: p.id, seq: seq++
             });
           }
         }
       }
 
-      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-      let totalSale = 0;
-      let totalMoneyIn = 0;
-      let runningBalance = 0;
-
-      const transactions = rawTxns.map(t => {
-        totalSale += t.debit;
-        totalMoneyIn += t.credit;
-        runningBalance += t.debit - t.credit;
-
-        return {
-          date: new Date(t.date).toISOString().split('T')[0],
-          txnType: t.txnType,
-          refNo: t.refNo,
-          paymentType: t.paymentType,
-          total: t.total,
-          debit: t.debit,
-          credit: t.credit,
-          receivedPaid: t.credit > 0 ? t.credit : t.debit,
-          txnBalance: t.total,
-          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
-          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
-          runningBalance
-        };
-      });
+      const { allEntries, totalDebit, totalCredit, closingBalance } = buildEntries(rawTxns, openingBalance);
+      const { pageEntries, totalEntries } = paginate(search, allEntries);
 
       return {
-        customers: combinedParties,
-        partyType: 'CUSTOMER',
-        partyName: resolvedParty.name,
+        status: 'OK' as const,
+        resolvedParty: true,
+        partyId, partyType: 'CUSTOMER', partyName: resolvedParty.name,
         accountingType: 'RECEIVABLE',
-        transactions,
+        openingBalance, closingBalance,
+        totalDebit, totalCredit,
+        entries: pageEntries, transactions: pageEntries, totalEntries, page, limit,
         summary: {
-          totalSale,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn,
-          totalMoneyOut: 0,
-          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
-          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
+          totalSale: totalDebit, totalPurchase: 0, totalExpense: 0,
+          totalMoneyIn: totalCredit, totalMoneyOut: 0,
+          totalReceivable: closingBalance >= 0 ? closingBalance : 0,
+          totalPayable: closingBalance < 0 ? Math.abs(closingBalance) : 0
         }
       };
     }
 
     // --- 3. VENDOR (PAYABLE: Credits increase payable, Debits decrease payable) ---
+    // Opening-balance logic intentionally left exactly as-is (company-wide vendor semantics, no
+    // pre-period ledger aggregation added here) — only the response contract is extended.
+    const vendor = await prisma.vendor.findUnique({ where: { id: partyId } });
+    const openingBalance = Number(vendor?.openingBalance) || 0;
+
     const vendorLedgers = await prisma.vendorLedger.findMany({
       where: {
         vendorId: partyId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
+        createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) }
       },
       orderBy: { createdAt: 'asc' }
     });
 
-    let totalPurchase = 0;
-    let totalMoneyOut = 0;
-    let runningPayable = 0;
-
-    const transactions = vendorLedgers.map(entry => {
+    const rawTxns: RawTxn[] = vendorLedgers.map((entry, idx) => {
       const isCredit = entry.type === 'CREDIT'; // Purchase Bill / Invoice increases payable
       const isDebit = entry.type === 'DEBIT';   // Payment Out / Purchase Return decreases payable
       const amount = Number(entry.amount) || 0;
-
-      if (isCredit) totalPurchase += amount;
-      if (isDebit) totalMoneyOut += amount;
-
-      runningPayable += isCredit ? amount : -amount;
-
+      const particular = entry.referenceType ? formatReferenceType(entry.referenceType) : 'Payment Out';
       return {
-        date: entry.createdAt.toISOString().split('T')[0],
-        txnType: entry.referenceType ? formatReferenceType(entry.referenceType) : 'Payment Out',
-        refNo: entry.referenceId ? entry.referenceId.slice(0, 8).toUpperCase() : '—',
+        date: entry.createdAt, txnType: particular,
+        refNo: formatVoucherRef(entry.referenceId),
         paymentType: entry.paymentMode || '—',
-        total: amount,
-        debit: isDebit ? amount : 0,
-        credit: isCredit ? amount : 0,
-        receivedPaid: isDebit ? amount : 0,
-        txnBalance: amount,
-        receivableBalance: runningPayable < 0 ? Math.abs(runningPayable) : 0,
-        payableBalance: runningPayable >= 0 ? runningPayable : 0,
-        runningBalance: runningPayable
+        debit: isDebit ? amount : 0, credit: isCredit ? amount : 0, total: amount,
+        referenceType: entry.referenceType || undefined, referenceId: entry.referenceId || undefined,
+        seq: idx
       };
     });
 
+    const { allEntries, totalDebit, totalCredit, closingBalance } = buildEntries(rawTxns, openingBalance, 'PAYABLE');
+    const { pageEntries, totalEntries } = paginate(search, allEntries);
+
     return {
-      customers: combinedParties,
-      partyType: 'VENDOR',
-      partyName: resolvedParty.name,
+      status: 'OK' as const,
+      resolvedParty: true,
+      partyId, partyType: 'VENDOR', partyName: resolvedParty.name,
       accountingType: 'PAYABLE',
-      transactions,
+      openingBalance, closingBalance,
+      totalDebit, totalCredit,
+      entries: pageEntries, transactions: pageEntries, totalEntries, page, limit,
       summary: {
-        totalSale: 0,
-        totalPurchase,
-        totalExpense: 0,
-        totalMoneyIn: 0,
-        totalMoneyOut,
-        totalReceivable: runningPayable < 0 ? Math.abs(runningPayable) : 0,
-        totalPayable: runningPayable >= 0 ? runningPayable : 0
+        totalSale: 0, totalPurchase: totalCredit, totalExpense: 0,
+        totalMoneyIn: 0, totalMoneyOut: totalDebit,
+        totalReceivable: closingBalance < 0 ? Math.abs(closingBalance) : 0,
+        totalPayable: closingBalance >= 0 ? closingBalance : 0
       }
     };
   }
@@ -3820,17 +3805,17 @@ export class FinanceService {
       const partyId = order.customerId || 'CASH_CUSTOMER';
       const partyName = order.customer ? order.customer.name : (order.customerName || 'Cash Customer');
       const phoneNo = order.customer ? (order.customer.phone || '—') : '—';
-      
+
       if (!partyMap.has(partyId)) {
         partyMap.set(partyId, { partyName, phoneNo, totalSaleAmount: 0, totalCost: 0 });
       }
-      
+
       const partyData = partyMap.get(partyId)!;
-      
+
       // Use tax-exclusive sales for P&L
       const taxExclusiveAmount = order.totalAmount - (order.taxAmount || 0);
       partyData.totalSaleAmount += taxExclusiveAmount;
-      
+
       for (const item of order.orderItems) {
         if (item.totalCost !== null && item.totalCost !== undefined) {
           partyData.totalCost += item.totalCost;
@@ -3936,19 +3921,19 @@ export class FinanceService {
 
     const dealerIds = [...new Set(orders.filter(o => o.partyType === 'DEALER' && o.partyId).map(o => o.partyId!))];
     const franchiseIds = [...new Set(orders.filter(o => o.partyType === 'FRANCHISE' && o.partyId).map(o => o.partyId!))];
-    
+
     const dealers = dealerIds.length > 0 ? await prisma.dealer.findMany({ where: { id: { in: dealerIds } } }) : [];
     const franchises = franchiseIds.length > 0 ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } } }) : [];
-    
+
     const dealerMap = new Map(dealers.map(d => [d.id, d.name]));
     const franchiseMap = new Map(franchises.map(f => [f.id, f.name]));
 
     for (const order of orders) {
       let partyName = 'Walk-in Customer';
       let partyType = 'Cash Customers';
-      
+
       const pType = order.partyType || 'CUSTOMER';
-      
+
       if (pType === 'CUSTOMER') {
         if (order.customerId && order.customer) {
           partyName = order.customer.name;
@@ -4023,7 +4008,7 @@ export class FinanceService {
     loanDate: Date;
   }) {
     const { franchiseId, accountName, accountNumber, lenderName, loanType, principalAmount, interestRate, loanDate } = data;
-    
+
     // Create Loan Account
     const loan = await prisma.loanAccount.create({
       data: {
@@ -4468,10 +4453,10 @@ export class FinanceService {
     // 1. Process Inventory Items (for opening and closing stock)
     for (const item of inventoryItems) {
       const cost = Number(item.costPrice || item.basePrice || 0);
-      
+
       const opQty = openingStockQtyMap.get(item.id) ?? 0;
-      const clQty = closingStockQtyMap.has(item.id) 
-        ? (closingStockQtyMap.get(item.id) ?? 0) 
+      const clQty = closingStockQtyMap.has(item.id)
+        ? (closingStockQtyMap.get(item.id) ?? 0)
         : (end ? 0 : (item.currentStock || 0));
 
       const opVal = Number((opQty > 0 ? opQty * cost : 0).toFixed(2));
@@ -4586,7 +4571,7 @@ export class FinanceService {
         const consumptionCost = Number(row.consumptionCost.toFixed(2));
 
         const netRevenue = sale - saleReturn;
-        
+
         let costOfItem = 0;
         if (mfgCost > 0) {
           costOfItem = mfgCost;
@@ -5397,7 +5382,7 @@ export class FinanceService {
     // than mutating the original Purchase Bill.
     const debitNoteRows = await prisma.purchaseReturn.findMany({
       where: {
-        status: { in: ['APPROVED', 'COMPLETED'] },
+        status: 'COMPLETED',
         taxAmount: { not: null },
         ...(partyId ? { vendorId: partyId } : {}),
         ...dateFilter
@@ -5449,7 +5434,7 @@ export class FinanceService {
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       }),
       prisma.purchaseReturn.aggregate({
-        where: { status: { in: ['APPROVED', 'COMPLETED'] }, taxAmount: { not: null }, ...dateFilter },
+        where: { status: 'COMPLETED', taxAmount: { not: null }, ...dateFilter },
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       })
     ]);
@@ -5570,7 +5555,7 @@ export class FinanceService {
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       }),
       prisma.purchaseReturn.aggregate({
-        where: { status: { in: ['APPROVED', 'COMPLETED'] }, taxAmount: { not: null }, createdAt: { gte: fyStart, lte: fyEnd } },
+        where: { status: 'COMPLETED', taxAmount: { not: null }, createdAt: { gte: fyStart, lte: fyEnd } },
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       })
     ]);
@@ -6235,7 +6220,7 @@ export class FinanceService {
 
     const expenses = await prisma.expense.findMany({
       where,
-      include: { 
+      include: {
         purchaseOrder: {
           include: {
             poItems: { include: { inventoryItem: true } }
@@ -6559,10 +6544,10 @@ export class FinanceService {
     const search = opts?.search?.trim().toLowerCase();
     const filtered = search
       ? parties.filter((p) =>
-          (p.name || '').toLowerCase().includes(search) ||
-          (p.phone || '').toLowerCase().includes(search) ||
-          (p.email || '').toLowerCase().includes(search)
-        )
+        (p.name || '').toLowerCase().includes(search) ||
+        (p.phone || '').toLowerCase().includes(search) ||
+        (p.email || '').toLowerCase().includes(search)
+      )
       : parties;
 
     return filtered.sort((a, b) => a.name.localeCompare(b.name));

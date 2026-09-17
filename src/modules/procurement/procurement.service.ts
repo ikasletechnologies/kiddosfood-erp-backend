@@ -1466,7 +1466,7 @@ export class ProcurementService {
       const completedReturns = await prisma.purchaseReturn.findMany({
         where: {
           vendorId,
-          status: { in: ['COMPLETED', 'APPROVED'] }
+          status: 'COMPLETED'
         },
         include: {
           procurementOrder: { include: { invoices: true } },
