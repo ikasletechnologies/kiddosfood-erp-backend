@@ -571,11 +571,12 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
+      const { startDate, endDate, search } = req.query;
       const report = await FinanceService.getPartyProfitLoss({
         franchiseId,
         startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        search: search as string
       });
       res.json(report);
     } catch (error: any) {
@@ -588,11 +589,12 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
+      const { startDate, endDate, search } = req.query;
       const report = await FinanceService.getPartyReportByItem({
         franchiseId,
         startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        search: search as string
       });
       res.json(report);
     } catch (error: any) {
@@ -605,11 +607,12 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { startDate, endDate } = req.query;
+      const { startDate, endDate, search } = req.query;
       const report = await FinanceService.getSalePurchaseByParty({
         franchiseId,
         startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        search: search as string
       });
       res.json(report);
     } catch (error: any) {

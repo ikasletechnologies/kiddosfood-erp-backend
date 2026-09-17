@@ -17,6 +17,153 @@ function applyStatementSearch<T extends { particular: string; voucherNo: string 
   const q = search.trim().toLowerCase();
   return entries.filter(e => e.particular.toLowerCase().includes(q) || e.voucherNo.toLowerCase().includes(q));
 }
+
+// Shared party identity resolution — the same rule across every "party"
+// report in this file: customerId first (a real Customer), then
+// partyType+partyId (Dealer/Franchise — Order.partyId is a loose reference,
+// not a Prisma relation, so display names are batch-resolved separately via
+// batchResolvePartyNames), and a honestly-labeled WALK_IN bucket for anything
+// with no resolvable identity. Never group by customerName/phone/a shared
+// placeholder string, and never merge different party types into one row.
+type ResolvedPartyType = 'CUSTOMER' | 'DEALER' | 'FRANCHISE' | 'VENDOR' | 'WALK_IN';
+type ResolvedParty = { key: string; partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string };
+
+function resolveOrderParty(o: { customerId: string | null; customer: { name: string; phone: string | null } | null; customerName: string | null; partyType: string | null; partyId: string | null }): ResolvedParty {
+  if (o.customerId) {
+    return { key: `CUSTOMER:${o.customerId}`, partyType: 'CUSTOMER', partyId: o.customerId, partyName: o.customer?.name || o.customerName || 'Customer', phoneNo: o.customer?.phone || '—' };
+  }
+  if (o.partyType === 'DEALER' && o.partyId) {
+    return { key: `DEALER:${o.partyId}`, partyType: 'DEALER', partyId: o.partyId, partyName: '', phoneNo: '—' };
+  }
+  if (o.partyType === 'FRANCHISE' && o.partyId) {
+    return { key: `FRANCHISE:${o.partyId}`, partyType: 'FRANCHISE', partyId: o.partyId, partyName: '', phoneNo: '—' };
+  }
+  return { key: 'WALK_IN', partyType: 'WALK_IN', partyId: null, partyName: 'Walk-in / Unattributed', phoneNo: '—' };
+}
+
+// A vendor purchase is never keyed by vendor.name (that's exactly the bug
+// that let a Vendor's purchase total merge onto an unrelated Customer/
+// Franchise row sharing the same name) — always vendor.id, in its own
+// VENDOR:<id> namespace so it can never collide with any other party type.
+function resolveVendorParty(vendorId: string, vendorName: string): ResolvedParty {
+  return { key: `VENDOR:${vendorId}`, partyType: 'VENDOR', partyId: vendorId, partyName: vendorName, phoneNo: '—' };
+}
+
+// Resolves a ReturnOrder to the same party a sale would resolve to, so a
+// return nets against the correct bucket: its own customerId/dealerId/
+// franchiseId when set (a standalone return), otherwise via its linked POS
+// order. Also returns the operating franchiseId (for scope filtering) where
+// it can be determined — SalesOrder carries no franchiseId at all, so a
+// return linked only to one is counted unconditionally rather than dropped.
+function resolveReturnParty(ret: {
+  customerId: string | null; dealerId: string | null; franchiseId: string | null;
+  customer: { name: string; phone: string | null } | null;
+  posOrder: { franchiseId: string | null; partyType: string | null; partyId: string | null; customerId: string | null; customerName: string | null; customer: { name: string; phone: string | null } | null } | null;
+}): { resolved: ResolvedParty; operatingFranchiseId: string | undefined } {
+  if (ret.customerId || ret.dealerId || ret.franchiseId) {
+    return {
+      resolved: resolveOrderParty({
+        customerId: ret.customerId, customer: ret.customer, customerName: null,
+        partyType: ret.dealerId ? 'DEALER' : ret.franchiseId ? 'FRANCHISE' : null,
+        partyId: ret.dealerId || ret.franchiseId || null
+      }),
+      operatingFranchiseId: ret.posOrder?.franchiseId || undefined
+    };
+  }
+  if (ret.posOrder) {
+    return { resolved: resolveOrderParty(ret.posOrder), operatingFranchiseId: ret.posOrder.franchiseId || undefined };
+  }
+  return { resolved: { key: 'WALK_IN', partyType: 'WALK_IN', partyId: null, partyName: 'Walk-in / Unattributed', phoneNo: '—' }, operatingFranchiseId: undefined };
+}
+
+// Batch-resolves display names/phones for DEALER and FRANCHISE buckets —
+// can't come from an `include` on Order (Order.partyId has no Prisma
+// relation to join through) — mutating the buckets in place.
+async function batchResolvePartyNames(buckets: Iterable<{ partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string }>) {
+  const list = Array.from(buckets);
+  const dealerIds = list.filter(b => b.partyType === 'DEALER').map(b => b.partyId!).filter(Boolean);
+  const franchiseIds = list.filter(b => b.partyType === 'FRANCHISE').map(b => b.partyId!).filter(Boolean);
+  const [dealers, franchises] = await Promise.all([
+    dealerIds.length ? prisma.dealer.findMany({ where: { id: { in: dealerIds } }, select: { id: true, name: true, phone: true } }) : Promise.resolve([] as any[]),
+    franchiseIds.length ? prisma.franchise.findMany({ where: { id: { in: franchiseIds } }, select: { id: true, name: true, contactNum: true } }) : Promise.resolve([] as any[])
+  ]);
+  const dealerNameMap = new Map(dealers.map(d => [d.id, d]));
+  const franchiseNameMap = new Map(franchises.map(f => [f.id, f]));
+  for (const bucket of list) {
+    if (bucket.partyType === 'DEALER' && bucket.partyId) {
+      const d = dealerNameMap.get(bucket.partyId);
+      bucket.partyName = d?.name || 'Dealer';
+      bucket.phoneNo = d?.phone || '—';
+    } else if (bucket.partyType === 'FRANCHISE' && bucket.partyId) {
+      const f = franchiseNameMap.get(bucket.partyId);
+      bucket.partyName = f?.name || 'Franchise';
+      bucket.phoneNo = f?.contactNum || '—';
+    }
+  }
+}
+
+// Human-friendly display label for a grouping/summary view (Sale & Purchase
+// By Party Group) — a legibility layer only; the underlying grouping key
+// stays the authoritative ResolvedPartyType, never this string.
+function partyTypeGroupLabel(partyType: ResolvedPartyType): string {
+  switch (partyType) {
+    case 'CUSTOMER': return 'Customers';
+    case 'DEALER': return 'Dealers';
+    case 'FRANCHISE': return 'Franchises';
+    case 'VENDOR': return 'Vendors';
+    case 'WALK_IN': return 'Walk-in / Unattributed';
+  }
+}
+
+// Epsilon-safe rounding to cents — avoids float artifacts like 251.69699999999998
+// showing up in a report instead of 251.70. Same pattern the frontend currency
+// formatter already uses; applied here so a value that leaves the service is
+// already reconciled to the cent, not just at render time.
+function roundCents(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+// The authoritative per-line COGS resolution, shared by getProfitAndLoss and
+// getPartyProfitLoss so the two reports can never silently diverge on what a
+// sale actually cost:
+//   1. OrderItem.totalCost — the real FIFO/production cost frozen at sale time
+//      (see pos.service.ts). Always preferred; never recomputed from today's
+//      live cost, which would re-cost old, already-booked sales.
+//   2. Recipe-based cost — sum of ingredient costPrice (or first vendor price)
+//      x quantity, scaled to the sold quantity.
+//   3. InventoryItem.costPrice by SKU — direct-product average purchase cost.
+//   4. Genuinely unavailable — no frozen cost, no recipe, no matching
+//      InventoryItem row at all. Returns cost 0 (matching the pre-existing
+//      getProfitAndLoss behavior, so extracting this changes nothing there)
+//      but reports the source as UNAVAILABLE so a caller that needs to know
+//      the difference between "real zero" and "no cost data" can.
+// Deliberately never falls back to Product.basePrice — that's a selling
+// price, not a cost, and using it inflates every item's apparent margin to
+// (price - price) = 0 whenever the real cost is unknown.
+function resolveOrderItemCost(
+  item: { totalCost?: number | null; quantity: number; product?: any },
+  invItemMap: Map<string, any>
+): { cost: number; source: 'FROZEN' | 'RECIPE' | 'INVENTORY_SKU' | 'UNAVAILABLE' } {
+  if (item.totalCost !== null && item.totalCost !== undefined) {
+    return { cost: item.totalCost, source: 'FROZEN' };
+  }
+  const product = item.product;
+  if (product?.recipe) {
+    let cost = 0;
+    const scalar = item.quantity / product.recipe.yieldQty;
+    for (const ri of product.recipe.recipeItems) {
+      const qtyUsed = ri.quantityRequired * scalar;
+      const costPerUnit = ri.inventoryItem?.costPrice || ri.inventoryItem?.vendors?.[0]?.price || 0;
+      cost += qtyUsed * costPerUnit;
+    }
+    return { cost, source: 'RECIPE' };
+  }
+  const invItem = product ? invItemMap.get(product.sku || '') : undefined;
+  if (invItem) {
+    return { cost: item.quantity * (invItem.costPrice || 0), source: 'INVENTORY_SKU' };
+  }
+  return { cost: 0, source: 'UNAVAILABLE' };
+}
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
@@ -26,6 +173,44 @@ import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
 
+
+// Shared Category Resolver
+// The correct category must check InventoryItem.category first (for actual raw material/purchases),
+// falling back to Product.category if it's a finished good sold via Order.
+function resolveCategory(item: any): string {
+  if (item?.inventoryItem?.category) return item.inventoryItem.category;
+  if (item?.product?.category) return item.product.category;
+  if (item?.category) return item.category;
+  return 'Uncategorized';
+}
+
+// Stock Movement Direction Mapper
+// Exhaustive mapping based on Prisma StockMovementType enum
+function getStockMovementDirection(type: string, quantity: number): 'IN' | 'OUT' {
+  switch (type) {
+    case 'PURCHASE_IN':
+    case 'PRODUCTION_IN':
+    case 'TRANSFER_IN':
+    case 'RECALL_RETURN_IN':
+    case 'RETURN_QUARANTINE_IN':
+    case 'SALES_RETURN_IN':
+      return 'IN';
+      
+    case 'PRODUCTION_OUT':
+    case 'SALES_OUT':
+    case 'WASTE_OUT':
+    case 'TRANSFER_OUT':
+    case 'RETURN_OUT':
+      return 'OUT';
+      
+    case 'ADJUSTMENT':
+      return quantity >= 0 ? 'IN' : 'OUT';
+      
+    default:
+      console.warn(`[FinanceService] Unmapped StockMovementType encountered: ${type}`);
+      return 'OUT'; // Fail safe or explicit default, but warned for dev attention
+  }
+}
 
 function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
   let start: Date | undefined = undefined;
@@ -246,33 +431,11 @@ export class FinanceService {
       totalRevenue += subTotalRevenue;
       totalOutputTax += inv.taxAmount || 0;
       for (const item of inv.order.orderItems) {
-        // `totalCost` is captured at sale time (see pos.service.ts) from the
-        // actual FIFO lot(s)/production batch this line drew from — the real
-        // cost of THIS sale, frozen at the moment it happened. Prefer it over
-        // recomputing from today's live costPrice, which drifts every time a
-        // new purchase lands and would silently re-cost old, already-booked sales.
-        if (item.totalCost !== null && item.totalCost !== undefined) {
-          totalCOGS += item.totalCost;
-          continue;
-        }
-
-        // Fallback for orders recorded before cost capture existed.
-        const product = item.product;
-        if (product) {
-          if (product.recipe) {
-            const scalar = item.quantity / product.recipe.yieldQty;
-            for (const ri of product.recipe.recipeItems) {
-              const qtyUsed = ri.quantityRequired * scalar;
-              const costPerUnit = ri.inventoryItem.costPrice || ri.inventoryItem.vendors[0]?.price || 0;
-              totalCOGS += (qtyUsed * costPerUnit);
-            }
-          } else {
-            // Direct product: get average buying/purchase cost from InventoryItem with matching SKU
-            const invItem = invItemMap.get(product.sku || '');
-            const costPerUnit = invItem?.costPrice || 0;
-            totalCOGS += (item.quantity * costPerUnit);
-          }
-        }
+        // See resolveOrderItemCost's own doc comment for the full preference
+        // order (frozen sale-time cost -> recipe -> InventoryItem by SKU).
+        // Extracted so getPartyProfitLoss can never silently diverge from
+        // this calculation — behavior here is unchanged.
+        totalCOGS += resolveOrderItemCost(item, invItemMap).cost;
       }
     }
 
@@ -3764,85 +3927,108 @@ export class FinanceService {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateRange = { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) };
 
-    // Fetch all final sales for the franchise
+    // Same "final sale" definition already used elsewhere in this report (one
+    // economic sale = one Order = one revenue contribution, no double counting
+    // across Quotation/Proforma/SalesOrder/Invoice for the same sale).
     const orders = await prisma.order.findMany({
-      where: finalSaleWhere({
-        franchiseId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
-      }),
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
       include: {
         customer: true,
-        orderItems: {
-          include: {
-            product: {
-              include: {
-                recipe: {
-                  include: {
-                    recipeItems: {
-                      include: {
-                        inventoryItem: true
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+        orderItems: { include: { product: { include: { recipe: { include: { recipeItems: { include: { inventoryItem: true } } } } } } } }
       }
     });
 
-    const partyMap = new Map<string, { partyName: string; phoneNo: string; totalSaleAmount: number; totalCost: number }>();
+    // Same InventoryItem-by-SKU cost source and scoping the authoritative
+    // getProfitAndLoss uses (see resolveOrderItemCost) — reused, not duplicated.
+    const inventoryItems = await prisma.inventoryItem.findMany({
+      where: franchiseId ? { franchiseId } : {}
+    });
+    const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
+
+    type Bucket = {
+      partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string;
+      totalSales: number; totalCost: number; costUnavailable: boolean;
+    };
+
+    const buckets = new Map<string, Bucket>();
 
     for (const order of orders) {
-      const partyId = order.customerId || 'CASH_CUSTOMER';
-      const partyName = order.customer ? order.customer.name : (order.customerName || 'Cash Customer');
-      const phoneNo = order.customer ? (order.customer.phone || '—') : '—';
-
-      if (!partyMap.has(partyId)) {
-        partyMap.set(partyId, { partyName, phoneNo, totalSaleAmount: 0, totalCost: 0 });
+      const resolved = resolveOrderParty(order);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSales: 0, totalCost: 0, costUnavailable: false });
       }
+      const bucket = buckets.get(resolved.key)!;
 
-      const partyData = partyMap.get(partyId)!;
-
-      // Use tax-exclusive sales for P&L
-      const taxExclusiveAmount = order.totalAmount - (order.taxAmount || 0);
-      partyData.totalSaleAmount += taxExclusiveAmount;
+      // Tax-exclusive net sales revenue — same basis as getProfitAndLoss.
+      bucket.totalSales += order.totalAmount - (order.taxAmount || 0);
 
       for (const item of order.orderItems) {
-        if (item.totalCost !== null && item.totalCost !== undefined) {
-          partyData.totalCost += item.totalCost;
-          continue;
-        }
-        let itemCost = 0;
-        const recipeItems = item.product?.recipe?.recipeItems || [];
-        if (recipeItems.length > 0) {
-          for (const ri of recipeItems) {
-            const materialCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
-            itemCost += ri.quantityRequired * materialCost;
-          }
-        } else {
-          itemCost = item.product?.basePrice || 0;
-        }
-        partyData.totalCost += itemCost * item.quantity;
+        const { cost, source } = resolveOrderItemCost(item, invItemMap);
+        bucket.totalCost += cost;
+        if (source === 'UNAVAILABLE') bucket.costUnavailable = true;
       }
     }
 
-    const reportRows = Array.from(partyMap.values()).map(data => {
-      return {
-        partyName: data.partyName,
-        phoneNo: data.phoneNo,
-        totalSaleAmount: data.totalSaleAmount,
-        profit: data.totalSaleAmount - data.totalCost
-      };
-    }).filter(r => r.totalSaleAmount > 0);
+    // Sales-return netting, reusing the exact fields the authoritative P&L nets
+    // with (ReturnItem.taxableValue for revenue, .costReversal for COGS,
+    // APPROVED/COMPLETED only, the return's own createdAt) — but per resolved
+    // party instead of one company-wide total, so a fully-returned sale nets
+    // to zero for the party it belongs to instead of continuing to inflate it.
+    const returns = await prisma.returnOrder.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, createdAt: dateRange },
+      include: {
+        items: true,
+        customer: true,
+        // SalesOrder carries no franchiseId at all, so it can't contribute an
+        // operating-franchise for scoping; a return linked only to one (no
+        // posOrder, no direct customerId/dealerId/franchiseId) is counted
+        // unconditionally below rather than silently dropped.
+        posOrder: { select: { franchiseId: true, partyType: true, partyId: true, customerId: true, customerName: true, customer: true } }
+      }
+    });
+
+    for (const ret of returns) {
+      const { resolved, operatingFranchiseId } = resolveReturnParty(ret);
+
+      if (franchiseId && operatingFranchiseId && operatingFranchiseId !== franchiseId) continue;
+
+      const bucket = buckets.get(resolved.key);
+      if (!bucket) continue; // return for a party with no sale-side row in this period — nothing to net against
+
+      for (const item of ret.items) {
+        bucket.totalSales -= (item.taxableValue || 0);
+        bucket.totalCost -= (item.costReversal || 0);
+      }
+    }
+
+    await batchResolvePartyNames(buckets.values());
+
+    let reportRows = Array.from(buckets.values())
+      .map(b => {
+        const totalSales = roundCents(b.totalSales);
+        const totalCost = roundCents(b.totalCost);
+        const profit = roundCents(b.totalSales - b.totalCost);
+        const margin = totalSales !== 0 ? roundCents((profit / totalSales) * 100) : null;
+        return {
+          partyId: b.partyId, partyType: b.partyType, partyName: b.partyName, phoneNo: b.phoneNo,
+          totalSales, totalCost, profit, margin, costUnavailable: b.costUnavailable
+        };
+      })
+      // Drop buckets with no real financial activity left (e.g. a walk-in sale
+      // fully reversed by a return nets to exactly zero on both sides) — never
+      // hides a party with genuine nonzero figures, including a net loss.
+      .filter(r => r.totalSales !== 0 || r.totalCost !== 0);
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.partyType.toLowerCase().includes(q));
+    }
 
     return reportRows;
   }
@@ -3851,118 +4037,205 @@ export class FinanceService {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    
+    // Using buildCreatedAtFilter for sales, and buildBillDateFilter for purchases
+    const dateRange = buildCreatedAtFilter(start, end).createdAt || {};
+    const billDateFilter = buildBillDateFilter(start, end);
 
-    // Fetch customer order items
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
-      include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          },
-          include: {
-            orderItems: true
-          }
-        }
+    type ReportRow = {
+      partyType: ResolvedPartyType;
+      partyId: string | null;
+      partyName: string;
+      itemId: string;
+      itemName: string;
+      saleQuantity: number;
+      saleAmount: number;
+      purchaseQuantity: number;
+      purchaseAmount: number;
+    };
+
+    const rowMap = new Map<string, ReportRow>();
+
+    const getRow = (party: ReturnType<typeof resolveOrderParty> | ReturnType<typeof resolveVendorParty>, itemId: string, itemName: string) => {
+      const key = `${party.partyType}:${party.partyId}:${itemId}`;
+      if (!rowMap.has(key)) {
+        rowMap.set(key, {
+          partyType: party.partyType,
+          partyId: party.partyId,
+          partyName: party.partyName,
+          itemId,
+          itemName,
+          saleQuantity: 0,
+          saleAmount: 0,
+          purchaseQuantity: 0,
+          purchaseAmount: 0
+        });
+      }
+      return rowMap.get(key)!;
+    };
+
+    // 1. SALES
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
+      include: { customer: true, orderItems: { include: { product: { select: { name: true, sku: true } } } } }
+    });
+
+    for (const order of orders) {
+      const resolved = resolveOrderParty(order);
+      for (const item of order.orderItems) {
+        if (!item.product) continue; // Skip unknown products
+        
+        // discountAmount has precedence, otherwise calculate from pct
+        const discountAmount = (item as any).discountAmount ?? (item.price * item.quantity * ((item.discountPct || 0) / 100));
+        const itemAmount = (item.price * item.quantity) - discountAmount;
+        
+        const row = getRow(resolved, item.product.sku || item.productId, item.product.name);
+        row.saleQuantity += item.quantity;
+        row.saleAmount += itemAmount;
+      }
+    }
+
+    // 2. PURCHASES
+    // Fetch authoritative VendorInvoices tied to GRNs
+    const invoices = await prisma.vendorInvoice.findMany({
+      where: {
+        status: { in: ['PAID', 'PENDING'] },
+        ...(franchiseId ? { warehouse: { franchiseId } } : {}),
+        ...billDateFilter
+      },
+      include: { 
+        vendor: true, 
+        grn: { include: { items: { include: { inventoryItem: true } } } },
+        procurementOrder: { include: { poItems: { include: { inventoryItem: true } } } }
       }
     });
 
-    const report = customers.map(cust => {
-      let saleQuantity = 0;
-      let saleAmount = 0;
+    for (const inv of invoices) {
+      const resolved = resolveVendorParty(inv.vendorId, inv.vendor.name);
+      
+      // If linked to GRN, use actual received inventory
+      if (inv.grn && inv.grn.items) {
+        // Calculate total GRN value to prorate invoice-level charges/discounts
+        let rawGrnValue = 0;
+        inv.grn.items.forEach(i => { rawGrnValue += (i.price * i.acceptedQty); });
 
-      for (const order of cust.orders) {
-        saleAmount += order.totalAmount;
-        for (const item of order.orderItems) {
-          saleQuantity += item.quantity;
+        // The authoritative invoice amount is inv.subtotal (or inv.amount for tax-inc).
+        // Using subtotal for tax-exclusive comparison.
+        const invoiceSubtotal = inv.subtotal || inv.amount;
+        
+        for (const item of inv.grn.items) {
+          if (!item.inventoryItem) continue;
+          const itemRawValue = item.price * item.acceptedQty;
+          
+          // Prorate the final invoice value for this item
+          const proratedAmount = rawGrnValue > 0 ? (itemRawValue / rawGrnValue) * invoiceSubtotal : 0;
+
+          const row = getRow(resolved, item.inventoryItem.id, item.inventoryItem.name);
+          row.purchaseQuantity += item.acceptedQty;
+          row.purchaseAmount += proratedAmount;
+        }
+      } else if (inv.procurementOrder && inv.procurementOrder.poItems) {
+        // Fallback to PO items if no GRN attached directly to invoice
+        let rawPoValue = 0;
+        inv.procurementOrder.poItems.forEach(i => { rawPoValue += (i.price * i.quantity); });
+        const invoiceSubtotal = inv.subtotal || inv.amount;
+
+        for (const item of inv.procurementOrder.poItems) {
+          if (!item.inventoryItem) continue;
+          const itemRawValue = item.price * item.quantity;
+          const proratedAmount = rawPoValue > 0 ? (itemRawValue / rawPoValue) * invoiceSubtotal : 0;
+          
+          const row = getRow(resolved, item.inventoryItem.id, item.inventoryItem.name);
+          row.purchaseQuantity += item.quantity;
+          row.purchaseAmount += proratedAmount;
         }
       }
+    }
 
-      return {
-        partyName: cust.name,
-        saleQuantity,
-        saleAmount,
-        purchaseQuantity: 0,
-        purchaseAmount: 0
-      };
-    }).filter(r => r.saleAmount > 0);
+    const rows = Array.from(rowMap.values());
 
-    return report;
+    // Batch-resolve Dealer/Franchise display names
+    await batchResolvePartyNames(rows as any);
+
+    let reportRows = rows.map(r => ({
+      ...r,
+      saleAmount: roundCents(r.saleAmount),
+      purchaseAmount: roundCents(r.purchaseAmount)
+    }));
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.itemName.toLowerCase().includes(q));
+    }
+
+    return reportRows;
   }
 
   static async getSalePurchaseByParty(filters: {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateRange = { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) };
 
-    const partyMap = new Map<string, { partyName: string; partyType: string; totalSale: number; totalPurchase: number; net: number }>();
+    type Bucket = { partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string; totalSale: number; totalPurchase: number };
+    const buckets = new Map<string, Bucket>();
 
-    // Fetch Sales
+    // Sales — same authoritative id+type party resolution and tax-exclusive
+    // basis as Party Wise P&L, so the two reports reconcile with each other.
     const orders = await prisma.order.findMany({
-      where: finalSaleWhere({
-        franchiseId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
-      }),
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
       include: { customer: true }
     });
 
-    const dealerIds = [...new Set(orders.filter(o => o.partyType === 'DEALER' && o.partyId).map(o => o.partyId!))];
-    const franchiseIds = [...new Set(orders.filter(o => o.partyType === 'FRANCHISE' && o.partyId).map(o => o.partyId!))];
-
-    const dealers = dealerIds.length > 0 ? await prisma.dealer.findMany({ where: { id: { in: dealerIds } } }) : [];
-    const franchises = franchiseIds.length > 0 ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } } }) : [];
-
-    const dealerMap = new Map(dealers.map(d => [d.id, d.name]));
-    const franchiseMap = new Map(franchises.map(f => [f.id, f.name]));
-
     for (const order of orders) {
-      let partyName = 'Walk-in Customer';
-      let partyType = 'Cash Customers';
-
-      const pType = order.partyType || 'CUSTOMER';
-
-      if (pType === 'CUSTOMER') {
-        if (order.customerId && order.customer) {
-          partyName = order.customer.name;
-          partyType = 'Customers';
-        } else if (order.customerName) {
-          partyName = order.customerName;
-          partyType = 'Cash Customers';
-        }
-      } else if (pType === 'DEALER' && order.partyId && dealerMap.has(order.partyId)) {
-        partyName = dealerMap.get(order.partyId)!;
-        partyType = 'Dealers';
-      } else if (pType === 'FRANCHISE' && order.partyId && franchiseMap.has(order.partyId)) {
-        partyName = franchiseMap.get(order.partyId)!;
-        partyType = 'Franchises';
+      const resolved = resolveOrderParty(order);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSale: 0, totalPurchase: 0 });
       }
-
-      if (!partyMap.has(partyName)) {
-        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
-      }
-      partyMap.get(partyName)!.totalSale += order.totalAmount;
+      buckets.get(resolved.key)!.totalSale += order.totalAmount - (order.taxAmount || 0);
     }
 
-    // Fetch Purchases — actually recognized liability (VendorInvoice,
-    // GRN-actual-price-derived), not po.totalAmount (the PO's ordered
-    // commitment). Queried directly off VendorInvoice (bill-level, keyed by
-    // its own billDate — see buildBillDateFilter) since ProcurementOrder has
-    // no billDate field of its own; same source/rationale as
-    // getProfitAndLoss/getTrialBalanceReport's Purchase line. A PO with no
-    // invoice yet (nothing received/billed) correctly contributes nothing.
+    // Sales-return netting — same fields/status/period semantics Party Wise
+    // P&L nets with (ReturnItem.taxableValue, APPROVED/COMPLETED only, the
+    // return's own createdAt), per resolved party. (Vendor-side purchase
+    // returns use a separate PurchaseReturn model and are not netted here —
+    // out of scope for this pass.)
+    const returns = await prisma.returnOrder.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, createdAt: dateRange },
+      include: {
+        items: true,
+        customer: true,
+        posOrder: { select: { franchiseId: true, partyType: true, partyId: true, customerId: true, customerName: true, customer: true } }
+      }
+    });
+    for (const ret of returns) {
+      const { resolved, operatingFranchiseId } = resolveReturnParty(ret);
+      if (franchiseId && operatingFranchiseId && operatingFranchiseId !== franchiseId) continue;
+      const bucket = buckets.get(resolved.key);
+      if (!bucket) continue;
+      for (const item of ret.items) {
+        bucket.totalSale -= (item.taxableValue || 0);
+      }
+    }
+
+    // Purchases — the actually recognized liability (VendorInvoice,
+    // GRN-actual-price-derived), keyed by vendor.id — never vendor.name,
+    // which is exactly what previously let a vendor's entire purchase total
+    // merge onto an unrelated Customer/Franchise/Dealer row sharing that
+    // vendor's name (e.g. two real records both named "ak"). Bill-level,
+    // keyed by its own billDate (see buildBillDateFilter) since
+    // ProcurementOrder has no billDate field of its own; same source/
+    // rationale as getProfitAndLoss/getTrialBalanceReport's Purchase line. A
+    // PO with no invoice yet (nothing received/billed) correctly contributes
+    // nothing.
     const invoices = await prisma.vendorInvoice.findMany({
       where: {
         procurementOrder: { franchiseId, status: { not: 'CANCELLED' } },
@@ -3972,22 +4245,31 @@ export class FinanceService {
     });
 
     for (const inv of invoices) {
-      const partyName = inv.procurementOrder?.vendor?.name || 'Unknown Vendor';
-      const partyType = 'Vendors';
-      if (!partyMap.has(partyName)) {
-        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
+      const vendor = inv.procurementOrder?.vendor;
+      if (!vendor) continue;
+      const resolved = resolveVendorParty(vendor.id, vendor.name);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSale: 0, totalPurchase: 0 });
       }
-      partyMap.get(partyName)!.totalPurchase += (inv.amount || 0);
+      buckets.get(resolved.key)!.totalPurchase += (inv.amount || 0);
     }
 
-    const report = Array.from(partyMap.values())
-      .map(r => ({
-        ...r,
-        net: r.totalSale - r.totalPurchase
+    await batchResolvePartyNames(buckets.values());
+
+    let reportRows = Array.from(buckets.values())
+      .map(b => ({
+        partyId: b.partyId, partyType: b.partyType, partyName: b.partyName,
+        totalSale: roundCents(b.totalSale), totalPurchase: roundCents(b.totalPurchase),
+        net: roundCents(b.totalSale - b.totalPurchase)
       }))
       .filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
 
-    return report;
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.partyType.toLowerCase().includes(q));
+    }
+
+    return reportRows;
   }
 
   static async getLoans(filters: { franchiseId: string }) {
@@ -4177,67 +4459,31 @@ export class FinanceService {
     franchiseId?: string,
     filters?: { category?: string; startDate?: Date; endDate?: Date }
   ) {
-    const { category, startDate, endDate } = filters || {};
+    const { category, endDate } = filters || {};
     const inclusiveEndDate = endDate ? new Date(endDate) : undefined;
     if (inclusiveEndDate) inclusiveEndDate.setHours(23, 59, 59, 999);
 
-    const scopeFilter = franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {};
+    // Reuse the authoritative inventory helper which accurately calculates
+    // currentStock (physical stock), transferableStock (saleable/available),
+    // and correctly scopes reservations and quarantines, respecting asOfDate.
+    const inventory = await (await import('../inventory/inventory.service')).InventoryService.getInventory(
+      franchiseId,
+      false, // includeInactive
+      undefined, // excludeCategories
+      category && category !== 'ALL' ? (category as ItemCategory) : undefined,
+      inclusiveEndDate ? inclusiveEndDate.toISOString() : undefined
+    );
 
-    const items = await prisma.inventoryItem.findMany({
-      where: {
-        ...scopeFilter,
-        isActive: true,
-        ...(category && category !== 'ALL' ? { category: category as ItemCategory } : {})
-      },
-      orderBy: { name: 'asc' }
-    });
-
-    const itemIds = items.map(i => i.id);
-
-    // Compute stock from movements as of inclusiveEndDate (or up to current if not provided)
-    const movements = await prisma.stockMovement.findMany({
-      where: {
-        itemId: { in: itemIds },
-        ...(inclusiveEndDate ? { createdAt: { lte: inclusiveEndDate } } : {})
-      },
-      select: { itemId: true, quantity: true, baseQty: true }
-    });
-
-    const stockMap = new Map<string, number>();
-    for (const m of movements) {
-      const val = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
-      stockMap.set(m.itemId, (stockMap.get(m.itemId) || 0) + val);
-    }
-
-    // Reserved quantity in active production runs (PENDING or IN_PROGRESS)
-    const reservedAggs = await prisma.productionItem.groupBy({
-      by: ['inventoryItemId'],
-      where: {
-        inventoryItemId: { in: itemIds },
-        production: {
-          status: { in: ['PENDING', 'IN_PROGRESS'] }
-        }
-      },
-      _sum: { usedQuantity: true }
-    });
-    const reservedMap = new Map<string, number>();
-    for (const r of reservedAggs) {
-      if (r.inventoryItemId) {
-        reservedMap.set(r.inventoryItemId, r._sum.usedQuantity || 0);
-      }
-    }
-
-    const data = items.map(item => {
+    const data = inventory.map(item => {
       const salePrice = Number(item.customerPrice || item.basePrice || item.franchisePrice || 0);
       const purchasePrice = Number(item.costPrice || 0);
 
-      const hasMovements = stockMap.has(item.id);
-      const stockQty = hasMovements
-        ? (stockMap.get(item.id) ?? 0)
-        : (inclusiveEndDate ? 0 : (item.currentStock || 0));
+      // InventoryService.getInventory natively computes physical stock as currentStock
+      // and saleable stock as transferableStock.
+      const stockQty = item.currentStock;
+      const availableQty = item.transferableStock;
+      const reservedQty = Math.max(0, stockQty - availableQty); // Derive reserved/blocked difference
 
-      const reservedQty = reservedMap.get(item.id) || 0;
-      const availableQty = Math.max(0, stockQty - reservedQty);
       const qtyForSale = availableQty;
       const stockValue = stockQty > 0 ? stockQty * purchasePrice : 0;
 
@@ -4261,7 +4507,7 @@ export class FinanceService {
         reservedStock: reservedQty,
         stockValue,
         minimumStock: item.minimumStock || 10,
-        status: stockQty <= (item.minimumStock || 10) ? 'LOW' : 'SAFE'
+        status: item.status
       };
     });
 
@@ -4269,23 +4515,36 @@ export class FinanceService {
   }
 
   static async getLowStockSummaryData(franchiseId: string) {
-    const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
-      orderBy: { name: 'asc' }
-    });
-    const data = items
-      .filter(item => (item.currentStock || 0) <= (item.minimumStock || 10))
+    // Reuse authoritative inventory helper for consistent stock value
+    const inventory = await (await import('../inventory/inventory.service')).InventoryService.getInventory(
+      franchiseId,
+      false, // includeInactive
+      undefined, // excludeCategories
+      undefined, // category
+      undefined // asOfDate
+    );
+
+    const data = inventory
       .map(item => {
-        const stockQty = item.currentStock || 0;
-        const purchasePrice = item.costPrice || 0;
-        const stockValue = stockQty > 0 ? stockQty * purchasePrice : 0;
+        const stockQty = item.currentStock;
+        const minStock = item.minimumStock || 10;
+        
+        let status = 'NORMAL';
+        if (stockQty <= 0) {
+          status = 'OUT_OF_STOCK';
+        } else if (minStock > 0 && stockQty <= minStock) {
+          status = 'RUNNING_LOW';
+        }
+
         return {
           itemName: item.name,
-          minimumStock: item.minimumStock || 10,
+          minimumStock: minStock,
           stockQty,
-          stockValue
+          status,
+          stockValue: stockQty > 0 ? stockQty * (item.costPrice || 0) : 0
         };
-      });
+      })
+      .filter(item => item.status === 'OUT_OF_STOCK' || item.status === 'RUNNING_LOW');
 
     return data;
   }
@@ -4735,48 +4994,51 @@ export class FinanceService {
       })
     ]);
 
-    const priorInwardTypes = ['PURCHASE_IN', 'PRODUCTION_IN', 'TRANSFER_IN', 'RECALL_RETURN_IN'];
-    const priorOutwardTypes = ['SALES_OUT', 'PRODUCTION_OUT', 'WASTE_OUT', 'TRANSFER_OUT', 'RETURN_OUT', 'RETURN_QUARANTINE_IN'];
-
     const priorMap: Record<string, number> = {};
     priorMovements.forEach(m => {
+      const dir = getStockMovementDirection(m.movementType, m.quantity);
       if (!priorMap[m.itemId]) priorMap[m.itemId] = 0;
-      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
-        priorMap[m.itemId] += m.quantity;
-      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
+      if (dir === 'IN') {
+        priorMap[m.itemId] += Math.abs(m.quantity);
+      } else {
         priorMap[m.itemId] -= Math.abs(m.quantity);
       }
     });
 
-    const periodInMap: Record<string, number> = {};
-    const periodOutMap: Record<string, number> = {};
+    const periodInMap: Record<string, { qty: number, amt: number }> = {};
+    const periodOutMap: Record<string, { qty: number, amt: number }> = {};
     periodMovements.forEach(m => {
-      if (!periodInMap[m.itemId]) periodInMap[m.itemId] = 0;
-      if (!periodOutMap[m.itemId]) periodOutMap[m.itemId] = 0;
+      const dir = getStockMovementDirection(m.movementType, m.quantity);
+      if (!periodInMap[m.itemId]) periodInMap[m.itemId] = { qty: 0, amt: 0 };
+      if (!periodOutMap[m.itemId]) periodOutMap[m.itemId] = { qty: 0, amt: 0 };
 
-      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
-        periodInMap[m.itemId] += m.quantity;
-      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
-        periodOutMap[m.itemId] += Math.abs(m.quantity);
+      const absQty = Math.abs(m.quantity);
+      const amt = absQty * (m.unitCost || 0);
+
+      if (dir === 'IN') {
+        periodInMap[m.itemId].qty += absQty;
+        periodInMap[m.itemId].amt += amt;
+      } else {
+        periodOutMap[m.itemId].qty += absQty;
+        periodOutMap[m.itemId].amt += amt;
       }
     });
 
     return items.map(item => {
       const beginningQuantity = start ? (priorMap[item.id] || 0) : 0;
-      const quantityIn = periodInMap[item.id] || 0;
-      const quantityOut = periodOutMap[item.id] || 0;
+      const quantityIn = periodInMap[item.id]?.qty || 0;
+      const purchaseAmount = periodInMap[item.id]?.amt || 0;
+      const quantityOut = periodOutMap[item.id]?.qty || 0;
+      const saleAmount = periodOutMap[item.id]?.amt || 0;
       const closingQuantity = beginningQuantity + quantityIn - quantityOut;
-
-      const purchasePrice = item.costPrice || 0;
-      const salePrice = item.customerPrice || item.basePrice || 0;
 
       return {
         itemName: item.name,
         beginningQuantity: Number(beginningQuantity.toFixed(2)),
         quantityIn: Number(quantityIn.toFixed(2)),
-        purchaseAmount: Number((quantityIn * purchasePrice).toFixed(2)),
+        purchaseAmount: Number(purchaseAmount.toFixed(2)),
         quantityOut: Number(quantityOut.toFixed(2)),
-        saleAmount: Number((quantityOut * salePrice).toFixed(2)),
+        saleAmount: Number(saleAmount.toFixed(2)),
         closingQuantity: Number(closingQuantity.toFixed(2))
       };
     });
@@ -5868,33 +6130,115 @@ export class FinanceService {
       }
     } : {};
 
-    const orders = await prisma.order.findMany({
-      where: { ...(franchiseId ? { franchiseId } : {}), discountAmount: { gt: 0 }, status: 'COMPLETED', ...dateFilter },
-      include: { orderItems: { include: { product: true } } },
-      orderBy: { createdAt: 'desc' }
-    });
+    const [orders, returnOrders] = await Promise.all([
+      prisma.order.findMany({
+        where: finalSaleWhere({
+          ...(franchiseId ? { franchiseId } : {}),
+          ...dateFilter
+        }),
+        include: { orderItems: { include: { product: true } } },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.returnOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: 'COMPLETED' as any,
+          ...dateFilter
+        },
+        include: { items: true }
+      })
+    ]);
 
-    const itemMap: Record<string, { itemName: string; totalSaleQty: number; totalSaleAmount: number; totalDiscountAmount: number }> = {};
+    interface ItemAgg {
+      itemId: string;
+      itemName: string;
+      totalSales: number;
+      discountAmount: number;
+      totalQtySold: number;
+    }
+
+    const itemMap: Record<string, ItemAgg> = {};
 
     orders.forEach(o => {
-      o.orderItems.forEach(item => {
-        const name = item.product?.name || item.productId;
-        if (!itemMap[name]) itemMap[name] = { itemName: name, totalSaleQty: 0, totalSaleAmount: 0, totalDiscountAmount: 0 };
-        itemMap[name].totalSaleQty += item.quantity || 0;
-        itemMap[name].totalSaleAmount += item.totalAmount || 0;
-        const itemSubtotal = (item.quantity || 0) * (item.price || 0);
-        itemMap[name].totalDiscountAmount += itemSubtotal * ((item.discountPct || 0) / 100);
+      const orderGross = o.orderItems.reduce((sum, item) => sum + (item.quantity || 0) * (item.price || 0), 0);
+      
+      let lineDiscountsSum = 0;
+      const lineDetails = o.orderItems.map(item => {
+        const gross = (item.quantity || 0) * (item.price || 0);
+        const lineDisc = gross * ((item.discountPct || 0) / 100);
+        lineDiscountsSum += lineDisc;
+        return { item, gross, lineDisc };
+      });
+
+      const orderHeaderDiscount = o.discountAmount || 0;
+      const excessOrderDiscount = Math.max(0, orderHeaderDiscount - lineDiscountsSum);
+
+      lineDetails.forEach(({ item, gross, lineDisc }) => {
+        const id = item.productId || 'unknown';
+        const name = item.product?.name || item.productId || 'Unknown Item';
+
+        let itemDisc = lineDisc;
+        if (excessOrderDiscount > 0 && orderGross > 0) {
+          itemDisc += excessOrderDiscount * (gross / orderGross);
+        }
+
+        if (!itemMap[id]) {
+          itemMap[id] = {
+            itemId: id,
+            itemName: name,
+            totalSales: 0,
+            discountAmount: 0,
+            totalQtySold: 0
+          };
+        }
+
+        itemMap[id].totalSales += gross;
+        itemMap[id].discountAmount += itemDisc;
+        itemMap[id].totalQtySold += (item.quantity || 0);
       });
     });
 
-    const data = Object.values(itemMap).map(r => ({
-      ...r,
-      totalSaleQty: Number(r.totalSaleQty.toFixed(2)),
-      totalSaleAmount: Number(r.totalSaleAmount.toFixed(2)),
-      totalDiscountAmount: Number(r.totalDiscountAmount.toFixed(2))
-    }));
+    returnOrders.forEach(ret => {
+      ret.items.forEach(rItem => {
+        const id = rItem.productId;
+        if (id && itemMap[id]) {
+          const retQty = rItem.quantity || 0;
+          const retRate = rItem.rate || 0;
+          const retGross = retQty * retRate;
+          const retDisc = rItem.discountAmount || 0;
 
-    return { data, totalDiscount: data.reduce((s, r) => s + r.totalDiscountAmount, 0) };
+          itemMap[id].totalSales = Math.max(0, itemMap[id].totalSales - retGross);
+          itemMap[id].discountAmount = Math.max(0, itemMap[id].discountAmount - retDisc);
+          itemMap[id].totalQtySold = Math.max(0, itemMap[id].totalQtySold - retQty);
+        }
+      });
+    });
+
+    const data = Object.values(itemMap)
+      .filter(r => r.discountAmount > 0.0001)
+      .map(r => {
+        const totalSales = Number(r.totalSales.toFixed(2));
+        const discountAmount = Number(r.discountAmount.toFixed(2));
+        const netAmount = Number(Math.max(0, totalSales - discountAmount).toFixed(2));
+        const discountPct = totalSales > 0 ? Number(((discountAmount / totalSales) * 100).toFixed(2)) : 0;
+
+        return {
+          itemId: r.itemId,
+          itemName: r.itemName,
+          totalSales,
+          discountAmount,
+          discountPct,
+          netAmount,
+          totalQtySold: Number(r.totalQtySold.toFixed(2)),
+          totalSaleQty: Number(r.totalQtySold.toFixed(2)),
+          totalSaleAmount: totalSales,
+          totalDiscountAmount: discountAmount
+        };
+      });
+
+    const totalDiscount = Number(data.reduce((s, r) => s + r.discountAmount, 0).toFixed(2));
+
+    return { data, totalDiscount };
   }
 
   static async getSalePurchaseByCategoryData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string): Promise<any> {
@@ -6258,8 +6602,13 @@ export class FinanceService {
       endDate: endDate ? new Date(endDate) : undefined
     });
 
+    // Grouped by the authoritative ResolvedPartyType each party row already
+    // carries (not a re-derived label) — a Vendor's purchase can no longer
+    // land in the "Franchises" bucket the way it did before getSalePurchaseByParty
+    // itself was fixed to key by id+type instead of name.
     const groupMap: Record<string, { groupName: string; totalSale: number; totalPurchase: number; net: number }> = {};
-    const getGroup = (name: string) => {
+    const getGroup = (partyType: ResolvedPartyType) => {
+      const name = partyTypeGroupLabel(partyType);
       if (!groupMap[name]) groupMap[name] = { groupName: name, totalSale: 0, totalPurchase: 0, net: 0 };
       return groupMap[name];
     };
@@ -6271,7 +6620,9 @@ export class FinanceService {
       group.net += party.net;
     }
 
-    return Object.values(groupMap).filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
+    return Object.values(groupMap)
+      .map(g => ({ groupName: g.groupName, totalSale: roundCents(g.totalSale), totalPurchase: roundCents(g.totalPurchase), net: roundCents(g.net) }))
+      .filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
   }
 
   /**

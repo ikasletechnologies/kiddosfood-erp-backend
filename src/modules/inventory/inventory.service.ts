@@ -542,53 +542,8 @@ export class InventoryService {
 
     const updated = await prisma.inventoryItem.update({ where: { id }, data: updatePayload });
 
-    // Handle opening/initial stock updates safely through stock movement ledger
-    if (data.initialStock !== undefined) {
-      const newInitialStock = Number(data.initialStock) || 0;
-      
-      const openingMovement = await prisma.stockMovement.findFirst({
-        where: {
-          itemId: id,
-          note: 'Opening Stock Balance'
-        }
-      });
-
-      if (openingMovement) {
-        const diff = newInitialStock - openingMovement.quantity;
-        if (diff !== 0) {
-          await prisma.$transaction(async tx => {
-            await tx.stockMovement.update({
-              where: { id: openingMovement.id },
-              data: { quantity: newInitialStock }
-            });
-            // Update cache currentStock
-            await tx.inventoryItem.update({
-              where: { id },
-              data: { currentStock: { increment: diff } }
-            });
-          });
-        }
-      } else if (newInitialStock > 0) {
-        await prisma.$transaction(async tx => {
-          await tx.stockMovement.create({
-            data: {
-              itemId: id,
-              movementType: StockMovementType.ADJUSTMENT,
-              quantity: newInitialStock,
-              referenceType: 'ADJUSTMENT',
-              note: 'Opening Stock Balance',
-              createdBy: data.userId,
-              warehouseId: (data.binLocation || data.warehouseId || '').trim() || null
-            }
-          });
-          // Update cache currentStock
-          await tx.inventoryItem.update({
-            where: { id },
-            data: { currentStock: { increment: newInitialStock } }
-          });
-        });
-      }
-    }
+    // Master-data updates must NEVER mutate stock, change currentStock, or create StockMovements.
+    // Stock adjustments are handled strictly via explicit inventory transaction endpoints.
 
     // Sync on update as well if category is orderable — same best-effort
     // resilience as createItem: this must never fail the user's actual
