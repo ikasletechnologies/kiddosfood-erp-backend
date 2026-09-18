@@ -674,6 +674,21 @@ export class InventoryService {
       const difference = data.newQuantity - computedStock;
       if (difference === 0) return { message: 'No change needed' };
 
+      // A positive adjustment (physical count found MORE stock, or an
+      // opening balance) must land in an APPROVED InventoryBatch, not just
+      // bump currentStock — every strict-FIFO consumer (Delivery Challan
+      // dispatch, Production, POS) only ever draws from APPROVED batch rows,
+      // so ledger-only stock is invisible to them and gets rejected as
+      // "Insufficient approved stock" even though currentStock shows
+      // plenty. A negative adjustment already goes through recordMovement's
+      // FIFO-depletion branch, which consumes real batches, so it needs no
+      // such passthrough.
+      let receiveAtCost: { unitCost: number; batchNumber: string } | undefined;
+      if (difference > 0) {
+        const item = await tx.inventoryItem.findUnique({ where: { id: data.itemId }, select: { costPrice: true } });
+        receiveAtCost = { unitCost: item?.costPrice || 0, batchNumber: `ADJ-${Date.now()}` };
+      }
+
       return this.recordMovement(tx, {
         itemId: data.itemId,
         type: StockMovementType.ADJUSTMENT,
@@ -682,6 +697,7 @@ export class InventoryService {
         referenceType: 'ADJUSTMENT',
         note: data.note || 'Physical count adjustment',
         userId: data.userId,
+        receiveAtCost,
       });
     });
   }
