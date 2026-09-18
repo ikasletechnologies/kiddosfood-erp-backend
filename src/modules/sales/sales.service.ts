@@ -3160,18 +3160,37 @@ export class SalesService {
     }
   }
 
-  static async getDeliveryChallans(filters: { customerId?: string; status?: string; search?: string }) {
+  static async getDeliveryChallans(filters: { customerId?: string; status?: string; search?: string; franchiseId?: string }) {
     // One-time safe migration: legacy rows stored status 'OPEN' before the IN_TRANSIT rename
     await prisma.deliveryChallan.updateMany({ where: { status: 'OPEN' }, data: { status: 'IN_TRANSIT' } });
 
     const where: any = {};
     if (filters.customerId) where.customerId = filters.customerId;
     if (filters.status) where.status = filters.status;
+    if (filters.franchiseId) {
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      if (hq && hq.id === filters.franchiseId) {
+        where.OR = [
+          { sourceFranchiseId: filters.franchiseId },
+          { sourceFranchiseId: null }
+        ];
+      } else {
+        where.OR = [
+          { sourceFranchiseId: filters.franchiseId },
+          { franchiseId: filters.franchiseId }
+        ];
+      }
+    }
     if (filters.search) {
-      where.OR = [
+      const searchOr = [
         { challanNumber: { contains: filters.search, mode: 'insensitive' } },
         { vehicleNo: { contains: filters.search, mode: 'insensitive' } }
       ];
+      if (where.OR) {
+        where.AND = [{ OR: searchOr }];
+      } else {
+        where.OR = searchOr;
+      }
     }
     return prisma.deliveryChallan.findMany({
       where,
@@ -3243,6 +3262,21 @@ export class SalesService {
     }
 
     SalesService.assertSingleDestination(data.customerId, data.dealerId, data.franchiseId);
+    if (data.customerId) {
+      const customer = await prisma.customer.findUnique({ where: { id: data.customerId } });
+      if (!customer) throw new Error('Selected customer not found.');
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      const isHqChallan = !data.sourceFranchiseId || (hq && hq.id === data.sourceFranchiseId);
+      if (isHqChallan) {
+        if (customer.franchiseId && hq && customer.franchiseId !== hq.id) {
+          throw new Error(`Customer "${customer.name}" belongs to a branch franchise and cannot receive challans from HQ.`);
+        }
+      } else {
+        if (customer.franchiseId !== data.sourceFranchiseId) {
+          throw new Error(`Customer "${customer.name}" does not belong to this franchise.`);
+        }
+      }
+    }
     if (data.dealerId) {
       const dealer = await prisma.dealer.findUnique({ where: { id: data.dealerId } });
       if (!dealer) throw new Error('Selected dealer not found.');
@@ -4038,8 +4072,13 @@ export class SalesService {
       const product = await tx.product.findUnique({ where: { id: item.productId } });
       if (!product || !product.sku) continue;
 
+      const hq = await FranchiseService.getHqFranchiseOrNull();
+      const isHqSource = !sourceId || (hq && hq.id === sourceId);
       const sourceItem = await tx.inventoryItem.findFirst({
-        where: { franchiseId: sourceId, sku: product.sku }
+        where: {
+          sku: product.sku,
+          ...(isHqSource ? { OR: [{ franchiseId: sourceId }, { franchiseId: null }] } : { franchiseId: sourceId })
+        }
       });
 
       if (sourceItem) {

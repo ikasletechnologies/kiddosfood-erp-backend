@@ -7,6 +7,7 @@ import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { FranchiseService } from '../franchise/franchise.service';
+import { InventoryService } from '../inventory/inventory.service';
 import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
@@ -1818,6 +1819,7 @@ export class FinanceService {
     deliveryCharges?: number;
     sourceFranchiseOrderId?: string;
     sourceQuotationId?: string;
+    sourceDeliveryChallanId?: string;
     roundOff?: number;
     stateOfSupply?: string;
     paymentType?: string;
@@ -1836,6 +1838,23 @@ export class FinanceService {
     }
 
     return prisma.$transaction(async (tx) => {
+      let sourceChallan: any = null;
+      if (data.sourceDeliveryChallanId) {
+        sourceChallan = await tx.deliveryChallan.findUnique({
+          where: { id: data.sourceDeliveryChallanId }
+        });
+        if (!sourceChallan) {
+          throw new Error('Source delivery challan not found.');
+        }
+        if (sourceChallan.status === 'CONVERTED') {
+          throw new Error('This delivery challan has already been converted to a sale.');
+        }
+        const currentDcStatus = sourceChallan.status === 'OPEN' ? 'IN_TRANSIT' : sourceChallan.status;
+        if (currentDcStatus !== 'CLOSED') {
+          throw new Error('Only delivered challans can be converted to sale (current status: ' + sourceChallan.status + ').');
+        }
+      }
+
       let subTotal = 0;
       let totalDiscount = data.discountAmount || 0;
       let totalTax = 0;
@@ -1863,9 +1882,76 @@ export class FinanceService {
       // manual/negotiated value — this chain has never had a separate
       // InventoryItem-configured "Customer Retail Discount" wired in, and
       // this fix does not introduce one.
+      // Customer tenancy validation
+      const effectiveCustomerId = data.partyType === 'CUSTOMER' ? (data.customerId || data.partyId) : data.customerId;
+      if (effectiveCustomerId) {
+        const customer = await tx.customer.findUnique({ where: { id: effectiveCustomerId } });
+        if (!customer) {
+          throw new Error('Selected customer not found.');
+        }
+        const hq = await FranchiseService.getHqFranchiseOrNull();
+        const isHqInvoice = !data.franchiseId || (hq && hq.id === data.franchiseId);
+        if (isHqInvoice) {
+          if (customer.franchiseId && hq && customer.franchiseId !== hq.id) {
+            throw new Error(`Customer "${customer.name}" belongs to a branch franchise and cannot be invoiced from HQ.`);
+          }
+        } else {
+          if (customer.franchiseId !== data.franchiseId) {
+            throw new Error(`Customer "${customer.name}" does not belong to this franchise branch.`);
+          }
+        }
+      }
+
       const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, data.franchiseId);
       const resolvedInvoicePartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
         data.partyType === 'DEALER' ? 'DEALER' : data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
+
+      // 1. Validate real stock for all items before invoice creation
+      const itemsToDeduct: Array<{
+        inventoryItem: any;
+        requiredBaseQty: number;
+        orderItemQty: number;
+        unitId?: string;
+        product: any;
+      }> = [];
+
+      for (const checkItem of data.items) {
+        const checkQty = Number(checkItem.qty ?? checkItem.quantity ?? 0);
+        if (checkQty <= 0) continue;
+
+        if (checkItem.productId) {
+          let prod = await tx.product.findUnique({ where: { id: checkItem.productId } });
+          let invItem: any = null;
+          if (prod) {
+            invItem = prod.sku
+              ? await tx.inventoryItem.findFirst({ where: { sku: prod.sku, franchiseId: scopeFranchiseId } })
+              : await tx.inventoryItem.findFirst({ where: { name: { equals: prod.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+          } else {
+            invItem = await tx.inventoryItem.findUnique({ where: { id: checkItem.productId } });
+          }
+
+          if (invItem) {
+            const conversionResult = await InventoryService.convertUnitToBase(invItem.id, checkItem.unit || 'NONE', checkQty, tx);
+            const requiredBaseQty = conversionResult.requiredBaseQty;
+            const availableStock = invItem.currentStock ?? 0;
+
+            if (availableStock < requiredBaseQty) {
+              const unitLabel = (invItem.baseUnit as any)?.shortName || (invItem.baseUnit as any)?.name || invItem.unit || 'Units';
+              throw new Error(
+                `Insufficient stock for "${invItem.name}" (SKU: ${invItem.sku || 'N/A'}). Available: ${availableStock} ${unitLabel}, Required: ${requiredBaseQty} ${unitLabel}. Invoice creation blocked.`
+              );
+            }
+
+            itemsToDeduct.push({
+              inventoryItem: invItem,
+              requiredBaseQty,
+              orderItemQty: checkQty,
+              unitId: conversionResult.unitId,
+              product: prod || { name: invItem.name, sku: invItem.sku }
+            });
+          }
+        }
+      }
 
       for (const item of data.items) {
         const qty = Number(item.qty ?? item.quantity ?? 0);
@@ -2025,7 +2111,7 @@ export class FinanceService {
           paymentStatus,
           paymentType: data.paymentType || 'CASH',
           stateOfSupply: data.stateOfSupply || null,
-          inventory_deducted: false,
+          inventory_deducted: Boolean(data.sourceDeliveryChallanId),
           orderItems: {
             create: orderItemsData
           }
@@ -2045,6 +2131,17 @@ export class FinanceService {
           notes: data.notes || null,
         }
       });
+
+      if (sourceChallan) {
+        await tx.deliveryChallan.update({
+          where: { id: sourceChallan.id },
+          data: {
+            status: 'CONVERTED',
+            convertedOrderId: order.id,
+            convertedInvoiceId: invoice.id
+          }
+        });
+      }
 
       // If created from a Franchise Order, update the related FranchiseOrder with the final approved amount
       if (data.sourceFranchiseOrderId) {
@@ -2192,9 +2289,23 @@ export class FinanceService {
       }
 
       // Automatically deduct inventory based on the items sold
-      if (!data.sourceFranchiseOrderId && data.partyType !== 'FRANCHISE') {
-        await POSService.deductInventoryIfNecessary(order.id, tx);
+      for (const ded of itemsToDeduct) {
+        await InventoryService.recordMovement(tx, {
+          itemId: ded.inventoryItem.id,
+          type: 'SALES_OUT',
+          quantity: -ded.orderItemQty,
+          baseQty: -ded.requiredBaseQty,
+          transactionUnit: ded.unitId,
+          referenceType: 'ORDER',
+          referenceId: order.id,
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name})`
+        });
       }
+
+      await tx.order.update({
+        where: { id: order.id },
+        data: { inventory_deducted: true }
+      });
 
       return {
         ...invoice,
@@ -3091,6 +3202,12 @@ export class FinanceService {
     // Build individual account details
     const accountDetails = accounts.map(a => ({ name: a.name, type: a.type, balance: a.balance || 0 }));
 
+        const totalAssets = currentAssetsAmount;
+    const totalLiabilities = currentLiabilitiesAmount;
+    const totalEquity = netProfit;
+    const totalLiabilitiesAndEquity = totalLiabilities + totalEquity;
+    const balancingDifference = totalAssets - totalLiabilitiesAndEquity;
+
     return {
       assets: [
         { name: "Fixed Assets", amount: 0, notes: "—" },
@@ -3121,7 +3238,13 @@ export class FinanceService {
         totalSales,
         totalCOGS,
         totalExpenses,
-        netProfit
+        netProfit,
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        totalLiabilitiesAndEquity,
+        balancingDifference,
+        isBalanced: Math.abs(balancingDifference) < 0.01
       }
     };
   }
@@ -3343,18 +3466,21 @@ export class FinanceService {
     vendorId?: string;
     dealerId?: string;
     partyId?: string;
-    partyType?: 'CUSTOMER' | 'DEALER' | 'VENDOR';
+    partyType?: 'CUSTOMER' | 'DEALER' | 'VENDOR' | 'FRANCHISE';
     partyName?: string;
+    search?: string;
     startDate?: Date;
     endDate?: Date;
+    page?: number;
+    limit?: number;
   }) {
     const { franchiseId, startDate, endDate } = filters;
-    const targetPartyId = (filters.partyId || filters.customerId || '').trim();
-    const targetPartyName = (filters.partyName || '').trim();
+    const targetPartyId = (filters.partyId || filters.customerId || filters.vendorId || filters.dealerId || '').trim();
+    const targetPartyName = (filters.partyName || filters.search || '').trim();
     const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch all customers, dealers, and vendors to populate dropdown & identify requested party
-    const [customersList, dealersList, vendorsList] = await Promise.all([
+    // Fetch all customers, dealers, vendors, and franchises for dropdown & identification
+    const [customersList, dealersList, vendorsList, franchisesList] = await Promise.all([
       prisma.customer.findMany({
         where: franchiseId ? { franchiseId } : {},
         select: { id: true, name: true, phone: true }
@@ -3365,301 +3491,120 @@ export class FinanceService {
       }),
       prisma.vendor.findMany({
         select: { id: true, name: true, contact: true }
+      }),
+      prisma.franchise.findMany({
+        select: { id: true, name: true, contactNum: true }
       })
     ]);
 
     const combinedParties = [
-      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' })),
-      ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' })),
-      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' }))
+      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' as const })),
+      ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' as const })),
+      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' as const })),
+      ...franchisesList.map(f => ({ id: f.id, name: f.name, phone: f.contactNum, partyType: 'FRANCHISE' as const }))
     ];
 
     // Determine target party
-    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR' } | null = null;
+    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR' | 'FRANCHISE' } | null = null;
 
     if (targetPartyId) {
       const match = combinedParties.find(p => p.id === targetPartyId);
-      if (match) {
-        resolvedParty = match as any;
-      }
+      if (match) resolvedParty = match;
     }
 
     if (!resolvedParty && targetPartyName) {
-      const nameMatch = combinedParties.find(p => p.name.toLowerCase() === targetPartyName.toLowerCase())
-        || combinedParties.find(p => p.name.toLowerCase().includes(targetPartyName.toLowerCase()));
-      if (nameMatch) {
-        resolvedParty = nameMatch as any;
-      }
+      const q = targetPartyName.toLowerCase();
+      const match = combinedParties.find(p => p.name.toLowerCase() === q)
+        || combinedParties.find(p => p.name.toLowerCase().includes(q));
+      if (match) resolvedParty = match;
     }
 
-    if (!resolvedParty) {
-      return {
-        customers: combinedParties,
-        transactions: [],
-        summary: {
-          totalSale: 0,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn: 0,
-          totalMoneyOut: 0,
-          totalReceivable: 0,
-          totalPayable: 0
-        }
-      };
-    }
+    type RawTxn = {
+      date: Date;
+      txnType: string;
+      refNo: string;
+      particular: string;
+      paymentType: string;
+      debit: number;
+      credit: number;
+      total: number;
+      partyName?: string;
+      partyType?: string;
+    };
 
-    const { id: partyId, partyType } = resolvedParty;
+    let rawTxns: RawTxn[] = [];
+    let openingBal = 0;
+    let accountingType: 'RECEIVABLE' | 'PAYABLE' = 'RECEIVABLE';
 
-    // --- 1. DEALER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
-    if (partyType === 'DEALER') {
-      const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
-      const openingBal = Number(dealer?.openingBalance) || 0;
-      let runningBalance = openingBal;
+    if (resolvedParty) {
+      const { id: partyId, partyType } = resolvedParty;
 
-      const [orders, payments, challans] = await Promise.all([
-        prisma.order.findMany({
-          where: {
-            partyType: 'DEALER',
-            partyId,
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          include: {
-            payments: { where: { isCancelled: false } }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.payment.findMany({
-          where: {
-            entityType: 'DEALER',
-            entityId: partyId,
-            isCancelled: false,
-            status: 'SUCCESS',
-            orderId: null, // Avoid double counting payments directly on orders
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.deliveryChallan.findMany({
-          where: {
-            dealerId: partyId,
-            challanDate: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { challanDate: 'asc' }
-        })
-      ]);
+      // ── 1. DEALER ──
+      if (partyType === 'DEALER') {
+        accountingType = 'RECEIVABLE';
+        const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
+        openingBal = Number(dealer?.openingBalance) || 0;
 
-      type RawTxn = {
-        date: Date;
-        txnType: string;
-        refNo: string;
-        paymentType: string;
-        debit: number;
-        credit: number;
-        total: number;
-        note?: string;
-      };
+        const [orders, payments, challans] = await Promise.all([
+          prisma.order.findMany({
+            where: {
+              partyType: 'DEALER',
+              partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            include: { payments: { where: { isCancelled: false } } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'DEALER',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              orderId: null,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.deliveryChallan.findMany({
+            where: {
+              dealerId: partyId,
+              ...(start || end ? { challanDate: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { challanDate: 'asc' }
+          })
+        ]);
 
-      const rawTxns: RawTxn[] = [];
-
-      // Opening balance entry if within range or as first row
-      if (openingBal !== 0 && (!start || (dealer?.asOfDate && new Date(dealer.asOfDate) >= start))) {
-        rawTxns.push({
-          date: dealer?.asOfDate ? new Date(dealer.asOfDate) : (dealer?.createdAt || new Date()),
-          txnType: 'Opening Balance',
-          refNo: 'OB-0001',
-          paymentType: '—',
-          debit: openingBal > 0 ? openingBal : 0,
-          credit: openingBal < 0 ? Math.abs(openingBal) : 0,
-          total: Math.abs(openingBal),
-          note: 'Dealer Opening Balance'
-        });
-      }
-
-      for (const o of orders) {
-        rawTxns.push({
-          date: o.createdAt,
-          txnType: 'POS Sale',
-          refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
-          paymentType: o.paymentType || 'CASH',
-          debit: o.totalAmount,
-          credit: 0,
-          total: o.totalAmount
-        });
-
-        for (const p of o.payments) {
-          rawTxns.push({
-            date: p.createdAt,
-            txnType: 'Payment-In',
-            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
-            paymentType: p.paymentMode || 'CASH',
-            debit: 0,
-            credit: p.paidAmount,
-            total: p.paidAmount
-          });
-        }
-      }
-
-      for (const p of payments) {
-        rawTxns.push({
-          date: p.createdAt,
-          txnType: 'Payment-In',
-          refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
-          paymentType: p.paymentMode || 'CASH',
-          debit: 0,
-          credit: p.paidAmount,
-          total: p.paidAmount
-        });
-      }
-
-      for (const c of challans) {
-        rawTxns.push({
-          date: c.challanDate,
-          txnType: 'Delivery Challan',
-          refNo: c.challanNumber || c.id.slice(0, 8).toUpperCase(),
-          paymentType: '—',
-          debit: 0,
-          credit: 0,
-          total: c.totalAmount
-        });
-      }
-
-      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-      let totalSale = 0;
-      let totalMoneyIn = 0;
-      runningBalance = 0;
-
-      const transactions = rawTxns.map(t => {
-        totalSale += t.debit;
-        totalMoneyIn += t.credit;
-        // Receivable increases with debits (sales), decreases with credits (payments)
-        runningBalance += t.debit - t.credit;
-
-        return {
-          date: new Date(t.date).toISOString().split('T')[0],
-          txnType: t.txnType,
-          refNo: t.refNo,
-          paymentType: t.paymentType,
-          total: t.total,
-          debit: t.debit,
-          credit: t.credit,
-          receivedPaid: t.credit > 0 ? t.credit : t.debit,
-          txnBalance: t.total,
-          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
-          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
-          runningBalance
-        };
-      });
-
-      return {
-        customers: combinedParties,
-        partyType: 'DEALER',
-        partyName: resolvedParty.name,
-        accountingType: 'RECEIVABLE',
-        transactions,
-        summary: {
-          totalSale,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn,
-          totalMoneyOut: 0,
-          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
-          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
-        }
-      };
-    }
-
-    // --- 2. CUSTOMER (RECEIVABLE: Debits increase receivable, Credits decrease receivable) ---
-    if (partyType === 'CUSTOMER') {
-      const customer = await prisma.customer.findUnique({ where: { id: partyId } });
-      const openingBal = Number(customer?.openingBalance) || 0;
-
-      const [ledgers, orders] = await Promise.all([
-        prisma.customerLedger.findMany({
-          where: {
-            customerId: partyId,
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          orderBy: { createdAt: 'asc' }
-        }),
-        prisma.order.findMany({
-          where: {
-            customerId: partyId,
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {})
-            }
-          },
-          include: {
-            payments: { where: { isCancelled: false } }
-          },
-          orderBy: { createdAt: 'asc' }
-        })
-      ]);
-
-      let rawTxns: Array<{
-        date: Date;
-        txnType: string;
-        refNo: string;
-        paymentType: string;
-        debit: number;
-        credit: number;
-        total: number;
-      }> = [];
-
-      if (ledgers.length > 0) {
-        rawTxns = ledgers.map(l => ({
-          date: l.createdAt,
-          txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
-          refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
-          paymentType: l.paymentMode || '—',
-          debit: l.type === 'DEBIT' ? l.amount : 0,
-          credit: l.type === 'CREDIT' ? l.amount : 0,
-          total: l.amount
-        }));
-      } else {
-        // Synthesize from orders & payments & opening balance
         if (openingBal !== 0) {
           rawTxns.push({
-            date: customer?.asOfDate ? new Date(customer.asOfDate) : (customer?.createdAt || new Date()),
+            date: dealer?.asOfDate ? new Date(dealer.asOfDate) : (dealer?.createdAt || new Date(2026, 0, 1)),
             txnType: 'Opening Balance',
+            particular: 'Dealer Opening Balance',
             refNo: 'OB-0001',
             paymentType: '—',
             debit: openingBal > 0 ? openingBal : 0,
             credit: openingBal < 0 ? Math.abs(openingBal) : 0,
-            total: Math.abs(openingBal)
+            total: Math.abs(openingBal),
           });
         }
 
         for (const o of orders) {
           rawTxns.push({
             date: o.createdAt,
-            txnType: 'Sale',
+            txnType: 'POS Sale',
+            particular: 'Sale Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
             refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
             paymentType: o.paymentType || 'CASH',
             debit: o.totalAmount,
             credit: 0,
             total: o.totalAmount
           });
-
           for (const p of o.payments) {
             rawTxns.push({
               date: p.createdAt,
               txnType: 'Payment-In',
+              particular: 'Payment Received ' + (p.paymentNumber || p.transactionRef || ''),
               refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
               paymentType: p.paymentMode || 'CASH',
               debit: 0,
@@ -3668,109 +3613,446 @@ export class FinanceService {
             });
           }
         }
+
+        for (const p of payments) {
+          rawTxns.push({
+            date: p.createdAt,
+            txnType: 'Payment-In',
+            particular: 'Direct Payment ' + (p.paymentNumber || p.transactionRef || ''),
+            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+            paymentType: p.paymentMode || 'CASH',
+            debit: 0,
+            credit: p.paidAmount,
+            total: p.paidAmount
+          });
+        }
+
+        for (const c of challans) {
+          rawTxns.push({
+            date: c.challanDate,
+            txnType: 'Delivery Challan',
+            particular: 'Challan ' + (c.challanNumber || ''),
+            refNo: c.challanNumber || c.id.slice(0, 8).toUpperCase(),
+            paymentType: '—',
+            debit: 0,
+            credit: 0,
+            total: c.totalAmount
+          });
+        }
       }
 
-      rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      // ── 2. CUSTOMER ──
+      else if (partyType === 'CUSTOMER') {
+        accountingType = 'RECEIVABLE';
+        const customer = await prisma.customer.findUnique({ where: { id: partyId } });
+        openingBal = Number(customer?.openingBalance) || 0;
 
-      let totalSale = 0;
-      let totalMoneyIn = 0;
-      let runningBalance = 0;
+        const [ledgers, orders, payments] = await Promise.all([
+          prisma.customerLedger.findMany({
+            where: {
+              customerId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.order.findMany({
+            where: {
+              customerId: partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            include: { payments: { where: { isCancelled: false } } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'CUSTOMER',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
 
-      const transactions = rawTxns.map(t => {
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: customer?.asOfDate ? new Date(customer.asOfDate) : (customer?.createdAt || new Date(2026, 0, 1)),
+            txnType: 'Opening Balance',
+            particular: 'Customer Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal > 0 ? openingBal : 0,
+            credit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            total: Math.abs(openingBal)
+          });
+        }
+
+        if (ledgers.length > 0) {
+          for (const l of ledgers) {
+            rawTxns.push({
+              date: l.createdAt,
+              txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
+              particular: (l as any).description || l.note || (l.referenceType === 'SALE' ? 'Sales Invoice' : 'Customer Payment'),
+              refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
+              paymentType: l.paymentMode || '—',
+              debit: l.type === 'DEBIT' ? l.amount : 0,
+              credit: l.type === 'CREDIT' ? l.amount : 0,
+              total: l.amount
+            });
+          }
+        } else {
+          for (const o of orders) {
+            rawTxns.push({
+              date: o.createdAt,
+              txnType: 'Sale',
+              particular: 'Sales Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+              refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+              paymentType: o.paymentType || 'CASH',
+              debit: o.totalAmount,
+              credit: 0,
+              total: o.totalAmount
+            });
+            for (const p of o.payments) {
+              rawTxns.push({
+                date: p.createdAt,
+                txnType: 'Payment-In',
+                particular: 'Payment Received',
+                refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+                paymentType: p.paymentMode || 'CASH',
+                debit: 0,
+                credit: p.paidAmount,
+                total: p.paidAmount
+              });
+            }
+          }
+
+          for (const p of payments) {
+            if (!orders.some(o => o.payments.some(op => op.id === p.id))) {
+              rawTxns.push({
+                date: p.createdAt,
+                txnType: 'Payment-In',
+                particular: 'Customer Payment',
+                refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+                paymentType: p.paymentMode || 'CASH',
+                debit: 0,
+                credit: p.paidAmount,
+                total: p.paidAmount
+              });
+            }
+          }
+        }
+      }
+
+      // ── 3. VENDOR ──
+      else if (partyType === 'VENDOR') {
+        accountingType = 'PAYABLE';
+        const vendor = await prisma.vendor.findUnique({ where: { id: partyId } });
+        openingBal = Number(vendor?.openingBalance) || 0;
+
+        const [ledgers, invoices, orders, payments] = await Promise.all([
+          prisma.vendorLedger.findMany({
+            where: {
+              vendorId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.vendorInvoice.findMany({
+            where: {
+              vendorId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.procurementOrder.findMany({
+            where: {
+              vendorId: partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'VENDOR',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
+
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: vendor?.asOfDate ? new Date(vendor.asOfDate) : (vendor?.createdAt || new Date(2026, 0, 1)),
+            txnType: 'Opening Balance',
+            particular: 'Vendor Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            credit: openingBal > 0 ? openingBal : 0,
+            total: Math.abs(openingBal)
+          });
+        }
+
+        if (ledgers.length > 0) {
+          for (const l of ledgers) {
+            const isCredit = l.type === 'CREDIT';
+            const isDebit = l.type === 'DEBIT';
+            rawTxns.push({
+              date: l.createdAt,
+              txnType: l.referenceType ? formatReferenceType(l.referenceType) : (isCredit ? 'Purchase Bill' : 'Payment Out'),
+              particular: (l as any).description || l.note || (isCredit ? 'Purchase Bill' : 'Vendor Payment'),
+              refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
+              paymentType: l.paymentMode || '—',
+              debit: isDebit ? l.amount : 0,
+              credit: isCredit ? l.amount : 0,
+              total: l.amount
+            });
+          }
+        } else {
+          // Synthesize from vendor invoices, procurement orders, and payments
+          for (const inv of invoices) {
+            rawTxns.push({
+              date: inv.billDate || inv.createdAt,
+              txnType: 'Purchase Bill',
+              particular: 'Vendor Bill ' + (inv.invoiceNumber || ''),
+              refNo: inv.invoiceNumber || inv.id.slice(0, 8).toUpperCase(),
+              paymentType: inv.paymentType || 'CASH',
+              debit: 0,
+              credit: Number(inv.amount) || 0,
+              total: Number(inv.amount) || 0
+            });
+          }
+
+          // POs without invoice
+          for (const po of orders) {
+            if (!invoices.some(inv => inv.poId === po.id)) {
+              rawTxns.push({
+                date: po.createdAt,
+                txnType: 'Purchase Order',
+                particular: 'PO ' + (po.poNumber || ''),
+                refNo: po.poNumber || po.id.slice(0, 8).toUpperCase(),
+                paymentType: 'CASH',
+                debit: 0,
+                credit: Number(po.totalAmount) || 0,
+                total: Number(po.totalAmount) || 0
+              });
+            }
+          }
+
+          for (const pay of payments) {
+            rawTxns.push({
+              date: pay.createdAt,
+              txnType: 'Payment Out',
+              particular: pay.transactionRef || ('Payment for ' + (pay.linkedDocId || 'Bill')),
+              refNo: pay.paymentNumber || pay.id.slice(0, 8).toUpperCase(),
+              paymentType: pay.paymentMode || 'CASH',
+              debit: Number(pay.paidAmount) || 0,
+              credit: 0,
+              total: Number(pay.paidAmount) || 0
+            });
+          }
+        }
+      }
+
+      // ── 4. FRANCHISE ──
+      else if (partyType === 'FRANCHISE') {
+        accountingType = 'RECEIVABLE';
+        const [orders, payments] = await Promise.all([
+          prisma.order.findMany({
+            where: {
+              partyType: 'FRANCHISE',
+              partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'FRANCHISE',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
+
+        for (const o of orders) {
+          rawTxns.push({
+            date: o.createdAt,
+            txnType: 'Franchise Order',
+            particular: 'Franchise Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+            refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+            paymentType: o.paymentType || 'CASH',
+            debit: o.totalAmount,
+            credit: 0,
+            total: o.totalAmount
+          });
+        }
+
+        for (const p of payments) {
+          rawTxns.push({
+            date: p.createdAt,
+            txnType: 'Payment-In',
+            particular: p.transactionRef || 'Franchise Receipt',
+            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+            paymentType: p.paymentMode || 'UPI',
+            debit: 0,
+            credit: p.paidAmount,
+            total: p.paidAmount
+          });
+        }
+      }
+    } else {
+      // If no party selected, aggregate from all recent transactions across the system
+      const [vendorInvoices, vendorPayments, posOrders, posPayments] = await Promise.all([
+        prisma.vendorInvoice.findMany({
+          where: { ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {}) },
+          include: { vendor: true },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.payment.findMany({
+          where: {
+            isCancelled: false,
+            status: { in: ['SUCCESS', 'PAID'] },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.order.findMany({
+          where: {
+            status: { not: 'CANCELLED' },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.procurementOrder.findMany({
+          where: {
+            status: { not: 'CANCELLED' },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          include: { vendor: true },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        })
+      ]);
+
+      for (const vi of vendorInvoices) {
+        rawTxns.push({
+          date: vi.billDate || vi.createdAt,
+          txnType: 'Purchase Bill',
+          particular: (vi.vendor?.name ? vi.vendor.name + ' - ' : '') + 'Bill ' + (vi.invoiceNumber || ''),
+          refNo: vi.invoiceNumber || vi.id.slice(0, 8).toUpperCase(),
+          paymentType: vi.paymentType || 'CASH',
+          debit: 0,
+          credit: Number(vi.amount) || 0,
+          total: Number(vi.amount) || 0,
+          partyName: vi.vendor?.name || 'Vendor',
+          partyType: 'VENDOR'
+        });
+      }
+
+      for (const p of vendorPayments) {
+        const isVendor = p.entityType === 'VENDOR';
+        rawTxns.push({
+          date: p.createdAt,
+          txnType: isVendor ? 'Payment Out' : 'Payment-In',
+          particular: p.transactionRef || (isVendor ? 'Vendor Payment' : 'Customer/Franchise Receipt'),
+          refNo: p.paymentNumber || p.id.slice(0, 8).toUpperCase(),
+          paymentType: p.paymentMode || 'CASH',
+          debit: isVendor ? p.paidAmount : 0,
+          credit: isVendor ? 0 : p.paidAmount,
+          total: p.paidAmount,
+          partyName: p.entityType || 'Party',
+          partyType: p.entityType || undefined
+        });
+      }
+
+      for (const o of posOrders) {
+        rawTxns.push({
+          date: o.createdAt,
+          txnType: o.partyType === 'FRANCHISE' ? 'Franchise Order' : 'POS Sale',
+          particular: (o.partyType || 'Customer') + ' - ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+          refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+          paymentType: o.paymentType || 'CASH',
+          debit: o.totalAmount,
+          credit: 0,
+          total: o.totalAmount,
+          partyName: o.partyType || 'Customer',
+          partyType: o.partyType || 'CUSTOMER'
+        });
+      }
+    }
+
+    rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    let totalSale = 0;
+    let totalPurchase = 0;
+    let totalMoneyIn = 0;
+    let totalMoneyOut = 0;
+    let runningBalance = openingBal;
+
+    const transactions = rawTxns.map(t => {
+      if (accountingType === 'RECEIVABLE') {
         totalSale += t.debit;
         totalMoneyIn += t.credit;
         runningBalance += t.debit - t.credit;
-
-        return {
-          date: new Date(t.date).toISOString().split('T')[0],
-          txnType: t.txnType,
-          refNo: t.refNo,
-          paymentType: t.paymentType,
-          total: t.total,
-          debit: t.debit,
-          credit: t.credit,
-          receivedPaid: t.credit > 0 ? t.credit : t.debit,
-          txnBalance: t.total,
-          receivableBalance: runningBalance >= 0 ? runningBalance : 0,
-          payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
-          runningBalance
-        };
-      });
+      } else {
+        totalPurchase += t.credit;
+        totalMoneyOut += t.debit;
+        runningBalance += t.credit - t.debit;
+      }
 
       return {
-        customers: combinedParties,
-        partyType: 'CUSTOMER',
-        partyName: resolvedParty.name,
-        accountingType: 'RECEIVABLE',
-        transactions,
-        summary: {
-          totalSale,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn,
-          totalMoneyOut: 0,
-          totalReceivable: runningBalance >= 0 ? runningBalance : 0,
-          totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0
-        }
-      };
-    }
-
-    // --- 3. VENDOR (PAYABLE: Credits increase payable, Debits decrease payable) ---
-    const vendorLedgers = await prisma.vendorLedger.findMany({
-      where: {
-        vendorId: partyId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
-      },
-      orderBy: { createdAt: 'asc' }
-    });
-
-    let totalPurchase = 0;
-    let totalMoneyOut = 0;
-    let runningPayable = 0;
-
-    const transactions = vendorLedgers.map(entry => {
-      const isCredit = entry.type === 'CREDIT'; // Purchase Bill / Invoice increases payable
-      const isDebit = entry.type === 'DEBIT';   // Payment Out / Purchase Return decreases payable
-      const amount = Number(entry.amount) || 0;
-
-      if (isCredit) totalPurchase += amount;
-      if (isDebit) totalMoneyOut += amount;
-
-      runningPayable += isCredit ? amount : -amount;
-
-      return {
-        date: entry.createdAt.toISOString().split('T')[0],
-        txnType: entry.referenceType ? formatReferenceType(entry.referenceType) : 'Payment Out',
-        refNo: entry.referenceId ? entry.referenceId.slice(0, 8).toUpperCase() : '—',
-        paymentType: entry.paymentMode || '—',
-        total: amount,
-        debit: isDebit ? amount : 0,
-        credit: isCredit ? amount : 0,
-        receivedPaid: isDebit ? amount : 0,
-        txnBalance: amount,
-        receivableBalance: runningPayable < 0 ? Math.abs(runningPayable) : 0,
-        payableBalance: runningPayable >= 0 ? runningPayable : 0,
-        runningBalance: runningPayable
+        date: new Date(t.date).toISOString().split('T')[0],
+        particular: t.particular || t.txnType || 'Transaction',
+        voucherNo: t.refNo || '—',
+        txnType: t.txnType,
+        refNo: t.refNo,
+        paymentType: t.paymentType || '—',
+        total: t.total,
+        debit: t.debit,
+        credit: t.credit,
+        receivedPaid: t.credit > 0 ? t.credit : t.debit,
+        txnBalance: t.total,
+        balance: runningBalance,
+        runningBalance: runningBalance,
+        receivableBalance: runningBalance >= 0 ? runningBalance : 0,
+        payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+        partyName: t.partyName || resolvedParty?.name || 'Party',
+        partyType: t.partyType || resolvedParty?.partyType || 'CUSTOMER'
       };
     });
 
     return {
       customers: combinedParties,
-      partyType: 'VENDOR',
-      partyName: resolvedParty.name,
-      accountingType: 'PAYABLE',
+      partyType: resolvedParty?.partyType || 'CUSTOMER',
+      partyName: resolvedParty?.name || 'All Parties',
+      accountingType,
+      openingBalance: openingBal,
+      closingBalance: runningBalance,
       transactions,
       summary: {
-        totalSale: 0,
+        totalSale,
         totalPurchase,
         totalExpense: 0,
-        totalMoneyIn: 0,
+        totalMoneyIn,
         totalMoneyOut,
-        totalReceivable: runningPayable < 0 ? Math.abs(runningPayable) : 0,
-        totalPayable: runningPayable >= 0 ? runningPayable : 0
+        totalReceivable: runningBalance >= 0 ? runningBalance : 0,
+        totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+        openingBalance: openingBal,
+        closingBalance: runningBalance
       }
     };
   }

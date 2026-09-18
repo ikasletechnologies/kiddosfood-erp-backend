@@ -535,16 +535,20 @@ export class FinanceController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
-      const { partyId, partyType, customerId, vendorId, dealerId, startDate, endDate } = req.query;
+      const { partyId, partyType, partyName, customerId, vendorId, dealerId, search, startDate, endDate, page, limit } = req.query;
       const report = await FinanceService.getPartyStatement({
         franchiseId,
         partyId: (partyId || customerId || vendorId || dealerId) as string,
         partyType: partyType as any,
+        partyName: (partyName || search) as string,
         customerId: customerId as string,
         vendorId: vendorId as string,
         dealerId: dealerId as string,
+        search: (search || partyName) as string,
         startDate: startDate ? new Date(startDate as string) : undefined,
-        endDate: endDate ? new Date(endDate as string) : undefined
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        page: page ? Number(page) : undefined,
+        limit: limit ? Number(limit) : undefined,
       });
       res.json(report);
     } catch (error: any) {
