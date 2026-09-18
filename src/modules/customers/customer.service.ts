@@ -1,10 +1,19 @@
 import prisma from '../../lib/prisma';
 
 export class CustomerService {
-  static async getAll(search?: string, franchiseId?: string) {
+  static async getAll(search?: string, franchiseId?: string, isHqScope: boolean = false) {
+    let franchiseWhere: any = undefined;
+    if (franchiseId) {
+      if (isHqScope) {
+        franchiseWhere = { OR: [{ franchiseId }, { franchiseId: null }] };
+      } else {
+        franchiseWhere = { franchiseId };
+      }
+    }
+
     const customers = await prisma.customer.findMany({
       where: {
-        ...(franchiseId && { franchiseId }),
+        ...(franchiseWhere ? franchiseWhere : {}),
         ...(search && {
           OR: [
             { name: { contains: search, mode: 'insensitive' } },

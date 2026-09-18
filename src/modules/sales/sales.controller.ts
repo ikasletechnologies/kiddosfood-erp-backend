@@ -394,10 +394,16 @@ export class SalesController {
 
   static async getDeliveryChallans(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      let franchiseId = req.query.franchiseId as string | undefined;
+      if (user?.role !== 'SUPER_ADMIN') {
+        franchiseId = user?.franchiseId || '__UNASSIGNED__';
+      }
       const challans = await SalesService.getDeliveryChallans({
         customerId: req.query.customerId as string,
         status: req.query.status as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        franchiseId,
       });
       res.json(challans);
     } catch (error) {
@@ -424,8 +430,14 @@ export class SalesController {
 
   static async createDeliveryChallan(req: Request, res: Response) {
     try {
-      const userId = (req as any).user?.userId || 'system';
-      const challan = await SalesService.createDeliveryChallan(req.body, userId);
+      const user = (req as any).user;
+      const userId = user?.userId || 'system';
+      const payload = { ...req.body };
+      if (user?.role !== 'SUPER_ADMIN') {
+        // Enforce franchise isolation: branch users can ONLY dispatch from their own franchise
+        payload.sourceFranchiseId = user?.franchiseId;
+      }
+      const challan = await SalesService.createDeliveryChallan(payload, userId);
       res.status(201).json(challan);
     } catch (error) {
       const message = (error as Error).message;
