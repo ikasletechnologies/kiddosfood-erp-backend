@@ -2080,11 +2080,23 @@ export class FinanceService {
         }
       }
 
-      const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, data.franchiseId);
+      let sellerFranchiseId = sourceChallan?.sourceFranchiseId || data.franchiseId;
+      if (!sourceChallan && (data.partyType === 'FRANCHISE' || data.sourceFranchiseOrderId)) {
+        const hqRow = await tx.franchise.findFirst({ where: { isHQ: true } });
+        if (hqRow) {
+          sellerFranchiseId = hqRow.id;
+        }
+      }
+      const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, sellerFranchiseId);
+      const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+      const isHqSeller = !scopeFranchiseId || (hq && hq.id === scopeFranchiseId);
+      const sellerInventoryScope = isHqSeller
+        ? { OR: [{ franchiseId: null }, ...(hq ? [{ franchiseId: hq.id }] : [])] }
+        : { franchiseId: scopeFranchiseId };
       const resolvedInvoicePartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
         data.partyType === 'DEALER' ? 'DEALER' : data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
 
-      // 1. Validate real stock for all items before invoice creation
+      // 1. Validate real available stock for all items before invoice creation
       const itemsToDeduct: Array<{
         inventoryItem: any;
         requiredBaseQty: number;
@@ -2099,27 +2111,87 @@ export class FinanceService {
 
         if (checkItem.productId) {
           let prod = await tx.product.findUnique({ where: { id: checkItem.productId } });
+          if (!prod) {
+            prod = await tx.product.findFirst({ where: { sku: checkItem.productId } });
+          }
+          if (!prod && (checkItem as any).sku) {
+            prod = await tx.product.findFirst({ where: { sku: (checkItem as any).sku } });
+          }
           let invItem: any = null;
-          if (prod) {
-            invItem = prod.sku
-              ? await tx.inventoryItem.findFirst({ where: { sku: prod.sku, franchiseId: scopeFranchiseId } })
-              : await tx.inventoryItem.findFirst({ where: { name: { equals: prod.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
-          } else {
-            invItem = await tx.inventoryItem.findUnique({ where: { id: checkItem.productId } });
+          const targetSku = prod?.sku || (checkItem as any).sku;
+          if (targetSku) {
+            invItem = await tx.inventoryItem.findFirst({
+              where: {
+                sku: targetSku,
+                ...sellerInventoryScope
+              },
+              include: { baseUnit: true }
+            });
+          } else if (checkItem.productId) {
+            invItem = await tx.inventoryItem.findFirst({
+              where: {
+                id: checkItem.productId,
+                ...sellerInventoryScope
+              },
+              include: { baseUnit: true }
+            });
+          }
+
+          const baseCurrentStock = invItem?.currentStock ?? 0;
+          let reservedQty = 0;
+          let blockedQty = 0;
+
+          if (invItem) {
+            // Deduct active franchise order reservations
+            const activeReservationSum = await tx.inventoryReservationAllocation.aggregate({
+              where: {
+                inventoryItemId: invItem.id,
+                reservation: { status: 'ACTIVE' }
+              },
+              _sum: {
+                reservedQty: true,
+                consumedQty: true,
+                releasedQty: true
+              }
+            });
+            reservedQty = Math.max(0,
+              (activeReservationSum._sum.reservedQty || 0) -
+              (activeReservationSum._sum.consumedQty || 0) -
+              (activeReservationSum._sum.releasedQty || 0)
+            );
+
+            // Deduct non-sellable (blocked, returned, rejected, hold, expired) batch stock
+            const quarantinedBatchSum = await tx.inventoryBatch.aggregate({
+              where: {
+                inventoryItemId: invItem.id,
+                currentQty: { gt: 0 },
+                status: { in: ['BLOCKED', 'RETURNED', 'REJECTED', 'QC_HOLD', 'EXPIRED'] }
+              },
+              _sum: { currentQty: true }
+            });
+            blockedQty = quarantinedBatchSum._sum.currentQty || 0;
+          }
+
+          const availableStock = Math.max(0, baseCurrentStock - reservedQty - blockedQty);
+          let requiredBaseQty = checkQty;
+          let unitLabel = checkItem.unit || 'Units';
+          let conversionResult = { requiredBaseQty: checkQty, unitId: undefined };
+
+          if (invItem) {
+            conversionResult = await InventoryService.convertUnitToBase(invItem.id, checkItem.unit || 'NONE', checkQty, tx);
+            requiredBaseQty = conversionResult.requiredBaseQty;
+            unitLabel = (invItem.baseUnit as any)?.shortName || (invItem.baseUnit as any)?.name || invItem.unit || 'Units';
+          }
+
+          if (availableStock < requiredBaseQty) {
+            const prodName = prod?.name || checkItem.productName || invItem?.name || 'Item';
+            const prodSku = targetSku || 'N/A';
+            throw new Error(
+              `Insufficient stock for "${prodName}" (SKU: ${prodSku}). Available: ${availableStock} ${unitLabel}, Required: ${requiredBaseQty} ${unitLabel}. Invoice creation blocked.`
+            );
           }
 
           if (invItem) {
-            const conversionResult = await InventoryService.convertUnitToBase(invItem.id, checkItem.unit || 'NONE', checkQty, tx);
-            const requiredBaseQty = conversionResult.requiredBaseQty;
-            const availableStock = invItem.currentStock ?? 0;
-
-            if (availableStock < requiredBaseQty) {
-              const unitLabel = (invItem.baseUnit as any)?.shortName || (invItem.baseUnit as any)?.name || invItem.unit || 'Units';
-              throw new Error(
-                `Insufficient stock for "${invItem.name}" (SKU: ${invItem.sku || 'N/A'}). Available: ${availableStock} ${unitLabel}, Required: ${requiredBaseQty} ${unitLabel}. Invoice creation blocked.`
-              );
-            }
-
             itemsToDeduct.push({
               inventoryItem: invItem,
               requiredBaseQty,
@@ -2142,11 +2214,22 @@ export class FinanceService {
 
         if (item.productId) {
           let product = await tx.product.findUnique({ where: { id: item.productId } });
+          if (!product) {
+            product = await tx.product.findFirst({ where: { sku: item.productId } });
+          }
+          if (!product && (item as any).sku) {
+            product = await tx.product.findFirst({ where: { sku: (item as any).sku } });
+          }
           let inv: any = null;
-          if (product) {
-            inv = product.sku
-              ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
-              : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+          const targetSku = product?.sku || (item as any).sku;
+          if (targetSku) {
+            inv = await tx.inventoryItem.findFirst({
+              where: {
+                sku: targetSku,
+                ...sellerInventoryScope
+              },
+              include: { baseUnit: true }
+            });
           } else {
             // Some callers reference an InventoryItem.id directly rather
             // than a Product.id (e.g. picked from the raw InventoryItem
@@ -2260,16 +2343,7 @@ export class FinanceService {
         if (cust) resolvedCustomerName = cust.name;
       }
 
-      // Resolve seller franchise identity:
-      // When goods are billed to a Franchise (HQ selling finished products to Franchise),
-      // the SELLER franchise is HQ (isHQ: true), and the BUYER is data.partyId (the Franchise).
-      let sellerFranchiseId = data.franchiseId;
-      if (data.partyType === 'FRANCHISE' || data.sourceFranchiseOrderId) {
-        const hq = await tx.franchise.findFirst({ where: { isHQ: true } });
-        if (hq) {
-          sellerFranchiseId = hq.id;
-        }
-      }
+      // SELLER franchise is resolved as sellerFranchiseId above.
 
       const order = await tx.order.create({
         data: {
@@ -5193,7 +5267,7 @@ export class FinanceService {
       }
     } : {};
 
-    const [orders, inventoryItems] = await Promise.all([
+    const [orders, inventoryItems, products] = await Promise.all([
       prisma.order.findMany({
         where: {
           ...(franchiseId ? { franchiseId } : {}),
@@ -5219,16 +5293,57 @@ export class FinanceService {
         }
       }),
       prisma.inventoryItem.findMany({
-        where: franchiseId ? { franchiseId } : {}
+        where: franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {}
+      }),
+      prisma.product.findMany({
+        where: { isActive: true },
+        select: { id: true, name: true, sku: true, category: true, productType: true }
       })
     ]);
 
     const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
-    const categoryMap: Record<string, { category: string; sale: number; revenue: number; cost: number; profit: number; netProfitLoss: number; margin: number }> = {};
+
+    // Check if category is a technical material classification type rather than a business category
+    const isTechnicalCategory = (cat?: string | null) => {
+      if (!cat) return true;
+      const clean = cat.trim().toUpperCase().replace(/[\s_-]+/g, '');
+      return clean === 'FINISHEDGOOD' || clean === 'FINISHEDGOODS' || clean === 'RAWMATERIAL' || clean === 'RAWMATERIALS' || clean === 'SEMIFINISHED' || clean === 'SEMIFINISHEDGOOD';
+    };
+
+    // Build category -> item names mapping from real DB catalog
+    const categoryCatalogItemsMap = new Map<string, Set<string>>();
+
+    const addItemToCategory = (catKey?: string | null, itemName?: string | null) => {
+      if (!catKey || !itemName) return;
+      const normalizedKey = catKey.trim().toUpperCase();
+      if (!categoryCatalogItemsMap.has(normalizedKey)) {
+        categoryCatalogItemsMap.set(normalizedKey, new Set());
+      }
+      categoryCatalogItemsMap.get(normalizedKey)!.add(itemName.trim());
+    };
+
+    // 1. From Products: map items ONLY to their actual business category (ignoring technical category types)
+    for (const p of products) {
+      if (!p.name) continue;
+      if (p.category && !isTechnicalCategory(p.category)) {
+        addItemToCategory(p.category, p.name);
+      }
+    }
+
+    const categoryMap: Record<string, {
+      category: string;
+      sale: number;
+      revenue: number;
+      cost: number;
+      profit: number;
+      netProfitLoss: number;
+      margin: number;
+    }> = {};
 
     for (const order of orders) {
       for (const item of order.orderItems) {
-        const category = item.product?.category || 'Uncategorized';
+        const rawCategory = item.product?.category;
+        const category = (!rawCategory || isTechnicalCategory(rawCategory)) ? 'Uncategorized' : rawCategory;
         if (!categoryMap[category]) {
           categoryMap[category] = { category, sale: 0, revenue: 0, cost: 0, profit: 0, netProfitLoss: 0, margin: 0 };
         }
@@ -5254,14 +5369,29 @@ export class FinanceService {
         categoryMap[category].sale += lineRevenue;
         categoryMap[category].revenue += lineRevenue;
         categoryMap[category].cost += lineCost;
+
+        // 2. Also ensure any item in completed orders is mapped to its category
+        const orderItemName = item.product?.name || (item as any).name;
+        if (category && orderItemName) {
+          addItemToCategory(category, orderItemName);
+        }
       }
     }
 
     return Object.values(categoryMap).map(cat => {
       const profit = Number((cat.revenue - cat.cost).toFixed(2));
       const margin = cat.revenue > 0 ? Number(((profit / cat.revenue) * 100).toFixed(2)) : 0;
+
+      const itemSet = categoryCatalogItemsMap.get(cat.category.trim().toUpperCase());
+      const itemNames = itemSet && itemSet.size > 0
+        ? Array.from(itemSet).sort((a, b) => a.localeCompare(b))
+        : [];
+      const items = itemNames.length > 0 ? itemNames.join(', ') : '\u2014';
+
       return {
         ...cat,
+        items,
+        itemNames,
         revenue: Number(cat.revenue.toFixed(2)),
         sale: Number(cat.sale.toFixed(2)),
         cost: Number(cat.cost.toFixed(2)),

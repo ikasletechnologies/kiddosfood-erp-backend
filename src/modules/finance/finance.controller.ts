@@ -317,7 +317,8 @@ export class FinanceController {
       });
       res.status(201).json(invoice);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const isBusinessError = /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to/i.test(error.message);
+      res.status(isBusinessError ? 400 : 500).json({ error: error.message });
     }
   }
 

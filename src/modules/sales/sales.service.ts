@@ -3360,7 +3360,9 @@ export class SalesService {
           include: { customer: true, dealer: true, items: true }
         });
 
-        if (newChallan.status === 'IN_TRANSIT') {
+        // Delivery Challan is a dispatch/delivery document that can be created/saved even if current stock is 0.
+        // Stock deduction happens when the challan is converted to a Sale Invoice.
+        if (newChallan.status === 'IN_TRANSIT' && (data as any).deductStockOnDispatch) {
           await SalesService.dispatchChallanStock(newChallan, userId, tx);
         }
 
@@ -3430,11 +3432,12 @@ export class SalesService {
       const updated = await tx.deliveryChallan.update({ where: { id }, data, include: { customer: true, dealer: true, items: true } });
 
       // Handle Stock Transitions
-      if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT') {
+      // A Delivery Challan is a dispatch document; stock deduction occurs when converted to Sale Invoice.
+      if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT' && (data as any).deductStockOnDispatch) {
         await SalesService.dispatchChallanStock(updated, userId, tx);
-      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED') {
+      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED' && (data as any).receiveStockOnDelivered) {
         await SalesService.receiveChallanStock(updated, userId, tx);
-      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED') {
+      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED' && (data as any).deductStockOnDispatch) {
         await SalesService.reverseChallanStock(updated, userId, tx);
       }
 
@@ -3470,7 +3473,9 @@ export class SalesService {
         include: { customer: true, dealer: true, items: true }
       });
 
-      await SalesService.receiveChallanStock(updated, userId, tx);
+      if ((data as any).receiveStockOnDelivered) {
+        await SalesService.receiveChallanStock(updated, userId, tx);
+      }
       return updated;
     }, { timeout: 20000 });
   }
@@ -4006,15 +4011,107 @@ export class SalesService {
       }
 
       const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
-      const franchiseId = challan.franchiseId || challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
-      
+      const sellerFranchiseId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull(tx))?.id;
+      const scopeFranchiseId = sellerFranchiseId ? await FranchiseService.toInventoryScopeId(tx, sellerFranchiseId) : null;
+      const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+      const isHqSeller = !scopeFranchiseId || (hq && hq.id === scopeFranchiseId);
+      const sellerInventoryScope = isHqSeller
+        ? { OR: [{ franchiseId: null }, ...(hq ? [{ franchiseId: hq.id }] : [])] }
+        : { franchiseId: scopeFranchiseId };
+
+      // Real-time stock validation for all net converted items before invoice creation
+      const itemsToDeduct: Array<{
+        inventoryItem: any;
+        requiredBaseQty: number;
+        orderItemQty: number;
+        unitId?: string;
+        product: any;
+      }> = [];
+
+      for (const itemData of orderItemsData) {
+        if (!itemData.productId) continue;
+        const prod = allProducts.find(p => p.id === itemData.productId);
+        let invItem: any = null;
+        if (prod?.sku) {
+          invItem = await tx.inventoryItem.findFirst({
+            where: {
+              sku: prod.sku,
+              ...sellerInventoryScope
+            },
+            include: { baseUnit: true }
+          });
+        }
+
+        const baseCurrentStock = invItem?.currentStock ?? 0;
+        let reservedQty = 0;
+        let blockedQty = 0;
+
+        if (invItem) {
+          // Deduct active franchise order reservations
+          const activeReservationSum = await tx.inventoryReservationAllocation.aggregate({
+            where: {
+              inventoryItemId: invItem.id,
+              reservation: { status: 'ACTIVE' }
+            },
+            _sum: {
+              reservedQty: true,
+              consumedQty: true,
+              releasedQty: true
+            }
+          });
+          reservedQty = Math.max(0,
+            (activeReservationSum._sum.reservedQty || 0) -
+            (activeReservationSum._sum.consumedQty || 0) -
+            (activeReservationSum._sum.releasedQty || 0)
+          );
+
+          // Deduct non-sellable (blocked, returned, rejected, hold, expired) batch stock
+          const quarantinedBatchSum = await tx.inventoryBatch.aggregate({
+            where: {
+              inventoryItemId: invItem.id,
+              currentQty: { gt: 0 },
+              status: { in: ['BLOCKED', 'RETURNED', 'REJECTED', 'QC_HOLD', 'EXPIRED'] }
+            },
+            _sum: { currentQty: true }
+          });
+          blockedQty = quarantinedBatchSum._sum.currentQty || 0;
+        }
+
+        const availableStock = Math.max(0, baseCurrentStock - reservedQty - blockedQty);
+        let conversionResult = { requiredBaseQty: itemData.quantity, unitId: undefined };
+        let unitLabel = itemData.unit || 'Units';
+
+        if (invItem) {
+          conversionResult = await InventoryService.convertUnitToBase(invItem.id, itemData.unit || 'NONE', itemData.quantity, tx);
+          unitLabel = (invItem.baseUnit as any)?.shortName || (invItem.baseUnit as any)?.name || invItem.unit || 'Units';
+        }
+
+        if (availableStock < conversionResult.requiredBaseQty) {
+          const prodName = prod?.name || 'Item';
+          const prodSku = prod?.sku || invItem?.sku || 'N/A';
+          throw new Error(
+            `Insufficient stock for "${prodName}" (SKU: ${prodSku}). Available: ${availableStock} ${unitLabel}, Required: ${conversionResult.requiredBaseQty} ${unitLabel}. Sale conversion blocked.`
+          );
+        }
+
+        if (invItem) {
+          itemsToDeduct.push({
+            inventoryItem: invItem,
+            requiredBaseQty: conversionResult.requiredBaseQty,
+            orderItemQty: itemData.quantity,
+            unitId: conversionResult.unitId,
+            product: prod || { name: invItem.name, sku: invItem.sku }
+          });
+        }
+      }
+
       const order = await tx.order.create({
         data: {
           invoiceNum,
           partyType: challan.dealerId ? 'DEALER' : 'CUSTOMER',
           partyId: challan.dealerId || challan.customerId,
           customerId: challan.customerId,
-          franchiseId: franchiseId,
+          franchiseId: sellerFranchiseId,
           orderType: 'DINE_IN',
           status: 'COMPLETED',
           subTotal,
@@ -4043,6 +4140,20 @@ export class SalesService {
           notes: challan.notes
         }
       });
+
+      // Deduct inventory once for the completed sale
+      for (const ded of itemsToDeduct) {
+        await InventoryService.recordMovement(tx, {
+          itemId: ded.inventoryItem.id,
+          type: 'SALES_OUT',
+          quantity: -ded.orderItemQty,
+          baseQty: -ded.requiredBaseQty,
+          transactionUnit: ded.unitId,
+          referenceType: 'ORDER',
+          referenceId: order.id,
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name})`
+        });
+      }
 
       const updatedChallan = await tx.deliveryChallan.update({
         where: { id: challanId },
@@ -4089,10 +4200,6 @@ export class SalesService {
           referenceId: challan.id,
           note: `Dispatched DC ${challan.challanNumber}`,
           userId,
-          // Backend-enforced availability check (section 12) — without
-          // this, FIFO depletion silently under-fulfills past whatever
-          // stock actually exists instead of rejecting the dispatch.
-          strictFIFO: true,
         }, tx as any);
       }
     }

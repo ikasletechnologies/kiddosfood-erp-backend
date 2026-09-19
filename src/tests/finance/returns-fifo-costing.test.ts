@@ -535,7 +535,7 @@ async function main() {
       createdSalesOrderIds.push(so.id);
 
       const challan = await SalesService.createDeliveryChallan({
-        customerId: customer.id, salesOrderId: so.id, sourceFranchiseId: hq.id, status: 'IN_TRANSIT',
+        customerId: customer.id, salesOrderId: so.id, sourceFranchiseId: hq.id, status: 'IN_TRANSIT', deductStockOnDispatch: true,
         items: [{ productId: product.id, productName: product.name, quantity: 6, rate: 25, taxPercent: 0 }]
       } as any, 'tester');
       createdChallanIds.push(challan.id);
