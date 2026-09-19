@@ -209,6 +209,11 @@ export class ProductService {
             inventoryFranchiseId: franchiseId || null,
             inventoryBasePrice: p.basePrice,
             inventoryCostPrice: 0,
+            costPrice: 0,
+            purchasePrice: 0,
+            purchaseRate: 0,
+            saleRate: p.basePrice,
+            gstRate: p.taxPercent,
             baseUnit: null,
             conversions: [],
             packSize
@@ -222,10 +227,15 @@ export class ProductService {
           inventoryFranchiseId: inv.franchiseId || (franchiseId || null),
           inventoryBasePrice: inv.basePrice,
           inventoryCostPrice: inv.costPrice,
+          costPrice: inv.costPrice ?? 0,
+          purchasePrice: inv.costPrice ?? 0,
+          purchaseRate: inv.costPrice ?? 0,
+          saleRate: p.basePrice,
+          gstRate: p.taxPercent,
           // Channel-specific prices live only on InventoryItem, never on
           // Product — without this, POS's getPrice(p, partyType) always
           // fell through to the generic base/franchise price for every
-          // channel (the ₹35-shown-for-Dealer bug).
+          // channel (the ₹135-shown-for-Dealer bug).
           franchisePrice: inv.franchisePrice,
           dealerPrice: inv.dealerPrice,
           customerPrice: inv.customerPrice,
@@ -236,14 +246,42 @@ export class ProductService {
       }).filter(Boolean) as any[];
     }
 
+    const skus = products.map(p => p.sku).filter(Boolean) as string[];
+    const namesWithoutSku = products.filter(p => !p.sku).map(p => p.name);
+    const inventoryWhere: any[] = [];
+    if (skus.length > 0) {
+      inventoryWhere.push({ sku: { in: skus } });
+    }
+    if (namesWithoutSku.length > 0) {
+      inventoryWhere.push({ name: { in: namesWithoutSku, mode: 'insensitive' } });
+    }
+
+    const inventory = inventoryWhere.length > 0
+      ? await prisma.inventoryItem.findMany({
+          where: { OR: inventoryWhere },
+          select: { sku: true, name: true, costPrice: true, basePrice: true, customerPrice: true, unit: true, franchiseId: true }
+        })
+      : [];
+
     return products.map(p => {
+      const pName = p.name.trim().toLowerCase();
+      const inv = p.sku
+        ? inventory.find(i => i.sku && i.sku.trim().toUpperCase() === p.sku!.trim().toUpperCase())
+        : inventory.find(i => i.name.trim().toLowerCase() === pName);
+
       const packSize = parseSkuPackSize(p.sku);
       // Same fix as above — packSize describes pack content, not a
       // transactable unit; see the comment on the franchise-scoped branch.
-      const resolvedUnit = p.recipe?.yieldUnit || packSize?.unit || 'PC';
+      const resolvedUnit = inv?.unit || p.recipe?.yieldUnit || packSize?.unit || 'PC';
       return {
         ...p,
         unit: resolvedUnit,
+        inventoryCostPrice: inv?.costPrice ?? 0,
+        costPrice: inv?.costPrice ?? 0,
+        purchasePrice: inv?.costPrice ?? 0,
+        purchaseRate: inv?.costPrice ?? 0,
+        saleRate: p.basePrice,
+        gstRate: p.taxPercent,
         packSize
       };
     });

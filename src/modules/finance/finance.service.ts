@@ -2175,7 +2175,7 @@ export class FinanceService {
           const availableStock = Math.max(0, baseCurrentStock - reservedQty - blockedQty);
           let requiredBaseQty = checkQty;
           let unitLabel = checkItem.unit || 'Units';
-          let conversionResult = { requiredBaseQty: checkQty, unitId: undefined };
+          let conversionResult: { requiredBaseQty: number; unitId?: string } = { requiredBaseQty: checkQty, unitId: undefined };
 
           if (invItem) {
             conversionResult = await InventoryService.convertUnitToBase(invItem.id, checkItem.unit || 'NONE', checkQty, tx);
@@ -4912,25 +4912,32 @@ export class FinanceService {
 
     const data = inventory
       .map(item => {
-        const stockQty = item.currentStock;
-        const minStock = item.minimumStock || 10;
+        const stockQty = Number(item.currentStock || 0);
+        const minStock = Number(item.minimumStock || 0);
+        const shortfall = Math.max(0, minStock - stockQty);
         
-        let status = 'NORMAL';
-        if (stockQty <= 0) {
-          status = 'OUT_OF_STOCK';
-        } else if (minStock > 0 && stockQty <= minStock) {
-          status = 'RUNNING_LOW';
+        let status = 'SAFE';
+        if (minStock > 0 && stockQty < minStock) {
+          status = stockQty <= 0 ? 'OUT_OF_STOCK' : 'LOW';
         }
 
         return {
+          id: item.id,
+          name: item.name,
           itemName: item.name,
-          minimumStock: minStock,
+          sku: item.sku,
+          category: (item as any).effectiveCategory || (item as any).productCategory || item.category,
+          unit: item.unit,
+          currentStock: stockQty,
           stockQty,
+          minimumStock: minStock,
+          minStock,
+          shortfall,
           status,
           stockValue: stockQty > 0 ? stockQty * (item.costPrice || 0) : 0
         };
       })
-      .filter(item => item.status === 'OUT_OF_STOCK' || item.status === 'RUNNING_LOW');
+      .filter(item => item.minimumStock > 0 && item.currentStock < item.minimumStock);
 
     return data;
   }
@@ -5332,6 +5339,7 @@ export class FinanceService {
 
     const categoryMap: Record<string, {
       category: string;
+      quantity: number;
       sale: number;
       revenue: number;
       cost: number;
@@ -5345,7 +5353,7 @@ export class FinanceService {
         const rawCategory = item.product?.category;
         const category = (!rawCategory || isTechnicalCategory(rawCategory)) ? 'Uncategorized' : rawCategory;
         if (!categoryMap[category]) {
-          categoryMap[category] = { category, sale: 0, revenue: 0, cost: 0, profit: 0, netProfitLoss: 0, margin: 0 };
+          categoryMap[category] = { category, quantity: 0, sale: 0, revenue: 0, cost: 0, profit: 0, netProfitLoss: 0, margin: 0 };
         }
 
         const qty = item.quantity || 0;
@@ -5366,32 +5374,22 @@ export class FinanceService {
           lineCost = qty * unitCost;
         }
 
+        categoryMap[category].quantity += qty;
         categoryMap[category].sale += lineRevenue;
         categoryMap[category].revenue += lineRevenue;
         categoryMap[category].cost += lineCost;
-
-        // 2. Also ensure any item in completed orders is mapped to its category
-        const orderItemName = item.product?.name || (item as any).name;
-        if (category && orderItemName) {
-          addItemToCategory(category, orderItemName);
-        }
       }
     }
 
     return Object.values(categoryMap).map(cat => {
       const profit = Number((cat.revenue - cat.cost).toFixed(2));
       const margin = cat.revenue > 0 ? Number(((profit / cat.revenue) * 100).toFixed(2)) : 0;
-
-      const itemSet = categoryCatalogItemsMap.get(cat.category.trim().toUpperCase());
-      const itemNames = itemSet && itemSet.size > 0
-        ? Array.from(itemSet).sort((a, b) => a.localeCompare(b))
-        : [];
-      const items = itemNames.length > 0 ? itemNames.join(', ') : '\u2014';
+      const quantity = Number((cat.quantity || 0).toFixed(2));
 
       return {
         ...cat,
-        items,
-        itemNames,
+        quantity,
+        items: quantity,
         revenue: Number(cat.revenue.toFixed(2)),
         sale: Number(cat.sale.toFixed(2)),
         cost: Number(cat.cost.toFixed(2)),

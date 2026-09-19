@@ -3,6 +3,7 @@ import { AlertService } from '../alerts/alert.service';
 import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
+import { areUnitsEquivalent, normalizeUnit, convertUnit, areUnitsConvertible } from '../../lib/conversion';
 
 export interface FifoConsumption {
   batchId: string;
@@ -270,6 +271,20 @@ export class InventoryService {
       pendingMap.set(po.inventoryItemId, (pendingMap.get(po.inventoryItemId) || 0) + po.quantity);
     });
 
+    const itemSkus = Array.from(new Set(items.map(i => i.sku).filter(Boolean)));
+    const matchingProducts = itemSkus.length > 0
+      ? await prisma.product.findMany({
+          where: { sku: { in: itemSkus } },
+          select: { sku: true, category: true }
+        })
+      : [];
+    const productCategoryBySku = new Map<string, string>();
+    for (const p of matchingProducts) {
+      if (p.sku && p.category) {
+        productCategoryBySku.set(p.sku, p.category);
+      }
+    }
+
     return items.map(item => {
       // Use recomputed stock from ledger (movements) as source of truth
       // When asOfDate is provided, any item with no movements prior to boundary has 0 stock
@@ -284,7 +299,11 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) > 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
       const outbound = Math.abs(todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) < 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0));
 
-      const status = computedStock <= item.minimumStock ? 'LOW' : 'SAFE';
+      const minStock = Number(item.minimumStock || 0);
+      const shortfall = Math.max(0, minStock - computedStock);
+      const productCategory = productCategoryBySku.get(item.sku) || null;
+      const effectiveCategory = productCategory || item.category;
+      const status = minStock > 0 && computedStock < minStock ? 'LOW' : 'SAFE';
 
       const incomingStock = pendingMap.get(item.id) || 0;
 
@@ -319,6 +338,11 @@ export class InventoryService {
       return {
         ...item,
         currentStock: computedStock,
+        minimumStock: minStock,
+        minStock,
+        shortfall,
+        productCategory,
+        effectiveCategory,
         transferableStock,
         inbound,
         outbound,
@@ -792,13 +816,21 @@ export class InventoryService {
 
     let finalBaseQty = data.baseQty !== undefined && data.baseQty !== null ? data.baseQty : data.quantity;
     
-    // Normalize transaction quantity to canonical stock units if units differ
-    if (data.transactionUnit && itemBefore.unit && data.transactionUnit.toUpperCase() !== itemBefore.unit.toUpperCase() && data.transactionUnit !== 'UNIT') {
-      try {
-        const { convertMeasurement } = require('@businessgroupikasle/erp-units');
-        finalBaseQty = convertMeasurement(data.quantity, data.transactionUnit.toUpperCase(), itemBefore.unit.toUpperCase()).toNumber();
-      } catch (err: any) {
-        throw new Error(`Unit conversion failed for "${itemBefore.name}": ${err.message}`);
+    // Normalize transaction quantity to canonical stock units if units differ and baseQty wasn't explicitly supplied
+    if (data.baseQty === undefined || data.baseQty === null) {
+      if (data.transactionUnit && itemBefore.unit && !areUnitsEquivalent(data.transactionUnit, itemBefore.unit) && data.transactionUnit !== 'UNIT') {
+        try {
+          if (areUnitsConvertible(data.transactionUnit, itemBefore.unit)) {
+            finalBaseQty = convertUnit(data.quantity, data.transactionUnit, itemBefore.unit);
+          } else {
+            const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+            const fromU = normalizeUnit(data.transactionUnit);
+            const toU = normalizeUnit(itemBefore.unit);
+            finalBaseQty = convertMeasurement(data.quantity, fromU as any, toU as any).toNumber();
+          }
+        } catch (err: any) {
+          throw new Error(`Unit conversion failed for "${itemBefore.name}": ${err.message}`);
+        }
       }
     }
     
@@ -1122,7 +1154,7 @@ export class InventoryService {
     return { item, movement };
   }
 
-  // New helper for unit conversion engine
+  // Helper for unit conversion engine
   static async convertUnitToBase(itemId: string, unitIdOrName: string, enteredQty: number, tx: any = prisma): Promise<{ requiredBaseQty: number; unitId?: string }> {
     const item = await tx.inventoryItem.findUnique({
       where: { id: itemId },
@@ -1131,26 +1163,40 @@ export class InventoryService {
 
     if (!item) throw new Error("Item not found");
     
-    // If no unit requested, assume base quantity
-    if (!unitIdOrName || unitIdOrName === "NONE" || unitIdOrName === item.unit) {
+    // 1. If no unit requested, or requested unit is equivalent to the item's unit (e.g. PC vs PCS, KG vs KGS, pkt vs packet):
+    // 1:1 conversion factor
+    if (!unitIdOrName || unitIdOrName === "NONE" || areUnitsEquivalent(unitIdOrName, item.unit)) {
       return { requiredBaseQty: enteredQty };
     }
     
-    // Look for conversion
-    const conversion = item.conversions.find((c: any) => c.unitId === unitIdOrName || c.unit.name.toLowerCase() === unitIdOrName.toLowerCase() || c.unit.shortName.toLowerCase() === unitIdOrName.toLowerCase());
+    // 2. Look for conversion in item.conversions
+    const conversion = item.conversions.find((c: any) => 
+      c.unitId === unitIdOrName || 
+      areUnitsEquivalent(c.unit.name, unitIdOrName) || 
+      areUnitsEquivalent(c.unit.shortName, unitIdOrName) ||
+      c.unit.name.toLowerCase() === unitIdOrName.toLowerCase() || 
+      c.unit.shortName.toLowerCase() === unitIdOrName.toLowerCase()
+    );
     
     if (conversion) {
       return { requiredBaseQty: enteredQty * conversion.multiplier, unitId: conversion.unit.id };
     }
     
-    // If requested unit is explicitly the base unit
-    if (item.baseUnit && (item.baseUnit.id === unitIdOrName || item.baseUnit.name.toLowerCase() === unitIdOrName.toLowerCase() || item.baseUnit.shortName.toLowerCase() === unitIdOrName.toLowerCase())) {
+    // 3. If requested unit is explicitly the base unit
+    if (item.baseUnit && (
+      item.baseUnit.id === unitIdOrName || 
+      areUnitsEquivalent(item.baseUnit.name, unitIdOrName) || 
+      areUnitsEquivalent(item.baseUnit.shortName, unitIdOrName) ||
+      item.baseUnit.name.toLowerCase() === unitIdOrName.toLowerCase() || 
+      item.baseUnit.shortName.toLowerCase() === unitIdOrName.toLowerCase()
+    )) {
       return { requiredBaseQty: enteredQty, unitId: item.baseUnit.id };
     }
     
-    // If no conversion found, fallback to 1:1 if unit strings match, else Error
-    if (item.unit && item.unit.toLowerCase() === unitIdOrName.toLowerCase()) {
-      return { requiredBaseQty: enteredQty };
+    // 4. Standard physical unit conversion (mass <-> mass, volume <-> volume)
+    if (item.unit && areUnitsConvertible(unitIdOrName, item.unit)) {
+      const convertedQty = convertUnit(enteredQty, unitIdOrName, item.unit);
+      return { requiredBaseQty: convertedQty };
     }
     
     throw new Error(`No unit conversion found for item ${item.name} to unit ${unitIdOrName}`);
@@ -1167,8 +1213,8 @@ export class InventoryService {
   static async getAlerts(franchiseId?: string) {
     const items = await this.getInventory(franchiseId);
     return items.filter(item => {
-      const threshold = item.minimumStock ?? 0;
-      return item.currentStock <= threshold;
+      const minStock = Number(item.minimumStock || 0);
+      return minStock > 0 && item.currentStock < minStock;
     });
   }
 
