@@ -11,6 +11,13 @@ class SocketService {
 
     this._io.on('connection', (socket) => {
       console.log(`🔌 Client connected to Real-time system: ${socket.id}`);
+
+      socket.on('join', (data: any) => {
+        if (data?.room) {
+          socket.join(data.room);
+          console.log(`🔌 Socket ${socket.id} joined room: ${data.room}`);
+        }
+      });
       
       socket.on('disconnect', () => {
          console.log(`🔌 Client disconnected: ${socket.id}`);

@@ -1,3 +1,4 @@
+import { WarehouseService } from '../warehouse/warehouse.service';
 import prisma from '../../lib/prisma';
 import { AuthService } from '../auth/auth.service';
 
@@ -193,6 +194,136 @@ export class FranchiseService {
     return prisma.franchise.update({
       where: { id },
       data: { status }
+    });
+  }
+  /**
+   * Dedicated Franchise Warehouse status check.
+   * Scoped strictly to the authenticated franchise.
+   */
+  static async getWarehouseStatus(franchiseId: string) {
+    const franchise = await prisma.franchise.findUnique({
+      where: { id: franchiseId },
+      include: {
+        primaryWarehouse: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            location: true,
+            type: true,
+            status: true,
+            createdAt: true,
+          }
+        }
+      }
+    });
+
+    if (!franchise) {
+      throw new Error('Franchise not found');
+    }
+
+    if (franchise.isHQ) {
+      throw new Error('Franchise warehouse setup is only applicable for Franchise branches.');
+    }
+
+    const hasWarehouse = Boolean(franchise.primaryWarehouseId && franchise.primaryWarehouse);
+
+    let nextCode: string | undefined;
+    if (!hasWarehouse) {
+      nextCode = await WarehouseService.previewNextWarehouseCode();
+    }
+
+    return {
+      configured: hasWarehouse,
+      franchise: {
+        id: franchise.id,
+        name: franchise.name,
+        location: franchise.location,
+      },
+      warehouse: franchise.primaryWarehouse || null,
+      nextCode,
+    };
+  }
+
+  /**
+   * Creates a dedicated warehouse scoped specifically to this franchise.
+   * Completely isolated from HQ / Super Admin setup flow.
+   */
+  static async setupFranchiseWarehouse(franchiseId: string, data: { name: string; location?: string; code?: string }) {
+    if (!data.name || !data.name.trim()) {
+      throw new Error('Warehouse name is required');
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const franchise = await tx.franchise.findUnique({
+        where: { id: franchiseId },
+        include: { primaryWarehouse: true }
+      });
+
+      if (!franchise) {
+        throw new Error('Franchise not found');
+      }
+
+      if (franchise.isHQ) {
+        throw new Error('Franchise warehouse setup cannot be used for HQ.');
+      }
+
+      // Idempotency: if franchise already has a primary warehouse, return it
+      if (franchise.primaryWarehouseId && franchise.primaryWarehouse) {
+        return franchise.primaryWarehouse;
+      }
+
+      // Generate unique warehouse code
+      let finalCode: string;
+      const requestedCode = data.code?.trim();
+      if (requestedCode) {
+        const codeClash = await tx.warehouse.findFirst({ where: { code: requestedCode } });
+        if (!codeClash) {
+          finalCode = requestedCode;
+          const match = requestedCode.match(/^WH-(\d+)$/i);
+          if (match) {
+            const n = parseInt(match[1], 10);
+            if (!isNaN(n)) {
+              const cur = await tx.numberSequence.findUnique({ where: { key: 'WAREHOUSE_CODE' } });
+              if (!cur || cur.value < n) {
+                await tx.numberSequence.upsert({
+                  where: { key: 'WAREHOUSE_CODE' },
+                  create: { key: 'WAREHOUSE_CODE', value: n },
+                  update: { value: n }
+                });
+              }
+            }
+          }
+        } else {
+          finalCode = await WarehouseService.nextWarehouseCode(tx);
+        }
+      } else {
+        finalCode = await WarehouseService.nextWarehouseCode(tx);
+      }
+
+      const nameKey = data.name.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      const nameClash = await tx.warehouse.findUnique({ where: { nameKey } });
+      if (nameClash) {
+        throw new Error(`A warehouse named "${nameClash.name}" already exists. Please choose a unique warehouse name.`);
+      }
+
+      const warehouse = await tx.warehouse.create({
+        data: {
+          name: data.name.trim(),
+          nameKey,
+          location: data.location?.trim() || null,
+          type: 'FRANCHISE',
+          code: finalCode,
+          status: 'ACTIVE',
+        }
+      });
+
+      await tx.franchise.update({
+        where: { id: franchise.id },
+        data: { primaryWarehouseId: warehouse.id }
+      });
+
+      return warehouse;
     });
   }
 }

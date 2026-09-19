@@ -1,7 +1,8 @@
 import { FranchiseService } from '../franchise/franchise.service';
+import { AlertService } from '../alerts/alert.service';
 import prisma from
   '../../lib/prisma';
-import { ItemCategory, StockMovementType } from '@prisma/client';
+import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
 
 export interface FifoConsumption {
   batchId: string;
@@ -19,6 +20,13 @@ export interface FifoConsumptionResult {
   consumedFromBatches: number;
   totalCost: number;
   unitCost: number;
+  // Quantity of this item sitting in BLOCKED/RETURNED (recalled/quarantined)
+  // lots that depleteBatchesFIFO deliberately skipped. A shortfall alongside
+  // a nonzero value here means the "missing" stock isn't untracked/legacy —
+  // it's specifically quarantined material, and recordMovement uses this to
+  // refuse the transaction instead of silently falling back to the item's
+  // aggregate currentStock (see recordMovement's blockRecalled check).
+  blockedQtyAvailable: number;
 }
 
 function mapCategoryToDb(category?: string): ItemCategory {
@@ -43,7 +51,7 @@ function mapCategoryToDb(category?: string): ItemCategory {
 // the same product name, which the bulk-import flow explicitly creates as
 // two distinct SKUs). Without that scope, a name match could try to
 // overwrite an unrelated product's SKU and hit its unique constraint.
-async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory; hsnCode?: string | null; sacCode?: string | null; gstRate?: number | null }) {
+async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: string; basePrice?: number | null; category: ItemCategory; hsnCode?: string | null; sacCode?: string | null; gstRate?: number | null; discountType?: string | null; discountValue?: number | null }) {
   const existingProduct = await tx.product.findFirst({ where: { sku: item.sku } })
     ?? await tx.product.findFirst({ where: { name: { equals: item.name, mode: 'insensitive' }, sku: null } });
 
@@ -58,6 +66,8 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
         taxPercent,
         hsnCode: item.hsnCode || null,
         sacCode: item.sacCode || null,
+        discountType: item.discountType || "PERCENT",
+        discountValue: item.discountValue || 0,
         isActive: true,
         productType: item.category === ItemCategory.FINISHED_GOOD ? 'FINISHED_GOOD' : 'MADE_TO_ORDER',
         category: 'Automated Sync'
@@ -73,7 +83,9 @@ async function syncProductFromInventoryItem(tx: any, item: { name: string; sku: 
         basePrice: item.basePrice || 0,
         taxPercent: item.gstRate !== undefined && item.gstRate !== null ? item.gstRate : existingProduct.taxPercent,
         hsnCode: item.hsnCode !== undefined ? item.hsnCode : existingProduct.hsnCode,
-        sacCode: item.sacCode !== undefined ? item.sacCode : existingProduct.sacCode
+        sacCode: item.sacCode !== undefined ? item.sacCode : existingProduct.sacCode,
+        discountType: item.discountType !== undefined ? item.discountType : existingProduct.discountType,
+        discountValue: item.discountValue !== undefined ? item.discountValue : existingProduct.discountValue
       }
     });
     console.log(`🔄 [Sync] Updated existing product for HQ Inventory Item: ${item.name}`);
@@ -193,6 +205,10 @@ export class InventoryService {
       include: {
         movements: { orderBy: { createdAt: 'desc' }, take: 5 },
         vendor: true,
+        inventoryBatches: {
+          where: { currentQty: { gt: 0 } },
+          select: { currentQty: true, status: true, expDate: true }
+        }
       },
       orderBy: { name: 'asc' },
     });
@@ -276,9 +292,34 @@ export class InventoryService {
       const hasPurchaseMovement = item.movements?.some(m => m.movementType === 'PURCHASE_IN');
       const isPurchased = !!item.vendorId || purchasedItemIds.has(item.id) || hasPurchaseMovement || incomingStock > 0;
 
+      let transferableStock = computedStock;
+      // Note: TypeScript might complain if batches isn't explicitly defined on the type, but it is since we included it.
+      const batches = (item as any).inventoryBatches || [];
+      if (batches.length > 0) {
+        let eligibleBatchesQty = 0;
+        let blockedQtyAvailable = 0;
+        for (const b of batches) {
+          if (b.status === 'BLOCKED' || b.status === 'RETURNED') {
+            blockedQtyAvailable += Number(b.currentQty);
+          } else if (b.status === 'APPROVED' && (!b.expDate || new Date(b.expDate) >= today)) {
+            eligibleBatchesQty += Number(b.currentQty);
+          }
+        }
+
+        if (blockedQtyAvailable > 0) {
+          transferableStock = Math.min(eligibleBatchesQty, computedStock);
+        } else {
+          const totalTrackedQty = batches.reduce((acc: number, b: any) => acc + Number(b.currentQty), 0);
+          const untrackedQty = Math.max(0, computedStock - totalTrackedQty);
+          transferableStock = Math.min(eligibleBatchesQty + untrackedQty, computedStock);
+        }
+      }
+      transferableStock = Math.max(0, transferableStock);
+
       return {
         ...item,
         currentStock: computedStock,
+        transferableStock,
         inbound,
         outbound,
         status,
@@ -389,6 +430,8 @@ export class InventoryService {
       if (data.franchisePrice !== undefined) createData.franchisePrice = Number(data.franchisePrice) || 0;
       if (data.dealerPrice !== undefined) createData.dealerPrice = Number(data.dealerPrice) || 0;
       if (data.customerPrice !== undefined) createData.customerPrice = Number(data.customerPrice) || 0;
+      if (data.discountType !== undefined) createData.discountType = data.discountType;
+      if (data.discountValue !== undefined) createData.discountValue = Number(data.discountValue) || 0;
 
       // Inherit an existing Product's price when the caller didn't supply
       // one — without this, creating the (missing) InventoryItem for an
@@ -480,13 +523,14 @@ export class InventoryService {
     const validFields = [
       'name', 'sku', 'category', 'unit', 'minimumStock', 'batchNo', 
       'expiryDate', 'franchiseId', 'vendorId', 'gstRate', 'hsnCode', 
-      'isActive', 'basePrice', 'costPrice', 'franchisePrice', 'dealerPrice', 'customerPrice'
+      'isActive', 'basePrice', 'costPrice', 'franchisePrice', 'dealerPrice', 'customerPrice',
+      'discountType', 'discountValue'
     ];
 
     const updatePayload: any = {};
     for (const key of validFields) {
       if (safeData[key] !== undefined) {
-        if (key === 'gstRate' || key === 'minimumStock') {
+        if (key === 'gstRate' || key === 'minimumStock' || key === 'discountValue') {
           updatePayload[key] = Number(safeData[key]) || 0;
         } else if (key === 'basePrice' || key === 'costPrice' || key === 'franchisePrice' || key === 'dealerPrice' || key === 'customerPrice') {
           updatePayload[key] = safeData[key] === null ? null : (Number(safeData[key]) || 0);
@@ -498,53 +542,8 @@ export class InventoryService {
 
     const updated = await prisma.inventoryItem.update({ where: { id }, data: updatePayload });
 
-    // Handle opening/initial stock updates safely through stock movement ledger
-    if (data.initialStock !== undefined) {
-      const newInitialStock = Number(data.initialStock) || 0;
-      
-      const openingMovement = await prisma.stockMovement.findFirst({
-        where: {
-          itemId: id,
-          note: 'Opening Stock Balance'
-        }
-      });
-
-      if (openingMovement) {
-        const diff = newInitialStock - openingMovement.quantity;
-        if (diff !== 0) {
-          await prisma.$transaction(async tx => {
-            await tx.stockMovement.update({
-              where: { id: openingMovement.id },
-              data: { quantity: newInitialStock }
-            });
-            // Update cache currentStock
-            await tx.inventoryItem.update({
-              where: { id },
-              data: { currentStock: { increment: diff } }
-            });
-          });
-        }
-      } else if (newInitialStock > 0) {
-        await prisma.$transaction(async tx => {
-          await tx.stockMovement.create({
-            data: {
-              itemId: id,
-              movementType: StockMovementType.ADJUSTMENT,
-              quantity: newInitialStock,
-              referenceType: 'ADJUSTMENT',
-              note: 'Opening Stock Balance',
-              createdBy: data.userId,
-              warehouseId: (data.binLocation || data.warehouseId || '').trim() || null
-            }
-          });
-          // Update cache currentStock
-          await tx.inventoryItem.update({
-            where: { id },
-            data: { currentStock: { increment: newInitialStock } }
-          });
-        });
-      }
-    }
+    // Master-data updates must NEVER mutate stock, change currentStock, or create StockMovements.
+    // Stock adjustments are handled strictly via explicit inventory transaction endpoints.
 
     // Sync on update as well if category is orderable — same best-effort
     // resilience as createItem: this must never fail the user's actual
@@ -675,6 +674,21 @@ export class InventoryService {
       const difference = data.newQuantity - computedStock;
       if (difference === 0) return { message: 'No change needed' };
 
+      // A positive adjustment (physical count found MORE stock, or an
+      // opening balance) must land in an APPROVED InventoryBatch, not just
+      // bump currentStock — every strict-FIFO consumer (Delivery Challan
+      // dispatch, Production, POS) only ever draws from APPROVED batch rows,
+      // so ledger-only stock is invisible to them and gets rejected as
+      // "Insufficient approved stock" even though currentStock shows
+      // plenty. A negative adjustment already goes through recordMovement's
+      // FIFO-depletion branch, which consumes real batches, so it needs no
+      // such passthrough.
+      let receiveAtCost: { unitCost: number; batchNumber: string } | undefined;
+      if (difference > 0) {
+        const item = await tx.inventoryItem.findUnique({ where: { id: data.itemId }, select: { costPrice: true } });
+        receiveAtCost = { unitCost: item?.costPrice || 0, batchNumber: `ADJ-${Date.now()}` };
+      }
+
       return this.recordMovement(tx, {
         itemId: data.itemId,
         type: StockMovementType.ADJUSTMENT,
@@ -683,6 +697,7 @@ export class InventoryService {
         referenceType: 'ADJUSTMENT',
         note: data.note || 'Physical count adjustment',
         userId: data.userId,
+        receiveAtCost,
       });
     });
   }
@@ -769,6 +784,7 @@ export class InventoryService {
       batchId?: string;
       unitCost?: number;
       strictFIFO?: boolean;
+      precalculatedFifo?: FifoConsumptionResult;
     }
   ): Promise<{ item: any; fifo?: FifoConsumptionResult }> {
     const itemBefore = await tx.inventoryItem.findUnique({ where: { id: data.itemId } });
@@ -808,18 +824,43 @@ export class InventoryService {
     let fifo: FifoConsumptionResult | undefined;
     let movementBatchId: string | undefined = data.batchId;
     let movementUnitCost: number | undefined = data.unitCost;
+    let consumptionBreakdown: any[] | undefined;
 
     if (stockChange < 0) {
-      fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
-      
-      if (data.strictFIFO && fifo.consumedFromBatches < Math.abs(stockChange)) {
+      if (data.precalculatedFifo) {
+        fifo = data.precalculatedFifo;
+      } else {
+        fifo = await this.depleteBatchesFIFO(tx, data.itemId, Math.abs(stockChange), data.warehouseId);
+      }
+      const shortfall = Math.abs(stockChange) - fifo.consumedFromBatches;
+
+      if (data.strictFIFO && shortfall > 0.0001) {
         throw new Error('Insufficient approved stock available for dispatch. Stock may be blocked or recalled.');
+      }
+
+      // Always-on, regardless of strictFIFO: a shortfall that exists only
+      // because part of this item's stock is BLOCKED/RETURNED (an active
+      // recall) must never be silently absorbed into the item's aggregate
+      // currentStock — that's exactly how POS/dispatch/transfer sold
+      // recalled inventory before this check existed (the shortfall was
+      // real, but nothing distinguished "no batch tracking exists at all"
+      // from "batches exist and are quarantined"). Untracked/legacy items
+      // with no batches at all still work exactly as before, since
+      // blockedQtyAvailable is 0 for them.
+      if (shortfall > 0.0001 && fifo.blockedQtyAvailable > 0) {
+        throw new Error('Cannot complete: this item has recalled/blocked stock and there is insufficient non-recalled stock to fulfill the requested quantity.');
       }
 
       // Only unambiguous when everything came from a single lot — a
       // movement that spans multiple batches has no single Batch ID to
       // report, so it's left null rather than picking one arbitrarily.
       if (fifo.consumptions.length === 1) movementBatchId = fifo.consumptions[0].batchId;
+      // A movement that spans multiple lots has no single Batch ID (above),
+      // which used to make it impossible to trace which ProductBatch(es) a
+      // sale/dispatch actually drew from — see the field comment on
+      // StockMovement.consumptionBreakdown. Persist the full breakdown in
+      // that case, mirroring bulkBreakdown/batchBreakdown elsewhere.
+      if (fifo.consumptions.length > 1) consumptionBreakdown = fifo.consumptions;
       movementUnitCost = fifo.consumedFromBatches > 0 ? fifo.unitCost : (updatedItem.costPrice || 0);
     } else if (stockChange > 0 && data.receiveAtCost) {
       const priorStock = updatedItem.currentStock - stockChange;
@@ -872,6 +913,7 @@ export class InventoryService {
         warehouseId: data.warehouseId ? (data.warehouseId.trim() || null) : null,
         batchId: movementBatchId || null,
         unitCost: movementUnitCost,
+        consumptionBreakdown: consumptionBreakdown as any,
       },
     });
 
@@ -887,18 +929,31 @@ export class InventoryService {
   // warehouse A can't silently draw from stock that's physically in warehouse B.
   static async depleteBatchesFIFO(tx: any, itemId: string, quantity: number, warehouseId?: string): Promise<FifoConsumptionResult> {
     let remaining = quantity;
-    const batches = await tx.inventoryBatch.findMany({
-      where: {
-        inventoryItemId: itemId,
-        currentQty: { gt: 0 },
-        status: 'APPROVED',
-        AND: [
-          { OR: [{ expDate: null }, { expDate: { gte: new Date() } }] },
-          ...(warehouseId ? [{ OR: [{ warehouseId }, { warehouseId: null }] }] : [])
-        ]
-      },
-      orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }]
-    });
+    // Row-locked (FOR UPDATE), not a plain findMany: without this, a sale
+    // can read a batch as APPROVED, a concurrent recall can commit BLOCKED
+    // on that same row a moment later, and this transaction's later
+    // per-batch `update` below (unconditioned on status, since it only
+    // matches by id) would still go through — selling recalled stock
+    // despite the recall having already committed. FOR UPDATE forces this
+    // transaction and initiateRecall/blockSales's UPDATEs on the same rows
+    // to serialize: whichever acquires the row lock first wins, and Postgres
+    // re-checks this WHERE clause against the row's latest committed state
+    // before returning it, so a row that lost the race and got BLOCKED in
+    // between is correctly excluded here rather than silently consumed.
+    const warehouseFilter = warehouseId
+      ? Prisma.sql`AND ("warehouseId" = ${warehouseId} OR "warehouseId" IS NULL)`
+      : Prisma.sql``;
+    const batches: Array<{ id: string; batchNumber: string; billNumber: string | null; productBatchId: string | null; currentQty: number; unitCost: number | null }> = await tx.$queryRaw(Prisma.sql`
+      SELECT id, "batchNumber", "billNumber", "productBatchId", "currentQty", "unitCost"
+      FROM "InventoryBatch"
+      WHERE "inventoryItemId" = ${itemId}
+        AND "currentQty" > 0
+        AND status = 'APPROVED'
+        AND ("expDate" IS NULL OR "expDate" >= now())
+        ${warehouseFilter}
+      ORDER BY "mfgDate" ASC, "createdAt" ASC
+      FOR UPDATE
+    `);
 
     let totalCost = 0;
     const consumptions: FifoConsumption[] = [];
@@ -915,7 +970,11 @@ export class InventoryService {
       remaining -= consumeQty;
       consumptions.push({
         batchId: batch.id,
-        billNumber: batch.batchNumber,
+        // Real Purchase Bill reference when this lot came from a GRN;
+        // falls back to batchNumber for production/QC/packaging-created
+        // bulk & retail lots (which have no purchase bill) and for older
+        // rows recorded before billNumber existed.
+        billNumber: batch.billNumber || batch.batchNumber,
         productBatchId: batch.productBatchId,
         qty: consumeQty,
         unitCost,
@@ -924,6 +983,23 @@ export class InventoryService {
     }
 
     const consumedFromBatches = quantity - remaining;
+
+    // Only queried when FIFO didn't fully cover the request — the common
+    // case (fully satisfied from APPROVED stock) skips this entirely.
+    let blockedQtyAvailable = 0;
+    if (remaining > 0.0001) {
+      const blockedBatches = await tx.inventoryBatch.findMany({
+        where: {
+          inventoryItemId: itemId,
+          currentQty: { gt: 0 },
+          status: { in: ['BLOCKED', 'RETURNED'] },
+          ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {}),
+        },
+        select: { currentQty: true },
+      });
+      blockedQtyAvailable = blockedBatches.reduce((s: number, b: any) => s + b.currentQty, 0);
+    }
+
     return {
       consumptions,
       consumedFromBatches,
@@ -932,7 +1008,118 @@ export class InventoryService {
       // Untracked remainder (no batch left to draw from) is excluded — callers
       // that need a full-quantity cost should fall back to costPrice for it.
       unitCost: consumedFromBatches > 0 ? totalCost / consumedFromBatches : 0,
+      blockedQtyAvailable,
     };
+  }
+
+  // Phase 3 (Sales/POS Return cost reversal): the inbound counterpart to
+  // depleteBatchesFIFO — given a pre-computed layer allocation (batchId +
+  // qty + unitCost per layer, already resolved by the caller by replaying
+  // the ORIGINAL sale's own FIFO consumption order — see
+  // SalesService._computeReturnFifoAllocation), credits each layer back to
+  // its own originating InventoryBatch row by id (preserving that batch's
+  // own recorded cost/expiry/lot identity exactly), incrementing
+  // currentStock once for the total, and writing ONE StockMovement summarizing
+  // the restock at the historical allocated cost(s) — never the item's
+  // current moving-average costPrice.
+  //
+  // `itemId` is the TARGET InventoryItem this stock is landing on (the
+  // return's own franchise/HQ scope, per FranchiseService.toInventoryScopeId
+  // — untouched by this method). A layer's batchId is only reused when that
+  // batch genuinely belongs to `itemId` — in the rare case a return's
+  // franchise scope differs from the original sale's operating-branch scope
+  // (e.g. a franchise-party POS sale processed at HQ), the original batch
+  // physically belongs to a DIFFERENT InventoryItem and must never be
+  // mutated on this item's behalf; a new batch is created instead, still at
+  // the historical allocated unitCost (never current cost). This is the
+  // same "batch row genuinely no longer exists" fallback the spec
+  // describes, generalized to also cover "exists, but not on this item."
+  static async restoreToBatches(tx: any, data: {
+    itemId: string;
+    allocation: Array<{ batchId: string | null; qty: number; unitCost: number }>;
+    movementType: string;
+    referenceType?: string;
+    referenceId?: string;
+    note?: string;
+    userId?: string;
+    warehouseId?: string | null;
+  }): Promise<{ item: any; movement: any } | null> {
+    const layers = (data.allocation || []).filter(l => l && l.qty > 0.0000001);
+    if (!layers.length) return null;
+
+    let totalQty = 0;
+    let totalCost = 0;
+    const appliedLayers: Array<{ batchId: string | null; qty: number; unitCost: number; totalCost: number }> = [];
+
+    for (const layer of layers) {
+      const unitCost = layer.unitCost || 0;
+      let restoredToBatchId: string | null = null;
+
+      if (layer.batchId) {
+        const updated = await tx.inventoryBatch.updateMany({
+          where: { id: layer.batchId, inventoryItemId: data.itemId },
+          data: { currentQty: { increment: layer.qty } },
+        });
+        if (updated.count > 0) restoredToBatchId = layer.batchId;
+      }
+
+      if (!restoredToBatchId) {
+        // Original batch row genuinely gone, or belongs to a different
+        // InventoryItem (cross-scope return) — create a fresh lot at the
+        // historical allocated cost, never at this item's current costPrice.
+        const newBatch = await tx.inventoryBatch.create({
+          data: {
+            inventoryItemId: data.itemId,
+            batchNumber: `RETURN-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`,
+            initialQty: layer.qty,
+            currentQty: layer.qty,
+            unitCost,
+            warehouseId: data.warehouseId || null,
+            status: 'APPROVED',
+          },
+        });
+        restoredToBatchId = newBatch.id;
+      }
+
+      totalQty += layer.qty;
+      totalCost += layer.qty * unitCost;
+      appliedLayers.push({ batchId: restoredToBatchId, qty: layer.qty, unitCost, totalCost: Math.round(layer.qty * unitCost * 100) / 100 });
+    }
+
+    if (totalQty <= 0.0000001) return null;
+
+    const item = await tx.inventoryItem.update({
+      where: { id: data.itemId },
+      data: { currentStock: { increment: totalQty } },
+    });
+
+    const blendedUnitCost = totalQty > 0 ? totalCost / totalQty : 0;
+    const singleLayer = appliedLayers.length === 1;
+
+    const movement = await tx.stockMovement.create({
+      data: {
+        itemId: data.itemId,
+        movementType: data.movementType as any,
+        quantity: totalQty,
+        baseQty: totalQty,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId,
+        note: data.note,
+        createdBy: data.userId,
+        warehouseId: data.warehouseId || null,
+        batchId: singleLayer ? appliedLayers[0].batchId : null,
+        unitCost: blendedUnitCost,
+        consumptionBreakdown: appliedLayers.length > 1 ? (appliedLayers as any) : null,
+      },
+    });
+
+    try {
+      await AlertService.reconcileInventoryAlert(data.itemId, tx);
+    } catch (e) {
+      console.error('[AlertService] Failed to reconcile item alert:', e);
+    }
+
+    return { item, movement };
   }
 
   // New helper for unit conversion engine
@@ -941,7 +1128,7 @@ export class InventoryService {
       where: { id: itemId },
       include: { baseUnit: true, conversions: { include: { unit: true } } }
     });
-    
+
     if (!item) throw new Error("Item not found");
     
     // If no unit requested, assume base quantity
@@ -1121,26 +1308,49 @@ export class InventoryService {
           ...(franchiseId ? { franchiseId } : {}),
           ...(category === 'ALL' ? {} : { category: category || ItemCategory.RAW_MATERIAL })
         },
+        movementType: { in: ['PRODUCTION_OUT', 'WASTE_OUT', 'ADJUSTMENT'] },
         quantity: { lt: 0 },
         ...(warehouseId ? { OR: [{ warehouseId }, { warehouseId: null }] } : {}),
         ...(startDate || endDate ? { createdAt: createdAtFilter } : {})
       },
       include: {
-        item: true
+        item: true,
+        batch: { select: { id: true, batchNumber: true, lotNumber: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    const productionIds = Array.from(
+      new Set(
+        movements
+          .filter(m => m.movementType === 'PRODUCTION_OUT' && m.referenceType === 'PRODUCTION' && m.referenceId)
+          .map(m => m.referenceId as string)
+      )
+    );
+
+    const productBatches = productionIds.length
+      ? await prisma.productBatch.findMany({
+          where: { productionId: { in: productionIds } },
+          select: { productionId: true, batchCode: true }
+        })
+      : [];
+    const batchCodeByProductionId = new Map(
+      productBatches.filter(pb => pb.productionId).map(pb => [pb.productionId!, pb.batchCode])
+    );
 
     return movements.map(m => {
       let consumptionType = 'Production Consumption';
       if (m.movementType === 'WASTE_OUT' && m.note?.toLowerCase().includes('expire')) {
         consumptionType = 'Expiry';
-      } else if (m.movementType === 'WASTE_OUT' && (m.note?.toLowerCase().includes('damage') || m.note === 'WASTE_DAMAGED')) {
+      } else if (m.movementType === 'WASTE_OUT') {
         consumptionType = 'Damage';
+      } else if (m.movementType === 'ADJUSTMENT') {
+        consumptionType = 'Manual Adjustment';
       }
 
       const qty = Math.abs(m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity);
       const value = qty * (m.item.costPrice || 0);
+      const batchCode = (m.referenceId && batchCodeByProductionId.get(m.referenceId)) || m.batch?.batchNumber || undefined;
 
       return {
         id: m.id,
@@ -1150,6 +1360,7 @@ export class InventoryService {
         unit: m.item.unit,
         quantity: qty,
         consumptionType,
+        batchCode,
         value,
         notes: m.note || ''
       };

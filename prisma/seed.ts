@@ -18,14 +18,14 @@ async function main() {
   const password = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'admin123', 10);
 
   await prisma.user.upsert({
-    where: { email: 'admin@kiddosfood.com' },
+    where: { email: 'admin@kiddosfoods.com' },
     update: {
       passwordHash: password,
       role: 'SUPER_ADMIN',
       franchiseId: null
     },
     create: {
-      email: 'admin@kiddosfood.com',
+      email: 'admin@kiddosfoods.com',
       passwordHash: password,
       fullName: 'System Super Admin',
       role: 'SUPER_ADMIN',

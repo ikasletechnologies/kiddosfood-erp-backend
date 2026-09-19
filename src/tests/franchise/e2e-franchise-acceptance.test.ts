@@ -256,6 +256,11 @@ async function runE2EFranchiseAcceptanceTest() {
     console.log('\n🧹 Cleaning up test data...');
     try {
       if (orderId) {
+        const res = await prisma.inventoryReservation.findUnique({ where: { franchiseOrderId: orderId } });
+        if (res) {
+          await prisma.inventoryReservationAllocation.deleteMany({ where: { reservationId: res.id } });
+          await prisma.inventoryReservation.delete({ where: { id: res.id } });
+        }
         await prisma.stockMovement.deleteMany({ where: { referenceId: orderId } });
         await prisma.franchiseLedger.deleteMany({ where: { referenceId: { contains: testId } } });
         await prisma.franchiseOrderItem.deleteMany({ where: { orderId } });

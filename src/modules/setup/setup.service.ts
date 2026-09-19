@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { FranchiseService } from '../franchise/franchise.service';
+import { WarehouseService } from '../warehouse/warehouse.service';
 
 // Single source of truth for "has this deployment completed its first-run
 // setup" — a Headquarters franchise plus that franchise's primary
@@ -22,6 +23,7 @@ export class SystemSetupService {
         hqWarehouseConfigured: false,
         hq: null,
         warehouse: null,
+        nextWarehouseCode: null,
         error: 'MULTIPLE_HQ',
       };
     }
@@ -36,6 +38,7 @@ export class SystemSetupService {
       hqWarehouseConfigured: !!warehouse,
       hq: hq ? { id: hq.id, name: hq.name } : null,
       warehouse: warehouse ? { id: warehouse.id, name: warehouse.name } : null,
+      nextWarehouseCode: await WarehouseService.previewNextWarehouseCode(),
     };
   }
 

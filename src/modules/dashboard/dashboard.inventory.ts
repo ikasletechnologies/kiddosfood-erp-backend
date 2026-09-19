@@ -1,12 +1,13 @@
 import prisma from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
+import { FinanceService } from '../finance/finance.service';
 
 export class DashboardInventoryService {
   static async getInventoryStats(franchiseId?: string) {
     const itemWhere: Prisma.InventoryItemWhereInput = franchiseId ? { franchiseId } : {};
     const batchWhere: Prisma.ProductBatchWhereInput = franchiseId ? { franchiseId } : {};
 
-    const [inventoryItems, productBatches, lowStockBatchCount] = await Promise.all([
+    const [inventoryItems, productBatches, lowStockBatchCount, valuation] = await Promise.all([
       // franchise relation was fetched but never read below — dropped to
       // avoid the join.
       prisma.inventoryItem.findMany({ where: itemWhere }),
@@ -24,14 +25,18 @@ export class DashboardInventoryService {
         orderBy: { expiryDate: 'asc' },
         take: 50
       }),
-      prisma.productBatch.count({ where: { ...batchWhere, expiryDate: { not: null }, quantity: { lte: 10 } } })
+      prisma.productBatch.count({ where: { ...batchWhere, expiryDate: { not: null }, quantity: { lte: 10 } } }),
+      // Reuse the authoritative Inventory Valuation report's formula
+      // (currentStock * costPrice only — no basePrice/sale-price fallback,
+      // see FinanceService.getInventoryValuationReport) instead of a second,
+      // diverging valuation formula living only in the dashboard.
+      FinanceService.getInventoryValuationReport(franchiseId)
     ]);
 
-    // Calculate inventory valuation
-    const inventoryValue = inventoryItems.reduce(
-      (sum, item) => sum + (item.currentStock * (item.costPrice || item.basePrice || 0)),
-      0
-    );
+    const inventoryValue = valuation.summary.totalStockValue;
+    // "Active SKUs" means InventoryItem.isActive, not "has any stock" — a
+    // zero-stock but still-listed SKU is still an active item master.
+    const activeSkuCount = inventoryItems.filter(item => item.isActive).length;
 
     // Build Inventory Alerts (finished goods / batches)
     const inventoryAlerts = productBatches.map(batch => {
@@ -117,7 +122,7 @@ export class DashboardInventoryService {
 
     return {
       inventoryValue,
-      inventoryItemCount: inventoryItems.length,
+      inventoryItemCount: activeSkuCount,
       lowStockCount: lowStockRawItems.length + lowStockBatchCount,
       inventoryAlerts: inventoryAlerts.slice(0, 10), // Limit dashboard view
       lowStockAlerts: lowStockList.slice(0, 10),

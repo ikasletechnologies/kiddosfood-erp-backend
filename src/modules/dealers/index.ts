@@ -9,6 +9,7 @@ router.post('/', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN'])
 router.get('/:id', authenticate, DealerController.getById);
 router.patch('/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DealerController.update);
 router.get('/:id/transactions', authenticate, DealerController.getTransactions);
+router.get('/:id/items', authenticate, DealerController.getItemHistory);
 router.delete('/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), DealerController.delete);
 
 export default router;

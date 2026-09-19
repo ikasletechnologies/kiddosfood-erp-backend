@@ -82,8 +82,8 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
   // matching is only correct for the legacy case of a product with no SKU.
   const existing = await tx.inventoryItem.findFirst({
     where: product.sku
-      ? { sku: product.sku }
-      : { name: { equals: product.name, mode: 'insensitive' } },
+      ? { sku: product.sku, franchiseId: hqFranchiseId }
+      : { name: { equals: product.name, mode: 'insensitive' }, franchiseId: hqFranchiseId },
   });
 
   if (existing) {
@@ -118,7 +118,7 @@ export class ProductService {
   /**
    * Fetch all products
    */
-  static async getAll(filters: any = {}, franchiseId?: string) {
+  static async getAll(filters: any = {}, franchiseId?: string, includeAll: boolean = false) {
     const products = await prisma.product.findMany({
       where: filters,
       include: { 
@@ -131,7 +131,14 @@ export class ProductService {
 
     if (franchiseId) {
       const skus = products.map(p => p.sku).filter(Boolean) as string[];
-      const names = products.map(p => p.name);
+      const namesWithoutSku = products.filter(p => !p.sku).map(p => p.name);
+      const inventoryWhere: any[] = [];
+      if (skus.length > 0) {
+        inventoryWhere.push({ sku: { in: skus } });
+      }
+      if (namesWithoutSku.length > 0) {
+        inventoryWhere.push({ name: { in: namesWithoutSku, mode: 'insensitive' } });
+      }
 
       // A null-franchiseId InventoryItem is the established "HQ-scoped"
       // convention used elsewhere (see InventoryService.createItem and
@@ -155,7 +162,7 @@ export class ProductService {
         where: {
           AND: [
             scopeFilter,
-            { OR: [{ sku: { in: skus } }, { name: { in: names, mode: 'insensitive' } }] }
+            inventoryWhere.length > 0 ? { OR: inventoryWhere } : {}
           ]
         },
         include: { baseUnit: true, conversions: { include: { unit: true } } }
@@ -164,17 +171,35 @@ export class ProductService {
       
       return products.map(p => {
         const pName = p.name.trim().toLowerCase();
-        // Match by SKU first, then fallback to Name (case-insensitive + trimmed)
-        const inv = inventory.find(i => i.sku && p.sku && i.sku.trim() === p.sku.trim()) || 
-                   inventory.find(i => i.name.trim().toLowerCase() === pName);
+        // Match by SKU strictly when product has a SKU — NEVER fall back to name,
+        // which would cause different size/weight variants sharing a name (e.g. APPAM 450G/900G)
+        // to collapse onto a single inventory row. Name matching is only valid for legacy SKU-less products.
+        const inv = p.sku
+          ? inventory.find(i => i.sku && i.sku.trim().toUpperCase() === p.sku!.trim().toUpperCase())
+          : inventory.find(i => i.name.trim().toLowerCase() === pName);
         
         const packSize = parseSkuPackSize(p.sku);
-        const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || 'PC';
+        // `unit` must be a real, transactable measurement unit — the one
+        // InventoryService.convertUnitToBase actually knows how to resolve
+        // against InventoryItem.unit/baseUnit/conversions. packSize (e.g.
+        // "450G" parsed off the SKU) describes how much product is in ONE
+        // sold unit — a label, not a unit itself — and stays available as
+        // its own `packSize` field below for display (see POS/franchise-
+        // orders, which already show it that way). Folding
+        // `${qty}${unit}` into `unit` here made every sale of a pack-size
+        // SKU send a synthetic string like "450G" through the whole sales
+        // pipeline, which InventoryService.convertUnitToBase — correctly —
+        // can never resolve, since nothing in the unit/conversion system
+        // was ever meant to represent "450G" as a real unit. Bare
+        // packSize.unit (e.g. "G") IS a real unit code per SKU_SIZE_RE, so
+        // it stays as a last-resort fallback when the item truly has no
+        // configured unit at all.
+        const resolvedUnit = inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || packSize?.unit || 'PC';
 
         if (!inv) {
           // If resolving for a branch franchise (non-HQ), exclude products
           // that have not yet been transferred/inwarded into this franchise's inventory.
-          if (!resolvingHQStock) {
+          if (!resolvingHQStock && !includeAll) {
             return null;
           }
           return {
@@ -197,6 +222,13 @@ export class ProductService {
           inventoryFranchiseId: inv.franchiseId || (franchiseId || null),
           inventoryBasePrice: inv.basePrice,
           inventoryCostPrice: inv.costPrice,
+          // Channel-specific prices live only on InventoryItem, never on
+          // Product — without this, POS's getPrice(p, partyType) always
+          // fell through to the generic base/franchise price for every
+          // channel (the ₹35-shown-for-Dealer bug).
+          franchisePrice: inv.franchisePrice,
+          dealerPrice: inv.dealerPrice,
+          customerPrice: inv.customerPrice,
           baseUnit: inv.baseUnit,
           conversions: inv.conversions,
           packSize
@@ -206,7 +238,9 @@ export class ProductService {
 
     return products.map(p => {
       const packSize = parseSkuPackSize(p.sku);
-      const resolvedUnit = (packSize ? `${packSize.qty}${packSize.unit}` : null) || p.recipe?.yieldUnit || 'PC';
+      // Same fix as above — packSize describes pack content, not a
+      // transactable unit; see the comment on the franchise-scoped branch.
+      const resolvedUnit = p.recipe?.yieldUnit || packSize?.unit || 'PC';
       return {
         ...p,
         unit: resolvedUnit,

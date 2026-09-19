@@ -26,8 +26,9 @@ export class DraftsController {
 
   static async deleteDraft(req: Request, res: Response) {
     try {
+      const userId = (req as any).user?.userId;
       const { id } = req.params;
-      await DraftsService.deleteDraft(id);
+      await DraftsService.deleteDraft(id, userId);
       res.status(204).send();
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

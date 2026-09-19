@@ -2,19 +2,36 @@ import { Request, Response } from 'express';
 import { CustomerService } from './customer.service';
 import { CRMService } from '../crm/crm.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { FranchiseService } from '../franchise/franchise.service';
 
 export class CustomerController {
   static async getAll(req: Request, res: Response) {
     try {
-      const { search } = req.query;
+      const { search, all } = req.query;
       const user = (req as any).user;
-      // SUPER_ADMIN may pick any scope (HQ or a specific franchise) via the query
-      // param; everyone else is always forced to their own franchise.
-      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
-      const franchiseId = user?.role === 'SUPER_ADMIN'
-        ? (req.query.franchiseId as string | undefined)
-        : ownFranchiseId;
-      const customers = await CustomerService.getAll(search as string, franchiseId);
+      let franchiseId: string | undefined;
+      let isHqScope = false;
+
+      if (user?.role === 'SUPER_ADMIN') {
+        if (req.query.franchiseId) {
+          franchiseId = req.query.franchiseId as string;
+          const hq = await FranchiseService.getHqFranchiseOrNull();
+          if (hq && hq.id === franchiseId) {
+            isHqScope = true;
+          }
+        } else if (all === 'true') {
+          franchiseId = undefined; // global overview when explicitly asked
+        } else {
+          // Default Super Admin strictly to HQ customers
+          const hq = await FranchiseService.getHqFranchiseOrNull();
+          franchiseId = hq?.id || undefined;
+          isHqScope = true;
+        }
+      } else {
+        const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+        franchiseId = ownFranchiseId;
+      }
+      const customers = await CustomerService.getAll(search as string, franchiseId, isHqScope);
       res.json(customers);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -124,4 +141,20 @@ export class CustomerController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getItemHistory(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { franchiseId: ownFranchiseId } = IsolationUtil.getFranchiseFilter(user);
+      const franchiseId = user?.role === 'SUPER_ADMIN'
+        ? (req.query.franchiseId as string | undefined)
+        : ownFranchiseId;
+      const history = await CustomerService.getItemHistory(req.params.id, franchiseId);
+      res.json(history);
+    } catch (error: any) {
+      const status = error.message === 'Customer not found' ? 404 : 500;
+      res.status(status).json({ error: error.message });
+    }
+  }
+
 }

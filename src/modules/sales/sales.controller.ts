@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import prisma from '../../lib/prisma';
 import { SalesService } from './sales.service';
 
 export class SalesController {
@@ -31,7 +32,11 @@ export class SalesController {
 
   static async createQuotation(req: Request, res: Response) {
     try {
-      const createdBy = (req as any).user?.userId;
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create estimates for Customers and Dealers.' });
+      }
+      const createdBy = user?.userId;
       const quotation = await SalesService.createQuotation({ ...req.body, createdBy });
       res.status(201).json(quotation);
     } catch (error) {
@@ -41,6 +46,10 @@ export class SalesController {
 
   static async updateQuotation(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create estimates for Customers and Dealers.' });
+      }
       const quotation = await SalesService.updateQuotation(req.params.id, req.body);
       res.json(quotation);
     } catch (error) {
@@ -195,7 +204,11 @@ export class SalesController {
 
   static async createProformaInvoice(req: Request, res: Response) {
     try {
-      const data = { ...req.body, createdBy: (req as any).user?.userId };
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create proforma invoices for Customers and Dealers.' });
+      }
+      const data = { ...req.body, createdBy: user?.userId };
       const proforma = await SalesService.createProformaInvoice(data);
       res.status(201).json(proforma);
     } catch (error) {
@@ -205,6 +218,10 @@ export class SalesController {
 
   static async updateProformaInvoice(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      if (user?.role === 'FRANCHISE_ADMIN' && req.body.partyType === 'FRANCHISE') {
+        return res.status(400).json({ error: 'Franchise users can only create proforma invoices for Customers and Dealers.' });
+      }
       const proforma = await SalesService.updateProformaInvoice(req.params.id, req.body);
       res.json(proforma);
     } catch (error) {
@@ -237,13 +254,13 @@ export class SalesController {
   static async getReturnOrders(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = user.role === 'SUPER_ADMIN'
-        ? (req.query.franchiseId as string | undefined)
-        : user.franchiseId;
+      const isSuperAdmin = user?.role === 'SUPER_ADMIN';
       const returns = await SalesService.getReturnOrders({
         status: req.query.status as string,
         customerId: req.query.customerId as string,
-        franchiseId,
+        dealerId: req.query.dealerId as string,
+        franchiseId: isSuperAdmin ? (req.query.franchiseId as string | undefined) : undefined,
+        operatingFranchiseId: !isSuperAdmin ? user?.franchiseId : (req.query.operatingFranchiseId as string | undefined),
         source: req.query.source as any,
         search: req.query.search as string
       });
@@ -255,20 +272,121 @@ export class SalesController {
 
   static async createReturnOrder(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+
+      if (!isSuperAdmin) {
+        if (!user?.franchiseId) {
+          return res.status(403).json({ error: 'Franchise context required to create return' });
+        }
+        if (!req.body.posOrderId) {
+          return res.status(400).json({ error: 'A valid sales invoice reference (posOrderId) is required to create a return' });
+        }
+
+        const sourceOrder = await prisma.order.findUnique({
+          where: { id: req.body.posOrderId },
+          include: { customer: true }
+        });
+
+        if (!sourceOrder) {
+          return res.status(404).json({ error: 'Sale invoice not found' });
+        }
+
+        if (sourceOrder.franchiseId !== user.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Invoice does not belong to your franchise' });
+        }
+
+        if (sourceOrder.partyType === 'FRANCHISE') {
+          return res.status(400).json({ error: 'Cannot create a sales return against an HQ procurement invoice' });
+        }
+
+        if (sourceOrder.status === 'CANCELLED') {
+          return res.status(400).json({ error: 'Cannot create a return against a cancelled invoice' });
+        }
+
+        // Sanitize: remove any forged party/order IDs
+        delete req.body.franchiseId;
+        delete req.body.franchiseOrderId;
+        delete req.body.salesOrderId;
+
+        if (sourceOrder.partyType === 'DEALER') {
+          req.body.dealerId = sourceOrder.partyId || req.body.dealerId;
+        } else if (sourceOrder.partyType === 'CUSTOMER') {
+          req.body.customerId = sourceOrder.customerId || req.body.customerId;
+        }
+      }
+
       const returnOrder = await SalesService.createReturnOrder(req.body);
       res.status(201).json(returnOrder);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to create return order';
+      const isBusinessError = /cannot return|maximum returnable|greater than zero|already returned|not found|integrity/i.test(msg);
+      res.status(isBusinessError ? 400 : 500).json({ error: msg });
     }
   }
 
   static async updateReturnOrder(req: Request, res: Response) {
     try {
-      const approverId = (req as any).user?.userId;
+      const user = (req as any).user;
+      const approverId = user?.userId;
+
+      if (user?.role !== 'SUPER_ADMIN') {
+        const existing = await prisma.returnOrder.findUnique({
+          where: { id: req.params.id },
+          include: { posOrder: true }
+        });
+        if (!existing) return res.status(404).json({ error: 'Return order not found' });
+        if (existing.posOrder?.franchiseId !== user?.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Return order does not belong to your franchise' });
+        }
+      }
+
       const returnOrder = await SalesService.updateReturnOrder(req.params.id, { ...req.body, approvedBy: approverId });
       res.json(returnOrder);
-    } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to update return order';
+      res.status(400).json({ error: msg });
+    }
+  }
+
+  // Phase 2: actually moves money/ledger/state for an approved return.
+  // Only refundMethod/accountId/method are read from the body — amount/
+  // rate/discount/gst are never accepted here; SalesService.recordRefund
+  // reads the refund amount exclusively from the already-correct
+  // ReturnOrder.refundAmount established at createReturnOrder time.
+  static async refundReturnOrder(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const createdBy = user?.userId;
+
+      if (user?.role !== 'SUPER_ADMIN') {
+        const existing = await prisma.returnOrder.findUnique({
+          where: { id: req.params.id },
+          include: { posOrder: true }
+        });
+        if (!existing) return res.status(404).json({ error: 'Return order not found' });
+        if (existing.posOrder?.franchiseId !== user?.franchiseId) {
+          return res.status(403).json({ error: 'Access denied: Return order does not belong to your franchise' });
+        }
+
+        if (req.body?.accountId) {
+          const account = await prisma.account.findUnique({ where: { id: req.body.accountId } });
+          if (account && account.franchiseId !== user?.franchiseId) {
+            return res.status(403).json({ error: 'Access denied: Account does not belong to your franchise' });
+          }
+        }
+      }
+
+      const result = await SalesService.recordRefund(req.params.id, {
+        refundMethod: req.body?.refundMethod,
+        accountId: req.body?.accountId,
+        method: req.body?.method,
+        createdBy
+      });
+      res.json(result);
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to process refund';
+      res.status(400).json({ error: msg });
     }
   }
 
@@ -276,10 +394,16 @@ export class SalesController {
 
   static async getDeliveryChallans(req: Request, res: Response) {
     try {
+      const user = (req as any).user;
+      let franchiseId = req.query.franchiseId as string | undefined;
+      if (user?.role !== 'SUPER_ADMIN') {
+        franchiseId = user?.franchiseId || '__UNASSIGNED__';
+      }
       const challans = await SalesService.getDeliveryChallans({
         customerId: req.query.customerId as string,
         status: req.query.status as string,
-        search: req.query.search as string
+        search: req.query.search as string,
+        franchiseId,
       });
       res.json(challans);
     } catch (error) {
@@ -306,8 +430,14 @@ export class SalesController {
 
   static async createDeliveryChallan(req: Request, res: Response) {
     try {
-      const userId = (req as any).user?.userId || 'system';
-      const challan = await SalesService.createDeliveryChallan(req.body, userId);
+      const user = (req as any).user;
+      const userId = user?.userId || 'system';
+      const payload = { ...req.body };
+      if (user?.role !== 'SUPER_ADMIN') {
+        // Enforce franchise isolation: branch users can ONLY dispatch from their own franchise
+        payload.sourceFranchiseId = user?.franchiseId;
+      }
+      const challan = await SalesService.createDeliveryChallan(payload, userId);
       res.status(201).json(challan);
     } catch (error) {
       const message = (error as Error).message;

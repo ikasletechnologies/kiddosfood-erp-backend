@@ -31,12 +31,22 @@ export class GRNController {
     }
   }
 
+  static async getRemainingQuantities(req: Request, res: Response) {
+    try {
+      const data = await GRNService.getRemainingQuantities(req.params.poId);
+      res.json(data);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async createFromPO(req: Request, res: Response) {
     try {
       const user = (req as any).user;
       const grn = await GRNService.createFromPO(req.params.poId, {
         ...req.body,
-        performedBy: user?.email || user?.userId
+        performedBy: user?.email || user?.userId,
+        user
       });
       res.status(201).json(grn);
     } catch (error: any) {
@@ -46,7 +56,8 @@ export class GRNController {
 
   static async approve(req: Request, res: Response) {
     try {
-      const grn = await GRNService.approve(req.params.id);
+      const user = (req as any).user;
+      const grn = await GRNService.approve(req.params.id, user);
       res.json(grn);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

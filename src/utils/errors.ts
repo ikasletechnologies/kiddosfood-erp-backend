@@ -9,3 +9,15 @@ export class PaymentValidationError extends Error {
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
+
+export class TransferValidationError extends Error {
+  public readonly statusCode: number = 400;
+  public readonly details: any;
+
+  constructor(message: string, details: any) {
+    super(message);
+    this.name = 'TransferValidationError';
+    this.details = details;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}

@@ -768,7 +768,7 @@ export class ProcurementService {
     if (isNaN(freightCost) || !isFinite(freightCost) || freightCost < 0) {
       throw new Error('Freight cost must be a valid non-negative number.');
     }
-    const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost);
+    const totalAmount = Number(Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discountAmount + freightCost).toFixed(2));
 
     // Existing usable credit — see getAvailableAdvance for why this isn't
     // just the raw ledger balance (it also excludes advance already
@@ -1029,7 +1029,7 @@ export class ProcurementService {
         if (isNaN(freight) || !isFinite(freight) || freight < 0) {
           throw new Error('Freight cost must be a valid non-negative number.');
         }
-        const totalAmount = Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight);
+        const totalAmount = Number(Math.max(0, totalSubtotal + totalCGST + totalSGST + totalIGST - discount + freight).toFixed(2));
 
         await tx.procurementOrderItem.deleteMany({ where: { poId } });
 
@@ -1066,7 +1066,7 @@ export class ProcurementService {
           throw new Error('Freight cost must be a valid non-negative number.');
         }
 
-        const totalAmount = Math.max(0, po.subtotal + po.cgst + po.sgst + po.igst - discount + freight);
+        const totalAmount = Number(Math.max(0, po.subtotal + po.cgst + po.sgst + po.igst - discount + freight).toFixed(2));
         updateData.discountAmount = discount;
         updateData.freightCost = freight;
         updateData.totalAmount = totalAmount;
@@ -1112,7 +1112,7 @@ export class ProcurementService {
           balanceAfterTransaction: nextBalance,
           paymentMode: 'CASH',
           referenceType: 'ADVANCE',
-          referenceId: po.id,
+          referenceId: po.poNumber || po.id,
           note: `Advance Payment for PO #${po.poNumber || po.id.substring(0, 8)}`
         }
       });
@@ -1466,7 +1466,7 @@ export class ProcurementService {
       const completedReturns = await prisma.purchaseReturn.findMany({
         where: {
           vendorId,
-          status: { in: ['COMPLETED', 'APPROVED'] }
+          status: 'COMPLETED'
         },
         include: {
           procurementOrder: { include: { invoices: true } },
@@ -1609,7 +1609,7 @@ export class ProcurementService {
   }
 
   static async recordPayment(vendorId: string, data: {
-    amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE';
+    amount: number; note: string; accountId: string; type?: 'PAYMENT' | 'ADVANCE' | 'REFUND';
     paymentMode?: any; referenceId?: string; vendorInvoiceId?: string; transactionRef?: string;
     idempotencyKey?: string; allowOverpayment?: boolean; date?: string;
   }) {
@@ -1653,7 +1653,17 @@ export class ProcurementService {
       // previously recorded valid payments. Reject anything beyond that
       // unless the caller explicitly opted into overpayment (which should
       // be recorded as a fresh vendor advance, not silently absorbed here).
-      if (!allowOverpayment) {
+      if (type === 'REFUND') {
+        const v = await this.getVendorById(vendorId);
+        if (!v) throw new Error("Vendor not found");
+        if (v.balance >= 0) {
+          throw new Error(`Cannot record refund. Vendor does not have a receivable balance (Current balance: ₹${v.balance}).`);
+        }
+        const receivable = Math.abs(v.balance);
+        if (amount > receivable + 0.01) {
+          throw new Error(`Refund amount of ₹${amount} exceeds the vendor's receivable balance of ₹${receivable.toFixed(2)}.`);
+        }
+      } else if (!allowOverpayment) {
         let outstanding: number | null = null;
         if (vendorInvoiceId) {
           const inv = await tx.vendorInvoice.findUnique({ where: { id: vendorInvoiceId } });
@@ -1681,13 +1691,13 @@ export class ProcurementService {
       const payment = await FinanceService.createPayment({
         tx,
         amount,
-        type: type === 'ADVANCE' ? 'ADVANCE' : 'INVOICE_LINKED',
-        flow: 'OUT',
+        type: type === 'ADVANCE' ? 'ADVANCE' : (type === 'REFUND' ? 'REFUND' : 'INVOICE_LINKED'),
+        flow: type === 'REFUND' ? 'IN' : 'OUT',
         status: 'PAID',
         sourceAccount: accountId,
         method: resolvedMode,
         sourceModule: 'PROCUREMENT',
-        linkedDocType: vendorInvoiceId ? 'INVOICE' : (targetPoId ? 'PO' : 'DIRECT'),
+        linkedDocType: type === 'REFUND' ? 'DIRECT' : (vendorInvoiceId ? 'INVOICE' : (targetPoId ? 'PO' : 'DIRECT')),
         linkedDocId: vendorInvoiceId || targetPoId,
         vendorInvoiceId: vendorInvoiceId,
         entityType: 'VENDOR',

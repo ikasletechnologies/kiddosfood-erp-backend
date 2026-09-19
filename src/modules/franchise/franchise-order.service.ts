@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, FranchiseOrderFulfillment, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
+import { InventoryReservationService } from '../inventory/inventory-reservation.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
 import { InventoryService } from '../inventory/inventory.service';
@@ -26,7 +27,7 @@ async function findHqStockItem(tx: any, hqId: string | null | undefined, product
     : { franchiseId: null };
 
   if (product.sku) {
-    const itemBySku = await tx.inventoryItem.findFirst({
+    return tx.inventoryItem.findFirst({
       where: {
         AND: [
           scopeFilter,
@@ -34,9 +35,9 @@ async function findHqStockItem(tx: any, hqId: string | null | undefined, product
         ]
       }
     });
-    if (itemBySku) return itemBySku;
   }
 
+  // Legacy fallback for products without a SKU only
   return tx.inventoryItem.findFirst({
     where: {
       AND: [
@@ -153,8 +154,9 @@ function computeFulfillmentForOrderSync(order: any, hqInventoryMap: { bySku: Map
     if (!product) continue;
     const requestedQty = Number(item.quantity || 0);
 
-    const hqItem = (product.sku && hqInventoryMap.bySku.get(product.sku.toUpperCase()))
-      || hqInventoryMap.byName.get(product.name.toUpperCase());
+    const hqItem = product.sku
+      ? hqInventoryMap.bySku.get(product.sku.toUpperCase())
+      : hqInventoryMap.byName.get(product.name.toUpperCase());
 
     const availableHqStock = Math.max(0, Number(hqItem?.currentStock || 0));
     const neededFromProduction = Math.max(0, requestedQty - availableHqStock);
@@ -404,6 +406,28 @@ export class FranchiseOrderService {
     const orderIds = orders.map(o => o.id);
     const orderNumbers = orders.map(o => o.orderNumber);
 
+    const payments = await prisma.payment.findMany({
+      where: {
+        OR: [
+          { linkedDocId: { in: orderNumbers } },
+          { linkedDocId: { in: orderIds } },
+        ],
+        status: 'SUCCESS',
+        isCancelled: false,
+      },
+      include: { account: true },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const paymentsByOrder = new Map<string, any[]>();
+    for (const p of payments) {
+      if (p.linkedDocId) {
+        const list = paymentsByOrder.get(p.linkedDocId) || [];
+        list.push(p);
+        paymentsByOrder.set(p.linkedDocId, list);
+      }
+    }
+
     const salesOrders = await prisma.order.findMany({
       where: {
         OR: [
@@ -439,6 +463,18 @@ export class FranchiseOrderService {
     return orders.map(order => {
       const inv = invoiceByOrderId.get(order.id) || invoiceByOrderNumber.get(order.orderNumber) || null;
 
+      const orderPaymentsRaw = [
+        ...(paymentsByOrder.get(order.orderNumber) || []),
+        ...(paymentsByOrder.get(order.id) || []),
+      ];
+      const uniquePayments = Array.from(new Map(orderPaymentsRaw.map(p => [p.id, p])).values());
+      const paidAmountSum = uniquePayments.reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+      const effectivePaidAmount = order.paymentStatus === 'PAID' ? Math.max(paidAmountSum, order.totalAmount) : paidAmountSum;
+      const balanceDue = Math.max(0, Number((order.totalAmount - effectivePaidAmount).toFixed(2)));
+      const effectivePaymentStatus = balanceDue <= 0.001 ? 'PAID' : (effectivePaidAmount > 0 ? 'PARTIAL' : order.paymentStatus);
+      const hqReceived = uniquePayments.length > 0 && uniquePayments.every(p => p.approvedBy !== null && p.approvedBy !== undefined && p.approvedBy !== '');
+      const franchisePaid = paidAmountSum > 0;
+
       // Dynamically re-evaluate fulfillment readiness for active orders against live HQ inventory
       let fulfillment: {
         fulfillmentPath: FranchiseOrderFulfillment | null;
@@ -456,6 +492,21 @@ export class FranchiseOrderService {
 
       return {
         ...order,
+        paymentStatus: effectivePaymentStatus,
+        paidAmount: effectivePaidAmount,
+        balanceDue,
+        franchisePaid,
+        hqReceived,
+        payments: uniquePayments.map(p => ({
+          id: p.id,
+          paidAmount: p.paidAmount,
+          paymentMode: p.paymentMode,
+          transactionRef: p.transactionRef,
+          createdAt: p.createdAt,
+          createdBy: p.createdBy,
+          approvedBy: p.approvedBy,
+          accountName: p.account?.name || null
+        })),
         ...fulfillment,
         hasInvoice: !!inv,
         invoice: inv,
@@ -541,8 +592,44 @@ export class FranchiseOrderService {
       finalAmount: salesOrder.invoice.finalAmount,
     } : null;
 
+    const payments = await prisma.payment.findMany({
+      where: {
+        OR: [
+          { linkedDocId: order.orderNumber },
+          { linkedDocId: order.id },
+          { transactionRef: { contains: order.orderNumber } }
+        ],
+        status: 'SUCCESS',
+        isCancelled: false,
+      },
+      include: { account: true },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const uniquePayments = Array.from(new Map(payments.map(p => [p.id, p])).values());
+    const paidAmountSum = uniquePayments.reduce((sum, p) => sum + (p.paidAmount || 0), 0);
+    const effectivePaidAmount = order.paymentStatus === 'PAID' ? Math.max(paidAmountSum, order.totalAmount) : paidAmountSum;
+    const balanceDue = Math.max(0, Number((order.totalAmount - effectivePaidAmount).toFixed(2)));
+    const effectivePaymentStatus = balanceDue <= 0.001 ? 'PAID' : (effectivePaidAmount > 0 ? 'PARTIAL' : order.paymentStatus);
+    const hqReceived = uniquePayments.length > 0 && uniquePayments.every(p => p.approvedBy !== null && p.approvedBy !== undefined && p.approvedBy !== '');
+    const franchisePaid = paidAmountSum > 0;
+
     return {
       ...order,
+      paymentStatus: effectivePaymentStatus,
+      paidAmount: effectivePaidAmount,
+      balanceDue,
+      franchisePaid,
+      hqReceived,
+      payments: uniquePayments.map(p => ({
+        id: p.id,
+        paidAmount: p.paidAmount,
+        paymentMode: p.paymentMode,
+        transactionRef: p.transactionRef,
+        createdAt: p.createdAt,
+        createdBy: p.createdBy,
+        accountName: p.account?.name || null
+      })),
       ...fulfillment,
       hasInvoice: !!inv,
       invoice: inv,
@@ -585,9 +672,84 @@ export class FranchiseOrderService {
       if (status === FranchiseOrderStatus.IN_PRODUCTION && !fulfillment.materialsReady) {
         throw new Error('Cannot start production: raw materials are insufficient (or no recipe is configured) for this order.');
       }
+      
+      // If order is newly APPROVED and we are fulfilling from STOCK, reserve physical FIFO layers now.
+      if (status === FranchiseOrderStatus.APPROVED && order.status === FranchiseOrderStatus.PENDING) {
+        if (fulfillment.fulfillmentPath === FranchiseOrderFulfillment.STOCK) {
+          const hq = await FranchiseService.getHqFranchiseOrNull(prisma as any);
+          const fullOrder = await prisma.franchiseOrder.findUnique({
+            where: { id },
+            include: { items: { include: { product: true } } },
+          });
+          const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
+          for (const item of fullOrder!.items) {
+            if (item.productType === ProductType.FINISHED_GOOD) {
+              const product = item.product;
+              const invItem = await findHqStockItem(prisma, hq?.id, product);
+              if (invItem) {
+                itemsToReserve.push({ productId: product.id, inventoryItemId: invItem.id, quantity: item.quantity });
+              } else {
+                throw new Error(`HQ Inventory item not found for product ${product.name}`);
+              }
+            }
+          }
+          
+          const updatedOrder = await prisma.$transaction(async tx => {
+            if (itemsToReserve.length > 0) {
+              await InventoryReservationService.reserveStock(tx, id, itemsToReserve);
+            }
+            return await tx.franchiseOrder.update({
+              where: { id },
+              data: updateData,
+              include: { items: { include: { product: true } }, franchise: true },
+            });
+          });
+
+          try {
+            SocketService.io.emit('franchise-order-updated', updatedOrder);
+          } catch (err) {
+            console.error('[Socket] Failed to emit franchise-order-updated', err);
+          }
+          return updatedOrder;
+        }
+      }
+    }
+
+    if (status === FranchiseOrderStatus.CANCELLED) {
+      const updatedOrder = await prisma.$transaction(async tx => {
+        await InventoryReservationService.releaseReservation(tx, id);
+        return await tx.franchiseOrder.update({
+          where: { id },
+          data: updateData,
+          include: { items: { include: { product: true } }, franchise: true },
+        });
+      });
+
+      try {
+        SocketService.io.emit('franchise-order-updated', updatedOrder);
+      } catch (err) {
+        console.error('[Socket] Failed to emit franchise-order-updated', err);
+      }
+      return updatedOrder;
     }
 
     if (status === FranchiseOrderStatus.DISPATCHED) {
+      if (order.status === FranchiseOrderStatus.DISPATCHED) {
+        // Idempotent: already dispatched, return order immediately
+        return prisma.franchiseOrder.findUnique({
+          where: { id },
+          include: { items: { include: { product: true } }, franchise: true },
+        });
+      }
+
+      if (order.status === FranchiseOrderStatus.CANCELLED) {
+        throw new Error('Cannot dispatch a cancelled order.');
+      }
+
+      if (order.status === FranchiseOrderStatus.DELIVERED) {
+        throw new Error('Cannot dispatch an order that has already been marked as DELIVERED.');
+      }
+
       const actual = extra?.actualDispatchDate
         ? new Date(extra.actualDispatchDate)
         : new Date();
@@ -606,10 +768,49 @@ export class FranchiseOrderService {
           where: { id },
           include: { items: true },
         });
+        if (!fullOrder) throw new Error('Order not found');
+        if (fullOrder.status === FranchiseOrderStatus.DISPATCHED) {
+          return; // Idempotency check inside transaction
+        }
+
         const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-        for (const item of fullOrder!.items) {
+        
+        let hasActiveReservation = false;
+        const existingReservation = await tx.inventoryReservation.findUnique({
+          where: { franchiseOrderId: id },
+          include: { allocations: true }
+        });
+        if (existingReservation && existingReservation.status === 'ACTIVE' && existingReservation.allocations.length > 0) {
+          hasActiveReservation = true;
+        }
+
+        if (!hasActiveReservation) {
+          // If the order jumped straight to dispatch, or was in production, or had no reservation from approval, reserve now before consumption
+          const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
+          for (const item of fullOrder.items) {
+            if (item.productType === ProductType.FINISHED_GOOD) {
+              const product = await tx.product.findUnique({ where: { id: item.productId } });
+              if (product) {
+                const invItem = await findHqStockItem(tx, hq?.id, product);
+                if (invItem) itemsToReserve.push({ productId: product.id, inventoryItemId: invItem.id, quantity: item.quantity });
+              }
+            }
+          }
+          if (itemsToReserve.length > 0) {
+            await InventoryReservationService.reserveStock(tx, id, itemsToReserve);
+          }
+        }
+        
+        const fifoResultByItem = await InventoryReservationService.consumeReservation(tx, id);
+        
+        for (const item of fullOrder.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
-            await deductBatchStock(tx, item.productId, item.quantity, hq?.id, id, fullOrder!.orderNumber);
+            const product = await tx.product.findUnique({ where: { id: item.productId } });
+            if (product) {
+              const invItem = await findHqStockItem(tx, hq?.id, product);
+              const precalculatedFifo = invItem ? fifoResultByItem.get(invItem.id) : undefined;
+              await deductBatchStock(tx, item.productId, item.quantity, hq?.id, id, fullOrder.orderNumber, precalculatedFifo);
+            }
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -635,6 +836,11 @@ export class FranchiseOrderService {
           throw new Error(`Cannot mark order as DELIVERED: order is currently "${fullOrder!.status}", not "DISPATCHED". This receipt may have already been processed.`);
         }
 
+        const reservation = await tx.inventoryReservation.findUnique({
+          where: { franchiseOrderId: id },
+          include: { allocations: { include: { inventoryBatch: true } } }
+        });
+
         // Loop through all order items to fulfill inventory updates
         for (const item of fullOrder!.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
@@ -658,25 +864,12 @@ export class FranchiseOrderService {
                   },
                 });
 
-            if (invItem) {
-              // Every stock change must leave a ledger trail — record receiveAtCost so
-              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
-              await InventoryService.recordMovement(tx, {
-                itemId: invItem.id,
-                type: 'TRANSFER_IN',
-                quantity: item.quantity,
-                referenceType: 'FRANCHISE_ORDER',
-                referenceId: id,
-                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
-                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
-              });
-            } else {
+            let targetInvItem = invItem;
+            if (!targetInvItem) {
               // Create new inventory item for the franchise if it doesn't exist.
-              // InventoryItem is scoped per franchise (@@unique([sku, franchiseId])),
-              // so the franchise row preserves the exact Product SKU.
               let sku = product.sku || `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
-              const newInvItem = await tx.inventoryItem.create({
+              targetInvItem = await tx.inventoryItem.create({
                 data: {
                   name: product.name,
                   sku,
@@ -689,30 +882,73 @@ export class FranchiseOrderService {
                   isActive: true
                 }
               });
-
-              // Opening balance for this branch item goes through the ledger
-              // with the exact wholesale acquisition price (item.unitPrice).
-              await InventoryService.recordMovement(tx, {
-                itemId: newInvItem.id,
-                type: 'TRANSFER_IN',
-                quantity: item.quantity,
-                referenceType: 'FRANCHISE_ORDER',
-                referenceId: id,
-                note: `Initial stock received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
-                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
-              });
             }
 
-            // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
-            await tx.productBatch.create({
-              data: {
-                productId: item.productId,
-                franchiseId: order.franchiseId,
-                quantity: item.quantity,
-                batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
-                expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 7 days for now
+            // Find HQ's inventory item for this product to map allocations
+            const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+            const hqInvItem = await findHqStockItem(tx, hq?.id || null, product);
+            
+            let totalProcessedQty = 0;
+
+            if (reservation && hqInvItem) {
+              const itemAllocs = reservation.allocations.filter(a => a.inventoryItemId === hqInvItem.id && a.consumedQty > 0);
+              for (const alloc of itemAllocs) {
+                if (totalProcessedQty >= item.quantity) break;
+                
+                const receiptQty = Math.min(alloc.consumedQty, item.quantity - totalProcessedQty);
+                const trueUnitCost = alloc.inventoryBatch.unitCost || item.unitPrice;
+                const batchNum = alloc.inventoryBatch.batchNumber;
+
+                await InventoryService.recordMovement(tx, {
+                  itemId: targetInvItem.id,
+                  type: 'TRANSFER_IN',
+                  quantity: receiptQty,
+                  referenceType: 'FRANCHISE_ORDER',
+                  referenceId: id,
+                  note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber} Batch ${batchNum})`,
+                  receiveAtCost: { unitCost: trueUnitCost, batchNumber: batchNum }
+                });
+                
+                // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
+                await tx.productBatch.create({
+                  data: {
+                    productId: item.productId,
+                    franchiseId: order.franchiseId,
+                    quantity: receiptQty,
+                    batchCode: batchNum,
+                    expiryDate: alloc.inventoryBatch.expDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+                  }
+                });
+
+                totalProcessedQty += receiptQty;
               }
-            });
+            }
+
+            if (totalProcessedQty < item.quantity) {
+              const fallbackQty = item.quantity - totalProcessedQty;
+              // Every stock change must leave a ledger trail — record receiveAtCost so
+              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
+              await InventoryService.recordMovement(tx, {
+                itemId: targetInvItem.id,
+                type: 'TRANSFER_IN',
+                quantity: fallbackQty,
+                referenceType: 'FRANCHISE_ORDER',
+                referenceId: id,
+                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
+                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
+              });
+
+              // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
+              await tx.productBatch.create({
+                data: {
+                  productId: item.productId,
+                  franchiseId: order.franchiseId,
+                  quantity: fallbackQty,
+                  batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
+                  expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 7 days for now
+                }
+              });
+            }
           }
         }
         await tx.franchiseOrder.update({ where: { id }, data: updateData });
@@ -739,8 +975,8 @@ export class FranchiseOrderService {
     return updatedOrder;
   }
 
-  // ─── Payment ───────────────────────────────────────────────────────────────
-  static async recordPayment(id: string, amount: number, accountId?: string, paidBy?: string) {
+  // ─── Payment ───────────────────────────────────────────────────────────
+  static async recordPayment(id: string, amount?: number, accountId?: string, paidBy?: string, isHqAdmin: boolean = false) {
     return prisma.$transaction(async (tx) => {
       const order = await tx.franchiseOrder.findUnique({
         where: { id },
@@ -748,157 +984,241 @@ export class FranchiseOrderService {
       });
       if (!order) throw new Error('Order not found');
 
-      if (order.paymentStatus === 'PAID') {
-        throw new Error('This order has already been paid.');
-      }
-
-      const payAmount = (amount && amount > 0) ? amount : order.totalAmount;
-      if (!(payAmount > 0)) {
-        throw new Error('Payment amount must be greater than zero.');
-      }
-
-      // 1. Resolve & Validate Franchise Payment Account
-      let franchiseAcc: any = null;
-
-      if (accountId) {
-        franchiseAcc = await tx.account.findUnique({ where: { id: accountId } });
-        if (!franchiseAcc || franchiseAcc.franchiseId !== order.franchiseId) {
-          throw new Error('Selected payment account was not found or does not belong to your franchise.');
-        }
-      } else {
-        // Fallback to the first active account configured for this franchise
-        franchiseAcc = await tx.account.findFirst({
-          where: {
-            franchiseId: order.franchiseId,
-            status: 'ACTIVE'
-          },
-          orderBy: [{ type: 'asc' }, { createdAt: 'asc' }]
-        });
-      }
-
-      if (!franchiseAcc) {
-        throw new Error(
-          `No active Bank or Cash Account found for ${order.franchise?.name || 'this franchise'}. Please configure a Bank Account in the Franchise section first.`
-        );
-      }
-
-      if (franchiseAcc.status !== 'ACTIVE') {
-        throw new Error(`The selected account "${franchiseAcc.name}" is inactive. Please select an active account.`);
-      }
-
-      // 2. Validate Franchise Account Balance
-      if (franchiseAcc.balance < payAmount) {
-        throw new Error(
-          `Insufficient Franchise Account Balance in "${franchiseAcc.name}". Available: ₹${franchiseAcc.balance.toLocaleString('en-IN')}, Required: ₹${payAmount.toLocaleString('en-IN')}.`
-        );
-      }
-
-      // 3. Debit Franchise Account (OUTFLOW)
-      await AccountService.adjustBalance(tx, franchiseAcc.id, payAmount, 'OUTFLOW');
-
-      // 4. Record Franchise OUTFLOW Payment
-      await tx.payment.create({
-        data: {
-          paidAmount: payAmount,
+      const existingPayments = await tx.payment.findMany({
+        where: {
+          OR: [
+            { linkedDocId: order.orderNumber },
+            { linkedDocId: order.id },
+            { transactionRef: { contains: order.orderNumber } }
+          ],
           status: 'SUCCESS',
-          accountId: franchiseAcc.id,
-          paymentMode: (franchiseAcc.type === 'BANK' ? 'BANK_TRANSFER' : (franchiseAcc.type === 'UPI' ? 'UPI' : 'CASH')) as any,
-          sourceModule: 'FRANCHISE',
-          linkedDocType: 'INVOICE',
-          linkedDocId: order.orderNumber,
-          entityType: 'FRANCHISE',
-          entityId: order.franchiseId,
-          transactionRef: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
-          createdBy: paidBy || 'FRANCHISE_SYSTEM'
-        }
+          isCancelled: false
+        },
+        include: { account: true }
       });
 
-      // 5. Update Franchise Ledger (CREDIT reducing outstanding balance to HQ)
-      const currentFranchise = await tx.franchise.findUnique({ where: { id: order.franchiseId } });
-      const newOutstanding = (currentFranchise?.outstandingAmount || 0) - payAmount;
-
-      await tx.franchiseLedger.create({
-        data: {
-          franchiseId: order.franchiseId,
-          type: LedgerType.CREDIT,
-          amount: payAmount,
-          balanceAfter: newOutstanding,
-          referenceType: FranchiseLedgerRefType.PAYMENT,
-          referenceId: order.orderNumber,
-          note: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
-        }
-      });
-
-      // 6. Update Franchise Outstanding Amount
-      await tx.franchise.update({
-        where: { id: order.franchiseId },
-        data: { outstandingAmount: newOutstanding }
-      });
-
-      // 7. Credit HQ Collections & Receiving Account (HQ Side INFLOW)
       const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-      if (hq) {
-        const hqAccount = await tx.account.findFirst({
-          where: {
-            OR: [{ franchiseId: hq.id }, { franchiseId: null }],
-            status: 'ACTIVE'
-          },
-          orderBy: { createdAt: 'asc' }
+      const currentFranchise = await tx.franchise.findUnique({ where: { id: order.franchiseId } });
+
+      if (isHqAdmin) {
+        // ─── FLOW A: SUPER ADMIN / HQ CONFIRMS RECEIPT OF FRANCHISE'S EXISTING PAYMENT ───
+        // Super Admin is NOT charging the franchise or recording a new franchise payment.
+        // Super Admin is confirming receipt of funds that the franchise already paid into an HQ Account.
+        if (existingPayments.length === 0) {
+          throw new Error('Franchise payment not received yet. The franchise must pay the order amount first before HQ can mark payment as received.');
+        }
+
+        const unapprovedPayments = existingPayments.filter(p => !p.approvedBy);
+        if (unapprovedPayments.length === 0) {
+          throw new Error('Payment has already been confirmed and received by HQ.');
+        }
+
+        let hqAccount: any = null;
+        if (accountId) {
+          hqAccount = await tx.account.findUnique({ where: { id: accountId } });
+          if (!hqAccount || (hqAccount.franchiseId && hq && hqAccount.franchiseId !== hq.id)) {
+            throw new Error('Selected payment account was not found or does not belong to HQ.');
+          }
+        } else {
+          hqAccount = await tx.account.findFirst({
+            where: {
+              OR: [{ franchiseId: hq?.id || null }, { franchiseId: null }],
+              status: 'ACTIVE'
+            },
+            orderBy: [{ type: 'asc' }, { createdAt: 'asc' }]
+          });
+        }
+
+        if (!hqAccount) {
+          throw new Error('No active HQ Cash or Bank Account found. Please configure an HQ Account in Banking & Accounts first.');
+        }
+
+        if (hqAccount.status !== 'ACTIVE') {
+          throw new Error(`The selected HQ account "${hqAccount.name}" is inactive. Please select an active account.`);
+        }
+
+        const totalAmountToReceive = unapprovedPayments.reduce((sum, p) => sum + p.paidAmount, 0);
+
+        // 1. Credit HQ Account (INFLOW into selected HQ Cash/Bank/UPI account)
+        await AccountService.adjustBalance(tx, hqAccount.id, totalAmountToReceive, 'INFLOW');
+
+        // 2. Mark existing source payments as confirmed & received by HQ (Approved with HQ Account reference)
+        const unapprovedIds = unapprovedPayments.map(p => p.id);
+        await tx.payment.updateMany({
+          where: { id: { in: unapprovedIds } },
+          data: {
+            approvedBy: paidBy || 'HQ_ADMIN',
+            reversalOfPaymentId: hqAccount.id,
+            transactionRef: `HQ Receipt confirmed for order ${order.orderNumber} in ${hqAccount.name}`
+          }
         });
 
-        if (hqAccount) {
-          await AccountService.adjustBalance(tx, hqAccount.id, payAmount, 'INFLOW');
+        // 3. Keep Order Payment Status as PAID (or update if needed)
+        const updatedOrder = await tx.franchiseOrder.update({
+          where: { id },
+          data: { paymentStatus: 'PAID' },
+          include: { items: { include: { product: true } }, franchise: true },
+        });
+
+        return updatedOrder;
+
+      } else {
+        // ─── FLOW B: FRANCHISE ADMIN PAYS HQ (SOURCE TRANSACTION FROM FRANCHISE ACCOUNT) ───
+        if (order.paymentStatus === 'PAID') {
+          throw new Error('This order has already been fully paid.');
         }
 
+        const alreadyPaid = existingPayments.reduce((sum, p) => sum + p.paidAmount, 0);
+        const balanceDue = Math.max(0, Number((order.totalAmount - alreadyPaid).toFixed(2)));
+
+        if (balanceDue <= 0.001) {
+          await tx.franchiseOrder.update({
+            where: { id },
+            data: { paymentStatus: 'PAID' }
+          });
+          throw new Error('This order has already been fully paid.');
+        }
+
+        const requestedAmount = (amount && amount > 0) ? amount : balanceDue;
+        const payAmount = Math.min(requestedAmount, balanceDue);
+        if (!(payAmount > 0)) {
+          throw new Error('Payment amount must be greater than zero.');
+        }
+
+        // 1. Resolve & Validate Franchise Payment Account
+        let franchiseAcc: any = null;
+        if (accountId) {
+          franchiseAcc = await tx.account.findUnique({ where: { id: accountId } });
+          if (!franchiseAcc || franchiseAcc.franchiseId !== order.franchiseId) {
+            throw new Error('Selected payment account was not found or does not belong to your franchise.');
+          }
+        } else {
+          franchiseAcc = await tx.account.findFirst({
+            where: {
+              franchiseId: order.franchiseId,
+              status: 'ACTIVE'
+            },
+            orderBy: [{ type: 'asc' }, { createdAt: 'asc' }]
+          });
+        }
+
+        if (!franchiseAcc) {
+          throw new Error(
+            `No active Bank or Cash Account found for ${order.franchise?.name || 'this franchise'}. Please configure a Bank Account in the Franchise section first.`
+          );
+        }
+
+        if (franchiseAcc.status !== 'ACTIVE') {
+          throw new Error(`The selected account "${franchiseAcc.name}" is inactive. Please select an active account.`);
+        }
+
+        // 2. Validate Franchise Account Balance
+        if (franchiseAcc.balance < payAmount) {
+          throw new Error(
+            `Insufficient Franchise Account Balance in "${franchiseAcc.name}". Available: ₹${franchiseAcc.balance.toLocaleString('en-IN')}, Required: ₹${payAmount.toLocaleString('en-IN')}.`
+          );
+        }
+
+        // 3. Debit Franchise Account (OUTFLOW)
+        await AccountService.adjustBalance(tx, franchiseAcc.id, payAmount, 'OUTFLOW');
+
+        // 4. Record SINGLE Source Payment (approvedBy is null until HQ confirms receipt)
         await tx.payment.create({
           data: {
             paidAmount: payAmount,
             status: 'SUCCESS',
-            accountId: hqAccount?.id || null,
+            accountId: franchiseAcc.id,
             paymentMode: (franchiseAcc.type === 'BANK' ? 'BANK_TRANSFER' : (franchiseAcc.type === 'UPI' ? 'UPI' : 'CASH')) as any,
             sourceModule: 'FRANCHISE',
             linkedDocType: 'INVOICE',
             linkedDocId: order.orderNumber,
             entityType: 'FRANCHISE',
             entityId: order.franchiseId,
-            transactionRef: `Franchise payment received from ${currentFranchise?.name || 'Franchise'} for order ${order.orderNumber}`,
-            createdBy: paidBy || 'FRANCHISE_SYSTEM'
+            transactionRef: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
+            createdBy: paidBy || 'FRANCHISE_USER',
+            approvedBy: null // HQ has not confirmed receipt yet
           }
         });
+
+        // 5. Update Franchise Ledger (CREDIT reducing outstanding balance to HQ)
+        const newOutstanding = (currentFranchise?.outstandingAmount || 0) - payAmount;
+        await tx.franchiseLedger.create({
+          data: {
+            franchiseId: order.franchiseId,
+            type: LedgerType.CREDIT,
+            amount: payAmount,
+            balanceAfter: newOutstanding,
+            referenceType: FranchiseLedgerRefType.PAYMENT,
+            referenceId: order.orderNumber,
+            note: `Payment to HQ for order ${order.orderNumber} via ${franchiseAcc.name}`,
+          }
+        });
+
+        // 6. Update Franchise Outstanding Amount
+        await tx.franchise.update({
+          where: { id: order.franchiseId },
+          data: { outstandingAmount: newOutstanding }
+        });
+
+        // 7. Update Franchise Order Payment Status
+        const newPaymentStatus = (alreadyPaid + payAmount >= order.totalAmount - 0.001) ? 'PAID' : 'PARTIAL';
+        const updatedOrder = await tx.franchiseOrder.update({
+          where: { id },
+          data: { paymentStatus: newPaymentStatus },
+          include: { items: { include: { product: true } }, franchise: true },
+        });
+
+        return updatedOrder;
       }
-
-      // 8. Mark Franchise Order as PAID
-      const updatedOrder = await tx.franchiseOrder.update({
-        where: { id },
-        data: { paymentStatus: 'PAID' },
-        include: { items: { include: { product: true } }, franchise: true },
-      });
-
-      return updatedOrder;
     });
-  }}
+  }
+}
 
 // FIFO batch deduction
-async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string) {
-  const batches = await tx.productBatch.findMany({
-    where: {
-      productId,
-      ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
-      quantity: { gt: 0 },
-      OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
-    },
-    orderBy: { createdAt: 'asc' }, // FIFO
-  });
-
-  let remaining = quantityNeeded;
-  for (const batch of batches) {
-    if (remaining <= 0) break;
-    const deduct = Math.min(batch.quantity, remaining);
-    await tx.productBatch.update({
-      where: { id: batch.id },
-      data: { quantity: { decrement: deduct } },
+async function deductBatchStock(tx: any, productId: string, quantityNeeded: number, hqId?: string, orderId?: string, orderNumber?: string, precalculatedFifo?: any) {
+  if (precalculatedFifo && precalculatedFifo.consumptions && precalculatedFifo.consumptions.length > 0) {
+    // Explicit synchronization contract: deduct exactly the same physical batches reserved by InventoryBatch
+    for (const cons of precalculatedFifo.consumptions) {
+      const invBatch = await tx.inventoryBatch.findUnique({ where: { id: cons.batchId } });
+      if (invBatch && invBatch.productBatchId) {
+        await tx.productBatch.update({
+          where: { id: invBatch.productBatchId },
+          data: { quantity: { decrement: cons.qty } },
+        });
+      }
+    }
+  } else {
+    const batches = await tx.productBatch.findMany({
+      where: {
+        productId,
+        ...(hqId ? { OR: [{ franchiseId: hqId }, { franchiseId: null }] } : {}),
+        quantity: { gt: 0 },
+        OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
+        // A batch under an active or completed recall must never be selected
+        // as a FIFO source for a franchise dispatch, even though ProductBatch.
+        // quantity itself is never decremented by recall (only InventoryBatch
+        // status is). Batches with no recall row, or only a CANCELLED one,
+        // remain eligible.
+        AND: [{
+          OR: [
+            { recall: { is: null } },
+            { recall: { status: { notIn: ['IN_PROGRESS', 'COMPLETED'] } } },
+          ],
+        }],
+      },
+      orderBy: { createdAt: 'asc' }, // FIFO
     });
-    remaining -= deduct;
+
+    let remaining = quantityNeeded;
+    for (const batch of batches) {
+      if (remaining <= 0) break;
+      const deduct = Math.min(batch.quantity, remaining);
+      await tx.productBatch.update({
+        where: { id: batch.id },
+        data: { quantity: { decrement: deduct } },
+      });
+      remaining -= deduct;
+    }
   }
 
   // Synchronize with Master InventoryItem at HQ
@@ -918,6 +1238,7 @@ async function deductBatchStock(tx: any, productId: string, quantityNeeded: numb
         referenceType: 'FRANCHISE_ORDER',
         referenceId: orderId,
         note: orderNumber ? `Dispatched to franchise (Order ${orderNumber})` : 'Dispatched to franchise',
+        precalculatedFifo: precalculatedFifo
       });
     }
   }

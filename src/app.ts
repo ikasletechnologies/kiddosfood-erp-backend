@@ -49,6 +49,7 @@ import { DraftsController } from './modules/drafts/drafts.controller';
 import { WorkflowApprovalsController } from './modules/workflow-approvals/workflow-approvals.controller';
 import WarehouseRoutes from './modules/warehouse/warehouse.routes';
 import SetupRoutes from './modules/setup/setup.routes';
+import AlertRoutes from './modules/alerts/alert.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -143,6 +144,7 @@ app.get('/health', async (_req: Request, res: Response) => {
 });
 
 // Warehouse Management
+app.get('/api/warehouses/next-code', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getNextWarehouseCode);
 app.get('/api/warehouses', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouses);
 app.post('/api/warehouses', (req, res, next) => { console.log('🎯 WAREHOUSE POST ROUTE HIT'); next(); }, authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.createWarehouse);
 app.get('/api/warehouses/:id/stock', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getWarehouseStock);
@@ -459,6 +461,7 @@ app.get('/api/grn', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN
 // getById with id="generate-lot-number" instead.
 app.get('/api/grn/generate-lot-number', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.generateLotNumber);
 app.get('/api/grn/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getById);
+app.get('/api/grn/po/:poId/remaining', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.getRemainingQuantities);
 app.post('/api/grn/from-po/:poId', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), GRNController.createFromPO);
 app.patch('/api/grn/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.approve);
 app.patch('/api/grn/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.cancel);
@@ -475,6 +478,10 @@ app.post('/api/vendor-invoices/:id/approve', authenticate, authorizeRole(['SUPER
 app.patch('/api/vendor-invoices/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), VendorInvoiceController.updateStatus);
 
 // Franchise Management & Logistics
+// Franchise Warehouse Setup (must be before /:id routes)
+app.get('/api/franchise/warehouse/status', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getWarehouseStatus);
+app.post('/api/franchise/warehouse/setup', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.setupWarehouse);
+
 app.get('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getAll);
 app.post('/api/franchise', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.create);
 app.get('/api/franchise/requests', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getRequests);
@@ -524,6 +531,7 @@ app.get('/api/customers/ledger-summary', authenticate, authorizeRole(['FRANCHISE
 app.get('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getOne);
 app.patch('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.update);
 app.get('/api/customers/:id/history', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getHistory);
+app.get('/api/customers/:id/items', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.getItemHistory);
 app.delete('/api/customers/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), CustomerController.delete);
 
 // Dealers & Business Partners
@@ -541,8 +549,9 @@ app.get('/api/waste/summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANC
 app.get('/api/waste/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.getOne);
 app.post('/api/waste', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), WasteController.create);
 
-// Stock Alerts
-app.get('/api/inventory/alerts', authenticate, authorizeRole(['FRANCHISE_ADMIN']), InventoryController.getAlerts);
+// Alerts System
+app.use('/api/alerts', AlertRoutes);
+app.get('/api/inventory/alerts', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getAlerts);
 
 // Warehouse
 app.use('/api/warehouse', WarehouseRoutes);
@@ -655,6 +664,7 @@ app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_A
 app.get('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getReturnOrders);
 app.post('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createReturnOrder);
 app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateReturnOrder);
+app.post('/api/sales/returns/:id/refund', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.refundReturnOrder);
 
 app.get('/api/sales/analytics', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getAnalytics);
 

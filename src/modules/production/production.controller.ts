@@ -124,13 +124,14 @@ export class ProductionController {
   // confirmPackaging below.
   static async startPackaging(req: Request, res: Response) {
     try {
-      const { packetSize, quantityPackets, productId } = req.body;
+      const { packetSize, quantityPackets, productId, newProduct } = req.body;
       const user = (req as any).user;
       const result = await ProductionService.startPackaging({
         batchId: req.params.id,
         packetSize,
         quantityPackets: Number(quantityPackets),
         productId: productId ? String(productId) : undefined,
+        newProduct,
         userId: user?.userId
       });
       res.json(result);

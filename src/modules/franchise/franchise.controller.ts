@@ -1,3 +1,4 @@
+import { IsolationUtil } from '../../utils/isolation.util';
 import { Request, Response } from 'express';
 import { FranchiseService } from './franchise.service';
 import { LogisticsService } from './logistics.service';
@@ -212,4 +213,46 @@ export class FranchiseController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  static async getWarehouseStatus(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = user.role === 'SUPER_ADMIN'
+        ? ((req.query.franchiseId as string) || user.franchiseId)
+        : user.franchiseId;
+
+      if (!franchiseId) {
+        return res.status(400).json({ error: 'Franchise context is required' });
+      }
+
+      const status = await FranchiseService.getWarehouseStatus(franchiseId);
+      res.json(status);
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async setupWarehouse(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseId = user.role === 'SUPER_ADMIN'
+        ? ((req.body.franchiseId as string) || (req.query.franchiseId as string) || user.franchiseId)
+        : user.franchiseId;
+
+      if (!franchiseId) {
+        return res.status(400).json({ error: 'Franchise context is required' });
+      }
+
+      const { name, location, code } = req.body;
+      const warehouse = await FranchiseService.setupFranchiseWarehouse(franchiseId, {
+        name,
+        location,
+        code,
+      });
+      res.status(201).json(warehouse);
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
 }

@@ -1,11 +1,217 @@
+function formatReferenceType(ref: string): string {
+  if (!ref) return '—';
+  return ref.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Only shorten a reference when it's a raw internal id (a UUID). A real business
+// reference (invoice/bill/return number, already human-readable) must pass through
+// unmodified — slicing it truncates the number itself (e.g. "PR-2026-00003" -> "PR-2026-").
+function formatVoucherRef(referenceId?: string | null): string {
+  if (!referenceId) return '—';
+  return UUID_PATTERN.test(referenceId) ? referenceId.slice(0, 8).toUpperCase() : referenceId;
+}
+
+function applyStatementSearch<T extends { particular: string; voucherNo: string }>(entries: T[], search?: string): T[] {
+  if (!search || !search.trim()) return entries;
+  const q = search.trim().toLowerCase();
+  return entries.filter(e => e.particular.toLowerCase().includes(q) || e.voucherNo.toLowerCase().includes(q));
+}
+
+// Shared party identity resolution — the same rule across every "party"
+// report in this file: customerId first (a real Customer), then
+// partyType+partyId (Dealer/Franchise — Order.partyId is a loose reference,
+// not a Prisma relation, so display names are batch-resolved separately via
+// batchResolvePartyNames), and a honestly-labeled WALK_IN bucket for anything
+// with no resolvable identity. Never group by customerName/phone/a shared
+// placeholder string, and never merge different party types into one row.
+type ResolvedPartyType = 'CUSTOMER' | 'DEALER' | 'FRANCHISE' | 'VENDOR' | 'WALK_IN';
+type ResolvedParty = { key: string; partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string };
+
+function resolveOrderParty(o: { customerId: string | null; customer: { name: string; phone: string | null } | null; customerName: string | null; partyType: string | null; partyId: string | null }): ResolvedParty {
+  if (o.customerId) {
+    return { key: `CUSTOMER:${o.customerId}`, partyType: 'CUSTOMER', partyId: o.customerId, partyName: o.customer?.name || o.customerName || 'Customer', phoneNo: o.customer?.phone || '—' };
+  }
+  if (o.partyType === 'DEALER' && o.partyId) {
+    return { key: `DEALER:${o.partyId}`, partyType: 'DEALER', partyId: o.partyId, partyName: '', phoneNo: '—' };
+  }
+  if (o.partyType === 'FRANCHISE' && o.partyId) {
+    return { key: `FRANCHISE:${o.partyId}`, partyType: 'FRANCHISE', partyId: o.partyId, partyName: '', phoneNo: '—' };
+  }
+  return { key: 'WALK_IN', partyType: 'WALK_IN', partyId: null, partyName: 'Walk-in / Unattributed', phoneNo: '—' };
+}
+
+// A vendor purchase is never keyed by vendor.name (that's exactly the bug
+// that let a Vendor's purchase total merge onto an unrelated Customer/
+// Franchise row sharing the same name) — always vendor.id, in its own
+// VENDOR:<id> namespace so it can never collide with any other party type.
+function resolveVendorParty(vendorId: string, vendorName: string): ResolvedParty {
+  return { key: `VENDOR:${vendorId}`, partyType: 'VENDOR', partyId: vendorId, partyName: vendorName, phoneNo: '—' };
+}
+
+// Resolves a ReturnOrder to the same party a sale would resolve to, so a
+// return nets against the correct bucket: its own customerId/dealerId/
+// franchiseId when set (a standalone return), otherwise via its linked POS
+// order. Also returns the operating franchiseId (for scope filtering) where
+// it can be determined — SalesOrder carries no franchiseId at all, so a
+// return linked only to one is counted unconditionally rather than dropped.
+function resolveReturnParty(ret: {
+  customerId: string | null; dealerId: string | null; franchiseId: string | null;
+  customer: { name: string; phone: string | null } | null;
+  posOrder: { franchiseId: string | null; partyType: string | null; partyId: string | null; customerId: string | null; customerName: string | null; customer: { name: string; phone: string | null } | null } | null;
+}): { resolved: ResolvedParty; operatingFranchiseId: string | undefined } {
+  if (ret.customerId || ret.dealerId || ret.franchiseId) {
+    return {
+      resolved: resolveOrderParty({
+        customerId: ret.customerId, customer: ret.customer, customerName: null,
+        partyType: ret.dealerId ? 'DEALER' : ret.franchiseId ? 'FRANCHISE' : null,
+        partyId: ret.dealerId || ret.franchiseId || null
+      }),
+      operatingFranchiseId: ret.posOrder?.franchiseId || undefined
+    };
+  }
+  if (ret.posOrder) {
+    return { resolved: resolveOrderParty(ret.posOrder), operatingFranchiseId: ret.posOrder.franchiseId || undefined };
+  }
+  return { resolved: { key: 'WALK_IN', partyType: 'WALK_IN', partyId: null, partyName: 'Walk-in / Unattributed', phoneNo: '—' }, operatingFranchiseId: undefined };
+}
+
+// Batch-resolves display names/phones for DEALER and FRANCHISE buckets —
+// can't come from an `include` on Order (Order.partyId has no Prisma
+// relation to join through) — mutating the buckets in place.
+async function batchResolvePartyNames(buckets: Iterable<{ partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string }>) {
+  const list = Array.from(buckets);
+  const dealerIds = list.filter(b => b.partyType === 'DEALER').map(b => b.partyId!).filter(Boolean);
+  const franchiseIds = list.filter(b => b.partyType === 'FRANCHISE').map(b => b.partyId!).filter(Boolean);
+  const [dealers, franchises] = await Promise.all([
+    dealerIds.length ? prisma.dealer.findMany({ where: { id: { in: dealerIds } }, select: { id: true, name: true, phone: true } }) : Promise.resolve([] as any[]),
+    franchiseIds.length ? prisma.franchise.findMany({ where: { id: { in: franchiseIds } }, select: { id: true, name: true, contactNum: true } }) : Promise.resolve([] as any[])
+  ]);
+  const dealerNameMap = new Map(dealers.map(d => [d.id, d]));
+  const franchiseNameMap = new Map(franchises.map(f => [f.id, f]));
+  for (const bucket of list) {
+    if (bucket.partyType === 'DEALER' && bucket.partyId) {
+      const d = dealerNameMap.get(bucket.partyId);
+      bucket.partyName = d?.name || 'Dealer';
+      bucket.phoneNo = d?.phone || '—';
+    } else if (bucket.partyType === 'FRANCHISE' && bucket.partyId) {
+      const f = franchiseNameMap.get(bucket.partyId);
+      bucket.partyName = f?.name || 'Franchise';
+      bucket.phoneNo = f?.contactNum || '—';
+    }
+  }
+}
+
+// Human-friendly display label for a grouping/summary view (Sale & Purchase
+// By Party Group) — a legibility layer only; the underlying grouping key
+// stays the authoritative ResolvedPartyType, never this string.
+function partyTypeGroupLabel(partyType: ResolvedPartyType): string {
+  switch (partyType) {
+    case 'CUSTOMER': return 'Customers';
+    case 'DEALER': return 'Dealers';
+    case 'FRANCHISE': return 'Franchises';
+    case 'VENDOR': return 'Vendors';
+    case 'WALK_IN': return 'Walk-in / Unattributed';
+  }
+}
+
+// Epsilon-safe rounding to cents — avoids float artifacts like 251.69699999999998
+// showing up in a report instead of 251.70. Same pattern the frontend currency
+// formatter already uses; applied here so a value that leaves the service is
+// already reconciled to the cent, not just at render time.
+function roundCents(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+// The authoritative per-line COGS resolution, shared by getProfitAndLoss and
+// getPartyProfitLoss so the two reports can never silently diverge on what a
+// sale actually cost:
+//   1. OrderItem.totalCost — the real FIFO/production cost frozen at sale time
+//      (see pos.service.ts). Always preferred; never recomputed from today's
+//      live cost, which would re-cost old, already-booked sales.
+//   2. Recipe-based cost — sum of ingredient costPrice (or first vendor price)
+//      x quantity, scaled to the sold quantity.
+//   3. InventoryItem.costPrice by SKU — direct-product average purchase cost.
+//   4. Genuinely unavailable — no frozen cost, no recipe, no matching
+//      InventoryItem row at all. Returns cost 0 (matching the pre-existing
+//      getProfitAndLoss behavior, so extracting this changes nothing there)
+//      but reports the source as UNAVAILABLE so a caller that needs to know
+//      the difference between "real zero" and "no cost data" can.
+// Deliberately never falls back to Product.basePrice — that's a selling
+// price, not a cost, and using it inflates every item's apparent margin to
+// (price - price) = 0 whenever the real cost is unknown.
+function resolveOrderItemCost(
+  item: { totalCost?: number | null; quantity: number; product?: any },
+  invItemMap: Map<string, any>
+): { cost: number; source: 'FROZEN' | 'RECIPE' | 'INVENTORY_SKU' | 'UNAVAILABLE' } {
+  if (item.totalCost !== null && item.totalCost !== undefined) {
+    return { cost: item.totalCost, source: 'FROZEN' };
+  }
+  const product = item.product;
+  if (product?.recipe) {
+    let cost = 0;
+    const scalar = item.quantity / product.recipe.yieldQty;
+    for (const ri of product.recipe.recipeItems) {
+      const qtyUsed = ri.quantityRequired * scalar;
+      const costPerUnit = ri.inventoryItem?.costPrice || ri.inventoryItem?.vendors?.[0]?.price || 0;
+      cost += qtyUsed * costPerUnit;
+    }
+    return { cost, source: 'RECIPE' };
+  }
+  const invItem = product ? invItemMap.get(product.sku || '') : undefined;
+  if (invItem) {
+    return { cost: item.quantity * (invItem.costPrice || 0), source: 'INVENTORY_SKU' };
+  }
+  return { cost: 0, source: 'UNAVAILABLE' };
+}
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
+import { FranchiseService } from '../franchise/franchise.service';
+import { InventoryService } from '../inventory/inventory.service';
 import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
 
+
+// Shared Category Resolver
+// The correct category must check InventoryItem.category first (for actual raw material/purchases),
+// falling back to Product.category if it's a finished good sold via Order.
+function resolveCategory(item: any): string {
+  if (item?.inventoryItem?.category) return item.inventoryItem.category;
+  if (item?.product?.category) return item.product.category;
+  if (item?.category) return item.category;
+  return 'Uncategorized';
+}
+
+// Stock Movement Direction Mapper
+// Exhaustive mapping based on Prisma StockMovementType enum
+function getStockMovementDirection(type: string, quantity: number): 'IN' | 'OUT' {
+  switch (type) {
+    case 'PURCHASE_IN':
+    case 'PRODUCTION_IN':
+    case 'TRANSFER_IN':
+    case 'RECALL_RETURN_IN':
+    case 'RETURN_QUARANTINE_IN':
+    case 'SALES_RETURN_IN':
+      return 'IN';
+      
+    case 'PRODUCTION_OUT':
+    case 'SALES_OUT':
+    case 'WASTE_OUT':
+    case 'TRANSFER_OUT':
+    case 'RETURN_OUT':
+      return 'OUT';
+      
+    case 'ADJUSTMENT':
+      return quantity >= 0 ? 'IN' : 'OUT';
+      
+    default:
+      console.warn(`[FinanceService] Unmapped StockMovementType encountered: ${type}`);
+      return 'OUT'; // Fail safe or explicit default, but warned for dev attention
+  }
+}
 
 function parseInclusiveDates(startDate?: string | Date, endDate?: string | Date): { start?: Date; end?: Date } {
   let start: Date | undefined = undefined;
@@ -226,35 +432,53 @@ export class FinanceService {
       totalRevenue += subTotalRevenue;
       totalOutputTax += inv.taxAmount || 0;
       for (const item of inv.order.orderItems) {
-        // `totalCost` is captured at sale time (see pos.service.ts) from the
-        // actual FIFO lot(s)/production batch this line drew from — the real
-        // cost of THIS sale, frozen at the moment it happened. Prefer it over
-        // recomputing from today's live costPrice, which drifts every time a
-        // new purchase lands and would silently re-cost old, already-booked sales.
-        if (item.totalCost !== null && item.totalCost !== undefined) {
-          totalCOGS += item.totalCost;
-          continue;
-        }
-
-        // Fallback for orders recorded before cost capture existed.
-        const product = item.product;
-        if (product) {
-          if (product.recipe) {
-            const scalar = item.quantity / product.recipe.yieldQty;
-            for (const ri of product.recipe.recipeItems) {
-              const qtyUsed = ri.quantityRequired * scalar;
-              const costPerUnit = ri.inventoryItem.costPrice || ri.inventoryItem.vendors[0]?.price || 0;
-              totalCOGS += (qtyUsed * costPerUnit);
-            }
-          } else {
-            // Direct product: get average buying/purchase cost from InventoryItem with matching SKU
-            const invItem = invItemMap.get(product.sku || '');
-            const costPerUnit = invItem?.costPrice || 0;
-            totalCOGS += (item.quantity * costPerUnit);
-          }
-        }
+        // See resolveOrderItemCost's own doc comment for the full preference
+        // order (frozen sale-time cost -> recipe -> InventoryItem by SKU).
+        // Extracted so getPartyProfitLoss can never silently diverge from
+        // this calculation — behavior here is unchanged.
+        totalCOGS += resolveOrderItemCost(item, invItemMap).cost;
       }
     }
+
+    // 1b. Return reversals — a completed return must reduce both revenue and
+    // COGS for the period it happened in, or P&L silently overstates both
+    // (and everything downstream: Balance Sheet net income, Dashboard Net
+    // Profit). Two return-financial fields already exist for exactly this,
+    // computed once at return-creation time and never re-derived here:
+    //   - ReturnItem.taxableValue: tax-EXCLUSIVE reversal, the same basis as
+    //     the tax-exclusive `subTotalRevenue` accumulated above — NOT
+    //     refundAmount/totalAmount, which are tax-INCLUSIVE (what's actually
+    //     paid back to the customer, a different figure).
+    //   - ReturnItem.costReversal: the exact historical FIFO cost being
+    //     reversed (proven to sum to the original sale's full COGS across
+    //     disjoint partial returns) — NOT re-derived from any StockMovement
+    //     or InventoryItem.costPrice.
+    // Scope: only APPROVED/COMPLETED returns count (matches the existing
+    // GST/credit-note aggregation convention and the financial-integrity
+    // test) — PENDING (not yet approved) and REJECTED must not move P&L.
+    // Period: filtered on the RETURN's own createdAt (like Expenses above
+    // are filtered on Expense.date, independent of some other event's
+    // date) — a return is booked in the period it actually happened in, not
+    // retroactively reopening the original sale's period.
+    // costReversal can be null (Case C / PROVENANCE_UNAVAILABLE — no
+    // original outbound stock movement could be traced, e.g. a
+    // Quotation/SalesOrder/Proforma conversion with no real inventory
+    // deduction); Prisma's _sum simply skips nulls, so COGS is only reduced
+    // by what's genuinely known, never fabricated.
+    const returnReversals = await prisma.returnItem.aggregate({
+      where: {
+        return: {
+          status: { in: ['APPROVED', 'COMPLETED'] },
+          ...(start || end ? { createdAt: dateQuery } : {}),
+          ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {})
+        }
+      },
+      _sum: { taxableValue: true, costReversal: true }
+    });
+    const totalReturnRevenue = returnReversals._sum.taxableValue || 0;
+    const totalReturnCOGS = returnReversals._sum.costReversal || 0;
+    totalRevenue -= totalReturnRevenue;
+    totalCOGS -= totalReturnCOGS;
 
     // 2. Purchases — the actually recognized liability (VendorInvoice),
     // whose amount/cgst/sgst/igst are derived from the GRN's actual price
@@ -293,6 +517,10 @@ export class FinanceService {
     return {
       revenue: totalRevenue,
       cogs: totalCOGS,
+      // Informational only — already netted into revenue/cogs above, not an
+      // additional adjustment a caller needs to apply.
+      returnRevenue: totalReturnRevenue,
+      returnCOGS: totalReturnCOGS,
       purchase: totalPurchases,
       taxPayable: totalOutputTax,
       taxReceivable: totalInputTax,
@@ -365,11 +593,11 @@ export class FinanceService {
       }),
       // 2. Total Collected (Cash)
       prisma.payment.aggregate({
-        where: { 
-          entityType: 'CUSTOMER', 
-          status: 'PAID', 
-          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
-          order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined 
+        where: {
+          entityType: 'CUSTOMER',
+          status: 'PAID',
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
+          order: filters.franchiseId ? { franchiseId: filters.franchiseId } : undefined
         },
         _sum: { paidAmount: true }
       }),
@@ -381,10 +609,10 @@ export class FinanceService {
       }),
       // 4. Total Expense Paid (Cash)
       prisma.payment.aggregate({
-        where: { 
-          sourceModule: 'EXPENSE', 
-          status: 'PAID', 
-          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}), 
+        where: {
+          sourceModule: 'EXPENSE',
+          status: 'PAID',
+          ...(filters.startDate || filters.endDate ? { createdAt: dateQuery } : {}),
           // Linkage check (optional if sourceModule is enough)
         },
         _sum: { paidAmount: true }
@@ -442,7 +670,19 @@ export class FinanceService {
     const opts = typeof filters === 'string' ? { franchiseId: filters } : (filters || {});
     const where: any = {};
     if (opts.franchiseId) {
-      where.order = { franchiseId: opts.franchiseId };
+      const targetFranchise = await prisma.franchise.findUnique({
+        where: { id: opts.franchiseId },
+        select: { id: true, isHQ: true }
+      });
+      if (targetFranchise && !targetFranchise.isHQ) {
+        // A branch franchise's Sale Invoices are strictly sales to local CUSTOMER and DEALER parties
+        where.order = {
+          franchiseId: opts.franchiseId,
+          partyType: { in: ['CUSTOMER', 'DEALER'] }
+        };
+      } else {
+        where.order = { franchiseId: opts.franchiseId };
+      }
     }
     if (opts.startDate || opts.endDate) {
       where.createdAt = {};
@@ -483,6 +723,33 @@ export class FinanceService {
       },
       orderBy: { createdAt: 'desc' }
     });
+
+    const dealerIds = [...new Set(invoices.map(i => i.order?.partyType === 'DEALER' ? i.order?.partyId : null).filter(Boolean))] as string[];
+    if (dealerIds.length > 0) {
+      const dealers = await prisma.dealer.findMany({
+        where: { id: { in: dealerIds } }
+      });
+      const dealerMap = new Map(dealers.map(d => [d.id, d]));
+      for (const inv of invoices) {
+        if (inv.order?.partyType === 'DEALER' && inv.order?.partyId && dealerMap.has(inv.order.partyId)) {
+          (inv.order as any).dealer = dealerMap.get(inv.order.partyId);
+        }
+      }
+    }
+
+    const buyerFranchiseIds = [...new Set(invoices.map(i => i.order?.partyType === 'FRANCHISE' ? i.order?.partyId : null).filter(Boolean))] as string[];
+    if (buyerFranchiseIds.length > 0) {
+      const buyerFranchises = await prisma.franchise.findMany({
+        where: { id: { in: buyerFranchiseIds } }
+      });
+      const franchiseMap = new Map(buyerFranchises.map(f => [f.id, f]));
+      for (const inv of invoices) {
+        if (inv.order?.partyType === 'FRANCHISE' && inv.order?.partyId && franchiseMap.has(inv.order.partyId)) {
+          (inv.order as any).buyerFranchise = franchiseMap.get(inv.order.partyId);
+        }
+      }
+    }
+
     return invoices.map((inv) => this.mergeAllocationsIntoPayments(inv));
   }
 
@@ -510,6 +777,26 @@ export class FinanceService {
         allocations: { include: { payment: true } }
       }
     });
+    if (!invoice) return null;
+
+    if (invoice.order && invoice.order.partyType === 'DEALER' && invoice.order.partyId) {
+      const dealer = await prisma.dealer.findUnique({
+        where: { id: invoice.order.partyId }
+      });
+      if (dealer) {
+        (invoice.order as any).dealer = dealer;
+      }
+    }
+
+    if (invoice.order && invoice.order.partyType === 'FRANCHISE' && invoice.order.partyId) {
+      const buyerFranchise = await prisma.franchise.findUnique({
+        where: { id: invoice.order.partyId }
+      });
+      if (buyerFranchise) {
+        (invoice.order as any).buyerFranchise = buyerFranchise;
+      }
+    }
+
     return this.mergeAllocationsIntoPayments(invoice);
   }
 
@@ -552,7 +839,7 @@ export class FinanceService {
       const status = data.isPaidImmediately ? "PAID" : "UNPAID";
 
       // 2. Create Expense
-      const expense = await tx.expense.create({ 
+      const expense = await tx.expense.create({
         data: {
           expenseNumber,
           franchiseId: data.franchiseId,
@@ -566,7 +853,7 @@ export class FinanceService {
           status: status,
           accountId: data.accountId,
           paymentMode: data.paymentMode || 'CASH'
-        } 
+        }
       });
 
       // 3. If PAID immediately and account provided, hit the ledger
@@ -1106,16 +1393,16 @@ export class FinanceService {
         _sum: { paidAmount: true },
       }),
       tx.paymentAllocation.aggregate({
-        where: { 
-          invoiceId, 
-          payment: { 
-            status: 'PAID', 
+        where: {
+          invoiceId,
+          payment: {
+            status: 'PAID',
             isCancelled: false,
             OR: [
               { invoiceId: null },
               { invoiceId: { not: invoiceId } }
             ]
-          } 
+          }
         },
         _sum: { amount: true },
       }),
@@ -1158,16 +1445,16 @@ export class FinanceService {
   }
 
   static async createPayment(data: any) {
-    const amount    = parseFloat(data.amount);
+    const amount = parseFloat(data.amount);
     // Server-side backstop for the ₹0/negative payment guard — the frontend
     // already checks this, but this is the only place that must actually
     // enforce it, since a client-supplied amount can never be trusted.
     if (!(amount > 0)) {
       throw new Error('Invalid payment amount: must be greater than zero.');
     }
-    const flow      = data.flow as 'IN' | 'OUT';
-    const status    = (data.status || 'PAID') as string;
-    const sourceId = data.sourceAccount as string;    
+    const flow = data.flow as 'IN' | 'OUT';
+    const status = (data.status || 'PAID') as string;
+    const sourceId = data.sourceAccount as string;
     const sourceModule = (data.sourceModule || 'MANUAL');
     const linkedDocType = data.linkedDocType || 'DIRECT';
     const linkedDocId = data.linkedDocId;
@@ -1188,7 +1475,7 @@ export class FinanceService {
     const accountTypeMap: Record<string, string> = {
       CASH_ACCOUNT: 'CASH',
       BANK_ACCOUNT: 'BANK',
-      UPI_WALLET:   'UPI',
+      UPI_WALLET: 'UPI',
       CASH: 'CASH',
       BANK: 'BANK',
       UPI: 'UPI',
@@ -1379,26 +1666,26 @@ export class FinanceService {
       const payment = await tx.payment.create({
         data: {
           paymentNumber,
-          paidAmount:     amount,
-          type:           paymentType as any,
-          sourceModule:   sourceModule as any,
-          linkedDocType:  linkedDocType as any,
-          linkedDocId:    linkedDocId,
+          paidAmount: amount,
+          type: paymentType as any,
+          sourceModule: sourceModule as any,
+          linkedDocType: linkedDocType as any,
+          linkedDocId: linkedDocId,
           vendorInvoiceId: data.vendorInvoiceId,
           // A multi-invoice receipt (isMultiInvoice) doesn't belong to one
           // Invoice/Order, so both stay null here — its per-invoice
           // attribution lives in the PaymentAllocation rows created below.
-          invoiceId:      !isMultiInvoice ? (singleInvoiceId || undefined) : undefined,
-          orderId:        !isMultiInvoice ? (data.orderId || orderIdForInvoice || undefined) : undefined,
-          entityType:     data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
-          entityId:       entityId,
-          paymentMode:    resolvedPaymentMode as any,
+          invoiceId: !isMultiInvoice ? (singleInvoiceId || undefined) : undefined,
+          orderId: !isMultiInvoice ? (data.orderId || orderIdForInvoice || undefined) : undefined,
+          entityType: data.entityType || (flow === 'OUT' ? 'VENDOR' : 'CUSTOMER'),
+          entityId: entityId,
+          paymentMode: resolvedPaymentMode as any,
           transactionRef: data.reference || data.note || undefined,
           status,
-          accountId:      account?.id ?? undefined,
-          createdBy:      data.createdBy,
+          accountId: account?.id ?? undefined,
+          createdBy: data.createdBy,
           idempotencyKey: data.idempotencyKey || undefined,
-          createdAt:      data.createdAt ? new Date(data.createdAt) : undefined,
+          createdAt: data.createdAt ? new Date(data.createdAt) : undefined,
         },
       });
 
@@ -1430,7 +1717,7 @@ export class FinanceService {
             orderBy: { createdAt: 'desc' }
           });
           const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
-          
+
           const isOutflow = flow === 'OUT';
           await tx.vendorLedger.create({
             data: {
@@ -1439,7 +1726,7 @@ export class FinanceService {
               amount: amount,
               balanceAfterTransaction: isOutflow ? currentBalance - amount : currentBalance + amount,
               sourceModule: sourceModule as any,
-              referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : 'PAYMENT',
+              referenceType: data.type === 'ADVANCE' ? 'ADVANCE' : (data.type === 'REFUND' ? 'REFUND' : 'PAYMENT'),
               referenceId: payment.id,
               invoiceId: data.vendorInvoiceId,
               accountId: account?.id,
@@ -1451,25 +1738,25 @@ export class FinanceService {
 
           // Update Invoice Status if linked
           if (data.vendorInvoiceId) {
-             const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
-             if (inv) {
-                // Check if fully paid: cash/bank payments PLUS whatever advance
-                // was already applied to this invoice must cover the gross
-                // amount — advance settles the invoice too, it just isn't a
-                // Payment row, so leaving it out of this sum under-counted
-                // how much of the invoice was actually settled.
-                const totalPaid = await tx.payment.aggregate({
-                   where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
-                   _sum: { paidAmount: true }
+            const inv = await tx.vendorInvoice.findUnique({ where: { id: data.vendorInvoiceId } });
+            if (inv) {
+              // Check if fully paid: cash/bank payments PLUS whatever advance
+              // was already applied to this invoice must cover the gross
+              // amount — advance settles the invoice too, it just isn't a
+              // Payment row, so leaving it out of this sum under-counted
+              // how much of the invoice was actually settled.
+              const totalPaid = await tx.payment.aggregate({
+                where: { vendorInvoiceId: data.vendorInvoiceId, status: 'PAID', isCancelled: false },
+                _sum: { paidAmount: true }
+              });
+              const total = (totalPaid._sum.paidAmount || 0) + (inv.advanceApplied || 0);
+              if (total >= inv.amount - 0.01) {
+                await tx.vendorInvoice.update({
+                  where: { id: data.vendorInvoiceId },
+                  data: { status: 'PAID' }
                 });
-                const total = (totalPaid._sum.paidAmount || 0) + (inv.advanceApplied || 0);
-                if (total >= inv.amount - 0.01) {
-                   await tx.vendorInvoice.update({
-                      where: { id: data.vendorInvoiceId },
-                      data: { status: 'PAID' }
-                   });
-                }
-             }
+              }
+            }
           }
         }
       }
@@ -1522,8 +1809,8 @@ export class FinanceService {
           const newStatus = paidSoFar >= invoiceRow.finalAmount - 0.01
             ? 'PAID'
             : paidSoFar > 0
-            ? 'PARTIAL'
-            : 'UNPAID';
+              ? 'PARTIAL'
+              : 'UNPAID';
           await tx.invoice.update({ where: { id: invId }, data: { status: newStatus } });
           await tx.order.update({ where: { id: invoiceRow.orderId }, data: { paymentStatus: newStatus } });
         }
@@ -1532,9 +1819,9 @@ export class FinanceService {
       // 5. Update account balance — ONLY if status is PAID
       if (account && status === 'PAID') {
         await AccountService.adjustBalance(
-          tx, 
-          account.id, 
-          amount, 
+          tx,
+          account.id,
+          amount,
           flow === 'IN' ? 'INFLOW' : 'OUTFLOW'
         );
       }
@@ -1624,7 +1911,7 @@ export class FinanceService {
    */
   static async cancelPayment(paymentId: string, cancelledBy?: string) {
     return prisma.$transaction(async (tx) => {
-      const original = await tx.payment.findUnique({ 
+      const original = await tx.payment.findUnique({
         where: { id: paymentId },
         include: { account: true }
       });
@@ -1644,7 +1931,7 @@ export class FinanceService {
         const reversalAmount = original.paidAmount;
 
         const pNum = await this.generatePaymentNumber(tx);
-        
+
         await tx.payment.create({
           data: {
             paymentNumber: pNum,
@@ -1668,7 +1955,7 @@ export class FinanceService {
         // If original was OUT (decreased balance) -> Inflow (increase balance)
         // If original was IN (increased balance) -> Outflow (decrease balance)
         const isOriginalOutflow = (original.entityType === 'VENDOR' || original.type === 'EXPENSE');
-        
+
         await tx.account.update({
           where: { id: original.accountId },
           data: {
@@ -1710,6 +1997,7 @@ export class FinanceService {
     deliveryCharges?: number;
     sourceFranchiseOrderId?: string;
     sourceQuotationId?: string;
+    sourceDeliveryChallanId?: string;
     roundOff?: number;
     stateOfSupply?: string;
     paymentType?: string;
@@ -1728,6 +2016,23 @@ export class FinanceService {
     }
 
     return prisma.$transaction(async (tx) => {
+      let sourceChallan: any = null;
+      if (data.sourceDeliveryChallanId) {
+        sourceChallan = await tx.deliveryChallan.findUnique({
+          where: { id: data.sourceDeliveryChallanId }
+        });
+        if (!sourceChallan) {
+          throw new Error('Source delivery challan not found.');
+        }
+        if (sourceChallan.status === 'CONVERTED') {
+          throw new Error('This delivery challan has already been converted to a sale.');
+        }
+        const currentDcStatus = sourceChallan.status === 'OPEN' ? 'IN_TRANSIT' : sourceChallan.status;
+        if (currentDcStatus !== 'CLOSED') {
+          throw new Error('Only delivered challans can be converted to sale (current status: ' + sourceChallan.status + ').');
+        }
+      }
+
       let subTotal = 0;
       let totalDiscount = data.discountAmount || 0;
       let totalTax = 0;
@@ -1743,16 +2048,161 @@ export class FinanceService {
         batchNumber: string | null;
       }[] = [];
 
+      // Trust boundary: this was the least-guarded financially-significant
+      // endpoint in the system — it accepted item.rate/gst verbatim from
+      // the request body with zero lookup of InventoryItem/Product master
+      // data. For every line with a resolvable product, re-derive the
+      // authoritative channel price and GST rate here, mirroring
+      // POSService.checkout's price/tax resolution. A line with no
+      // resolvable product (a hand-typed custom line) keeps whatever the
+      // client sent, since there's nothing authoritative to check it
+      // against. Discount is left as the pre-existing, legitimate
+      // manual/negotiated value — this chain has never had a separate
+      // InventoryItem-configured "Customer Retail Discount" wired in, and
+      // this fix does not introduce one.
+      // Customer tenancy validation
+      const effectiveCustomerId = data.partyType === 'CUSTOMER' ? (data.customerId || data.partyId) : data.customerId;
+      if (effectiveCustomerId) {
+        const customer = await tx.customer.findUnique({ where: { id: effectiveCustomerId } });
+        if (!customer) {
+          throw new Error('Selected customer not found.');
+        }
+        const hq = await FranchiseService.getHqFranchiseOrNull();
+        const isHqInvoice = !data.franchiseId || (hq && hq.id === data.franchiseId);
+        if (isHqInvoice) {
+          if (customer.franchiseId && hq && customer.franchiseId !== hq.id) {
+            throw new Error(`Customer "${customer.name}" belongs to a branch franchise and cannot be invoiced from HQ.`);
+          }
+        } else {
+          if (customer.franchiseId !== data.franchiseId) {
+            throw new Error(`Customer "${customer.name}" does not belong to this franchise branch.`);
+          }
+        }
+      }
+
+      const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, data.franchiseId);
+      const resolvedInvoicePartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
+        data.partyType === 'DEALER' ? 'DEALER' : data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
+
+      // 1. Validate real stock for all items before invoice creation
+      const itemsToDeduct: Array<{
+        inventoryItem: any;
+        requiredBaseQty: number;
+        orderItemQty: number;
+        unitId?: string;
+        product: any;
+      }> = [];
+
+      for (const checkItem of data.items) {
+        const checkQty = Number(checkItem.qty ?? checkItem.quantity ?? 0);
+        if (checkQty <= 0) continue;
+
+        if (checkItem.productId) {
+          let prod = await tx.product.findUnique({ where: { id: checkItem.productId } });
+          let invItem: any = null;
+          if (prod) {
+            invItem = prod.sku
+              ? await tx.inventoryItem.findFirst({ where: { sku: prod.sku, franchiseId: scopeFranchiseId } })
+              : await tx.inventoryItem.findFirst({ where: { name: { equals: prod.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+          } else {
+            invItem = await tx.inventoryItem.findUnique({ where: { id: checkItem.productId } });
+          }
+
+          if (invItem) {
+            const conversionResult = await InventoryService.convertUnitToBase(invItem.id, checkItem.unit || 'NONE', checkQty, tx);
+            const requiredBaseQty = conversionResult.requiredBaseQty;
+            const availableStock = invItem.currentStock ?? 0;
+
+            if (availableStock < requiredBaseQty) {
+              const unitLabel = (invItem.baseUnit as any)?.shortName || (invItem.baseUnit as any)?.name || invItem.unit || 'Units';
+              throw new Error(
+                `Insufficient stock for "${invItem.name}" (SKU: ${invItem.sku || 'N/A'}). Available: ${availableStock} ${unitLabel}, Required: ${requiredBaseQty} ${unitLabel}. Invoice creation blocked.`
+              );
+            }
+
+            itemsToDeduct.push({
+              inventoryItem: invItem,
+              requiredBaseQty,
+              orderItemQty: checkQty,
+              unitId: conversionResult.unitId,
+              product: prod || { name: invItem.name, sku: invItem.sku }
+            });
+          }
+        }
+      }
+
       for (const item of data.items) {
         const qty = Number(item.qty ?? item.quantity ?? 0);
-        const rate = Number(item.rate ?? item.price ?? 0);
-        const gst = Number(item.gst ?? item.taxPercent ?? 0);
-        const discountPct = Number(item.discount ?? item.discountPct ?? 0);
+        let rate = Number(item.rate ?? item.price ?? 0);
+        let gst = Number(item.gst ?? item.taxPercent ?? 0);
+        // "Customer Retail Discount" default — CUSTOMER channel only, and
+        // only used below if the client sent no explicit discount at all.
+        let autoDiscountType = 'PERCENT';
+        let autoDiscountValue = 0;
+
+        if (item.productId) {
+          let product = await tx.product.findUnique({ where: { id: item.productId } });
+          let inv: any = null;
+          if (product) {
+            inv = product.sku
+              ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+              : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+          } else {
+            // Some callers reference an InventoryItem.id directly rather
+            // than a Product.id (e.g. picked from the raw InventoryItem
+            // catalog) — resolve that identity too.
+            inv = await tx.inventoryItem.findUnique({ where: { id: item.productId } });
+          }
+          if (!product && !inv) {
+            // A productId was supplied but resolves to nothing — accepting
+            // the client-submitted rate here would silently reopen the
+            // exact trust hole this resolver exists to close (a real
+            // Dealer price of ₹40 with a resolution failure otherwise
+            // accepting a submitted ₹1). Reject instead of guessing.
+            throw new Error(`Cannot price line item "${item.productName || item.productId}" — productId "${item.productId}" does not match any known Product or InventoryItem. Remove the reference to use a free-text price, or fix the id.`);
+          }
+          const channelPrice =
+            resolvedInvoicePartyType === 'DEALER' ? inv?.dealerPrice :
+              resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
+                inv?.customerPrice;
+          rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+          gst = inv?.gstRate ?? product?.taxPercent ?? 0;
+          if (resolvedInvoicePartyType === 'CUSTOMER') {
+            autoDiscountType = inv?.discountType || product?.discountType || 'PERCENT';
+            autoDiscountValue = Number(inv?.discountValue ?? product?.discountValue ?? 0);
+          }
+        }
+
+        // A negotiated discount is legitimate but can never exceed the
+        // line/document it's discounting, and never be negative — that's
+        // what keeps this a "manual discount" rather than a way to
+        // fabricate a negative or inflated invoice total.
+        const hasExplicitDiscount = item.discountAmount !== undefined || item.discount !== undefined || item.discountPct !== undefined;
+        let discountPct = Number(item.discount ?? item.discountPct ?? 0);
+        discountPct = Math.max(0, Math.min(discountPct, 100));
 
         const itemSubtotal = qty * rate;
-        const itemDiscount = item.discountAmount !== undefined
-          ? Number(item.discountAmount)
-          : (itemSubtotal * discountPct / 100);
+        let itemDiscount: number;
+        if (item.discountAmount !== undefined) {
+          itemDiscount = Number(item.discountAmount);
+        } else if (hasExplicitDiscount) {
+          itemDiscount = itemSubtotal * discountPct / 100;
+        } else if (autoDiscountValue > 0) {
+          // No explicit discount sent at all — fall back to the Item
+          // Master's Customer Retail Discount (already gated to CUSTOMER
+          // above; stays 0 for Dealer/Franchise).
+          itemDiscount = autoDiscountType === 'FLAT'
+            ? autoDiscountValue * qty
+            : itemSubtotal * autoDiscountValue / 100;
+        } else {
+          itemDiscount = 0;
+        }
+        itemDiscount = Math.max(0, Math.min(itemDiscount, itemSubtotal));
+        // Reflect whatever discount actually got applied (including the
+        // Customer Retail Discount auto-fill above) in the stored percent,
+        // not just an explicitly-submitted one — keeps OrderItem.discountPct
+        // consistent with the dollar amount for record-keeping.
+        discountPct = itemSubtotal > 0 ? (itemDiscount / itemSubtotal) * 100 : 0;
         const itemTaxableAmount = Math.max(0, itemSubtotal - itemDiscount);
         const itemTax = itemTaxableAmount * (gst / 100);
 
@@ -1769,13 +2219,18 @@ export class FinanceService {
           price: rate,
           discountPct: discountPct,
           taxAmount: itemTax,
-          totalAmount: itemSubtotal - itemDiscount + itemTax,
+          totalAmount: itemTaxableAmount + itemTax,
           batchNumber: item.batchNumber || null
         });
       }
 
       const deliveryCharge = Number(data.deliveryCharge ?? data.deliveryCharges ?? 0);
-      const totalAmount = subTotal + totalTax - totalDiscount + deliveryCharge;
+      // Bound the aggregate discount (whether an explicit data.discountAmount
+      // or the summed item discounts above) to what's actually on the bill,
+      // and floor the final total at zero — the same clamp POSService.checkout
+      // applies to its manualDiscount, closing the equivalent hole here.
+      totalDiscount = Math.max(0, Math.min(totalDiscount, subTotal + totalTax));
+      const totalAmount = Math.max(0, subTotal + totalTax - totalDiscount + deliveryCharge);
       const year = new Date().getFullYear();
       // Atomic sequence (same NumberSequence pattern as payment/GRN numbers)
       // instead of COUNT()-based generation, which two invoices saved in the
@@ -1805,15 +2260,26 @@ export class FinanceService {
         if (cust) resolvedCustomerName = cust.name;
       }
 
+      // Resolve seller franchise identity:
+      // When goods are billed to a Franchise (HQ selling finished products to Franchise),
+      // the SELLER franchise is HQ (isHQ: true), and the BUYER is data.partyId (the Franchise).
+      let sellerFranchiseId = data.franchiseId;
+      if (data.partyType === 'FRANCHISE' || data.sourceFranchiseOrderId) {
+        const hq = await tx.franchise.findFirst({ where: { isHQ: true } });
+        if (hq) {
+          sellerFranchiseId = hq.id;
+        }
+      }
+
       const order = await tx.order.create({
         data: {
           invoiceNum,
           sourceQuotationId: data.sourceFranchiseOrderId || (data as any).sourceQuotationId || null,
           partyType: (data.partyType || 'CUSTOMER') as any,
-          partyId: data.partyId,
-          customerId: data.customerId,
+          partyId: data.partyId || (data.partyType === 'CUSTOMER' ? data.customerId : null),
+          customerId: data.partyType === 'CUSTOMER' ? (data.customerId || data.partyId) : null,
           customerName: resolvedCustomerName,
-          franchiseId: data.franchiseId,
+          franchiseId: sellerFranchiseId,
           orderType: 'DINE_IN',
           status: 'COMPLETED',
           subTotal,
@@ -1823,7 +2289,7 @@ export class FinanceService {
           paymentStatus,
           paymentType: data.paymentType || 'CASH',
           stateOfSupply: data.stateOfSupply || null,
-          inventory_deducted: false,
+          inventory_deducted: Boolean(data.sourceDeliveryChallanId),
           orderItems: {
             create: orderItemsData
           }
@@ -1843,6 +2309,17 @@ export class FinanceService {
           notes: data.notes || null,
         }
       });
+
+      if (sourceChallan) {
+        await tx.deliveryChallan.update({
+          where: { id: sourceChallan.id },
+          data: {
+            status: 'CONVERTED',
+            convertedOrderId: order.id,
+            convertedInvoiceId: invoice.id
+          }
+        });
+      }
 
       // If created from a Franchise Order, update the related FranchiseOrder with the final approved amount
       if (data.sourceFranchiseOrderId) {
@@ -1990,9 +2467,23 @@ export class FinanceService {
       }
 
       // Automatically deduct inventory based on the items sold
-      if (!data.sourceFranchiseOrderId && data.partyType !== 'FRANCHISE') {
-        await POSService.deductInventoryIfNecessary(order.id, tx);
+      for (const ded of itemsToDeduct) {
+        await InventoryService.recordMovement(tx, {
+          itemId: ded.inventoryItem.id,
+          type: 'SALES_OUT',
+          quantity: -ded.orderItemQty,
+          baseQty: -ded.requiredBaseQty,
+          transactionUnit: ded.unitId,
+          referenceType: 'ORDER',
+          referenceId: order.id,
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name})`
+        });
       }
+
+      await tx.order.update({
+        where: { id: order.id },
+        data: { inventory_deducted: true }
+      });
 
       return {
         ...invoice,
@@ -2533,10 +3024,10 @@ export class FinanceService {
       const orderTotal = Number(p.order?.totalAmount ?? p.invoice?.totalAmount ?? p.vendorInvoice?.amount ?? p.paidAmount);
       const paidForOrder = p.order?.payments?.length
         ? this.sumOrderPaidWithAllocations(
-            p.order.payments,
-            (p.order as any).invoice?.allocations,
-            (x) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')
-          )
+          p.order.payments,
+          (p.order as any).invoice?.allocations,
+          (x) => !x.isCancelled && (x.status === 'PAID' || x.status === 'SUCCESS')
+        )
         : Number(p.paidAmount);
       const receivableAmount = Number(p.paidAmount);
       const balanceAmount = Math.max(0, orderTotal - paidForOrder);
@@ -2889,6 +3380,12 @@ export class FinanceService {
     // Build individual account details
     const accountDetails = accounts.map(a => ({ name: a.name, type: a.type, balance: a.balance || 0 }));
 
+        const totalAssets = currentAssetsAmount;
+    const totalLiabilities = currentLiabilitiesAmount;
+    const totalEquity = netProfit;
+    const totalLiabilitiesAndEquity = totalLiabilities + totalEquity;
+    const balancingDifference = totalAssets - totalLiabilitiesAndEquity;
+
     return {
       assets: [
         { name: "Fixed Assets", amount: 0, notes: "—" },
@@ -2919,7 +3416,13 @@ export class FinanceService {
         totalSales,
         totalCOGS,
         totalExpenses,
-        netProfit
+        netProfit,
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        totalLiabilitiesAndEquity,
+        balancingDifference,
+        isBalanced: Math.abs(balancingDifference) < 0.01
       }
     };
   }
@@ -3138,94 +3641,585 @@ export class FinanceService {
   static async getPartyStatement(filters: {
     franchiseId?: string;
     customerId?: string;
+    vendorId?: string;
+    dealerId?: string;
+    partyId?: string;
+    partyType?: 'CUSTOMER' | 'DEALER' | 'VENDOR' | 'FRANCHISE';
+    partyName?: string;
+    search?: string;
     startDate?: Date;
     endDate?: Date;
+    page?: number;
+    limit?: number;
   }) {
-    const { franchiseId, customerId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate } = filters;
+    const targetPartyId = (filters.partyId || filters.customerId || filters.vendorId || filters.dealerId || '').trim();
+    const targetPartyName = (filters.partyName || filters.search || '').trim();
     const { start, end } = parseInclusiveDates(startDate, endDate);
 
-    // Fetch all customers and vendors for current franchise to populate dropdown
-    const customersList = await prisma.customer.findMany({
-      where: { franchiseId },
-      select: { id: true, name: true, phone: true }
-    });
-    const vendorsList = await prisma.vendor.findMany({
-      select: { id: true, name: true, contact: true }
-    });
+    // Fetch all customers, dealers, vendors, and franchises for dropdown & identification
+    const [customersList, dealersList, vendorsList, franchisesList] = await Promise.all([
+      prisma.customer.findMany({
+        where: franchiseId ? { franchiseId } : {},
+        select: { id: true, name: true, phone: true }
+      }),
+      prisma.dealer.findMany({
+        where: franchiseId ? { franchiseId } : {},
+        select: { id: true, name: true, phone: true }
+      }),
+      prisma.vendor.findMany({
+        select: { id: true, name: true, contact: true }
+      }),
+      prisma.franchise.findMany({
+        select: { id: true, name: true, contactNum: true }
+      })
+    ]);
+
     const combinedParties = [
-      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone })),
-      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact }))
+      ...customersList.map(c => ({ id: c.id, name: c.name, phone: c.phone, partyType: 'CUSTOMER' as const })),
+      ...dealersList.map(d => ({ id: d.id, name: d.name, phone: d.phone, partyType: 'DEALER' as const })),
+      ...vendorsList.map(v => ({ id: v.id, name: v.name, phone: v.contact, partyType: 'VENDOR' as const })),
+      ...franchisesList.map(f => ({ id: f.id, name: f.name, phone: f.contactNum, partyType: 'FRANCHISE' as const }))
     ];
 
-    if (!customerId) {
-      return {
-        customers: combinedParties,
-        transactions: [],
-        summary: {
-          totalSale: 0,
-          totalPurchase: 0,
-          totalExpense: 0,
-          totalMoneyIn: 0,
-          totalMoneyOut: 0,
-          totalReceivable: 0,
-          totalPayable: 0
+    // Determine target party
+    let resolvedParty: { id: string; name: string; partyType: 'CUSTOMER' | 'DEALER' | 'VENDOR' | 'FRANCHISE' } | null = null;
+
+    if (targetPartyId) {
+      const match = combinedParties.find(p => p.id === targetPartyId);
+      if (match) resolvedParty = match;
+    }
+
+    if (!resolvedParty && targetPartyName) {
+      const q = targetPartyName.toLowerCase();
+      const match = combinedParties.find(p => p.name.toLowerCase() === q)
+        || combinedParties.find(p => p.name.toLowerCase().includes(q));
+      if (match) resolvedParty = match;
+    }
+
+    type RawTxn = {
+      date: Date;
+      txnType: string;
+      refNo: string;
+      particular: string;
+      paymentType: string;
+      debit: number;
+      credit: number;
+      total: number;
+      partyName?: string;
+      partyType?: string;
+    };
+
+    let rawTxns: RawTxn[] = [];
+    let openingBal = 0;
+    let accountingType: 'RECEIVABLE' | 'PAYABLE' = 'RECEIVABLE';
+
+    if (resolvedParty) {
+      const { id: partyId, partyType } = resolvedParty;
+
+      // ── 1. DEALER ──
+      if (partyType === 'DEALER') {
+        accountingType = 'RECEIVABLE';
+        const dealer = await prisma.dealer.findUnique({ where: { id: partyId } });
+        openingBal = Number(dealer?.openingBalance) || 0;
+
+        const [orders, payments, challans] = await Promise.all([
+          prisma.order.findMany({
+            where: {
+              partyType: 'DEALER',
+              partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            include: { payments: { where: { isCancelled: false } } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'DEALER',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              orderId: null,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.deliveryChallan.findMany({
+            where: {
+              dealerId: partyId,
+              ...(start || end ? { challanDate: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { challanDate: 'asc' }
+          })
+        ]);
+
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: dealer?.asOfDate ? new Date(dealer.asOfDate) : (dealer?.createdAt || new Date(2026, 0, 1)),
+            txnType: 'Opening Balance',
+            particular: 'Dealer Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal > 0 ? openingBal : 0,
+            credit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            total: Math.abs(openingBal),
+          });
         }
-      };
-    }
 
-    // Fetch customer or vendor ledgers
-    const isCustomer = customersList.some(c => c.id === customerId);
-    let ledgers: any[] = [];
-    if (isCustomer) {
-      ledgers = await prisma.customerLedger.findMany({
-        where: {
-          customerId,
-          createdAt: {
-            ...(start ? { gte: start } : {}),
-            ...(end ? { lte: end } : {})
+        for (const o of orders) {
+          rawTxns.push({
+            date: o.createdAt,
+            txnType: 'POS Sale',
+            particular: 'Sale Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+            refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+            paymentType: o.paymentType || 'CASH',
+            debit: o.totalAmount,
+            credit: 0,
+            total: o.totalAmount
+          });
+          for (const p of o.payments) {
+            rawTxns.push({
+              date: p.createdAt,
+              txnType: 'Payment-In',
+              particular: 'Payment Received ' + (p.paymentNumber || p.transactionRef || ''),
+              refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+              paymentType: p.paymentMode || 'CASH',
+              debit: 0,
+              credit: p.paidAmount,
+              total: p.paidAmount
+            });
           }
-        },
-        orderBy: { createdAt: 'asc' }
-      });
+        }
+
+        for (const p of payments) {
+          rawTxns.push({
+            date: p.createdAt,
+            txnType: 'Payment-In',
+            particular: 'Direct Payment ' + (p.paymentNumber || p.transactionRef || ''),
+            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+            paymentType: p.paymentMode || 'CASH',
+            debit: 0,
+            credit: p.paidAmount,
+            total: p.paidAmount
+          });
+        }
+
+        for (const c of challans) {
+          rawTxns.push({
+            date: c.challanDate,
+            txnType: 'Delivery Challan',
+            particular: 'Challan ' + (c.challanNumber || ''),
+            refNo: c.challanNumber || c.id.slice(0, 8).toUpperCase(),
+            paymentType: '—',
+            debit: 0,
+            credit: 0,
+            total: c.totalAmount
+          });
+        }
+      }
+
+      // ── 2. CUSTOMER ──
+      else if (partyType === 'CUSTOMER') {
+        accountingType = 'RECEIVABLE';
+        const customer = await prisma.customer.findUnique({ where: { id: partyId } });
+        openingBal = Number(customer?.openingBalance) || 0;
+
+        const [ledgers, orders, payments] = await Promise.all([
+          prisma.customerLedger.findMany({
+            where: {
+              customerId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.order.findMany({
+            where: {
+              customerId: partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            include: { payments: { where: { isCancelled: false } } },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'CUSTOMER',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
+
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: customer?.asOfDate ? new Date(customer.asOfDate) : (customer?.createdAt || new Date(2026, 0, 1)),
+            txnType: 'Opening Balance',
+            particular: 'Customer Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal > 0 ? openingBal : 0,
+            credit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            total: Math.abs(openingBal)
+          });
+        }
+
+        if (ledgers.length > 0) {
+          for (const l of ledgers) {
+            rawTxns.push({
+              date: l.createdAt,
+              txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
+              particular: (l as any).description || l.note || (l.referenceType === 'SALE' ? 'Sales Invoice' : 'Customer Payment'),
+              refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
+              paymentType: l.paymentMode || '—',
+              debit: l.type === 'DEBIT' ? l.amount : 0,
+              credit: l.type === 'CREDIT' ? l.amount : 0,
+              total: l.amount
+            });
+          }
+        } else {
+          for (const o of orders) {
+            rawTxns.push({
+              date: o.createdAt,
+              txnType: 'Sale',
+              particular: 'Sales Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+              refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+              paymentType: o.paymentType || 'CASH',
+              debit: o.totalAmount,
+              credit: 0,
+              total: o.totalAmount
+            });
+            for (const p of o.payments) {
+              rawTxns.push({
+                date: p.createdAt,
+                txnType: 'Payment-In',
+                particular: 'Payment Received',
+                refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+                paymentType: p.paymentMode || 'CASH',
+                debit: 0,
+                credit: p.paidAmount,
+                total: p.paidAmount
+              });
+            }
+          }
+
+          for (const p of payments) {
+            if (!orders.some(o => o.payments.some(op => op.id === p.id))) {
+              rawTxns.push({
+                date: p.createdAt,
+                txnType: 'Payment-In',
+                particular: 'Customer Payment',
+                refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+                paymentType: p.paymentMode || 'CASH',
+                debit: 0,
+                credit: p.paidAmount,
+                total: p.paidAmount
+              });
+            }
+          }
+        }
+      }
+
+      // ── 3. VENDOR ──
+      else if (partyType === 'VENDOR') {
+        accountingType = 'PAYABLE';
+        const vendor = await prisma.vendor.findUnique({ where: { id: partyId } });
+        openingBal = Number(vendor?.openingBalance) || 0;
+
+        const [ledgers, invoices, orders, payments] = await Promise.all([
+          prisma.vendorLedger.findMany({
+            where: {
+              vendorId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.vendorInvoice.findMany({
+            where: {
+              vendorId: partyId,
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.procurementOrder.findMany({
+            where: {
+              vendorId: partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'VENDOR',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
+
+        if (openingBal !== 0) {
+          rawTxns.push({
+            date: vendor?.asOfDate ? new Date(vendor.asOfDate) : (vendor?.createdAt || new Date(2026, 0, 1)),
+            txnType: 'Opening Balance',
+            particular: 'Vendor Opening Balance',
+            refNo: 'OB-0001',
+            paymentType: '—',
+            debit: openingBal < 0 ? Math.abs(openingBal) : 0,
+            credit: openingBal > 0 ? openingBal : 0,
+            total: Math.abs(openingBal)
+          });
+        }
+
+        if (ledgers.length > 0) {
+          for (const l of ledgers) {
+            const isCredit = l.type === 'CREDIT';
+            const isDebit = l.type === 'DEBIT';
+            rawTxns.push({
+              date: l.createdAt,
+              txnType: l.referenceType ? formatReferenceType(l.referenceType) : (isCredit ? 'Purchase Bill' : 'Payment Out'),
+              particular: (l as any).description || l.note || (isCredit ? 'Purchase Bill' : 'Vendor Payment'),
+              refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
+              paymentType: l.paymentMode || '—',
+              debit: isDebit ? l.amount : 0,
+              credit: isCredit ? l.amount : 0,
+              total: l.amount
+            });
+          }
+        } else {
+          // Synthesize from vendor invoices, procurement orders, and payments
+          for (const inv of invoices) {
+            rawTxns.push({
+              date: inv.billDate || inv.createdAt,
+              txnType: 'Purchase Bill',
+              particular: 'Vendor Bill ' + (inv.invoiceNumber || ''),
+              refNo: inv.invoiceNumber || inv.id.slice(0, 8).toUpperCase(),
+              paymentType: inv.paymentType || 'CASH',
+              debit: 0,
+              credit: Number(inv.amount) || 0,
+              total: Number(inv.amount) || 0
+            });
+          }
+
+          // POs without invoice
+          for (const po of orders) {
+            if (!invoices.some(inv => inv.poId === po.id)) {
+              rawTxns.push({
+                date: po.createdAt,
+                txnType: 'Purchase Order',
+                particular: 'PO ' + (po.poNumber || ''),
+                refNo: po.poNumber || po.id.slice(0, 8).toUpperCase(),
+                paymentType: 'CASH',
+                debit: 0,
+                credit: Number(po.totalAmount) || 0,
+                total: Number(po.totalAmount) || 0
+              });
+            }
+          }
+
+          for (const pay of payments) {
+            rawTxns.push({
+              date: pay.createdAt,
+              txnType: 'Payment Out',
+              particular: pay.transactionRef || ('Payment for ' + (pay.linkedDocId || 'Bill')),
+              refNo: pay.paymentNumber || pay.id.slice(0, 8).toUpperCase(),
+              paymentType: pay.paymentMode || 'CASH',
+              debit: Number(pay.paidAmount) || 0,
+              credit: 0,
+              total: Number(pay.paidAmount) || 0
+            });
+          }
+        }
+      }
+
+      // ── 4. FRANCHISE ──
+      else if (partyType === 'FRANCHISE') {
+        accountingType = 'RECEIVABLE';
+        const [orders, payments] = await Promise.all([
+          prisma.order.findMany({
+            where: {
+              partyType: 'FRANCHISE',
+              partyId,
+              status: { not: 'CANCELLED' },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          }),
+          prisma.payment.findMany({
+            where: {
+              entityType: 'FRANCHISE',
+              entityId: partyId,
+              isCancelled: false,
+              status: { in: ['SUCCESS', 'PAID'] },
+              ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+            },
+            orderBy: { createdAt: 'asc' }
+          })
+        ]);
+
+        for (const o of orders) {
+          rawTxns.push({
+            date: o.createdAt,
+            txnType: 'Franchise Order',
+            particular: 'Franchise Order ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+            refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+            paymentType: o.paymentType || 'CASH',
+            debit: o.totalAmount,
+            credit: 0,
+            total: o.totalAmount
+          });
+        }
+
+        for (const p of payments) {
+          rawTxns.push({
+            date: p.createdAt,
+            txnType: 'Payment-In',
+            particular: p.transactionRef || 'Franchise Receipt',
+            refNo: p.paymentNumber || p.transactionRef || p.id.slice(0, 8).toUpperCase(),
+            paymentType: p.paymentMode || 'UPI',
+            debit: 0,
+            credit: p.paidAmount,
+            total: p.paidAmount
+          });
+        }
+      }
     } else {
-      ledgers = await prisma.vendorLedger.findMany({
-        where: {
-          vendorId: customerId,
-          createdAt: {
-            ...(start ? { gte: start } : {}),
-            ...(end ? { lte: end } : {})
-          }
-        },
-        orderBy: { createdAt: 'asc' }
-      });
+      // If no party selected, aggregate from all recent transactions across the system
+      const [vendorInvoices, vendorPayments, posOrders, posPayments] = await Promise.all([
+        prisma.vendorInvoice.findMany({
+          where: { ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {}) },
+          include: { vendor: true },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.payment.findMany({
+          where: {
+            isCancelled: false,
+            status: { in: ['SUCCESS', 'PAID'] },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.order.findMany({
+          where: {
+            status: { not: 'CANCELLED' },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        }),
+        prisma.procurementOrder.findMany({
+          where: {
+            status: { not: 'CANCELLED' },
+            ...(start || end ? { createdAt: { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) } } : {})
+          },
+          include: { vendor: true },
+          take: 50,
+          orderBy: { createdAt: 'desc' }
+        })
+      ]);
+
+      for (const vi of vendorInvoices) {
+        rawTxns.push({
+          date: vi.billDate || vi.createdAt,
+          txnType: 'Purchase Bill',
+          particular: (vi.vendor?.name ? vi.vendor.name + ' - ' : '') + 'Bill ' + (vi.invoiceNumber || ''),
+          refNo: vi.invoiceNumber || vi.id.slice(0, 8).toUpperCase(),
+          paymentType: vi.paymentType || 'CASH',
+          debit: 0,
+          credit: Number(vi.amount) || 0,
+          total: Number(vi.amount) || 0,
+          partyName: vi.vendor?.name || 'Vendor',
+          partyType: 'VENDOR'
+        });
+      }
+
+      for (const p of vendorPayments) {
+        const isVendor = p.entityType === 'VENDOR';
+        rawTxns.push({
+          date: p.createdAt,
+          txnType: isVendor ? 'Payment Out' : 'Payment-In',
+          particular: p.transactionRef || (isVendor ? 'Vendor Payment' : 'Customer/Franchise Receipt'),
+          refNo: p.paymentNumber || p.id.slice(0, 8).toUpperCase(),
+          paymentType: p.paymentMode || 'CASH',
+          debit: isVendor ? p.paidAmount : 0,
+          credit: isVendor ? 0 : p.paidAmount,
+          total: p.paidAmount,
+          partyName: p.entityType || 'Party',
+          partyType: p.entityType || undefined
+        });
+      }
+
+      for (const o of posOrders) {
+        rawTxns.push({
+          date: o.createdAt,
+          txnType: o.partyType === 'FRANCHISE' ? 'Franchise Order' : 'POS Sale',
+          particular: (o.partyType || 'Customer') + ' - ' + (o.invoiceNum || o.id.slice(0, 8).toUpperCase()),
+          refNo: o.invoiceNum || o.id.slice(0, 8).toUpperCase(),
+          paymentType: o.paymentType || 'CASH',
+          debit: o.totalAmount,
+          credit: 0,
+          total: o.totalAmount,
+          partyName: o.partyType || 'Customer',
+          partyType: o.partyType || 'CUSTOMER'
+        });
+      }
     }
 
-    // Format transaction rows
-    let runningBalance = 0;
-    const transactions = ledgers.map(entry => {
-      const isDebit = entry.type === 'DEBIT';
-      runningBalance += isDebit ? entry.amount : -entry.amount;
+    rawTxns.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    let totalSale = 0;
+    let totalPurchase = 0;
+    let totalMoneyIn = 0;
+    let totalMoneyOut = 0;
+    let runningBalance = openingBal;
+
+    const transactions = rawTxns.map(t => {
+      if (accountingType === 'RECEIVABLE') {
+        totalSale += t.debit;
+        totalMoneyIn += t.credit;
+        runningBalance += t.debit - t.credit;
+      } else {
+        totalPurchase += t.credit;
+        totalMoneyOut += t.debit;
+        runningBalance += t.credit - t.debit;
+      }
+
       return {
-        date: entry.createdAt.toISOString().split('T')[0],
-        txnType: entry.referenceType || 'Payment',
-        refNo: entry.referenceId ? entry.referenceId.slice(0, 8).toUpperCase() : '—',
-        paymentType: entry.paymentMode || '—',
-        total: entry.amount,
-        receivedPaid: isDebit ? 0 : entry.amount,
-        txnBalance: entry.amount,
+        date: new Date(t.date).toISOString().split('T')[0],
+        particular: t.particular || t.txnType || 'Transaction',
+        voucherNo: t.refNo || '—',
+        txnType: t.txnType,
+        refNo: t.refNo,
+        paymentType: t.paymentType || '—',
+        total: t.total,
+        debit: t.debit,
+        credit: t.credit,
+        receivedPaid: t.credit > 0 ? t.credit : t.debit,
+        txnBalance: t.total,
+        balance: runningBalance,
+        runningBalance: runningBalance,
         receivableBalance: runningBalance >= 0 ? runningBalance : 0,
         payableBalance: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+        partyName: t.partyName || resolvedParty?.name || 'Party',
+        partyType: t.partyType || resolvedParty?.partyType || 'CUSTOMER'
       };
     });
-
-    // Compute summaries
-    const totalSale = isCustomer ? ledgers.filter(l => l.referenceType === 'SALE').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalPurchase = !isCustomer ? ledgers.filter(l => l.referenceType === 'PURCHASE' || l.referenceType === 'PURCHASE_BILL').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalMoneyIn = isCustomer ? ledgers.filter(l => l.type === 'CREDIT').reduce((s, l) => s + l.amount, 0) : 0;
-    const totalMoneyOut = !isCustomer ? ledgers.filter(l => l.type === 'DEBIT').reduce((s, l) => s + l.amount, 0) : 0;
 
     return {
       customers: combinedParties,
+      partyType: resolvedParty?.partyType || 'CUSTOMER',
+      partyName: resolvedParty?.name || 'All Parties',
+      accountingType,
+      openingBalance: openingBal,
+      closingBalance: runningBalance,
       transactions,
       summary: {
         totalSale,
@@ -3233,8 +4227,10 @@ export class FinanceService {
         totalExpense: 0,
         totalMoneyIn,
         totalMoneyOut,
-        totalReceivable: isCustomer && runningBalance >= 0 ? runningBalance : 0,
-        totalPayable: (!isCustomer && runningBalance < 0) ? Math.abs(runningBalance) : 0
+        totalReceivable: runningBalance >= 0 ? runningBalance : 0,
+        totalPayable: runningBalance < 0 ? Math.abs(runningBalance) : 0,
+        openingBalance: openingBal,
+        closingBalance: runningBalance
       }
     };
   }
@@ -3243,85 +4239,108 @@ export class FinanceService {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateRange = { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) };
 
-    // Fetch all final sales for the franchise
+    // Same "final sale" definition already used elsewhere in this report (one
+    // economic sale = one Order = one revenue contribution, no double counting
+    // across Quotation/Proforma/SalesOrder/Invoice for the same sale).
     const orders = await prisma.order.findMany({
-      where: finalSaleWhere({
-        franchiseId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
-      }),
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
       include: {
         customer: true,
-        orderItems: {
-          include: {
-            product: {
-              include: {
-                recipe: {
-                  include: {
-                    recipeItems: {
-                      include: {
-                        inventoryItem: true
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+        orderItems: { include: { product: { include: { recipe: { include: { recipeItems: { include: { inventoryItem: true } } } } } } } }
       }
     });
 
-    const partyMap = new Map<string, { partyName: string; phoneNo: string; totalSaleAmount: number; totalCost: number }>();
+    // Same InventoryItem-by-SKU cost source and scoping the authoritative
+    // getProfitAndLoss uses (see resolveOrderItemCost) — reused, not duplicated.
+    const inventoryItems = await prisma.inventoryItem.findMany({
+      where: franchiseId ? { franchiseId } : {}
+    });
+    const invItemMap = new Map(inventoryItems.map(i => [i.sku, i]));
+
+    type Bucket = {
+      partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string;
+      totalSales: number; totalCost: number; costUnavailable: boolean;
+    };
+
+    const buckets = new Map<string, Bucket>();
 
     for (const order of orders) {
-      const partyId = order.customerId || 'CASH_CUSTOMER';
-      const partyName = order.customer ? order.customer.name : (order.customerName || 'Cash Customer');
-      const phoneNo = order.customer ? (order.customer.phone || '—') : '—';
-      
-      if (!partyMap.has(partyId)) {
-        partyMap.set(partyId, { partyName, phoneNo, totalSaleAmount: 0, totalCost: 0 });
+      const resolved = resolveOrderParty(order);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSales: 0, totalCost: 0, costUnavailable: false });
       }
-      
-      const partyData = partyMap.get(partyId)!;
-      
-      // Use tax-exclusive sales for P&L
-      const taxExclusiveAmount = order.totalAmount - (order.taxAmount || 0);
-      partyData.totalSaleAmount += taxExclusiveAmount;
-      
+      const bucket = buckets.get(resolved.key)!;
+
+      // Tax-exclusive net sales revenue — same basis as getProfitAndLoss.
+      bucket.totalSales += order.totalAmount - (order.taxAmount || 0);
+
       for (const item of order.orderItems) {
-        if (item.totalCost !== null && item.totalCost !== undefined) {
-          partyData.totalCost += item.totalCost;
-          continue;
-        }
-        let itemCost = 0;
-        const recipeItems = item.product?.recipe?.recipeItems || [];
-        if (recipeItems.length > 0) {
-          for (const ri of recipeItems) {
-            const materialCost = ri.inventoryItem?.costPrice || ri.inventoryItem?.basePrice || 0;
-            itemCost += ri.quantityRequired * materialCost;
-          }
-        } else {
-          itemCost = item.product?.basePrice || 0;
-        }
-        partyData.totalCost += itemCost * item.quantity;
+        const { cost, source } = resolveOrderItemCost(item, invItemMap);
+        bucket.totalCost += cost;
+        if (source === 'UNAVAILABLE') bucket.costUnavailable = true;
       }
     }
 
-    const reportRows = Array.from(partyMap.values()).map(data => {
-      return {
-        partyName: data.partyName,
-        phoneNo: data.phoneNo,
-        totalSaleAmount: data.totalSaleAmount,
-        profit: data.totalSaleAmount - data.totalCost
-      };
-    }).filter(r => r.totalSaleAmount > 0);
+    // Sales-return netting, reusing the exact fields the authoritative P&L nets
+    // with (ReturnItem.taxableValue for revenue, .costReversal for COGS,
+    // APPROVED/COMPLETED only, the return's own createdAt) — but per resolved
+    // party instead of one company-wide total, so a fully-returned sale nets
+    // to zero for the party it belongs to instead of continuing to inflate it.
+    const returns = await prisma.returnOrder.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, createdAt: dateRange },
+      include: {
+        items: true,
+        customer: true,
+        // SalesOrder carries no franchiseId at all, so it can't contribute an
+        // operating-franchise for scoping; a return linked only to one (no
+        // posOrder, no direct customerId/dealerId/franchiseId) is counted
+        // unconditionally below rather than silently dropped.
+        posOrder: { select: { franchiseId: true, partyType: true, partyId: true, customerId: true, customerName: true, customer: true } }
+      }
+    });
+
+    for (const ret of returns) {
+      const { resolved, operatingFranchiseId } = resolveReturnParty(ret);
+
+      if (franchiseId && operatingFranchiseId && operatingFranchiseId !== franchiseId) continue;
+
+      const bucket = buckets.get(resolved.key);
+      if (!bucket) continue; // return for a party with no sale-side row in this period — nothing to net against
+
+      for (const item of ret.items) {
+        bucket.totalSales -= (item.taxableValue || 0);
+        bucket.totalCost -= (item.costReversal || 0);
+      }
+    }
+
+    await batchResolvePartyNames(buckets.values());
+
+    let reportRows = Array.from(buckets.values())
+      .map(b => {
+        const totalSales = roundCents(b.totalSales);
+        const totalCost = roundCents(b.totalCost);
+        const profit = roundCents(b.totalSales - b.totalCost);
+        const margin = totalSales !== 0 ? roundCents((profit / totalSales) * 100) : null;
+        return {
+          partyId: b.partyId, partyType: b.partyType, partyName: b.partyName, phoneNo: b.phoneNo,
+          totalSales, totalCost, profit, margin, costUnavailable: b.costUnavailable
+        };
+      })
+      // Drop buckets with no real financial activity left (e.g. a walk-in sale
+      // fully reversed by a return nets to exactly zero on both sides) — never
+      // hides a party with genuine nonzero figures, including a net loss.
+      .filter(r => r.totalSales !== 0 || r.totalCost !== 0);
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.partyType.toLowerCase().includes(q));
+    }
 
     return reportRows;
   }
@@ -3330,118 +4349,205 @@ export class FinanceService {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    
+    // Using buildCreatedAtFilter for sales, and buildBillDateFilter for purchases
+    const dateRange = buildCreatedAtFilter(start, end).createdAt || {};
+    const billDateFilter = buildBillDateFilter(start, end);
 
-    // Fetch customer order items
-    const customers = await prisma.customer.findMany({
-      where: { franchiseId },
-      include: {
-        orders: {
-          where: {
-            status: { not: 'CANCELLED' },
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {})
-            }
-          },
-          include: {
-            orderItems: true
-          }
-        }
+    type ReportRow = {
+      partyType: ResolvedPartyType;
+      partyId: string | null;
+      partyName: string;
+      itemId: string;
+      itemName: string;
+      saleQuantity: number;
+      saleAmount: number;
+      purchaseQuantity: number;
+      purchaseAmount: number;
+    };
+
+    const rowMap = new Map<string, ReportRow>();
+
+    const getRow = (party: ReturnType<typeof resolveOrderParty> | ReturnType<typeof resolveVendorParty>, itemId: string, itemName: string) => {
+      const key = `${party.partyType}:${party.partyId}:${itemId}`;
+      if (!rowMap.has(key)) {
+        rowMap.set(key, {
+          partyType: party.partyType,
+          partyId: party.partyId,
+          partyName: party.partyName,
+          itemId,
+          itemName,
+          saleQuantity: 0,
+          saleAmount: 0,
+          purchaseQuantity: 0,
+          purchaseAmount: 0
+        });
+      }
+      return rowMap.get(key)!;
+    };
+
+    // 1. SALES
+    const orders = await prisma.order.findMany({
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
+      include: { customer: true, orderItems: { include: { product: { select: { name: true, sku: true } } } } }
+    });
+
+    for (const order of orders) {
+      const resolved = resolveOrderParty(order);
+      for (const item of order.orderItems) {
+        if (!item.product) continue; // Skip unknown products
+        
+        // discountAmount has precedence, otherwise calculate from pct
+        const discountAmount = (item as any).discountAmount ?? (item.price * item.quantity * ((item.discountPct || 0) / 100));
+        const itemAmount = (item.price * item.quantity) - discountAmount;
+        
+        const row = getRow(resolved, item.product.sku || item.productId, item.product.name);
+        row.saleQuantity += item.quantity;
+        row.saleAmount += itemAmount;
+      }
+    }
+
+    // 2. PURCHASES
+    // Fetch authoritative VendorInvoices tied to GRNs
+    const invoices = await prisma.vendorInvoice.findMany({
+      where: {
+        status: { in: ['PAID', 'PENDING'] },
+        ...(franchiseId ? { warehouse: { franchiseId } } : {}),
+        ...billDateFilter
+      },
+      include: { 
+        vendor: true, 
+        grn: { include: { items: { include: { inventoryItem: true } } } },
+        procurementOrder: { include: { poItems: { include: { inventoryItem: true } } } }
       }
     });
 
-    const report = customers.map(cust => {
-      let saleQuantity = 0;
-      let saleAmount = 0;
+    for (const inv of invoices) {
+      const resolved = resolveVendorParty(inv.vendorId, inv.vendor.name);
+      
+      // If linked to GRN, use actual received inventory
+      if (inv.grn && inv.grn.items) {
+        // Calculate total GRN value to prorate invoice-level charges/discounts
+        let rawGrnValue = 0;
+        inv.grn.items.forEach(i => { rawGrnValue += (i.price * i.acceptedQty); });
 
-      for (const order of cust.orders) {
-        saleAmount += order.totalAmount;
-        for (const item of order.orderItems) {
-          saleQuantity += item.quantity;
+        // The authoritative invoice amount is inv.subtotal (or inv.amount for tax-inc).
+        // Using subtotal for tax-exclusive comparison.
+        const invoiceSubtotal = inv.subtotal || inv.amount;
+        
+        for (const item of inv.grn.items) {
+          if (!item.inventoryItem) continue;
+          const itemRawValue = item.price * item.acceptedQty;
+          
+          // Prorate the final invoice value for this item
+          const proratedAmount = rawGrnValue > 0 ? (itemRawValue / rawGrnValue) * invoiceSubtotal : 0;
+
+          const row = getRow(resolved, item.inventoryItem.id, item.inventoryItem.name);
+          row.purchaseQuantity += item.acceptedQty;
+          row.purchaseAmount += proratedAmount;
+        }
+      } else if (inv.procurementOrder && inv.procurementOrder.poItems) {
+        // Fallback to PO items if no GRN attached directly to invoice
+        let rawPoValue = 0;
+        inv.procurementOrder.poItems.forEach(i => { rawPoValue += (i.price * i.quantity); });
+        const invoiceSubtotal = inv.subtotal || inv.amount;
+
+        for (const item of inv.procurementOrder.poItems) {
+          if (!item.inventoryItem) continue;
+          const itemRawValue = item.price * item.quantity;
+          const proratedAmount = rawPoValue > 0 ? (itemRawValue / rawPoValue) * invoiceSubtotal : 0;
+          
+          const row = getRow(resolved, item.inventoryItem.id, item.inventoryItem.name);
+          row.purchaseQuantity += item.quantity;
+          row.purchaseAmount += proratedAmount;
         }
       }
+    }
 
-      return {
-        partyName: cust.name,
-        saleQuantity,
-        saleAmount,
-        purchaseQuantity: 0,
-        purchaseAmount: 0
-      };
-    }).filter(r => r.saleAmount > 0);
+    const rows = Array.from(rowMap.values());
 
-    return report;
+    // Batch-resolve Dealer/Franchise display names
+    await batchResolvePartyNames(rows as any);
+
+    let reportRows = rows.map(r => ({
+      ...r,
+      saleAmount: roundCents(r.saleAmount),
+      purchaseAmount: roundCents(r.purchaseAmount)
+    }));
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.itemName.toLowerCase().includes(q));
+    }
+
+    return reportRows;
   }
 
   static async getSalePurchaseByParty(filters: {
     franchiseId?: string;
     startDate?: Date;
     endDate?: Date;
+    search?: string;
   }) {
-    const { franchiseId, startDate, endDate } = filters;
+    const { franchiseId, startDate, endDate, search } = filters;
     const { start, end } = parseInclusiveDates(startDate, endDate);
+    const dateRange = { ...(start ? { gte: start } : {}), ...(end ? { lte: end } : {}) };
 
-    const partyMap = new Map<string, { partyName: string; partyType: string; totalSale: number; totalPurchase: number; net: number }>();
+    type Bucket = { partyType: ResolvedPartyType; partyId: string | null; partyName: string; phoneNo: string; totalSale: number; totalPurchase: number };
+    const buckets = new Map<string, Bucket>();
 
-    // Fetch Sales
+    // Sales — same authoritative id+type party resolution and tax-exclusive
+    // basis as Party Wise P&L, so the two reports reconcile with each other.
     const orders = await prisma.order.findMany({
-      where: finalSaleWhere({
-        franchiseId,
-        createdAt: {
-          ...(start ? { gte: start } : {}),
-          ...(end ? { lte: end } : {})
-        }
-      }),
+      where: finalSaleWhere({ franchiseId, createdAt: dateRange }),
       include: { customer: true }
     });
 
-    const dealerIds = [...new Set(orders.filter(o => o.partyType === 'DEALER' && o.partyId).map(o => o.partyId!))];
-    const franchiseIds = [...new Set(orders.filter(o => o.partyType === 'FRANCHISE' && o.partyId).map(o => o.partyId!))];
-    
-    const dealers = dealerIds.length > 0 ? await prisma.dealer.findMany({ where: { id: { in: dealerIds } } }) : [];
-    const franchises = franchiseIds.length > 0 ? await prisma.franchise.findMany({ where: { id: { in: franchiseIds } } }) : [];
-    
-    const dealerMap = new Map(dealers.map(d => [d.id, d.name]));
-    const franchiseMap = new Map(franchises.map(f => [f.id, f.name]));
-
     for (const order of orders) {
-      let partyName = 'Walk-in Customer';
-      let partyType = 'Cash Customers';
-      
-      const pType = order.partyType || 'CUSTOMER';
-      
-      if (pType === 'CUSTOMER') {
-        if (order.customerId && order.customer) {
-          partyName = order.customer.name;
-          partyType = 'Customers';
-        } else if (order.customerName) {
-          partyName = order.customerName;
-          partyType = 'Cash Customers';
-        }
-      } else if (pType === 'DEALER' && order.partyId && dealerMap.has(order.partyId)) {
-        partyName = dealerMap.get(order.partyId)!;
-        partyType = 'Dealers';
-      } else if (pType === 'FRANCHISE' && order.partyId && franchiseMap.has(order.partyId)) {
-        partyName = franchiseMap.get(order.partyId)!;
-        partyType = 'Franchises';
+      const resolved = resolveOrderParty(order);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSale: 0, totalPurchase: 0 });
       }
-
-      if (!partyMap.has(partyName)) {
-        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
-      }
-      partyMap.get(partyName)!.totalSale += order.totalAmount;
+      buckets.get(resolved.key)!.totalSale += order.totalAmount - (order.taxAmount || 0);
     }
 
-    // Fetch Purchases — actually recognized liability (VendorInvoice,
-    // GRN-actual-price-derived), not po.totalAmount (the PO's ordered
-    // commitment). Queried directly off VendorInvoice (bill-level, keyed by
-    // its own billDate — see buildBillDateFilter) since ProcurementOrder has
-    // no billDate field of its own; same source/rationale as
-    // getProfitAndLoss/getTrialBalanceReport's Purchase line. A PO with no
-    // invoice yet (nothing received/billed) correctly contributes nothing.
+    // Sales-return netting — same fields/status/period semantics Party Wise
+    // P&L nets with (ReturnItem.taxableValue, APPROVED/COMPLETED only, the
+    // return's own createdAt), per resolved party. (Vendor-side purchase
+    // returns use a separate PurchaseReturn model and are not netted here —
+    // out of scope for this pass.)
+    const returns = await prisma.returnOrder.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, createdAt: dateRange },
+      include: {
+        items: true,
+        customer: true,
+        posOrder: { select: { franchiseId: true, partyType: true, partyId: true, customerId: true, customerName: true, customer: true } }
+      }
+    });
+    for (const ret of returns) {
+      const { resolved, operatingFranchiseId } = resolveReturnParty(ret);
+      if (franchiseId && operatingFranchiseId && operatingFranchiseId !== franchiseId) continue;
+      const bucket = buckets.get(resolved.key);
+      if (!bucket) continue;
+      for (const item of ret.items) {
+        bucket.totalSale -= (item.taxableValue || 0);
+      }
+    }
+
+    // Purchases — the actually recognized liability (VendorInvoice,
+    // GRN-actual-price-derived), keyed by vendor.id — never vendor.name,
+    // which is exactly what previously let a vendor's entire purchase total
+    // merge onto an unrelated Customer/Franchise/Dealer row sharing that
+    // vendor's name (e.g. two real records both named "ak"). Bill-level,
+    // keyed by its own billDate (see buildBillDateFilter) since
+    // ProcurementOrder has no billDate field of its own; same source/
+    // rationale as getProfitAndLoss/getTrialBalanceReport's Purchase line. A
+    // PO with no invoice yet (nothing received/billed) correctly contributes
+    // nothing.
     const invoices = await prisma.vendorInvoice.findMany({
       where: {
         procurementOrder: { franchiseId, status: { not: 'CANCELLED' } },
@@ -3451,22 +4557,31 @@ export class FinanceService {
     });
 
     for (const inv of invoices) {
-      const partyName = inv.procurementOrder?.vendor?.name || 'Unknown Vendor';
-      const partyType = 'Vendors';
-      if (!partyMap.has(partyName)) {
-        partyMap.set(partyName, { partyName, partyType, totalSale: 0, totalPurchase: 0, net: 0 });
+      const vendor = inv.procurementOrder?.vendor;
+      if (!vendor) continue;
+      const resolved = resolveVendorParty(vendor.id, vendor.name);
+      if (!buckets.has(resolved.key)) {
+        buckets.set(resolved.key, { partyType: resolved.partyType, partyId: resolved.partyId, partyName: resolved.partyName, phoneNo: resolved.phoneNo, totalSale: 0, totalPurchase: 0 });
       }
-      partyMap.get(partyName)!.totalPurchase += (inv.amount || 0);
+      buckets.get(resolved.key)!.totalPurchase += (inv.amount || 0);
     }
 
-    const report = Array.from(partyMap.values())
-      .map(r => ({
-        ...r,
-        net: r.totalSale - r.totalPurchase
+    await batchResolvePartyNames(buckets.values());
+
+    let reportRows = Array.from(buckets.values())
+      .map(b => ({
+        partyId: b.partyId, partyType: b.partyType, partyName: b.partyName,
+        totalSale: roundCents(b.totalSale), totalPurchase: roundCents(b.totalPurchase),
+        net: roundCents(b.totalSale - b.totalPurchase)
       }))
       .filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
 
-    return report;
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      reportRows = reportRows.filter(r => r.partyName.toLowerCase().includes(q) || r.partyType.toLowerCase().includes(q));
+    }
+
+    return reportRows;
   }
 
   static async getLoans(filters: { franchiseId: string }) {
@@ -3487,7 +4602,7 @@ export class FinanceService {
     loanDate: Date;
   }) {
     const { franchiseId, accountName, accountNumber, lenderName, loanType, principalAmount, interestRate, loanDate } = data;
-    
+
     // Create Loan Account
     const loan = await prisma.loanAccount.create({
       data: {
@@ -3656,67 +4771,31 @@ export class FinanceService {
     franchiseId?: string,
     filters?: { category?: string; startDate?: Date; endDate?: Date }
   ) {
-    const { category, startDate, endDate } = filters || {};
+    const { category, endDate } = filters || {};
     const inclusiveEndDate = endDate ? new Date(endDate) : undefined;
     if (inclusiveEndDate) inclusiveEndDate.setHours(23, 59, 59, 999);
 
-    const scopeFilter = franchiseId ? { OR: [{ franchiseId }, { franchiseId: null }] } : {};
+    // Reuse the authoritative inventory helper which accurately calculates
+    // currentStock (physical stock), transferableStock (saleable/available),
+    // and correctly scopes reservations and quarantines, respecting asOfDate.
+    const inventory = await (await import('../inventory/inventory.service')).InventoryService.getInventory(
+      franchiseId,
+      false, // includeInactive
+      undefined, // excludeCategories
+      category && category !== 'ALL' ? (category as ItemCategory) : undefined,
+      inclusiveEndDate ? inclusiveEndDate.toISOString() : undefined
+    );
 
-    const items = await prisma.inventoryItem.findMany({
-      where: {
-        ...scopeFilter,
-        isActive: true,
-        ...(category && category !== 'ALL' ? { category: category as ItemCategory } : {})
-      },
-      orderBy: { name: 'asc' }
-    });
-
-    const itemIds = items.map(i => i.id);
-
-    // Compute stock from movements as of inclusiveEndDate (or up to current if not provided)
-    const movements = await prisma.stockMovement.findMany({
-      where: {
-        itemId: { in: itemIds },
-        ...(inclusiveEndDate ? { createdAt: { lte: inclusiveEndDate } } : {})
-      },
-      select: { itemId: true, quantity: true, baseQty: true }
-    });
-
-    const stockMap = new Map<string, number>();
-    for (const m of movements) {
-      const val = m.baseQty !== null && m.baseQty !== undefined ? m.baseQty : m.quantity;
-      stockMap.set(m.itemId, (stockMap.get(m.itemId) || 0) + val);
-    }
-
-    // Reserved quantity in active production runs (PENDING or IN_PROGRESS)
-    const reservedAggs = await prisma.productionItem.groupBy({
-      by: ['inventoryItemId'],
-      where: {
-        inventoryItemId: { in: itemIds },
-        production: {
-          status: { in: ['PENDING', 'IN_PROGRESS'] }
-        }
-      },
-      _sum: { usedQuantity: true }
-    });
-    const reservedMap = new Map<string, number>();
-    for (const r of reservedAggs) {
-      if (r.inventoryItemId) {
-        reservedMap.set(r.inventoryItemId, r._sum.usedQuantity || 0);
-      }
-    }
-
-    const data = items.map(item => {
+    const data = inventory.map(item => {
       const salePrice = Number(item.customerPrice || item.basePrice || item.franchisePrice || 0);
       const purchasePrice = Number(item.costPrice || 0);
 
-      const hasMovements = stockMap.has(item.id);
-      const stockQty = hasMovements
-        ? (stockMap.get(item.id) ?? 0)
-        : (inclusiveEndDate ? 0 : (item.currentStock || 0));
+      // InventoryService.getInventory natively computes physical stock as currentStock
+      // and saleable stock as transferableStock.
+      const stockQty = item.currentStock;
+      const availableQty = item.transferableStock;
+      const reservedQty = Math.max(0, stockQty - availableQty); // Derive reserved/blocked difference
 
-      const reservedQty = reservedMap.get(item.id) || 0;
-      const availableQty = Math.max(0, stockQty - reservedQty);
       const qtyForSale = availableQty;
       const stockValue = stockQty > 0 ? stockQty * purchasePrice : 0;
 
@@ -3740,7 +4819,7 @@ export class FinanceService {
         reservedStock: reservedQty,
         stockValue,
         minimumStock: item.minimumStock || 10,
-        status: stockQty <= (item.minimumStock || 10) ? 'LOW' : 'SAFE'
+        status: item.status
       };
     });
 
@@ -3748,23 +4827,36 @@ export class FinanceService {
   }
 
   static async getLowStockSummaryData(franchiseId: string) {
-    const items = await prisma.inventoryItem.findMany({
-      where: { franchiseId, isActive: true },
-      orderBy: { name: 'asc' }
-    });
-    const data = items
-      .filter(item => (item.currentStock || 0) <= (item.minimumStock || 10))
+    // Reuse authoritative inventory helper for consistent stock value
+    const inventory = await (await import('../inventory/inventory.service')).InventoryService.getInventory(
+      franchiseId,
+      false, // includeInactive
+      undefined, // excludeCategories
+      undefined, // category
+      undefined // asOfDate
+    );
+
+    const data = inventory
       .map(item => {
-        const stockQty = item.currentStock || 0;
-        const purchasePrice = item.costPrice || 0;
-        const stockValue = stockQty > 0 ? stockQty * purchasePrice : 0;
+        const stockQty = item.currentStock;
+        const minStock = item.minimumStock || 10;
+        
+        let status = 'NORMAL';
+        if (stockQty <= 0) {
+          status = 'OUT_OF_STOCK';
+        } else if (minStock > 0 && stockQty <= minStock) {
+          status = 'RUNNING_LOW';
+        }
+
         return {
           itemName: item.name,
-          minimumStock: item.minimumStock || 10,
+          minimumStock: minStock,
           stockQty,
-          stockValue
+          status,
+          stockValue: stockQty > 0 ? stockQty * (item.costPrice || 0) : 0
         };
-      });
+      })
+      .filter(item => item.status === 'OUT_OF_STOCK' || item.status === 'RUNNING_LOW');
 
     return data;
   }
@@ -3932,10 +5024,10 @@ export class FinanceService {
     // 1. Process Inventory Items (for opening and closing stock)
     for (const item of inventoryItems) {
       const cost = Number(item.costPrice || item.basePrice || 0);
-      
+
       const opQty = openingStockQtyMap.get(item.id) ?? 0;
-      const clQty = closingStockQtyMap.has(item.id) 
-        ? (closingStockQtyMap.get(item.id) ?? 0) 
+      const clQty = closingStockQtyMap.has(item.id)
+        ? (closingStockQtyMap.get(item.id) ?? 0)
         : (end ? 0 : (item.currentStock || 0));
 
       const opVal = Number((opQty > 0 ? opQty * cost : 0).toFixed(2));
@@ -4050,7 +5142,7 @@ export class FinanceService {
         const consumptionCost = Number(row.consumptionCost.toFixed(2));
 
         const netRevenue = sale - saleReturn;
-        
+
         let costOfItem = 0;
         if (mfgCost > 0) {
           costOfItem = mfgCost;
@@ -4214,48 +5306,51 @@ export class FinanceService {
       })
     ]);
 
-    const priorInwardTypes = ['PURCHASE_IN', 'PRODUCTION_IN', 'TRANSFER_IN', 'RECALL_RETURN_IN'];
-    const priorOutwardTypes = ['SALES_OUT', 'PRODUCTION_OUT', 'WASTE_OUT', 'TRANSFER_OUT', 'RETURN_OUT', 'RETURN_QUARANTINE_IN'];
-
     const priorMap: Record<string, number> = {};
     priorMovements.forEach(m => {
+      const dir = getStockMovementDirection(m.movementType, m.quantity);
       if (!priorMap[m.itemId]) priorMap[m.itemId] = 0;
-      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
-        priorMap[m.itemId] += m.quantity;
-      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
+      if (dir === 'IN') {
+        priorMap[m.itemId] += Math.abs(m.quantity);
+      } else {
         priorMap[m.itemId] -= Math.abs(m.quantity);
       }
     });
 
-    const periodInMap: Record<string, number> = {};
-    const periodOutMap: Record<string, number> = {};
+    const periodInMap: Record<string, { qty: number, amt: number }> = {};
+    const periodOutMap: Record<string, { qty: number, amt: number }> = {};
     periodMovements.forEach(m => {
-      if (!periodInMap[m.itemId]) periodInMap[m.itemId] = 0;
-      if (!periodOutMap[m.itemId]) periodOutMap[m.itemId] = 0;
+      const dir = getStockMovementDirection(m.movementType, m.quantity);
+      if (!periodInMap[m.itemId]) periodInMap[m.itemId] = { qty: 0, amt: 0 };
+      if (!periodOutMap[m.itemId]) periodOutMap[m.itemId] = { qty: 0, amt: 0 };
 
-      if (priorInwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity > 0)) {
-        periodInMap[m.itemId] += m.quantity;
-      } else if (priorOutwardTypes.includes(m.movementType) || (m.movementType === 'ADJUSTMENT' && m.quantity < 0)) {
-        periodOutMap[m.itemId] += Math.abs(m.quantity);
+      const absQty = Math.abs(m.quantity);
+      const amt = absQty * (m.unitCost || 0);
+
+      if (dir === 'IN') {
+        periodInMap[m.itemId].qty += absQty;
+        periodInMap[m.itemId].amt += amt;
+      } else {
+        periodOutMap[m.itemId].qty += absQty;
+        periodOutMap[m.itemId].amt += amt;
       }
     });
 
     return items.map(item => {
       const beginningQuantity = start ? (priorMap[item.id] || 0) : 0;
-      const quantityIn = periodInMap[item.id] || 0;
-      const quantityOut = periodOutMap[item.id] || 0;
+      const quantityIn = periodInMap[item.id]?.qty || 0;
+      const purchaseAmount = periodInMap[item.id]?.amt || 0;
+      const quantityOut = periodOutMap[item.id]?.qty || 0;
+      const saleAmount = periodOutMap[item.id]?.amt || 0;
       const closingQuantity = beginningQuantity + quantityIn - quantityOut;
-
-      const purchasePrice = item.costPrice || 0;
-      const salePrice = item.customerPrice || item.basePrice || 0;
 
       return {
         itemName: item.name,
         beginningQuantity: Number(beginningQuantity.toFixed(2)),
         quantityIn: Number(quantityIn.toFixed(2)),
-        purchaseAmount: Number((quantityIn * purchasePrice).toFixed(2)),
+        purchaseAmount: Number(purchaseAmount.toFixed(2)),
         quantityOut: Number(quantityOut.toFixed(2)),
-        saleAmount: Number((quantityOut * salePrice).toFixed(2)),
+        saleAmount: Number(saleAmount.toFixed(2)),
         closingQuantity: Number(closingQuantity.toFixed(2))
       };
     });
@@ -4861,7 +5956,7 @@ export class FinanceService {
     // than mutating the original Purchase Bill.
     const debitNoteRows = await prisma.purchaseReturn.findMany({
       where: {
-        status: { in: ['APPROVED', 'COMPLETED'] },
+        status: 'COMPLETED',
         taxAmount: { not: null },
         ...(partyId ? { vendorId: partyId } : {}),
         ...dateFilter
@@ -4913,7 +6008,7 @@ export class FinanceService {
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       }),
       prisma.purchaseReturn.aggregate({
-        where: { status: { in: ['APPROVED', 'COMPLETED'] }, taxAmount: { not: null }, ...dateFilter },
+        where: { status: 'COMPLETED', taxAmount: { not: null }, ...dateFilter },
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       })
     ]);
@@ -5034,7 +6129,7 @@ export class FinanceService {
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       }),
       prisma.purchaseReturn.aggregate({
-        where: { status: { in: ['APPROVED', 'COMPLETED'] }, taxAmount: { not: null }, createdAt: { gte: fyStart, lte: fyEnd } },
+        where: { status: 'COMPLETED', taxAmount: { not: null }, createdAt: { gte: fyStart, lte: fyEnd } },
         _sum: { taxableValue: true, cgst: true, sgst: true, igst: true, taxAmount: true }
       })
     ]);
@@ -5347,33 +6442,115 @@ export class FinanceService {
       }
     } : {};
 
-    const orders = await prisma.order.findMany({
-      where: { ...(franchiseId ? { franchiseId } : {}), discountAmount: { gt: 0 }, status: 'COMPLETED', ...dateFilter },
-      include: { orderItems: { include: { product: true } } },
-      orderBy: { createdAt: 'desc' }
-    });
+    const [orders, returnOrders] = await Promise.all([
+      prisma.order.findMany({
+        where: finalSaleWhere({
+          ...(franchiseId ? { franchiseId } : {}),
+          ...dateFilter
+        }),
+        include: { orderItems: { include: { product: true } } },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.returnOrder.findMany({
+        where: {
+          ...(franchiseId ? { franchiseId } : {}),
+          status: 'COMPLETED' as any,
+          ...dateFilter
+        },
+        include: { items: true }
+      })
+    ]);
 
-    const itemMap: Record<string, { itemName: string; totalSaleQty: number; totalSaleAmount: number; totalDiscountAmount: number }> = {};
+    interface ItemAgg {
+      itemId: string;
+      itemName: string;
+      totalSales: number;
+      discountAmount: number;
+      totalQtySold: number;
+    }
+
+    const itemMap: Record<string, ItemAgg> = {};
 
     orders.forEach(o => {
-      o.orderItems.forEach(item => {
-        const name = item.product?.name || item.productId;
-        if (!itemMap[name]) itemMap[name] = { itemName: name, totalSaleQty: 0, totalSaleAmount: 0, totalDiscountAmount: 0 };
-        itemMap[name].totalSaleQty += item.quantity || 0;
-        itemMap[name].totalSaleAmount += item.totalAmount || 0;
-        const itemSubtotal = (item.quantity || 0) * (item.price || 0);
-        itemMap[name].totalDiscountAmount += itemSubtotal * ((item.discountPct || 0) / 100);
+      const orderGross = o.orderItems.reduce((sum, item) => sum + (item.quantity || 0) * (item.price || 0), 0);
+      
+      let lineDiscountsSum = 0;
+      const lineDetails = o.orderItems.map(item => {
+        const gross = (item.quantity || 0) * (item.price || 0);
+        const lineDisc = gross * ((item.discountPct || 0) / 100);
+        lineDiscountsSum += lineDisc;
+        return { item, gross, lineDisc };
+      });
+
+      const orderHeaderDiscount = o.discountAmount || 0;
+      const excessOrderDiscount = Math.max(0, orderHeaderDiscount - lineDiscountsSum);
+
+      lineDetails.forEach(({ item, gross, lineDisc }) => {
+        const id = item.productId || 'unknown';
+        const name = item.product?.name || item.productId || 'Unknown Item';
+
+        let itemDisc = lineDisc;
+        if (excessOrderDiscount > 0 && orderGross > 0) {
+          itemDisc += excessOrderDiscount * (gross / orderGross);
+        }
+
+        if (!itemMap[id]) {
+          itemMap[id] = {
+            itemId: id,
+            itemName: name,
+            totalSales: 0,
+            discountAmount: 0,
+            totalQtySold: 0
+          };
+        }
+
+        itemMap[id].totalSales += gross;
+        itemMap[id].discountAmount += itemDisc;
+        itemMap[id].totalQtySold += (item.quantity || 0);
       });
     });
 
-    const data = Object.values(itemMap).map(r => ({
-      ...r,
-      totalSaleQty: Number(r.totalSaleQty.toFixed(2)),
-      totalSaleAmount: Number(r.totalSaleAmount.toFixed(2)),
-      totalDiscountAmount: Number(r.totalDiscountAmount.toFixed(2))
-    }));
+    returnOrders.forEach(ret => {
+      ret.items.forEach(rItem => {
+        const id = rItem.productId;
+        if (id && itemMap[id]) {
+          const retQty = rItem.quantity || 0;
+          const retRate = rItem.rate || 0;
+          const retGross = retQty * retRate;
+          const retDisc = rItem.discountAmount || 0;
 
-    return { data, totalDiscount: data.reduce((s, r) => s + r.totalDiscountAmount, 0) };
+          itemMap[id].totalSales = Math.max(0, itemMap[id].totalSales - retGross);
+          itemMap[id].discountAmount = Math.max(0, itemMap[id].discountAmount - retDisc);
+          itemMap[id].totalQtySold = Math.max(0, itemMap[id].totalQtySold - retQty);
+        }
+      });
+    });
+
+    const data = Object.values(itemMap)
+      .filter(r => r.discountAmount > 0.0001)
+      .map(r => {
+        const totalSales = Number(r.totalSales.toFixed(2));
+        const discountAmount = Number(r.discountAmount.toFixed(2));
+        const netAmount = Number(Math.max(0, totalSales - discountAmount).toFixed(2));
+        const discountPct = totalSales > 0 ? Number(((discountAmount / totalSales) * 100).toFixed(2)) : 0;
+
+        return {
+          itemId: r.itemId,
+          itemName: r.itemName,
+          totalSales,
+          discountAmount,
+          discountPct,
+          netAmount,
+          totalQtySold: Number(r.totalQtySold.toFixed(2)),
+          totalSaleQty: Number(r.totalQtySold.toFixed(2)),
+          totalSaleAmount: totalSales,
+          totalDiscountAmount: discountAmount
+        };
+      });
+
+    const totalDiscount = Number(data.reduce((s, r) => s + r.discountAmount, 0).toFixed(2));
+
+    return { data, totalDiscount };
   }
 
   static async getSalePurchaseByCategoryData(franchiseIdOrFilters?: any, startDateParam?: string, endDateParam?: string, categoryParam?: string): Promise<any> {
@@ -5699,7 +6876,7 @@ export class FinanceService {
 
     const expenses = await prisma.expense.findMany({
       where,
-      include: { 
+      include: {
         purchaseOrder: {
           include: {
             poItems: { include: { inventoryItem: true } }
@@ -5737,8 +6914,13 @@ export class FinanceService {
       endDate: endDate ? new Date(endDate) : undefined
     });
 
+    // Grouped by the authoritative ResolvedPartyType each party row already
+    // carries (not a re-derived label) — a Vendor's purchase can no longer
+    // land in the "Franchises" bucket the way it did before getSalePurchaseByParty
+    // itself was fixed to key by id+type instead of name.
     const groupMap: Record<string, { groupName: string; totalSale: number; totalPurchase: number; net: number }> = {};
-    const getGroup = (name: string) => {
+    const getGroup = (partyType: ResolvedPartyType) => {
+      const name = partyTypeGroupLabel(partyType);
       if (!groupMap[name]) groupMap[name] = { groupName: name, totalSale: 0, totalPurchase: 0, net: 0 };
       return groupMap[name];
     };
@@ -5750,7 +6932,9 @@ export class FinanceService {
       group.net += party.net;
     }
 
-    return Object.values(groupMap).filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
+    return Object.values(groupMap)
+      .map(g => ({ groupName: g.groupName, totalSale: roundCents(g.totalSale), totalPurchase: roundCents(g.totalPurchase), net: roundCents(g.net) }))
+      .filter(r => r.totalSale !== 0 || r.totalPurchase !== 0);
   }
 
   /**
@@ -6023,10 +7207,10 @@ export class FinanceService {
     const search = opts?.search?.trim().toLowerCase();
     const filtered = search
       ? parties.filter((p) =>
-          (p.name || '').toLowerCase().includes(search) ||
-          (p.phone || '').toLowerCase().includes(search) ||
-          (p.email || '').toLowerCase().includes(search)
-        )
+        (p.name || '').toLowerCase().includes(search) ||
+        (p.phone || '').toLowerCase().includes(search) ||
+        (p.email || '').toLowerCase().includes(search)
+      )
       : parties;
 
     return filtered.sort((a, b) => a.name.localeCompare(b.name));

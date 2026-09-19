@@ -46,7 +46,11 @@ export class DashboardAnalyticsService {
       orderItemsForPeriod,
     ] = await Promise.all([
       prisma.order.aggregate({
-        where: { ...whereClause, status: { not: 'CANCELLED' }, createdAt: { gte: today, lte: periodEnd } },
+        // Revenue must be actual completed/posted sales, not every
+        // non-cancelled order — {not:'CANCELLED'} let REFUNDED and
+        // still-in-progress (PENDING/PREPARING/READY) orders count as
+        // revenue. COMPLETED matches the real AnalyticsService.getDailySalesSummary.
+        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: today, lte: periodEnd } },
         _sum: { totalAmount: true },
         _count: { id: true }
       }),
@@ -56,7 +60,7 @@ export class DashboardAnalyticsService {
         _count: true
       }),
       prisma.order.aggregate({
-        where: { ...whereClause, status: { not: 'CANCELLED' }, createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
+        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: prevPeriodStart, lte: prevPeriodEnd } },
         _sum: { totalAmount: true }
       }),
       prisma.franchiseOrder.aggregate({
@@ -76,7 +80,7 @@ export class DashboardAnalyticsService {
         }
       }),
       prisma.order.findMany({
-        where: { ...whereClause, status: { not: 'CANCELLED' }, createdAt: { gte: bucketsWindowStart, lte: periodEnd } },
+        where: { ...whereClause, status: 'COMPLETED', createdAt: { gte: bucketsWindowStart, lte: periodEnd } },
         select: { totalAmount: true, createdAt: true }
       }),
       prisma.franchiseOrder.findMany({
@@ -84,7 +88,11 @@ export class DashboardAnalyticsService {
         select: { totalAmount: true, createdAt: true }
       }),
       prisma.order.aggregate({
-        where: { ...whereClause, orderType: 'B2B', status: { not: 'CANCELLED' }, createdAt: { gte: today, lte: periodEnd } },
+        // 'B2B' is never actually written to Order.orderType anywhere in the
+        // codebase — real B2B/GST invoice sales use 'TAX_INVOICE' (see
+        // pos.service.ts / sales.service.ts / finance.service.ts's own
+        // TAX_INVOICE filter for invoice logic).
+        where: { ...whereClause, orderType: 'TAX_INVOICE', status: 'COMPLETED', createdAt: { gte: today, lte: periodEnd } },
         _sum: { totalAmount: true }
       }),
       prisma.expense.aggregate({
@@ -110,19 +118,19 @@ export class DashboardAnalyticsService {
       }),
       prisma.orderItem.groupBy({
         by: ['productId'],
-        where: { order: { ...whereClause, status: { not: 'CANCELLED' }, createdAt: { gte: today, lte: periodEnd } } },
+        where: { order: { ...whereClause, status: 'COMPLETED', createdAt: { gte: today, lte: periodEnd } } },
         _sum: { quantity: true, totalAmount: true },
         orderBy: { _sum: { quantity: 'desc' } },
         take: 5
       }),
       prisma.order.findMany({
-        where: { ...whereClause, status: { not: 'CANCELLED' } },
+        where: { ...whereClause, status: 'COMPLETED' },
         take: 5,
         orderBy: { createdAt: 'desc' },
         include: { customer: true }
       }),
       prisma.orderItem.findMany({
-        where: { order: { ...whereClause, status: { not: 'CANCELLED' }, createdAt: { gte: today, lte: periodEnd } } },
+        where: { order: { ...whereClause, status: 'COMPLETED', createdAt: { gte: today, lte: periodEnd } } },
         select: {
           quantity: true,
           unitCost: true,

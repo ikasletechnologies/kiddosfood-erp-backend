@@ -11,6 +11,86 @@ function normalizeWarehouseName(s: string) {
 }
 
 export class WarehouseService {
+  /**
+   * Generates the next sequential, guaranteed-unique Warehouse Code (e.g. WH-001, WH-002).
+   * Atomically increments the number sequence within a transaction and verifies no collision.
+   */
+  static async nextWarehouseCode(tx?: any): Promise<string> {
+    const run = async (t: any) => {
+      const existingSeq = await t.numberSequence.findUnique({ where: { key: 'WAREHOUSE_CODE' } });
+      if (!existingSeq) {
+        const warehouses = await t.warehouse.findMany({ select: { code: true } });
+        let maxNum = 0;
+        for (const w of warehouses) {
+          if (w.code) {
+            const match = w.code.match(/^WH-(\d+)$/i);
+            if (match) {
+              const n = parseInt(match[1], 10);
+              if (!isNaN(n) && n > maxNum) maxNum = n;
+            }
+          }
+        }
+        await t.numberSequence.upsert({
+          where: { key: 'WAREHOUSE_CODE' },
+          create: { key: 'WAREHOUSE_CODE', value: maxNum },
+          update: {}
+        });
+      }
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const seq = await t.numberSequence.upsert({
+          where: { key: 'WAREHOUSE_CODE' },
+          create: { key: 'WAREHOUSE_CODE', value: 1 },
+          update: { value: { increment: 1 } }
+        });
+        const candidate = `WH-${String(seq.value).padStart(3, '0')}`;
+        const collision = await t.warehouse.findFirst({ where: { code: candidate } });
+        if (!collision) {
+          return candidate;
+        }
+      }
+      return `WH-${Date.now().toString().slice(-4)}`;
+    };
+
+    return tx ? run(tx) : prisma.$transaction(run);
+  }
+
+  /**
+   * Previews the next available Warehouse Code for display without consuming the sequence.
+   */
+  static async previewNextWarehouseCode(): Promise<string> {
+    const existingSeq = await prisma.numberSequence.findUnique({ where: { key: 'WAREHOUSE_CODE' } });
+    let nextVal = 1;
+    if (existingSeq) {
+      nextVal = existingSeq.value + 1;
+    } else {
+      const warehouses = await prisma.warehouse.findMany({ select: { code: true } });
+      let maxNum = 0;
+      for (const w of warehouses) {
+        if (w.code) {
+          const match = w.code.match(/^WH-(\d+)$/i);
+          if (match) {
+            const n = parseInt(match[1], 10);
+            if (!isNaN(n) && n > maxNum) maxNum = n;
+          }
+        }
+      }
+      nextVal = maxNum + 1;
+    }
+
+    let candidateVal = nextVal;
+    for (let i = 0; i < 50; i++) {
+      const candidate = `WH-${String(candidateVal).padStart(3, '0')}`;
+      const exists = await prisma.warehouse.findFirst({ where: { code: candidate } });
+      if (!exists) {
+        return candidate;
+      }
+      candidateVal++;
+    }
+
+    return `WH-${String(candidateVal).padStart(3, '0')}`;
+  }
+
   // The single warehouse-creation path — every caller (the generic admin
   // endpoint, the setup wizard) goes through this so there's one place that
   // owns the nameKey/duplicate-name rule and the optional franchise link,
@@ -35,14 +115,42 @@ export class WarehouseService {
         }
       }
 
+      // Unique code assignment
+      let finalCode: string;
+      const requestedCode = data.code?.trim();
+      if (requestedCode) {
+        const codeClash = await tx.warehouse.findFirst({ where: { code: requestedCode } });
+        if (!codeClash) {
+          finalCode = requestedCode;
+          const match = requestedCode.match(/^WH-(\d+)$/i);
+          if (match) {
+            const n = parseInt(match[1], 10);
+            if (!isNaN(n)) {
+              const cur = await tx.numberSequence.findUnique({ where: { key: 'WAREHOUSE_CODE' } });
+              if (!cur || cur.value < n) {
+                await tx.numberSequence.upsert({
+                  where: { key: 'WAREHOUSE_CODE' },
+                  create: { key: 'WAREHOUSE_CODE', value: n },
+                  update: { value: n }
+                });
+              }
+            }
+          }
+        } else {
+          finalCode = await WarehouseService.nextWarehouseCode(tx);
+        }
+      } else {
+        finalCode = await WarehouseService.nextWarehouseCode(tx);
+      }
+
       const warehouse = await tx.warehouse.create({
         data: {
           name: data.name.trim(),
           nameKey,
-          location: data.location,
-          type: data.type,
-          code: data.code,
-          status: data.status,
+          location: data.location?.trim() || null,
+          type: data.type || null,
+          code: finalCode,
+          status: data.status || 'ACTIVE',
         },
       });
 
@@ -70,6 +178,7 @@ export class WarehouseService {
     }
     return this.create({ ...data, type: 'MAIN', franchiseId: hq.id });
   }
+
   /**
    * Get the primary warehouse and its bins for a given franchise.
    */
@@ -110,7 +219,6 @@ export class WarehouseService {
    * Gets physical stock strictly broken down by Item, Batch, and Bin.
    */
   static async getWarehouseStock(warehouseId: string) {
-    // We group stock movements by itemId, batchId, and binId to find the exact physical balance.
     const movements = await prisma.stockMovement.findMany({
       where: { warehouseId },
       include: {
@@ -120,7 +228,6 @@ export class WarehouseService {
       },
     });
 
-    // Grouping structure: { itemId_batchId_binId: { ...details, balance } }
     const balanceMap: Record<string, any> = {};
 
     for (const m of movements) {
@@ -136,7 +243,7 @@ export class WarehouseService {
           unit: m.item.unit,
           batchId: m.batchId,
           batchCode: m.batch?.batchNumber || '-',
-          status: m.batch?.status || 'READY', // Fallback status
+          status: m.batch?.status || 'READY',
           binId: m.binId,
           binCode: m.bin?.code || 'Not Assigned',
           balance: 0,
@@ -146,32 +253,115 @@ export class WarehouseService {
       balanceMap[key].balance += (m.baseQty !== null ? m.baseQty : m.quantity);
     }
 
-    // Filter out zero balances
     return Object.values(balanceMap).filter((b: any) => Math.abs(b.balance) > 0.001);
   }
 
   /**
    * Bin Management
    */
+  static async getAllBins(filters?: { warehouseId?: string }) {
+    const where: any = {};
+    if (filters?.warehouseId && filters.warehouseId !== 'ALL') {
+      where.warehouseId = filters.warehouseId;
+    }
+
+    const bins = await prisma.warehouseBin.findMany({
+      where,
+      include: {
+        warehouse: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            location: true,
+            status: true,
+            type: true,
+          },
+        },
+        movements: {
+          select: {
+            itemId: true,
+            quantity: true,
+            baseQty: true,
+          },
+        },
+      },
+      orderBy: [
+        { warehouse: { name: 'asc' } },
+        { code: 'asc' },
+      ],
+    });
+
+    return bins.map((b) => {
+      const itemIds = new Set(b.movements.map((m) => m.itemId));
+      const totalQty = b.movements.reduce((sum, m) => sum + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
+      return {
+        id: b.id,
+        warehouseId: b.warehouseId,
+        code: b.code,
+        description: b.description,
+        warehouse: b.warehouse,
+        itemCount: itemIds.size,
+        totalQuantity: totalQty,
+        hasStock: Math.abs(totalQty) > 0.001,
+        status: b.warehouse?.status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE',
+      };
+    });
+  }
+
   static async createBin(warehouseId: string, code: string, description?: string) {
+    const cleanCode = code.trim().toUpperCase();
+    const existing = await prisma.warehouseBin.findFirst({
+      where: { warehouseId, code: cleanCode },
+    });
+    if (existing) {
+      throw new Error(`Bin code "${cleanCode}" already exists in this warehouse.`);
+    }
+
     return prisma.warehouseBin.create({
-      data: { warehouseId, code, description },
+      data: { warehouseId, code: cleanCode, description: description?.trim() || null },
+      include: {
+        warehouse: {
+          select: { id: true, name: true, code: true, location: true, status: true, type: true },
+        },
+      },
     });
   }
 
   static async updateBin(binId: string, code: string, description?: string) {
+    const current = await prisma.warehouseBin.findUnique({ where: { id: binId } });
+    if (!current) throw new Error('Bin not found');
+
+    const cleanCode = code.trim().toUpperCase();
+    const existing = await prisma.warehouseBin.findFirst({
+      where: {
+        warehouseId: current.warehouseId,
+        code: cleanCode,
+        NOT: { id: binId },
+      },
+    });
+    if (existing) {
+      throw new Error(`Bin code "${cleanCode}" already exists in this warehouse.`);
+    }
+
     return prisma.warehouseBin.update({
       where: { id: binId },
-      data: { code, description },
+      data: {
+        code: cleanCode,
+        description: description !== undefined ? (description?.trim() || null) : undefined,
+      },
+      include: {
+        warehouse: {
+          select: { id: true, name: true, code: true, location: true, status: true, type: true },
+        },
+      },
     });
   }
 
   static async deleteBin(binId: string) {
-    // In a real ERP, we might just deactivate, but for now we'll allow delete
-    // if there are no movements tied to it.
     const hasMovements = await prisma.stockMovement.findFirst({ where: { binId } });
     if (hasMovements) {
-      throw new Error('Cannot delete bin that has stock movements.');
+      throw new Error('Cannot delete bin that has recorded stock movements.');
     }
     return prisma.warehouseBin.delete({ where: { id: binId } });
   }
@@ -188,13 +378,11 @@ export class WarehouseService {
     userId?: string;
   }) {
     return prisma.$transaction(async (tx) => {
-      // 1. Verify bin exists
       const bin = await tx.warehouseBin.findUnique({ where: { id: data.newBinId } });
       if (!bin || bin.warehouseId !== data.warehouseId) {
         throw new Error('Invalid bin or warehouse');
       }
 
-      // 2. We use an ADJUSTMENT movement to move it out of null bin and into new bin.
       const basePayload = {
         itemId: data.itemId,
         movementType: 'ADJUSTMENT' as any,
@@ -205,7 +393,6 @@ export class WarehouseService {
         batchId: data.batchId || null,
       };
 
-      // Out of "Not Assigned" (null bin)
       await tx.stockMovement.create({
         data: {
           ...basePayload,
@@ -214,7 +401,6 @@ export class WarehouseService {
         },
       });
 
-      // Into new Bin
       await tx.stockMovement.create({
         data: {
           ...basePayload,

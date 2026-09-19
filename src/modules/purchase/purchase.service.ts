@@ -417,7 +417,7 @@ export class PurchaseService {
         include: { vendor: true, items: true, procurementOrder: true }
       });
 
-      if (initialStatus === 'COMPLETED' || initialStatus === 'APPROVED') {
+      if (initialStatus === 'COMPLETED') {
         if (returnSource !== 'GRN_REJECTION') {
           for (const item of created.items) {
             const material = await tx.inventoryItem.findFirst({
@@ -448,23 +448,50 @@ export class PurchaseService {
 
   static async updatePurchaseReturn(id: string, data: { status: string }) {
     const { status } = data;
-    
+    if (status === 'APPROVED') {
+      throw new Error('APPROVED status is no longer supported. Use COMPLETED instead.');
+    }
+    if (status !== 'COMPLETED' && status !== 'CANCELLED') {
+      throw new Error(`Invalid status "${status}". Allowed statuses are COMPLETED or CANCELLED.`);
+    }
+
     return prisma.$transaction(async (tx) => {
       const existing = await tx.purchaseReturn.findUnique({
         where: { id },
         include: { items: true, vendor: true }
       });
       if (!existing) throw new Error('Purchase Return not found');
-      
-      // If already completed and user passes completed, ensure ledger recognition is posted if missing
+
+      // Double-completion protection / Idempotency:
       if (existing.status === 'COMPLETED' && status === 'COMPLETED') {
         await this.recognizeReturn(tx, id);
         return existing;
       }
       if (existing.status === 'COMPLETED') throw new Error('Cannot update a completed return');
+      if (existing.status === 'CANCELLED') throw new Error('Cannot update a cancelled return');
 
-      // 1. If transitioning to APPROVED or COMPLETED, trigger Inventory and Financial adjustments
-      if (status === 'APPROVED' || status === 'COMPLETED') {
+      if (status === 'COMPLETED') {
+        // Atomic status claim: update status from PENDING to COMPLETED only if it is currently PENDING.
+        // In PostgreSQL/Prisma, updateMany returns count of rows affected. If count === 0, another
+        // concurrent request already updated status to COMPLETED.
+        const claimed = await tx.purchaseReturn.updateMany({
+          where: { id, status: 'PENDING' },
+          data: { status: 'COMPLETED' }
+        });
+
+        if (claimed.count === 0) {
+          // Another concurrent transaction claimed and completed this return.
+          const reFetched = await tx.purchaseReturn.findUnique({
+            where: { id },
+            include: { vendor: true, items: true, procurementOrder: true }
+          });
+          if (reFetched && reFetched.status === 'COMPLETED') {
+            await this.recognizeReturn(tx, id);
+            return reFetched;
+          }
+          throw new Error('Cannot update return: status changed concurrently');
+        }
+
         if (existing.returnSource !== 'GRN_REJECTION') {
           for (const item of existing.items) {
             const material = await tx.inventoryItem.findFirst({
@@ -485,9 +512,14 @@ export class PurchaseService {
           }
         }
 
-        // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor)
+        // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor) and GST breakdown
         await this.backfillPurchaseReturnTax(tx, id);
         await this.recognizeReturn(tx, id);
+
+        return tx.purchaseReturn.findUnique({
+          where: { id },
+          include: { vendor: true, items: true, procurementOrder: true }
+        });
       }
 
       return tx.purchaseReturn.update({

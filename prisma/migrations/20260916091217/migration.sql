@@ -38,7 +38,7 @@ CREATE TYPE "PaymentTerms" AS ENUM ('NET_7', 'NET_30', 'ADVANCE', 'IMMEDIATE');
 CREATE TYPE "VendorLedgerSource" AS ENUM ('PROCUREMENT', 'INVENTORY', 'FINANCE', 'MANUAL');
 
 -- CreateEnum
-CREATE TYPE "VendorLedgerReferenceType" AS ENUM ('PO', 'PAYMENT', 'ADVANCE', 'ADJUSTMENT', 'OPENING_BALANCE', 'RETURN', 'PURCHASE');
+CREATE TYPE "VendorLedgerReferenceType" AS ENUM ('PO', 'PAYMENT', 'ADVANCE', 'ADJUSTMENT', 'OPENING_BALANCE', 'RETURN', 'PURCHASE', 'REFUND');
 
 -- CreateEnum
 CREATE TYPE "PaymentSourceModule" AS ENUM ('POS', 'PROCUREMENT', 'PAYROLL', 'FRANCHISE', 'EXPENSE', 'MANUAL', 'TRANSFER');
@@ -47,7 +47,7 @@ CREATE TYPE "PaymentSourceModule" AS ENUM ('POS', 'PROCUREMENT', 'PAYROLL', 'FRA
 CREATE TYPE "LinkedDocType" AS ENUM ('INVOICE', 'PO', 'PAYSLIP', 'EXPENSE_BILL', 'DIRECT', 'TRANSFER');
 
 -- CreateEnum
-CREATE TYPE "AccountingPaymentType" AS ENUM ('INVOICE_LINKED', 'ADVANCE', 'EXPENSE', 'DIRECT', 'REVERSAL', 'INTERNAL_TRANSFER');
+CREATE TYPE "AccountingPaymentType" AS ENUM ('INVOICE_LINKED', 'ADVANCE', 'EXPENSE', 'DIRECT', 'REVERSAL', 'INTERNAL_TRANSFER', 'REFUND');
 
 -- CreateEnum
 CREATE TYPE "LedgerType" AS ENUM ('CREDIT', 'DEBIT');
@@ -62,7 +62,7 @@ CREATE TYPE "FranchiseLedgerRefType" AS ENUM ('ORDER', 'PAYMENT', 'RETURN', 'ADJ
 CREATE TYPE "ItemCategory" AS ENUM ('RAW_MATERIAL', 'SEMI_FINISHED', 'FINISHED_GOOD', 'PACKAGING');
 
 -- CreateEnum
-CREATE TYPE "StockMovementType" AS ENUM ('PURCHASE_IN', 'PRODUCTION_OUT', 'PRODUCTION_IN', 'SALES_OUT', 'WASTE_OUT', 'TRANSFER_IN', 'TRANSFER_OUT', 'ADJUSTMENT', 'RETURN_OUT', 'RECALL_RETURN_IN', 'RETURN_QUARANTINE_IN');
+CREATE TYPE "StockMovementType" AS ENUM ('PURCHASE_IN', 'PRODUCTION_OUT', 'PRODUCTION_IN', 'SALES_OUT', 'WASTE_OUT', 'TRANSFER_IN', 'TRANSFER_OUT', 'ADJUSTMENT', 'RETURN_OUT', 'RECALL_RETURN_IN', 'RETURN_QUARANTINE_IN', 'SALES_RETURN_IN');
 
 -- CreateEnum
 CREATE TYPE "GRNStatus" AS ENUM ('PENDING', 'COMPLETED', 'CANCELLED');
@@ -154,6 +154,9 @@ CREATE TYPE "QCAction" AS ENUM ('APPROVE', 'REJECT_RETURN', 'REJECT_SCRAP', 'REW
 -- CreateEnum
 CREATE TYPE "InventoryStockState" AS ENUM ('RECEIVED', 'QC_HOLD', 'APPROVED', 'REJECTED', 'BLOCKED', 'EXPIRED', 'RETURNED');
 
+-- CreateEnum
+CREATE TYPE "ReservationStatus" AS ENUM ('ACTIVE', 'CONSUMED', 'RELEASED', 'PARTIAL');
+
 -- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
@@ -236,6 +239,17 @@ CREATE TABLE "Dealer" (
     "phone" TEXT,
     "email" TEXT,
     "address" TEXT,
+    "state" TEXT,
+    "district" TEXT,
+    "city" TEXT,
+    "pincode" TEXT,
+    "shippingAddress" TEXT,
+    "gstNumber" TEXT,
+    "gstType" TEXT,
+    "openingBalance" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "openingBalanceType" TEXT,
+    "asOfDate" TIMESTAMP(3),
+    "creditLimit" DOUBLE PRECISION,
     "status" TEXT NOT NULL DEFAULT 'ACTIVE',
     "franchiseId" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -359,6 +373,8 @@ CREATE TABLE "InventoryItem" (
     "franchisePrice" DOUBLE PRECISION DEFAULT 0,
     "dealerPrice" DOUBLE PRECISION DEFAULT 0,
     "customerPrice" DOUBLE PRECISION DEFAULT 0,
+    "discountType" TEXT DEFAULT 'PERCENT',
+    "discountValue" DOUBLE PRECISION DEFAULT 0,
     "baseUnitId" TEXT,
 
     CONSTRAINT "InventoryItem_pkey" PRIMARY KEY ("id")
@@ -398,6 +414,7 @@ CREATE TABLE "StockMovement" (
     "warehouseId" TEXT,
     "batchId" TEXT,
     "unitCost" DOUBLE PRECISION,
+    "consumptionBreakdown" JSONB,
 
     CONSTRAINT "StockMovement_pkey" PRIMARY KEY ("id")
 );
@@ -587,6 +604,7 @@ CREATE TABLE "VendorInvoice" (
     "freightCost" DOUBLE PRECISION DEFAULT 0,
     "advanceApplied" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "warehouseId" TEXT,
+    "paymentType" TEXT NOT NULL DEFAULT 'CASH',
 
     CONSTRAINT "VendorInvoice_pkey" PRIMARY KEY ("id")
 );
@@ -608,6 +626,8 @@ CREATE TABLE "Product" (
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "hsnCode" TEXT,
     "sacCode" TEXT,
+    "discountType" TEXT DEFAULT 'PERCENT',
+    "discountValue" DOUBLE PRECISION DEFAULT 0,
     "productType" "ProductType" NOT NULL DEFAULT 'FINISHED_GOOD',
     "shelfLifeDays" INTEGER,
 
@@ -787,6 +807,7 @@ CREATE TABLE "ProductPackaging" (
     "spoiledQty" INTEGER,
     "confirmedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "bulkBreakdown" JSONB,
 
     CONSTRAINT "ProductPackaging_pkey" PRIMARY KEY ("id")
 );
@@ -914,6 +935,7 @@ CREATE TABLE "Order" (
     "inventory_deducted" BOOLEAN NOT NULL DEFAULT false,
     "sourceQuotationId" TEXT,
     "sourceProformaInvoiceId" TEXT,
+    "sourceSalesOrderId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "Order_pkey" PRIMARY KEY ("id")
@@ -1387,6 +1409,7 @@ CREATE TABLE "SalesOrder" (
     "courierName" TEXT,
     "notes" TEXT,
     "createdBy" TEXT,
+    "convertedInvoiceId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "paymentStatus" TEXT NOT NULL DEFAULT 'UNPAID',
@@ -1462,6 +1485,7 @@ CREATE TABLE "ReturnOrder" (
     "returnNumber" TEXT NOT NULL,
     "salesOrderId" TEXT,
     "customerId" TEXT,
+    "dealerId" TEXT,
     "reason" TEXT NOT NULL,
     "status" "ReturnStatus" NOT NULL DEFAULT 'PENDING',
     "refundAmount" DOUBLE PRECISION NOT NULL,
@@ -1492,8 +1516,16 @@ CREATE TABLE "ReturnItem" (
     "productName" TEXT NOT NULL,
     "quantity" DOUBLE PRECISION NOT NULL,
     "rate" DOUBLE PRECISION NOT NULL,
+    "discountAmount" DOUBLE PRECISION,
+    "taxableValue" DOUBLE PRECISION,
+    "gstRate" DOUBLE PRECISION,
+    "taxAmount" DOUBLE PRECISION,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "costAllocation" JSONB,
+    "costReversal" DOUBLE PRECISION,
+    "costProvenance" TEXT,
     "condition" TEXT,
+    "recallId" TEXT,
 
     CONSTRAINT "ReturnItem_pkey" PRIMARY KEY ("id")
 );
@@ -1574,6 +1606,10 @@ CREATE TABLE "DeliveryChallanReturnItem" (
     "quantity" DOUBLE PRECISION NOT NULL,
     "unit" TEXT NOT NULL DEFAULT 'NONE',
     "condition" TEXT,
+    "costAllocation" JSONB,
+    "costReversal" DOUBLE PRECISION,
+    "costProvenance" TEXT,
+    "recallId" TEXT,
 
     CONSTRAINT "DeliveryChallanReturnItem_pkey" PRIMARY KEY ("id")
 );
@@ -1758,6 +1794,7 @@ CREATE TABLE "InventoryBatch" (
     "inventoryItemId" TEXT NOT NULL,
     "batchNumber" TEXT NOT NULL,
     "lotNumber" TEXT,
+    "billNumber" TEXT,
     "mfgDate" TIMESTAMP(3),
     "expDate" TIMESTAMP(3),
     "initialQty" DOUBLE PRECISION NOT NULL,
@@ -1891,6 +1928,51 @@ CREATE TABLE "LoanTransaction" (
     CONSTRAINT "LoanTransaction_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "InventoryReservation" (
+    "id" TEXT NOT NULL,
+    "franchiseOrderId" TEXT NOT NULL,
+    "status" "ReservationStatus" NOT NULL DEFAULT 'ACTIVE',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    "releasedAt" TIMESTAMP(3),
+
+    CONSTRAINT "InventoryReservation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "InventoryReservationAllocation" (
+    "id" TEXT NOT NULL,
+    "reservationId" TEXT NOT NULL,
+    "inventoryBatchId" TEXT NOT NULL,
+    "inventoryItemId" TEXT NOT NULL,
+    "reservedQty" DOUBLE PRECISION NOT NULL,
+    "consumedQty" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "releasedQty" DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+    CONSTRAINT "InventoryReservationAllocation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "GstinCache" (
+    "id" TEXT NOT NULL,
+    "gstin" TEXT NOT NULL,
+    "legalName" TEXT,
+    "tradeName" TEXT,
+    "status" TEXT,
+    "constitution" TEXT,
+    "taxpayerType" TEXT,
+    "registrationDate" TEXT,
+    "pan" TEXT,
+    "address" TEXT,
+    "state" TEXT,
+    "natureOfBusiness" JSONB,
+    "raw" JSONB,
+    "fetchedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "GstinCache_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
@@ -1935,6 +2017,9 @@ CREATE UNIQUE INDEX "InventoryItem_sku_franchiseId_key" ON "InventoryItem"("sku"
 
 -- CreateIndex
 CREATE INDEX "StockMovement_movementType_createdAt_idx" ON "StockMovement"("movementType", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "StockMovement_batchId_referenceType_idx" ON "StockMovement"("batchId", "referenceType");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Vendor_vendorCode_key" ON "Vendor"("vendorCode");
@@ -2004,6 +2089,9 @@ CREATE INDEX "FranchiseOrder_status_idx" ON "FranchiseOrder"("status");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Order_invoiceNum_key" ON "Order"("invoiceNum");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Order_sourceSalesOrderId_key" ON "Order"("sourceSalesOrderId");
 
 -- CreateIndex
 CREATE INDEX "Order_franchiseId_createdAt_idx" ON "Order"("franchiseId", "createdAt");
@@ -2108,6 +2196,9 @@ CREATE INDEX "ReturnOrder_franchiseId_createdAt_idx" ON "ReturnOrder"("franchise
 CREATE INDEX "ReturnOrder_createdAt_idx" ON "ReturnOrder"("createdAt");
 
 -- CreateIndex
+CREATE INDEX "ReturnItem_recallId_idx" ON "ReturnItem"("recallId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "DeliveryChallan_challanNumber_key" ON "DeliveryChallan"("challanNumber");
 
 -- CreateIndex
@@ -2118,6 +2209,9 @@ CREATE UNIQUE INDEX "DeliveryChallanReturn_returnNumber_key" ON "DeliveryChallan
 
 -- CreateIndex
 CREATE UNIQUE INDEX "DeliveryChallanReturn_idempotencyKey_key" ON "DeliveryChallanReturn"("idempotencyKey");
+
+-- CreateIndex
+CREATE INDEX "DeliveryChallanReturnItem_recallId_idx" ON "DeliveryChallanReturnItem"("recallId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "PurchaseReturn_returnNumber_key" ON "PurchaseReturn"("returnNumber");
@@ -2132,6 +2226,12 @@ CREATE UNIQUE INDEX "RequestForQuotation_rfqNumber_key" ON "RequestForQuotation"
 CREATE UNIQUE INDEX "Warehouse_nameKey_key" ON "Warehouse"("nameKey");
 
 -- CreateIndex
+CREATE INDEX "InventoryBatch_productBatchId_idx" ON "InventoryBatch"("productBatchId");
+
+-- CreateIndex
+CREATE INDEX "InventoryBatch_inventoryItemId_status_idx" ON "InventoryBatch"("inventoryItemId", "status");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "InspectionRecord_grnItemId_key" ON "InspectionRecord"("grnItemId");
 
 -- CreateIndex
@@ -2139,6 +2239,21 @@ CREATE UNIQUE INDEX "SystemSetting_key_key" ON "SystemSetting"("key");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ItemUnitConversion_itemId_unitId_key" ON "ItemUnitConversion"("itemId", "unitId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "InventoryReservation_franchiseOrderId_key" ON "InventoryReservation"("franchiseOrderId");
+
+-- CreateIndex
+CREATE INDEX "InventoryReservationAllocation_reservationId_idx" ON "InventoryReservationAllocation"("reservationId");
+
+-- CreateIndex
+CREATE INDEX "InventoryReservationAllocation_inventoryBatchId_idx" ON "InventoryReservationAllocation"("inventoryBatchId");
+
+-- CreateIndex
+CREATE INDEX "InventoryReservationAllocation_inventoryItemId_idx" ON "InventoryReservationAllocation"("inventoryItemId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "GstinCache_gstin_key" ON "GstinCache"("gstin");
 
 -- AddForeignKey
 ALTER TABLE "User" ADD CONSTRAINT "User_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2171,10 +2286,13 @@ ALTER TABLE "Franchise" ADD CONSTRAINT "Franchise_primaryWarehouseId_fkey" FOREI
 ALTER TABLE "DailySettlement" ADD CONSTRAINT "DailySettlement_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "Cheque" ADD CONSTRAINT "Cheque_accountId_fkey" FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Cheque" ADD CONSTRAINT "Cheque_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "Cheque" ADD CONSTRAINT "Cheque_accountId_fkey" FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_baseUnitId_fkey" FOREIGN KEY ("baseUnitId") REFERENCES "Unit"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2183,19 +2301,19 @@ ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_franchiseId_fkey" FORE
 ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_vendorId_fkey" FOREIGN KEY ("vendorId") REFERENCES "Vendor"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_baseUnitId_fkey" FOREIGN KEY ("baseUnitId") REFERENCES "Unit"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_productPackagingId_fkey" FOREIGN KEY ("productPackagingId") REFERENCES "ProductPackaging"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "Warehouse"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "WasteEntry" ADD CONSTRAINT "WasteEntry_productPackagingId_fkey" FOREIGN KEY ("productPackagingId") REFERENCES "ProductPackaging"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_batchId_fkey" FOREIGN KEY ("batchId") REFERENCES "InventoryBatch"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_binId_fkey" FOREIGN KEY ("binId") REFERENCES "WarehouseBin"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2204,13 +2322,10 @@ ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_binId_fkey" FOREIGN KE
 ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_itemId_fkey" FOREIGN KEY ("itemId") REFERENCES "InventoryItem"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "Warehouse"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
 ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_unitId_fkey" FOREIGN KEY ("unitId") REFERENCES "Unit"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_batchId_fkey" FOREIGN KEY ("batchId") REFERENCES "InventoryBatch"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "StockMovement" ADD CONSTRAINT "StockMovement_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "Warehouse"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "VendorLedger" ADD CONSTRAINT "VendorLedger_accountId_fkey" FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2279,13 +2394,13 @@ ALTER TABLE "RecipeItem" ADD CONSTRAINT "RecipeItem_inventoryItemId_fkey" FOREIG
 ALTER TABLE "RecipeItem" ADD CONSTRAINT "RecipeItem_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "Production" ADD CONSTRAINT "Production_operatorId_fkey" FOREIGN KEY ("operatorId") REFERENCES "Employee"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
 ALTER TABLE "Production" ADD CONSTRAINT "Production_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Production" ADD CONSTRAINT "Production_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Production" ADD CONSTRAINT "Production_operatorId_fkey" FOREIGN KEY ("operatorId") REFERENCES "Employee"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Production" ADD CONSTRAINT "Production_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -2384,10 +2499,10 @@ ALTER TABLE "Payment" ADD CONSTRAINT "Payment_vendorInvoiceId_fkey" FOREIGN KEY 
 ALTER TABLE "Invoice" ADD CONSTRAINT "Invoice_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_paymentId_fkey" FOREIGN KEY ("paymentId") REFERENCES "Payment"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_invoiceId_fkey" FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_invoiceId_fkey" FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "PaymentAllocation" ADD CONSTRAINT "PaymentAllocation_paymentId_fkey" FOREIGN KEY ("paymentId") REFERENCES "Payment"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Account" ADD CONSTRAINT "Account_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2474,16 +2589,22 @@ ALTER TABLE "ProformaInvoiceItem" ADD CONSTRAINT "ProformaInvoiceItem_proformaIn
 ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_dealerId_fkey" FOREIGN KEY ("dealerId") REFERENCES "Dealer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_franchiseOrderId_fkey" FOREIGN KEY ("franchiseOrderId") REFERENCES "FranchiseOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_posOrderId_fkey" FOREIGN KEY ("posOrderId") REFERENCES "Order"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_salesOrderId_fkey" FOREIGN KEY ("salesOrderId") REFERENCES "SalesOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "ReturnOrder" ADD CONSTRAINT "ReturnOrder_posOrderId_fkey" FOREIGN KEY ("posOrderId") REFERENCES "Order"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "ReturnItem" ADD CONSTRAINT "ReturnItem_recallId_fkey" FOREIGN KEY ("recallId") REFERENCES "BatchRecall"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "ReturnItem" ADD CONSTRAINT "ReturnItem_returnId_fkey" FOREIGN KEY ("returnId") REFERENCES "ReturnOrder"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -2501,10 +2622,13 @@ ALTER TABLE "DeliveryChallanItem" ADD CONSTRAINT "DeliveryChallanItem_challanId_
 ALTER TABLE "DeliveryChallanReturn" ADD CONSTRAINT "DeliveryChallanReturn_challanId_fkey" FOREIGN KEY ("challanId") REFERENCES "DeliveryChallan"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_returnId_fkey" FOREIGN KEY ("returnId") REFERENCES "DeliveryChallanReturn"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_recallId_fkey" FOREIGN KEY ("recallId") REFERENCES "BatchRecall"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_challanItemId_fkey" FOREIGN KEY ("challanItemId") REFERENCES "DeliveryChallanItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DeliveryChallanReturnItem" ADD CONSTRAINT "DeliveryChallanReturnItem_returnId_fkey" FOREIGN KEY ("returnId") REFERENCES "DeliveryChallanReturn"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "PurchaseReturn" ADD CONSTRAINT "PurchaseReturn_procurementOrderId_fkey" FOREIGN KEY ("procurementOrderId") REFERENCES "ProcurementOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2571,3 +2695,15 @@ ALTER TABLE "LoanAccount" ADD CONSTRAINT "LoanAccount_franchiseId_fkey" FOREIGN 
 
 -- AddForeignKey
 ALTER TABLE "LoanTransaction" ADD CONSTRAINT "LoanTransaction_loanAccountId_fkey" FOREIGN KEY ("loanAccountId") REFERENCES "LoanAccount"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryReservation" ADD CONSTRAINT "InventoryReservation_franchiseOrderId_fkey" FOREIGN KEY ("franchiseOrderId") REFERENCES "FranchiseOrder"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryReservationAllocation" ADD CONSTRAINT "InventoryReservationAllocation_reservationId_fkey" FOREIGN KEY ("reservationId") REFERENCES "InventoryReservation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryReservationAllocation" ADD CONSTRAINT "InventoryReservationAllocation_inventoryBatchId_fkey" FOREIGN KEY ("inventoryBatchId") REFERENCES "InventoryBatch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryReservationAllocation" ADD CONSTRAINT "InventoryReservationAllocation_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

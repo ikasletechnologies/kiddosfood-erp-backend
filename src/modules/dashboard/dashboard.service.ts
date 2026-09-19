@@ -3,6 +3,7 @@ import { DashboardInventoryService } from './dashboard.inventory';
 import { DashboardCollectionsService } from './dashboard.collections';
 import { DashboardDispatchService } from './dashboard.dispatch';
 import { DashboardAnalyticsService } from './dashboard.analytics';
+import { FinanceService } from '../finance/finance.service';
 
 export class DashboardService {
   static async getSummary(params: { franchiseId?: string; startDate?: string; endDate?: string; period?: string }) {
@@ -21,13 +22,14 @@ export class DashboardService {
       disp,
       ana,
       dealerCount,
-      vendorLedgerTotals,
-      cashAccounts,
+      payableParties,
+      receivableParties,
+      cashFlow,
+      pnl,
       productions,
       batches,
       recentPurchases,
       recentB2BOrders,
-      recentFranchiseOrders,
       recentB2CBills,
       supplierPaymentsDue
     ] = await Promise.all([
@@ -36,17 +38,28 @@ export class DashboardService {
       DashboardDispatchService.getDispatchStats(franchiseId),
       DashboardAnalyticsService.getAnalyticsStats({ franchiseId, startDate, endDate, period }),
       prisma.dealer.count({ where: franchiseId ? { franchiseId } : {} }),
-      prisma.vendorLedger.groupBy({
-        by: ['vendorId', 'type'],
-        _sum: { amount: true }
-      }),
-      prisma.account.findMany({
-        where: {
-          type: { in: ['CASH', 'BANK'] },
-          status: 'ACTIVE',
-          ...(franchiseId ? { franchiseId } : {})
-        }
-      }),
+      // Vendor Payables — reuse the same VENDOR-ledger balance formula the
+      // working Reports > All Parties (Payables) view already uses, instead
+      // of a second CREDIT/DEBIT groupBy living only in the dashboard.
+      // VendorLedger has no franchiseId column at all (vendors are global),
+      // so this figure is always company-wide regardless of outlet filter —
+      // an existing architectural limitation, not something a dashboard
+      // query can scope around.
+      FinanceService.getAllPartiesData(undefined, undefined, undefined, { datasetType: 'PAYABLE' }),
+      // Pending Receivables — the general "who owes us" figure across every
+      // CUSTOMER/DEALER/FRANCHISE party (unpaid/partial invoices only,
+      // returns/cancellations already excluded), not the Dealer-only subset
+      // `col.totalDealerOutstanding` matches (that figure is kept separately
+      // below for the Franchise Dashboard's dealer-collections widget, which
+      // genuinely wants only the dealer network).
+      FinanceService.getAllPartiesData(franchiseId, undefined, undefined, { datasetType: 'RECEIVABLE' }),
+      // Cash Position — reuse AccountService.getAccounts via getCashFlow so
+      // UPI accounts are included and "All Outlets" resolves to the real HQ
+      // franchise id instead of a literal franchiseId:null query.
+      FinanceService.getCashFlow(franchiseId || null),
+      // Net Profit — the real P&L engine (FIFO COGS from OrderItem.totalCost,
+      // real expenses), not a client-side totalSales-totalPurchase guess.
+      FinanceService.getProfitAndLoss({ franchiseId, startDate: today, endDate: periodEnd }),
       prisma.production.findMany({
         where: {
           status: 'COMPLETED',
@@ -55,7 +68,8 @@ export class DashboardService {
         },
         select: {
           quantity: true,
-          actualYield: true
+          actualYield: true,
+          recipe: { select: { yieldQty: true } }
         }
       }),
       prisma.productBatch.findMany({
@@ -78,36 +92,59 @@ export class DashboardService {
         orderBy: { createdAt: 'desc' },
         include: { vendor: { select: { name: true } } }
       }),
+      // B2B = a real, financially-recognized sale to a DEALER or FRANCHISE
+      // party — per Order.partyType, the authoritative classification field
+      // (already used correctly by getPartyReceivables/getAllPartiesData).
+      // NOT orderType: that field is 'DINE_IN'-vs-'TAX_INVOICE' bookkeeping
+      // unrelated to who the party is — FinanceService.createInvoice (the
+      // Sale Invoice page every Dealer/Franchise/Customer invoice actually
+      // goes through) hardcodes orderType:'DINE_IN' regardless of party,
+      // so a 'TAX_INVOICE' filter here silently excluded every Dealer/
+      // Franchise sale created from that page — this list was never
+      // populated by real Dealer/Franchise data, only genuinely empty by
+      // construction. Deliberately NOT prisma.franchiseOrder — that model
+      // (FranchiseOrderType STOCK/REQUEST) is HQ→franchise stock supply,
+      // never linked to an Invoice, and not part of FinanceService.
+      // getProfitAndLoss's revenue — it's inventory movement, not a
+      // recognized sale, so it must not be counted as a B2B sale here.
       prisma.order.findMany({
         where: {
           ...(franchiseId ? { franchiseId } : {}),
-          orderType: 'B2B',
-          status: { not: 'CANCELLED' },
+          partyType: { in: ['DEALER', 'FRANCHISE'] },
+          status: 'COMPLETED',
           createdAt: { gte: today, lte: periodEnd }
         },
         take: 5,
         orderBy: { createdAt: 'desc' },
-        include: { customer: { select: { name: true } } }
+        select: { invoiceNum: true, partyType: true, customerName: true, totalAmount: true, createdAt: true }
       }),
-      prisma.franchiseOrder.findMany({
+      // "Recent B2C Counter Bills" specifically means a POS counter sale to
+      // a Customer — not every Customer sale. orderType alone can't tell
+      // POS apart from other origins: 'DINE_IN' is what FinanceService.
+      // createInvoice (the Sale Invoice page) hardcodes for EVERY invoice
+      // regardless of party (see the B2B query above), and 'TAX_INVOICE' is
+      // set by BOTH POSService.checkout AND SalesService.
+      // convertProformaToInvoice (a Proforma conversion, not POS). The one
+      // reliable POS-origin signal is orderType:'TAX_INVOICE' combined with
+      // no source-conversion reference — POSService.checkout/createOrder
+      // never set sourceQuotationId/sourceProformaInvoiceId (grep-confirmed:
+      // pos.service.ts never assigns either field), while every conversion
+      // path that also uses TAX_INVOICE always stamps one. partyType:
+      // 'CUSTOMER' then excludes a Dealer/Franchise walking up to the same
+      // counter (POSService.checkout sets a real, never-null partyType).
+      prisma.order.findMany({
         where: {
           ...(franchiseId ? { franchiseId } : {}),
-          status: { in: ['DELIVERED', 'DISPATCHED'] as any },
+          orderType: 'TAX_INVOICE',
+          sourceQuotationId: null,
+          sourceProformaInvoiceId: null,
+          partyType: 'CUSTOMER',
+          status: 'COMPLETED',
           createdAt: { gte: today, lte: periodEnd }
         },
         take: 5,
         orderBy: { createdAt: 'desc' },
-        include: { franchise: { select: { name: true } } }
-      }),
-      prisma.order.findMany({
-        where: {
-          ...(franchiseId ? { franchiseId } : {}),
-          orderType: { not: 'B2B' },
-          status: { not: 'CANCELLED' },
-          createdAt: { gte: today, lte: periodEnd }
-        },
-        take: 5,
-        orderBy: { createdAt: 'desc' }
+        select: { invoiceNum: true, customerName: true, totalAmount: true, createdAt: true }
       }),
       prisma.procurementOrder.findMany({
         where: {
@@ -121,42 +158,40 @@ export class DashboardService {
       })
     ]);
 
-    // Format B2B Sales Details combining B2B orders & completed Franchise orders
-    const recentB2BSales = [
-      ...recentB2BOrders.map(o => ({
-        invoiceNum: o.invoiceNum,
-        customerName: o.customerName || o.customer?.name || "B2B Client",
-        totalAmount: o.totalAmount
-      })),
-      ...recentFranchiseOrders.map(f => ({
-        invoiceNum: f.orderNumber,
-        customerName: (f as any).franchise?.name || "B2B Franchise Client",
-        totalAmount: f.totalAmount
-      }))
-    ].slice(0, 5);
+    // Recent B2B Sales Details: real Dealer/Franchise Orders only (see the
+    // query comment above for why franchiseOrder is deliberately excluded).
+    const recentB2BSales = recentB2BOrders.map(o => ({
+      invoiceNum: o.invoiceNum,
+      customerName: o.customerName || (o.partyType === 'FRANCHISE' ? 'Franchise Client' : 'Dealer Client'),
+      partyType: o.partyType,
+      totalAmount: o.totalAmount
+    }));
 
-    // Calculate vendorPayables from ledger credit balances + unpaid PO balances
-    const balanceByVendor = new Map<string, number>();
-    for (const row of vendorLedgerTotals) {
-      const delta = (row._sum.amount || 0) * (row.type === 'CREDIT' ? 1 : -1);
-      balanceByVendor.set(row.vendorId, (balanceByVendor.get(row.vendorId) || 0) + delta);
-    }
-    let vendorPayables = 0;
-    for (const balance of balanceByVendor.values()) {
-      if (balance > 0) vendorPayables += balance;
-    }
-    const unpaidPoTotal = supplierPaymentsDue.reduce((sum, po) => sum + (po.balance || po.totalAmount || 0), 0);
-    if (vendorPayables === 0 && unpaidPoTotal > 0) {
-      vendorPayables = unpaidPoTotal;
-    }
+    // Vendor Payables: payableParties already carries only VENDOR rows with
+    // currentBalance < 0 meaning "amount owed to that vendor" (see
+    // FinanceService.getAllPartiesData / getAllPartiesReport's
+    // payableBalance mapping) — sum their absolute value. Always
+    // company-wide (VendorLedger has no franchiseId column).
+    const vendorPayables = payableParties.reduce((sum: number, p: any) => sum + (p.currentBalance < 0 ? Math.abs(p.currentBalance) : 0), 0);
 
-    // Calculate dailyCashPosition
-    const dailyCashPosition = cashAccounts.reduce((s, acc) => s + (acc.balance || 0), 0);
+    // Pending Receivables: receivableParties carries CUSTOMER/DEALER/
+    // FRANCHISE rows with currentBalance > 0 meaning "amount that party owes
+    // us" — sum them for the company-/outlet-wide total.
+    const totalReceivables = receivableParties.reduce((sum: number, p: any) => sum + (p.currentBalance > 0 ? p.currentBalance : 0), 0);
 
-    // Calculate production KPIs
+    // Cash Position: FinanceService.getCashFlow already includes CASH+BANK+UPI
+    // and resolves "no franchiseId" to the real HQ franchise id.
+    const dailyCashPosition = cashFlow.totalLiquidity;
+
+    // Calculate production KPIs. "Planned/expected" output must be scaled by
+    // the recipe's yield (quantity * recipe.yieldQty), not the raw batch
+    // quantity, or a recipe with yieldQty != 1 always shows a wrong %.
     const totalProducedQty = productions.reduce((s, p) => s + (p.actualYield || 0), 0);
-    const plannedQty = productions.reduce((s, p) => s + (p.quantity || 0), 0);
-    const yieldPercentage = plannedQty > 0 ? ((totalProducedQty / plannedQty) * 100).toFixed(1) : "100.0";
+    const plannedQty = productions.reduce((s, p) => s + (p.quantity || 0) * (p.recipe?.yieldQty ?? 1), 0);
+    // No completed production in this window means "no data", not a fake
+    // 100% — a real 0% yield (a production failure) must never be
+    // indistinguishable from "nothing produced yet".
+    const yieldPercentage = plannedQty > 0 ? Number(((totalProducedQty / plannedQty) * 100).toFixed(1)) : null;
     const totalWastage = batches.reduce((s, b) => s + (b.rejectionQty || 0), 0);
 
     return {
@@ -185,10 +220,21 @@ export class DashboardService {
         
         // Calculated/PRD KPIs
         vendorPayables,
+        totalReceivables,
         dailyCashPosition,
         productionQuantity: totalProducedQty,
-        yieldPercentage: Number(yieldPercentage),
-        wastage: totalWastage
+        yieldPercentage,
+        wastage: totalWastage,
+
+        // Net Profit — FinanceService.getProfitAndLoss's own revenue/COGS
+        // (Invoice-based, FIFO cost), so this reconciles exactly with the
+        // P&L report for the same scope/date range. Deliberately NOT
+        // totalSales-totalPurchase (that mixed Order-based sales with a
+        // VendorInvoice/COGS blend and was never a real profit figure).
+        netProfit: pnl.netProfit,
+        grossProfit: pnl.grossProfit,
+        pnlRevenue: pnl.revenue,
+        pnlExpenses: pnl.expenses
       },
       
       // Detailed operational lists (Connected to DB, no hardcoding)
