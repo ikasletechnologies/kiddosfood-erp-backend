@@ -674,7 +674,6 @@ export class ProcurementService {
   static async createPurchaseOrder(data: {
     vendorId: string;
     franchiseId?: string;
-    poNumber?: string;
     advancePaid?: number;
     accountId?: string; // Source account for advance
     expectedDeliveryDate?: string;
@@ -787,22 +786,14 @@ export class ProcurementService {
 
     try {
       return await prisma.$transaction(async (tx) => {
-      // The client generates and displays this number the instant the "New PO"
-      // screen loads, with no backend round trip — we just persist whatever it
-      // shows so the number on screen always matches what gets saved. Anything
-      // that creates a PO without one (older clients, scripts, tests) still gets
-      // a real sequential number from generatePONumber, unchanged.
-      const requestedPoNumber = data.poNumber?.trim();
-      let poNumber: string;
-      if (requestedPoNumber) {
-        const clash = await tx.procurementOrder.findUnique({ where: { poNumber: requestedPoNumber } });
-        if (clash) {
-          throw new Error(`Purchase Order number "${requestedPoNumber}" is already in use. Please refresh and try again.`);
-        }
-        poNumber = requestedPoNumber;
-      } else {
-        poNumber = await ProcurementService.generatePONumber(tx);
-      }
+      // PO numbers are always generated here, inside the create transaction —
+      // never accepted from the client. A client-supplied number can't be
+      // trusted as authoritative: it can go stale (computed before other POs
+      // were created), collide across browsers/sessions, or simply be wrong.
+      // generatePONumber() is the single atomic, collision-safe generator
+      // (see NumberSequence-backed nextPOSequence below); every PO, from
+      // every caller, gets its number from it and only from it.
+      const poNumber = await ProcurementService.generatePONumber(tx);
 
       const po = await tx.procurementOrder.create({
         data: {
@@ -903,7 +894,7 @@ export class ProcurementService {
       });
     } catch (error: any) {
       if (error?.code === 'P2002' && error?.meta?.target?.includes?.('poNumber')) {
-        throw new Error(`Purchase Order number "${data.poNumber}" is already in use. Please refresh and try again.`);
+        throw new Error('Purchase Order number generation collided. Please try again.');
       }
       throw error;
     }
@@ -1920,18 +1911,25 @@ export class ProcurementService {
     const run = async (t: any) => {
       for (let attempt = 0; attempt < 10; attempt++) {
         const seq = await ProcurementService.nextPOSequence(t, year);
-        const candidate = `PO-${year}-${seq.toString().padStart(4, '0')}`;
+        // 3-digit padding matches the existing PO-YYYY-NNN convention already
+        // established by every real persisted PO (PO-2026-010, -011, ...) —
+        // grows past 3 digits naturally once a year's sequence exceeds 999.
+        const candidate = `PO-${year}-${seq.toString().padStart(3, '0')}`;
         const collision = await t.procurementOrder.findUnique({ where: { poNumber: candidate } });
         if (!collision) {
           return candidate;
         }
       }
       const fallbackSeq = await ProcurementService.nextPOSequence(t, year);
-      return `PO-${year}-${fallbackSeq.toString().padStart(4, '0')}`;
+      return `PO-${year}-${fallbackSeq.toString().padStart(3, '0')}`;
     };
     return tx ? run(tx) : prisma.$transaction(run);
   }
 
+  // Read-only preview only — does NOT reserve or consume a number (no write).
+  // The frontend must not treat this as final; only the number returned by
+  // an actual createPurchaseOrder() call (via generatePONumber, above) is
+  // authoritative.
   static async getNextPONumber(): Promise<{ nextPONumber: string }> {
     const year = new Date().getFullYear();
     const key = `PO_${year}`;
@@ -1956,7 +1954,7 @@ export class ProcurementService {
       }
       nextVal = maxNum + 1;
     }
-    return { nextPONumber: `PO-${year}-${nextVal.toString().padStart(4, '0')}` };
+    return { nextPONumber: `PO-${year}-${nextVal.toString().padStart(3, '0')}` };
   }
 
   private static async generateOpeningBalanceNumber(tx: any): Promise<string> {
