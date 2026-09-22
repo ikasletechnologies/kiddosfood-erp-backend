@@ -4078,7 +4078,7 @@ export class SalesService {
         }
 
         const availableStock = Math.max(0, baseCurrentStock - reservedQty - blockedQty);
-        let conversionResult = { requiredBaseQty: itemData.quantity, unitId: undefined };
+        let conversionResult: { requiredBaseQty: number; unitId?: string } = { requiredBaseQty: itemData.quantity, unitId: undefined };
         let unitLabel = itemData.unit || 'Units';
 
         if (invItem) {

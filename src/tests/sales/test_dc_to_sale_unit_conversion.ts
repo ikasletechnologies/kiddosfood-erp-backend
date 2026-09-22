@@ -71,7 +71,7 @@ async function runValidation() {
     }]
   });
 
-  console.log(`   Created Sale Invoice: ${saleInvoice.invoiceNumber}`);
+  console.log(`   Created Sale Invoice: ${saleInvoice.order.invoiceNum}`);
   const appamInvAfter = await prisma.inventoryItem.findUnique({ where: { id: appamInv.id } });
   console.log(`   Stock Before: ${stockBefore} ${appamInv.unit}, Stock After: ${appamInvAfter?.currentStock} ${appamInv.unit}`);
   if ((appamInvAfter?.currentStock ?? 0) !== stockBefore - testQty) {

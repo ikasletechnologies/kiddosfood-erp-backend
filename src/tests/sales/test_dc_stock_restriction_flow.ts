@@ -121,7 +121,7 @@ async function main() {
       receivedBy: 'Receiver',
       podReference: 'POD-123'
     }, 'tester');
-    if (deliveredDc1.status !== 'CLOSED') throw new Error(`Expected status CLOSED, got ${deliveredDc1.status}`);
+    if (!deliveredDc1 || deliveredDc1.status !== 'CLOSED') throw new Error(`Expected status CLOSED, got ${deliveredDc1?.status}`);
     console.log(`   ✅ Challan marked as Delivered (CLOSED) without error`);
 
     // 3. Attempt to convert to Sale Invoice when stock is 0 -> MUST BE BLOCKED
