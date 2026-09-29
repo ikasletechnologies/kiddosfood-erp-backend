@@ -85,7 +85,7 @@ export class ProcurementService {
             creditLimit: data.creditLimit !== undefined && data.creditLimit !== null ? Number(data.creditLimit) : null,
             remark: data.remark,
             gstNumber: data.gstNumber,
-            category: data.category,
+            category: data.category as any,
             paymentTerms: data.paymentTerms || 'IMMEDIATE',
             status: data.status || 'ACTIVE'
           }

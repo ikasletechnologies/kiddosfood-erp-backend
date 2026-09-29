@@ -1,4 +1,4 @@
-﻿import prisma from '../lib/prisma';
+import prisma from '../lib/prisma';
 import { PurchaseService } from '../modules/purchase/purchase.service';
 import { ProcurementService } from '../modules/procurement/procurement.service';
 import { VendorInvoiceService } from '../modules/vendor-invoices/vendor-invoices.service';
@@ -12,7 +12,7 @@ async function runTests() {
       name: `Test Vendor PR Ledger ${Date.now()}`,
       contact: '9876543210',
       email: `test_pr_${Date.now()}@example.com`,
-      category: 'Supplies',
+      category: 'SUPPLIES' as any,
       status: 'ACTIVE',
       openingBalance: 0
     }
@@ -127,7 +127,7 @@ async function runTests() {
     data: {
       name: `Test Vendor B ${Date.now()}`,
       contact: '9876543211',
-      category: 'Supplies',
+      category: 'SUPPLIES' as any,
       status: 'ACTIVE',
       openingBalance: 0
     }
