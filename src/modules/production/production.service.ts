@@ -1143,6 +1143,81 @@ export class ProductionService {
     });
   }
 
+  static async wasteBalance(data: { batchId: string; userId?: string; note?: string }) {
+    return prisma.$transaction(async (tx) => {
+      // Lock batch
+      await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${data.batchId} FOR UPDATE`;
+      const batch = await tx.productBatch.findUnique({
+        where: { id: data.batchId },
+        include: {
+          product: true,
+          production: { include: { recipe: true } },
+          packagings: true
+        }
+      });
+      if (!batch) throw new Error('Batch not found');
+      if (batch.packagingStatus === 'PACKAGED') throw new Error('Batch already fully packaged');
+
+      const approvedQty = batch.approvedQty || 0;
+      const packagedQty = batch.packagedQty || 0;
+      
+      const batchPendingWeight = batch.packagings
+        .filter(p => p.status === 'AWAITING_CONFIRMATION')
+        .reduce((sum, p) => sum + (p.totalWeight || 0), 0);
+        
+      const effectivePackaged = packagedQty + batchPendingWeight;
+      const balanceQty = Math.max(0, approvedQty - effectivePackaged);
+
+      if (balanceQty <= 0) {
+        return tx.productBatch.update({
+          where: { id: batch.id },
+          data: { packagingStatus: 'PACKAGED' }
+        });
+      }
+
+      // We need to waste the bulk item
+      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+      if (!franchiseId) throw new Error('Franchise ID not found for batch');
+      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
+
+      const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
+
+      // Where is it? In the warehouse of the production
+      const warehouseId = batch.production?.warehouseId;
+      if (!warehouseId) throw new Error('Cannot waste balance: No warehouse assigned to this production run');
+
+      // 1. Record stock out for the bulk item (like WasteService does)
+      await InventoryService.recordMovement(tx, {
+        itemId: bulkItem.id,
+        type: 'WASTE_OUT',
+        quantity: -balanceQty,
+        referenceType: 'WASTE',
+        note: data.note || `Wasted remaining batch balance yield (${balanceQty.toFixed(3)} ${bulkItem.unit})`,
+        warehouseId,
+        userId: data.userId
+      });
+
+      // 2. We should ideally create a wasteEntry row for reporting!
+      await tx.wasteEntry.create({
+        data: {
+          inventoryItemId: bulkItem.id,
+          quantity: balanceQty,
+          reason: 'YIELD_LOSS',
+          note: data.note || `Batch balance wasted`,
+          franchiseId: invFranchiseId,
+          warehouseId,
+          costAtTime: bulkItem.unitCost || 0,
+        }
+      });
+
+      // 3. Update batch to PACKAGED
+      return tx.productBatch.update({
+        where: { id: batch.id },
+        data: { packagingStatus: 'PACKAGED' }
+      });
+    });
+  }
+
   private static parseWeight(size: string, bulkUnit: string): number {
     const match = size.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
     // Silently treating an unparseable size as "1 KG per packet" let a typo

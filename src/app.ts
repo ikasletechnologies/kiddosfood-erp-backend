@@ -261,6 +261,8 @@ app.get('/api/production/batches-all', authenticate, authorizeRole(['SUPER_ADMIN
 app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPendingQC);
 app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.inspectBatch);
 app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPackaging);
+app.post('/api/production/batches/:id/waste-balance', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.wasteBalance);
+// Trigger restart
 app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.confirmPackaging);
 app.post('/api/production/packagings/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.cancelPackaging);
 app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.savePackagingVerification);

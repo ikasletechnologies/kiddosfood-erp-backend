@@ -194,6 +194,21 @@ export class ProductionController {
     }
   }
 
+  static async wasteBalance(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { note } = req.body || {};
+      const result = await ProductionService.wasteBalance({
+        batchId: req.params.id,
+        userId: user?.userId,
+        note,
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message, stack: error.stack });
+    }
+  }
+
   static async getPendingQC(req: Request, res: Response) {
     try {
       const user = (req as any).user;
