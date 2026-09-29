@@ -347,7 +347,7 @@ model Vendor {
   manualAdvanceAdj       Float              @default(0)
   rating                 Float?             @default(5.0)
   createdAt              DateTime           @default(now())
-  category               String?
+  category               PurchaseType?
   gstNumber              String?
   paymentTerms           PaymentTerms       @default(IMMEDIATE)
   status                 VendorStatus       @default(ACTIVE)
@@ -2141,10 +2141,13 @@ enum POStatus {
 }
 
 enum PurchaseType {
+  ALL
   RAW_MATERIAL
   PACKAGING
-  ASSET
-  MISC
+  EQUIPMENT
+  CONSUMABLES
+  SERVICES
+  OTHERS
 }
 
 enum POPaymentStatus {
