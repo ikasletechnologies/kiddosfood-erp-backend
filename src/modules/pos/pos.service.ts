@@ -98,7 +98,7 @@ export class POSService {
         const orderItems = await tx.orderItem.findMany({ where: { orderId } });
         const finalSubTotal = orderItems.reduce((acc, obj) => acc + (obj.totalAmount || 0), 0);
         const finalTax = Number((finalSubTotal * 0.05).toFixed(2)); // 5% flat overall tax
-        const finalTotal = Math.round(finalSubTotal + finalTax);
+        const finalTotal = Math.ceil(Number((finalSubTotal + finalTax).toFixed(2))); // round-off always up
 
         const updatedOrder = await tx.order.update({
           where: { id: orderId },
@@ -419,7 +419,13 @@ export class POSService {
     // resolution below for why `discountAmount`/`totalAmount` above are no
     // longer used to determine what's actually charged.
     manualDiscount?: number,
-    paymentMode: string
+    paymentMode: string,
+    // Credit sale ("Other/Credit Payments" at the counter): the bill is
+    // booked against a real Customer/Dealer and only `paidAmount` (0..total)
+    // is collected now — the rest stays outstanding, same recording as a
+    // Sale Invoice created with a partial/zero receivedAmount.
+    creditSale?: boolean,
+    paidAmount?: number
   }) {
     // Validate prices first before proceeding
     if (data.items) {
@@ -468,6 +474,16 @@ export class POSService {
     // FinanceService.getPayments shows it instead of falling through to the
     // generic "Manual Entry" string (see resolvePartyName/getPayments).
     const displayName = data.customerName || (resolvedPartyType === 'DEALER' ? 'Dealer' : 'Walk-in Customer');
+
+    const isCreditSale = !!data.creditSale;
+    if (isCreditSale) {
+      if (resolvedPartyType === 'FRANCHISE') {
+        throw new Error('Franchise sales are billed to franchise credit through Franchise Orders, not a POS credit sale.');
+      }
+      if (!hasRealCustomer && !(resolvedPartyType === 'DEALER' && resolvedPartyId)) {
+        throw new Error('Select a customer or dealer for a credit sale — a walk-in bill cannot be left unpaid.');
+      }
+    }
 
     // A settled business day is a closed accounting period — its snapshot
     // (see closeDay) must not silently drift because a new sale landed in
@@ -519,9 +535,17 @@ export class POSService {
 
         const discountValue = resolvedPartyType === 'CUSTOMER' ? (inv?.discountValue ?? product.discountValue ?? 0) : 0;
         const discountType = inv?.discountType || product.discountType || 'PERCENT';
-        const itemDiscountPerUnit = discountValue > 0
+        const masterDiscountPerUnit = discountValue > 0
           ? (discountType === 'PERCENT' ? unitPrice * (discountValue / 100) : discountValue)
           : 0;
+        // Cashier-edited line discount (₹ per unit) replaces the master
+        // discount for that line. Same trust level as manualDiscount: no
+        // item-master value to check it against, so it's only bounded to
+        // the line's own price.
+        const override = item.discountPerUnit;
+        const itemDiscountPerUnit = override !== undefined && override !== null && Number.isFinite(Number(override))
+          ? Math.min(Math.max(0, Number(override)), unitPrice)
+          : masterDiscountPerUnit;
 
         // Real per-product tax rate, sourced server-side rather than trusting
         // item.taxPercent from the client (BUG 3 previously desynced this
@@ -547,7 +571,16 @@ export class POSService {
       const manualDiscountCap = Math.max(0, serverSubtotal + serverTax - serverProductDiscount);
       const manualDiscount = Math.min(requestedManualDiscount, manualDiscountCap);
       const finalDiscountAmount = Number((serverProductDiscount + manualDiscount).toFixed(2));
-      const finalTotalAmount = Math.round(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount));
+      // Round-off always goes UP to the next rupee (never down); rounded to
+      // paise first so float noise doesn't bump an already-exact total.
+      const finalTotalAmount = Math.ceil(Number(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount).toFixed(2)));
+
+      // Amount actually collected now. A normal counter sale is paid in full;
+      // a credit sale collects 0..total and leaves the rest outstanding.
+      const receivedNow = isCreditSale
+        ? Math.min(Math.max(0, Number(data.paidAmount) || 0), finalTotalAmount)
+        : finalTotalAmount;
+      const paymentStatus = receivedNow >= finalTotalAmount - 0.01 ? 'PAID' : receivedNow > 0 ? 'PARTIAL' : 'UNPAID';
 
       const order = await tx.order.create({
         data: {
@@ -563,7 +596,8 @@ export class POSService {
           discountAmount: finalDiscountAmount,
           totalAmount: finalTotalAmount,
           status: 'COMPLETED',
-          paymentStatus: 'PAID',
+          paymentStatus,
+          ...(isCreditSale ? { paymentType: 'CREDIT' } : {}),
           orderItems: {
             create: resolvedLines.map(l => ({
               productId: l.productId,
@@ -596,8 +630,8 @@ export class POSService {
           totalAmount: order.subTotal,
           taxAmount: order.taxAmount,
           finalAmount: order.totalAmount,
-          status: 'PAID',
-          description: 'POS Counter Billing Sale',
+          status: paymentStatus === 'PAID' ? 'PAID' : 'PENDING',
+          description: isCreditSale ? 'POS Counter Billing Sale (Credit)' : 'POS Counter Billing Sale',
           notes: displayName ? `Counter Sale - ${displayName}` : 'Counter Sale'
         }
       });
@@ -623,9 +657,11 @@ export class POSService {
         finalAccountId = defaultAccount?.id || targetType;
       }
       
-      await FinanceService.createPayment({
+      // A credit sale with nothing collected now creates no Payment row and
+      // moves no money — the invoice simply stays PENDING/outstanding.
+      if (receivedNow > 0) await FinanceService.createPayment({
         tx,
-        amount: finalTotalAmount,
+        amount: receivedNow,
         flow: 'IN',
         status: 'PAID',
         sourceAccount: finalAccountId, 
@@ -645,8 +681,24 @@ export class POSService {
         createdBy: 'POS_CHECKOUT'
       });
 
-      // 3. Customer Ledger CREDIT if real customer
-      if (hasRealCustomer && data.customerId) {
+      // 3. Customer Ledger. A credit sale DEBITs the full bill as a SALE (what
+      // the customer owes). The part payment collected now, if any, is
+      // already CREDITed by FinanceService.createPayment above (entityType
+      // CUSTOMER) — writing a second CREDIT here would double-count it, so
+      // the resulting balance is exactly the unpaid remainder.
+      if (isCreditSale && hasRealCustomer && data.customerId) {
+        await tx.customerLedger.create({
+          data: {
+            customerId: data.customerId,
+            type: 'DEBIT',
+            amount: finalTotalAmount,
+            paymentMode: 'CASH',
+            referenceType: 'SALE',
+            referenceId: order.id,
+            note: `POS Credit Sale — Invoice #${order.invoiceNum}`
+          }
+        });
+      } else if (hasRealCustomer && data.customerId) {
         await tx.customerLedger.create({
           data: {
             customerId: data.customerId,
