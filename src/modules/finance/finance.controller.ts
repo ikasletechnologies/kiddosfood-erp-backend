@@ -389,7 +389,11 @@ export class FinanceController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
 
-      const payments = await FinanceService.getPayments(franchiseId);
+      const payments = await FinanceService.getPayments(franchiseId, {
+        startDate: req.query.startDate as string | undefined,
+        endDate: req.query.endDate as string | undefined,
+        type: req.query.type as string | undefined,
+      });
       res.json({ payments });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

@@ -51,6 +51,7 @@ import WarehouseRoutes from './modules/warehouse/warehouse.routes';
 import SetupRoutes from './modules/setup/setup.routes';
 import AlertRoutes from './modules/alerts/alert.routes';
 import EWayBillRoutes from './modules/eway-bill/ewaybill.routes';
+import AttachmentRoutes from './modules/attachments/attachment.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -59,6 +60,10 @@ console.log('📦 BACKEND APP INITIALIZING...');
 const app: Express = express();
 
 app.use(cors());
+// Attachment uploads carry the file base64-encoded (≤5 MB file ≈ 6.7 MB of
+// JSON), above the 100 kb default. Parsed here first with a larger limit;
+// the global parser below then sees an already-parsed body and skips it.
+app.use('/api/attachments', express.json({ limit: '8mb' }));
 app.use(express.json());
 
 // Advanced API Flow Logger
@@ -562,6 +567,9 @@ app.use('/api/warehouse', WarehouseRoutes);
 // E-Way Bills (GST Rule 138)
 app.use('/api/eway-bills', EWayBillRoutes);
 
+// File attachments (Sales Order Image / Document, …)
+app.use('/api/attachments', AttachmentRoutes);
+
 // System Setup — first-run HQ/warehouse setup status
 app.use('/api/setup', SetupRoutes);
 
@@ -678,6 +686,7 @@ app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMI
 app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallan);
 app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallan);
 app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateDeliveryChallan);
+app.delete('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.deleteDeliveryChallan);
 app.post('/api/sales/delivery-challans/:id/deliver', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.markDeliveryChallanDelivered);
 app.post('/api/sales/delivery-challans/:id/convert-to-sale', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertDeliveryChallanToSale);
 

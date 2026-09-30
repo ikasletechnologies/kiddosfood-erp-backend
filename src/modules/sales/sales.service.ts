@@ -3377,20 +3377,67 @@ export class SalesService {
     }
   }
 
-  static async updateDeliveryChallan(id: string, data: { status?: string; vehicleNo?: string; driverName?: string; notes?: string; customerId?: string | null; dealerId?: string | null; franchiseId?: string | null }, userId: string = 'system') {
+  // Edit form save and status actions both land here. Only whitelisted
+  // header fields are written (the old version passed the whole request —
+  // items array, date strings — straight to Prisma, which is invalid), and
+  // "same status" is a no-op only when nothing else changed. Previously an
+  // edit of an IN_TRANSIT challan re-sent status IN_TRANSIT and hit that
+  // no-op, silently discarding vehicle number / driver name / every edit.
+  static async updateDeliveryChallan(id: string, raw: any, userId: string = 'system') {
+    const data: any = { ...(raw || {}) };
+    if (data.status === 'OPEN') data.status = 'IN_TRANSIT';
+
+    const header: Record<string, any> = {};
+    const text = (v: any) => (v === null || v === undefined || String(v).trim() === '' ? null : String(v).trim());
+    for (const k of ['vehicleNo', 'driverName', 'notes', 'termsConditions', 'stateOfSupply']) {
+      if (k in data) header[k] = text(data[k]);
+    }
+    for (const k of ['customerId', 'dealerId', 'franchiseId']) {
+      if (k in data) header[k] = data[k] || null;
+    }
+    if (data.challanDate) {
+      const d = new Date(data.challanDate);
+      if (!isNaN(d.getTime())) header.challanDate = d;
+    }
+    if ('dueDate' in data) {
+      const d = data.dueDate ? new Date(data.dueDate) : null;
+      if (d === null || !isNaN(d.getTime())) header.dueDate = d;
+    }
+    const wantsItems = Array.isArray(data.items) && data.items.length > 0;
+    const hasEdits = Object.keys(header).length > 0 || wantsItems;
+
+    // Replacement items are priced up front with the same rules as create —
+    // applied only while the challan is still a DRAFT (after dispatch, stock
+    // may already be committed against the original lines).
+    const pre = await prisma.deliveryChallan.findUnique({ where: { id }, select: { status: true, dealerId: true, franchiseId: true, sourceFranchiseId: true } });
+    if (!pre) throw new Error('Delivery challan not found');
+    let priced: ReturnType<typeof calculateTotals> | null = null;
+    if (wantsItems && pre.status === 'DRAFT') {
+      const dealerId = 'dealerId' in header ? header.dealerId : pre.dealerId;
+      const franchiseId = 'franchiseId' in header ? header.franchiseId : pre.franchiseId;
+      const partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' = dealerId ? 'DEALER' : franchiseId ? 'FRANCHISE' : 'CUSTOMER';
+      const scope = pre.sourceFranchiseId ? await FranchiseService.toInventoryScopeId(prisma, pre.sourceFranchiseId) : null;
+      const pricedItems = await applyAuthoritativePricing(
+        prisma,
+        data.items.map((i: any) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
+        scope,
+        partyType,
+        false
+      );
+      priced = calculateTotals(pricedItems);
+    }
+
     return prisma.$transaction(async (tx) => {
       const currentChallan = await tx.deliveryChallan.findUnique({ where: { id }, include: { items: true } });
       if (!currentChallan) throw new Error('Delivery challan not found');
 
       // Legacy rows/clients may still send/hold 'OPEN' — treat it as IN_TRANSIT
       const currentStatus = currentChallan.status === 'OPEN' ? 'IN_TRANSIT' : currentChallan.status;
-      if (data.status === 'OPEN') data.status = 'IN_TRANSIT';
 
-      // Idempotent no-op: repeat "Dispatch"/"Mark Delivered" clicks land here
-      // with the SAME target status as the current one — status validation
-      // below would otherwise reject e.g. IN_TRANSIT -> IN_TRANSIT, but a
-      // duplicate click must be a harmless no-op, not an error toast.
-      if (data.status && data.status === currentStatus) {
+      // Idempotent no-op: a repeat "Dispatch"/"Mark Delivered" click carries
+      // only the SAME status — harmless, not an error. An edit (same status
+      // plus changed fields) must still be saved.
+      if (data.status && data.status === currentStatus && !hasEdits) {
         return tx.deliveryChallan.findUnique({ where: { id }, include: { customer: true, dealer: true, items: true } });
       }
 
@@ -3398,15 +3445,18 @@ export class SalesService {
       if ((currentStatus === 'CLOSED' || currentStatus === 'CONVERTED') && data.status && data.status !== currentStatus) {
         throw new Error('Cannot change status of a closed delivery challan');
       }
+      if (hasEdits && (currentStatus === 'CLOSED' || currentStatus === 'CONVERTED' || currentStatus === 'CANCELLED')) {
+        throw new Error(`Cannot edit a ${currentStatus === 'CLOSED' ? 'delivered' : currentStatus.toLowerCase()} delivery challan`);
+      }
 
-      if ('customerId' in data || 'dealerId' in data || 'franchiseId' in data) {
+      if ('customerId' in header || 'dealerId' in header || 'franchiseId' in header) {
         SalesService.assertSingleDestination(
-          'customerId' in data ? data.customerId : currentChallan.customerId,
-          'dealerId' in data ? data.dealerId : currentChallan.dealerId,
-          'franchiseId' in data ? data.franchiseId : currentChallan.franchiseId
+          'customerId' in header ? header.customerId : currentChallan.customerId,
+          'dealerId' in header ? header.dealerId : currentChallan.dealerId,
+          'franchiseId' in header ? header.franchiseId : currentChallan.franchiseId
         );
-        if (data.dealerId) {
-          const dealer = await tx.dealer.findUnique({ where: { id: data.dealerId } });
+        if (header.dealerId) {
+          const dealer = await tx.dealer.findUnique({ where: { id: header.dealerId } });
           if (!dealer) throw new Error('Selected dealer not found.');
           if (dealer.status === 'INACTIVE') {
             throw new Error('Dealer is inactive. This operation is not allowed.');
@@ -3417,9 +3467,13 @@ export class SalesService {
       // Invoice Qty vs Dispatch Qty guard also applies to Draft -> Dispatch
       // (createDeliveryChallan only checks it for a challan created
       // already-IN_TRANSIT — most challans start DRAFT then dispatch later).
+      const replaceItems = priced && currentStatus === 'DRAFT';
       if (currentChallan.sourceInvoiceId && currentStatus === 'DRAFT' && data.status === 'IN_TRANSIT') {
         const remaining = await SalesService.getRemainingInvoiceQty(currentChallan.sourceInvoiceId, id);
-        for (const item of currentChallan.items) {
+        // Check the lines actually being dispatched (the edited ones, if replaced).
+        const linesToCheck: Array<{ productId: string | null; quantity: number; productName: string }> =
+          replaceItems ? priced!.computed.map((i: any) => ({ productId: i.productId || null, quantity: i.quantity, productName: i.productName })) : currentChallan.items;
+        for (const item of linesToCheck) {
           if (!item.productId) continue;
           const r = remaining[item.productId];
           if (!r) continue;
@@ -3429,7 +3483,33 @@ export class SalesService {
         }
       }
 
-      const updated = await tx.deliveryChallan.update({ where: { id }, data, include: { customer: true, dealer: true, items: true } });
+      const updated = await tx.deliveryChallan.update({
+        where: { id },
+        data: {
+          ...header,
+          ...(data.status && data.status !== currentStatus ? { status: data.status } : {}),
+          ...(replaceItems ? {
+            subTotal: priced!.subTotal,
+            taxAmount: priced!.taxAmount,
+            totalAmount: priced!.totalAmount,
+            items: {
+              deleteMany: {},
+              create: priced!.computed.map((i: any) => ({
+                productId: i.productId || null,
+                productName: i.productName,
+                batchNumber: i.batchNumber || null,
+                quantity: i.quantity,
+                unit: i.unit || 'NONE',
+                rate: i.rate,
+                taxPercent: i.taxPercent || 0,
+                taxAmount: i.taxAmount,
+                totalAmount: i.totalAmount,
+              })),
+            },
+          } : {}),
+        },
+        include: { customer: true, dealer: true, items: true },
+      });
 
       // Handle Stock Transitions
       // A Delivery Challan is a dispatch document; stock deduction occurs when converted to Sale Invoice.
@@ -3443,6 +3523,26 @@ export class SalesService {
 
       return updated;
     }, { timeout: 20000 });
+  }
+
+  // Hard delete — DRAFT challans only. A draft has moved no stock and has no
+  // returns/conversion; anything dispatched or beyond is a real dispatch
+  // record and must stay (cancel it instead). Previously the UI "deleted"
+  // by removing a localStorage copy only, so the challan never went away.
+  static async deleteDeliveryChallan(id: string) {
+    return prisma.$transaction(async (tx) => {
+      const dc = await tx.deliveryChallan.findUnique({ where: { id }, include: { _count: { select: { returns: true } } } });
+      if (!dc) throw new Error('Delivery challan not found');
+      if (dc.status !== 'DRAFT') {
+        throw new Error('Only draft delivery challans can be deleted. A dispatched challan must be cancelled instead.');
+      }
+      if (dc._count.returns > 0 || dc.convertedInvoiceId || dc.convertedOrderId) {
+        throw new Error('This delivery challan has returns or a linked sale and cannot be deleted.');
+      }
+      await tx.deliveryChallanItem.deleteMany({ where: { challanId: id } });
+      await tx.deliveryChallan.delete({ where: { id } });
+      return { success: true };
+    });
   }
 
   // Explicit delivery confirmation — separate from a generic status PATCH so
@@ -3582,7 +3682,9 @@ export class SalesService {
 
     // sourceInvoiceId is an Order.id — resolve the human-readable invoice
     // number for the ones that have one, in a single batched query.
-    const invoiceIds = [...new Set(challans.map(c => c.sourceInvoiceId).filter(Boolean))] as string[];
+    // Includes convertedOrderId too: a challan converted to a sale should
+    // show the invoice it became, not just the one it was created from.
+    const invoiceIds = [...new Set(challans.flatMap(c => [c.sourceInvoiceId, c.convertedOrderId]).filter(Boolean))] as string[];
     const orders = invoiceIds.length
       ? await prisma.order.findMany({ where: { id: { in: invoiceIds } }, select: { id: true, invoiceNum: true } })
       : [];
@@ -3598,7 +3700,11 @@ export class SalesService {
         challanId: dc.id,
         challanNumber: dc.challanNumber,
         sourceInvoiceId: dc.sourceInvoiceId,
-        invoiceNumber: dc.sourceInvoiceId ? invoiceNumById.get(dc.sourceInvoiceId) || null : null,
+        invoiceNumber: (dc.sourceInvoiceId ? invoiceNumById.get(dc.sourceInvoiceId) : null)
+          || (dc.convertedOrderId ? invoiceNumById.get(dc.convertedOrderId) : null)
+          || null,
+        convertedOrderId: dc.convertedOrderId,
+        convertedInvoiceId: dc.convertedInvoiceId,
         salesOrderId: dc.salesOrderId,
         partyType,
         partyName,

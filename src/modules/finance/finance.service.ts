@@ -1037,9 +1037,26 @@ export class FinanceService {
     }
   }
 
-  static async getPayments(franchiseId?: string) {
+  // `opts` are optional and only applied when a caller passes them, so
+  // existing callers (Accounting → Payments, Payout Receipts) are unchanged.
+  //  - startDate / endDate: "YYYY-MM-DD", inclusive, as IST calendar days.
+  //    Previously the Payment-In page sent these but they were ignored, so
+  //    its date filter never changed the list.
+  //  - type: INFLOW | OUTFLOW, using the same flow rule as the mapped `flow`
+  //    field below (VENDOR = OUT, everything else = IN).
+  static async getPayments(franchiseId?: string, opts: { startDate?: string; endDate?: string; type?: string } = {}) {
+    const IST = '+05:30';
+    const createdAt: any = {};
+    if (opts.startDate && /^\d{4}-\d{2}-\d{2}$/.test(opts.startDate)) createdAt.gte = new Date(`${opts.startDate}T00:00:00.000${IST}`);
+    if (opts.endDate && /^\d{4}-\d{2}-\d{2}$/.test(opts.endDate)) createdAt.lte = new Date(`${opts.endDate}T23:59:59.999${IST}`);
+    const flowWhere = opts.type === 'INFLOW'
+      ? { OR: [{ entityType: null }, { entityType: { not: 'VENDOR' } }] }
+      : opts.type === 'OUTFLOW' ? { entityType: 'VENDOR' } : null;
+
     const payments = await prisma.payment.findMany({
       where: {
+        ...(Object.keys(createdAt).length ? { createdAt } : {}),
+        ...(flowWhere ? { AND: [flowWhere] } : {}),
         // A multi-invoice receipt has orderId=null (it doesn't belong to
         // one order), so the plain `order: { franchiseId }` filter below
         // would silently exclude it from every franchise-scoped query —

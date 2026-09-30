@@ -899,9 +899,18 @@ export class POSService {
   // prevented settling the same business day twice. `businessDate` is always
   // computed server-side (never trusted from the client) to stop that.
 
-  private static startOfToday() {
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // Business day = the IST calendar day, independent of the server's own
+  // timezone. Previously this used the server's local midnight: fine on an
+  // IST machine, but on a UTC host (typical cloud/Docker) the "day" ran
+  // 05:30 IST → 05:30 IST, so a sale made yesterday and a refund made early
+  // today landed in the same Day Closing and netted to ₹0. On an IST server
+  // this returns the exact same instant as before (18:30Z the previous day),
+  // so existing DailySettlement.businessDate rows still match.
+  // Override with BUSINESS_TZ_OFFSET_MINUTES for a non-IST business.
+  private static startOfToday(now: Date = new Date()) {
+    const offsetMs = Number(process.env.BUSINESS_TZ_OFFSET_MINUTES ?? 330) * 60_000;
+    const local = new Date(now.getTime() + offsetMs);
+    return new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - offsetMs);
   }
 
   static async getTodaySettlement(franchiseId: string) {
@@ -933,10 +942,20 @@ export class POSService {
     // reconciliation target.
     const orders = await prisma.order.findMany({
       where: { franchiseId, status: 'COMPLETED', createdAt: dateRange },
-      select: { totalAmount: true }
+      select: { totalAmount: true, payments: { select: { paidAmount: true, status: true, isCancelled: true } } }
     });
     const orderCount = orders.length;
     const grandTotal = orders.reduce((sum, o) => sum + o.totalAmount, 0);
+
+    // Credit sales (POS "Other/Credit Payments", or a Sale Invoice saved
+    // unpaid/partial): the part of today's bills still unpaid. This is sales
+    // value that legitimately has no receipt today.
+    const creditOutstanding = orders.reduce((sum, o) => {
+      const paid = o.payments
+        .filter(p => !p.isCancelled && (p.status === 'PAID' || p.status === 'SUCCESS'))
+        .reduce((s, p) => s + (p.paidAmount || 0), 0);
+      return sum + Math.max(0, o.totalAmount - paid);
+    }, 0);
 
     // Actual settled receipts for those sales — this Payment.paymentMode
     // value (canonical PaymentMode enum: CASH/UPI/CARD/...) is the source
@@ -952,8 +971,15 @@ export class POSService {
         createdAt: dateRange,
         order: { franchiseId }
       },
-      select: { paymentMode: true, paidAmount: true }
+      select: { paymentMode: true, paidAmount: true, order: { select: { createdAt: true } } }
     });
+
+    // Receipts collected today against bills from an EARLIER day (credit
+    // being paid off). Real cash in the drawer today, but not part of
+    // today's gross sales.
+    const creditCollected = receipts
+      .filter(p => p.order && p.order.createdAt < businessDate)
+      .reduce((s, p) => s + p.paidAmount, 0);
 
     let cashTotal = 0, upiTotal = 0, cardTotal = 0, otherTotal = 0;
     for (const p of receipts) {
@@ -993,11 +1019,13 @@ export class POSService {
       collectionTotal,
       refundTotal,
       netTotal,
-      // Every current POS sale is paid in full at checkout (Counter Billing
-      // has no partial/credit-sale path — "Franchise Credit" sales go
-      // through a separate FranchiseOrder ledger entirely, not this Order
-      // table), so collected receipts must equal gross sales value exactly.
-      reconciled: Math.abs(collectionTotal - grandTotal) < 0.01
+      creditOutstanding,
+      creditCollected,
+      // Expected receipts = today's gross sales − what was left on credit +
+      // credit from earlier days collected today. (Before credit sales
+      // existed this was simply collectionTotal === grandTotal.)
+      expectedCollection: grandTotal - creditOutstanding + creditCollected,
+      reconciled: Math.abs(collectionTotal - (grandTotal - creditOutstanding + creditCollected)) < 0.01
     };
   }
 
@@ -1011,7 +1039,7 @@ export class POSService {
 
     if (!summary.reconciled) {
       throw new Error(
-        `Settlement mismatch detected. Payment mode total ₹${summary.collectionTotal.toFixed(2)} does not match expected collection ₹${summary.grandTotal.toFixed(2)}.`
+        `Settlement mismatch detected. Payment mode total ₹${summary.collectionTotal.toFixed(2)} does not match expected collection ₹${summary.expectedCollection.toFixed(2)}.`
       );
     }
 

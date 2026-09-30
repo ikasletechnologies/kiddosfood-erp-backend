@@ -2570,3 +2570,23 @@ model EWayBillVehicleUpdate {
 
   @@index([ewayBillId])
 }
+
+// Generic file attachment (images / documents) linked to any document by
+// (entityType, entityId) — first used by Sales Orders' Image/Document buttons.
+// Bytes are stored in the database so it works on any host without extra
+// file-storage configuration; AttachmentService caps size and file types.
+model Attachment {
+  id          String   @id @default(uuid())
+  entityType  String // SALES_ORDER, …
+  entityId    String
+  kind        String   @default("DOCUMENT") // IMAGE | DOCUMENT
+  fileName    String
+  mimeType    String
+  size        Int
+  data        Bytes
+  franchiseId String?
+  uploadedBy  String?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
