@@ -98,7 +98,7 @@ export class POSService {
         const orderItems = await tx.orderItem.findMany({ where: { orderId } });
         const finalSubTotal = orderItems.reduce((acc, obj) => acc + (obj.totalAmount || 0), 0);
         const finalTax = Number((finalSubTotal * 0.05).toFixed(2)); // 5% flat overall tax
-        const finalTotal = finalSubTotal + finalTax;
+        const finalTotal = Math.round(finalSubTotal + finalTax);
 
         const updatedOrder = await tx.order.update({
           where: { id: orderId },
@@ -547,7 +547,7 @@ export class POSService {
       const manualDiscountCap = Math.max(0, serverSubtotal + serverTax - serverProductDiscount);
       const manualDiscount = Math.min(requestedManualDiscount, manualDiscountCap);
       const finalDiscountAmount = Number((serverProductDiscount + manualDiscount).toFixed(2));
-      const finalTotalAmount = Number(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount).toFixed(2));
+      const finalTotalAmount = Math.round(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount));
 
       const order = await tx.order.create({
         data: {

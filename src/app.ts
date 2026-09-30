@@ -50,6 +50,7 @@ import { WorkflowApprovalsController } from './modules/workflow-approvals/workfl
 import WarehouseRoutes from './modules/warehouse/warehouse.routes';
 import SetupRoutes from './modules/setup/setup.routes';
 import AlertRoutes from './modules/alerts/alert.routes';
+import EWayBillRoutes from './modules/eway-bill/ewaybill.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -557,6 +558,9 @@ app.get('/api/inventory/alerts', authenticate, authorizeRole(['SUPER_ADMIN', 'FR
 
 // Warehouse
 app.use('/api/warehouse', WarehouseRoutes);
+
+// E-Way Bills (GST Rule 138)
+app.use('/api/eway-bills', EWayBillRoutes);
 
 // System Setup — first-run HQ/warehouse setup status
 app.use('/api/setup', SetupRoutes);

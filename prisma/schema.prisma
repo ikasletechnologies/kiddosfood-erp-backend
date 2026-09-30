@@ -2445,3 +2445,128 @@ model Alert {
   @@index([type, severity])
 }
 
+
+// ─── E-Way Bill (GST Rule 138, form EWB-01) ──────────────────────────────────
+// Field names/codes deliberately mirror the NIC e-way bill JSON schema
+// (supplyType "O"/"I", docType "INV"/"CHL"/…, transMode "1".."4", state codes
+// as integers) so a row exports to the portal's bulk-upload JSON 1:1.
+//
+// The EWB number itself is issued by the NIC portal, never minted here: a row
+// stays DRAFT until the user records the 12-digit number the portal returned
+// (EWayBillService.markGenerated). Header totals are always recomputed
+// server-side from the items — never trusted from the client.
+model EWayBill {
+  id               String                  @id @default(uuid())
+  refNumber        String                  @unique // internal ref, EWB-DFT-00001
+  ewbNumber        String?                 @unique // 12-digit number issued by the NIC portal
+  ewbDate          DateTime?
+  validUntil       DateTime?
+  status           String                  @default("DRAFT") // DRAFT | GENERATED | CANCELLED
+  franchiseId      String?
+  sourceType       String                  @default("MANUAL") // SALE_INVOICE | DELIVERY_CHALLAN | STOCK_TRANSFER | MANUAL
+  sourceId         String?
+
+  // Part A — document
+  supplyType       String                  @default("O") // O = Outward, I = Inward
+  subSupplyType    String                  @default("1") // 1 Supply, 2 Import, 3 Export, 4 Job Work, 5 For Own Use, 8 Others, …
+  subSupplyDesc    String?
+  docType          String                  @default("INV") // INV | BIL | BOE | CHL | OTH
+  docNo            String
+  docDate          DateTime
+  transactionType  Int                     @default(1) // 1 Regular, 2 Bill To-Ship To, 3 Bill From-Dispatch From, 4 Combination
+
+  // Part A — consignor
+  fromGstin        String
+  fromTradeName    String
+  fromAddr1        String?
+  fromAddr2        String?
+  fromPlace        String?
+  fromPincode      String
+  fromStateCode    Int
+  actFromStateCode Int
+
+  // Part A — consignee ("URP" gstin = unregistered person)
+  toGstin          String
+  toTradeName      String
+  toAddr1          String?
+  toAddr2          String?
+  toPlace          String?
+  toPincode        String
+  toStateCode      Int
+  actToStateCode   Int
+
+  // Part A — value (derived from items)
+  totalValue       Float                   @default(0) // taxable value
+  cgstValue        Float                   @default(0)
+  sgstValue        Float                   @default(0)
+  igstValue        Float                   @default(0)
+  cessValue        Float                   @default(0)
+  otherValue       Float                   @default(0)
+  totInvValue      Float                   @default(0)
+
+  // Part B — transport
+  transMode        String? // 1 Road, 2 Rail, 3 Air, 4 Ship
+  transDistance    Int                     @default(0) // km
+  transporterId    String?
+  transporterName  String?
+  transDocNo       String?
+  transDocDate     DateTime?
+  vehicleNo        String?
+  vehicleType      String                  @default("R") // R Regular, O Over-Dimensional Cargo
+
+  cancelReason     String? // 1 Duplicate, 2 Order Cancelled, 3 Data Entry Mistake, 4 Others
+  cancelRemarks    String?
+  cancelledAt      DateTime?
+  extensionCount   Int                     @default(0)
+  notes            String?
+  createdBy        String?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  items            EWayBillItem[]
+  vehicleUpdates   EWayBillVehicleUpdate[]
+
+  @@index([franchiseId, status])
+  @@index([sourceType, sourceId])
+  @@index([docNo])
+}
+
+model EWayBillItem {
+  id            String   @id @default(uuid())
+  ewayBillId    String
+  itemNo        Int
+  productName   String
+  productDesc   String?
+  hsnCode       String
+  quantity      Float
+  qtyUnit       String   @default("NOS") // UQC code: KGS, NOS, PCS, BOX, LTR …
+  taxableAmount Float
+  cgstRate      Float    @default(0)
+  sgstRate      Float    @default(0)
+  igstRate      Float    @default(0)
+  cessRate      Float    @default(0)
+  ewayBill      EWayBill @relation(fields: [ewayBillId], references: [id], onDelete: Cascade)
+
+  @@index([ewayBillId])
+}
+
+// Part-B history: every vehicle change / validity extension after generation.
+model EWayBillVehicleUpdate {
+  id            String    @id @default(uuid())
+  ewayBillId    String
+  kind          String    @default("VEHICLE") // VEHICLE | EXTENSION
+  vehicleNo     String?
+  transMode     String?
+  transDocNo    String?
+  transDocDate  DateTime?
+  fromPlace     String?
+  fromStateCode Int?
+  reasonCode    String // vehicle: 1 Break Down, 2 Transhipment, 3 Others, 4 First Time; extension: 99 Others …
+  reasonRemarks String?
+  remainingKm   Int?
+  validUntil    DateTime?
+  createdBy     String?
+  createdAt     DateTime  @default(now())
+  ewayBill      EWayBill  @relation(fields: [ewayBillId], references: [id], onDelete: Cascade)
+
+  @@index([ewayBillId])
+}
