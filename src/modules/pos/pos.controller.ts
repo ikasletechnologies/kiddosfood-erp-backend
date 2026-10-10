@@ -67,7 +67,11 @@ export class POSController {
         taxAmount: taxAmount ?? 0,
         discountAmount: discountAmount ?? 0,
         totalAmount,
-        paymentMode: paymentMode || 'CASH'
+        paymentMode: paymentMode || 'CASH',
+        // Required by POSService.checkout — a sale is never booked as paid
+        // unless the collected amount is actually supplied.
+        paidAmount: req.body.paidAmount,
+        creditSale: req.body.creditSale
       });
 
       // Auto-add loyalty points: 1 point per ₹10 spent

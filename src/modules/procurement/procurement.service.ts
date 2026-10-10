@@ -1150,7 +1150,10 @@ export class ProcurementService {
         include: { vendor: true, poItems: { include: { inventoryItem: true } } }
       });
 
-      if (status === 'APPROVED' || status === 'RECEIVED') {
+      // Approval alone never settles anything: an approved-but-unreceived PO
+      // only shows as paid from payments/advances explicitly recorded on it
+      // (see settleVendorOrders).
+      if (status === 'RECEIVED') {
         await this.settleVendorOrders(po.vendorId, tx);
         return tx.procurementOrder.findUnique({
           where: { id: poId },
@@ -1287,15 +1290,13 @@ export class ProcurementService {
       },
       orderBy: { createdAt: 'desc' }
     });
-    const vendorIds = Array.from(new Set(orders.map(o => o.vendorId)));
-    const allLedger = await prisma.vendorLedger.findMany({
-      where: { vendorId: { in: vendorIds } }
-    });
     return orders.map((po: any) => {
-      const linkedPayments = allLedger
-        .filter(l => l.referenceId === po.id && l.type === 'CREDIT')
-        .reduce((sum, l) => sum + l.amount, 0);
-      const livePaid = Math.max(po.paid || 0, linkedPayments);
+      // po.paid is maintained by every real payment/advance path. The old
+      // max() against this PO's CREDIT ledger rows picked up the cancel /
+      // delete "Reversal of PO" adjustments (the only CREDIT rows keyed by
+      // po.id — payments are keyed by payment id), which made a cancelled
+      // PO show as fully Paid.
+      const livePaid = po.paid || 0;
 
       // Calculate fulfillment stats (Support both structured poItems and legacy JSON items)
       let totalItemsCount = 0;
@@ -1335,10 +1336,9 @@ export class ProcurementService {
     });
     if (!po) return null;
 
-    const linkedPayments = await prisma.vendorLedger.findMany({
-      where: { vendorId: po.vendorId, referenceId: po.id, type: 'CREDIT' }
-    });
-    const livePaid = Math.max(po.paid || 0, linkedPayments.reduce((s, l) => s + l.amount, 0));
+    // See getPurchaseOrders — po.paid only; CREDIT rows keyed by po.id are
+    // cancel/delete reversals, not payments.
+    const livePaid = po.paid || 0;
 
     return {
       ...po,
@@ -1749,11 +1749,18 @@ export class ProcurementService {
 
       if (availableAdvance <= 0.01) return;
 
-      // 4. Find all outstanding orders (APPROVED or RECEIVED, not closed, having remaining balance)
+      // 4. Find outstanding orders whose goods have been received (GRN
+      // approved), not closed, having remaining balance. APPROVED POs used to
+      // be included, so any unmatched vendor debit (a purchase return, or the
+      // part of a bill payment above its PO's total) was silently written
+      // into a just-approved PO's `paid` — showing it as Paid with 0 units
+      // received and no payment recorded against it. Advance on an
+      // unreceived PO is applied only explicitly (createPurchaseOrder's
+      // advancePaid, recordAdvancePayment, applyAdvanceToPO).
       const outstandingOrders = await tx.procurementOrder.findMany({
-        where: { 
-          vendorId, 
-          status: { in: ['APPROVED', 'RECEIVED'] },
+        where: {
+          vendorId,
+          status: 'RECEIVED',
           balance: { gt: 0 }
         },
         orderBy: { createdAt: 'asc' }

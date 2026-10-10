@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { createOrderItemUnitResolver } from '../../utils/order-item-unit.util';
 
 export class DealerService {
   static async getAll(franchiseId?: string) {
@@ -298,13 +299,16 @@ export class DealerService {
       name: string;
       sku: string;
       category?: string;
-      unit?: string;
+      unit: string | null;
       quantitySold: number;
       totalValue: number;
       lastPurchased: Date;
       orderCount: number;
     }>();
 
+    // Same unit resolution and per-product-and-unit grouping as
+    // CustomerService.getItemHistory.
+    const resolveUnit = createOrderItemUnitResolver();
     for (const order of orders as any[]) {
       for (const item of order.orderItems || []) {
         if (!item.productId && !item.product) continue;
@@ -312,13 +316,14 @@ export class DealerService {
         const prodName = item.product?.name || item.productName || 'Product';
         const sku = item.product?.sku || '—';
         const category = item.product?.category || '—';
-        const unit = item.product?.unit || item.unit || 'PCS';
+        const unit = await resolveUnit(item, order.franchiseId);
+        const groupKey = `${prodId}|${unit ?? ''}`;
         const qty = Number(item.quantity) || 0;
         const val = Number(item.totalAmount || (item.price * item.quantity)) || 0;
         const dt = new Date(order.createdAt);
 
-        if (!productMap.has(prodId)) {
-          productMap.set(prodId, {
+        if (!productMap.has(groupKey)) {
+          productMap.set(groupKey, {
             productId: prodId,
             name: prodName,
             sku,
@@ -330,7 +335,7 @@ export class DealerService {
             orderCount: 1
           });
         } else {
-          const p = productMap.get(prodId)!;
+          const p = productMap.get(groupKey)!;
           p.quantitySold += qty;
           p.totalValue += val;
           p.orderCount += 1;
@@ -346,13 +351,15 @@ export class DealerService {
         const prodName = item.productName || 'Product';
         const sku = '—';
         const category = '—';
-        const unit = item.unit || 'PCS';
+        // Challan stock leaves the dispatching (source) franchise's inventory.
+        const unit = await resolveUnit({ unit: item.unit, product: { name: item.productName } }, ch.sourceFranchiseId || ch.franchiseId);
+        const groupKey = `${prodId}|${unit ?? ''}`;
         const qty = Number(item.quantity) || 0;
         const val = Number(item.totalAmount || (item.rate * item.quantity)) || 0;
         const dt = new Date(ch.challanDate || ch.createdAt);
 
-        if (!productMap.has(prodId)) {
-          productMap.set(prodId, {
+        if (!productMap.has(groupKey)) {
+          productMap.set(groupKey, {
             productId: prodId,
             name: prodName,
             sku,
@@ -364,7 +371,7 @@ export class DealerService {
             orderCount: 1
           });
         } else {
-          const p = productMap.get(prodId)!;
+          const p = productMap.get(groupKey)!;
           p.quantitySold += qty;
           p.totalValue += val;
           p.orderCount += 1;

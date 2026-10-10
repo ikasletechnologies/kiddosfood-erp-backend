@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import { createOrderItemUnitResolver } from '../../utils/order-item-unit.util';
 
 export class CustomerService {
   static async getAll(search?: string, franchiseId?: string, isHqScope: boolean = false) {
@@ -57,7 +58,9 @@ export class CustomerService {
     if (customerIds.length === 0) return result;
 
     const orders = await prisma.order.findMany({
-      where: { customerId: { in: customerIds } },
+      // A cancelled bill is no longer collectible (cancelInvoice only allows
+      // cancelling one with no active payments), so it adds nothing due.
+      where: { customerId: { in: customerIds }, status: { not: 'CANCELLED' } },
       select: {
         customerId: true,
         totalAmount: true,
@@ -303,13 +306,14 @@ export class CustomerService {
       name: string;
       sku: string;
       category?: string;
-      unit?: string;
+      unit: string | null;
       quantitySold: number;
       totalValue: number;
       lastPurchased: Date;
       orderCount: number;
     }>();
 
+    const resolveUnit = createOrderItemUnitResolver();
     for (const order of orders as any[]) {
       for (const item of order.orderItems || []) {
         if (!item.productId && !item.product) continue;
@@ -317,13 +321,17 @@ export class CustomerService {
         const prodName = item.product?.name || item.productName || 'Product';
         const sku = item.product?.sku || '—';
         const category = item.product?.category || '—';
-        const unit = item.product?.unit || item.unit || 'PCS';
+        // The unit this line was actually sold in (null only if genuinely
+        // unknown). Grouped per product AND unit so quantities sold in
+        // different units are never added together.
+        const unit = await resolveUnit(item, order.franchiseId);
+        const groupKey = `${prodId}|${unit ?? ''}`;
         const qty = Number(item.quantity) || 0;
         const val = Number(item.totalAmount || (item.price * item.quantity)) || 0;
         const dt = new Date(order.createdAt);
 
-        if (!productMap.has(prodId)) {
-          productMap.set(prodId, {
+        if (!productMap.has(groupKey)) {
+          productMap.set(groupKey, {
             productId: prodId,
             name: prodName,
             sku,
@@ -335,7 +343,7 @@ export class CustomerService {
             orderCount: 1
           });
         } else {
-          const p = productMap.get(prodId)!;
+          const p = productMap.get(groupKey)!;
           p.quantitySold += qty;
           p.totalValue += val;
           p.orderCount += 1;

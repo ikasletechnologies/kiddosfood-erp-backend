@@ -45,12 +45,13 @@ async function verifyPurchaseReturns() {
        console.log("✅ SUCCESS: GRN Rejection return correctly ignored inventory.");
     }
     
-    // Check Vendor Ledger
+    // Check Vendor Ledger — rejected goods were never billed (GRN bill = accepted
+    // qty only), so a GRN-rejection return must post no DEBIT.
     const grnLedger = await prisma.vendorLedger.findFirst({ where: { referenceId: grnPr.id, type: 'DEBIT' } });
-    if (grnLedger?.amount === 20) {
-      console.log("✅ SUCCESS: Vendor Ledger correctly debited ₹20.");
+    if (!grnLedger) {
+      console.log("✅ SUCCESS: GRN Rejection return posted no Vendor Ledger debit.");
     } else {
-      console.error("❌ FAILED: Vendor Ledger debit incorrect or missing.");
+      console.error(`❌ FAILED: GRN Rejection return debited the Vendor Ledger ₹${grnLedger.amount}.`);
     }
 
     // === Case 2: Manual Return (KG converted to G) ===

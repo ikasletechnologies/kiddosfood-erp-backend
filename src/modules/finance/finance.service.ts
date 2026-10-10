@@ -666,6 +666,59 @@ export class FinanceService {
     };
   }
 
+  /**
+   * Payment-In: one party's Tax Invoices that can still receive a payment,
+   * with paid-so-far and outstanding computed by the SAME rule
+   * createPayment's overpayment guard enforces (getInvoicePaidAmount:
+   * direct PAID payments + this invoice's share of multi-invoice receipts),
+   * so the form can never offer an amount the save would reject. Excludes
+   * cancelled, draft and fully settled invoices. Read-only.
+   */
+  static async getOutstandingInvoicesForParty(params: { partyType: string; partyId: string; franchiseId?: string | null }) {
+    const partyType = (params.partyType || 'CUSTOMER').toUpperCase();
+    if (!['CUSTOMER', 'DEALER', 'FRANCHISE'].includes(partyType)) throw new PaymentValidationError('INVALID_PARTY', 'Party type must be CUSTOMER, DEALER or FRANCHISE.');
+    if (!params.partyId) throw new PaymentValidationError('INVALID_PARTY', 'Select a party to load its outstanding invoices.');
+
+    // An Order's party: customerId (or partyId) for CUSTOMER, partyId otherwise.
+    const partyFilter = partyType === 'CUSTOMER'
+      ? { OR: [{ customerId: params.partyId }, { partyType: 'CUSTOMER' as any, partyId: params.partyId }] }
+      : { partyType: partyType as any, partyId: params.partyId };
+
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        status: { notIn: ['CANCELLED', 'DRAFT'] },
+        order: { status: { not: 'CANCELLED' }, ...partyFilter, ...(params.franchiseId ? { franchiseId: params.franchiseId } : {}) },
+      },
+      include: {
+        order: { select: { id: true, invoiceNum: true, partyType: true, partyId: true, customerId: true, franchiseId: true } },
+        payments: { select: { paidAmount: true, status: true, isCancelled: true } },
+        allocations: { select: { amount: true, payment: { select: { status: true, isCancelled: true, invoiceId: true } } } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    return invoices
+      .map((inv) => {
+        const direct = inv.payments.filter(p => p.status === 'PAID' && !p.isCancelled).reduce((s, p) => s + (p.paidAmount || 0), 0);
+        const allocated = inv.allocations
+          .filter(a => a.payment.status === 'PAID' && !a.payment.isCancelled && a.payment.invoiceId !== inv.id)
+          .reduce((s, a) => s + (a.amount || 0), 0);
+        const paidSoFar = round2(direct + allocated);
+        return {
+          id: inv.id,
+          orderId: inv.orderId,
+          invoiceNum: inv.order?.invoiceNum || null,
+          createdAt: inv.createdAt,
+          status: inv.status,
+          finalAmount: inv.finalAmount,
+          paidSoFar,
+          outstanding: Math.max(0, round2(inv.finalAmount - paidSoFar)),
+        };
+      })
+      .filter(i => i.outstanding > 0.009);
+  }
+
   static async getInvoices(filters?: { franchiseId?: string; startDate?: string; endDate?: string; search?: string; status?: string } | string) {
     const opts = typeof filters === 'string' ? { franchiseId: filters } : (filters || {});
     const where: any = {};
@@ -946,6 +999,48 @@ export class FinanceService {
     });
   }
 
+  /**
+   * Voids the CustomerLedger effect of a cancelled document without deleting
+   * history: for every customer with rows of the given reference types keyed
+   * to `referenceId`, posts one ADJUSTMENT row for the opposite of their net
+   * amount. Earlier ADJUSTMENT rows on the same referenceId are part of that
+   * net, so calling this again (retry, backfill) posts nothing — no duplicate
+   * reversals. Returns the rows it created.
+   */
+  static async reverseCustomerLedgerEntries(tx: any, params: {
+    referenceId: string;
+    referenceTypes: Array<'SALE' | 'PAYMENT' | 'RETURN'>;
+    note: string;
+  }) {
+    const rows = await tx.customerLedger.findMany({
+      where: { referenceId: params.referenceId, referenceType: { in: [...params.referenceTypes, 'ADJUSTMENT'] } },
+      orderBy: { createdAt: 'asc' }
+    });
+    const netByCustomer = new Map<string, { net: number; paymentMode: any }>();
+    for (const r of rows) {
+      const entry = netByCustomer.get(r.customerId) || { net: 0, paymentMode: r.paymentMode };
+      entry.net += r.type === 'DEBIT' ? r.amount : -r.amount;
+      netByCustomer.set(r.customerId, entry);
+    }
+    const created: any[] = [];
+    for (const [customerId, { net, paymentMode }] of netByCustomer) {
+      const amount = Math.round(Math.abs(net) * 100) / 100;
+      if (amount < 0.01) continue;
+      created.push(await tx.customerLedger.create({
+        data: {
+          customerId,
+          type: net > 0 ? 'CREDIT' : 'DEBIT',
+          amount,
+          paymentMode: paymentMode || 'CASH',
+          referenceType: 'ADJUSTMENT',
+          referenceId: params.referenceId,
+          note: params.note
+        }
+      }));
+    }
+    return created;
+  }
+
   static async cancelInvoice(invoiceId: string, user?: any) {
     return prisma.$transaction(async (tx) => {
       const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
@@ -971,9 +1066,20 @@ export class FinanceService {
       });
 
       if (invoice.orderId) {
-        await tx.order.update({
+        const order = await tx.order.update({
           where: { id: invoice.orderId },
           data: { status: "CANCELLED", paymentStatus: "CANCELLED" }
+        });
+
+        // Reverse the receivable this invoice put on the customer ledger
+        // (its SALE debit, plus any payment credit keyed to the order
+        // itself). The original rows stay for audit; the reversal nets the
+        // invoice to zero. Its payments were already cancelled above (a
+        // precondition), and cancelPayment reverses their own ledger rows.
+        await this.reverseCustomerLedgerEntries(tx, {
+          referenceId: order.id,
+          referenceTypes: ['SALE', 'PAYMENT'],
+          note: `Reversal — Invoice #${order.invoiceNum} cancelled`
         });
       }
 
@@ -1068,7 +1174,8 @@ export class FinanceService {
           ],
         } : {}),
       },
-      include: { order: true, invoice: true, account: true },
+      // allocations → invoice numbers for a multi-invoice receipt (orderId is null there).
+      include: { order: true, invoice: true, account: true, allocations: { include: { invoice: { include: { order: { select: { invoiceNum: true } } } } } } },
       orderBy: { createdAt: 'desc' }
     });
 
@@ -1132,6 +1239,8 @@ export class FinanceService {
         invoiceId: p.invoiceId,
         orderId: p.order?.id || p.invoice?.orderId || null,
         invoiceNum: p.order?.invoiceNum || null,
+        // Every invoice this receipt settles (single or multi-invoice).
+        invoiceNums: Array.from(new Set([p.order?.invoiceNum, ...(p.allocations || []).map((a: any) => a.invoice?.order?.invoiceNum)].filter(Boolean))),
         isCancelled: p.isCancelled,
         accountName: p.account?.name || "Unknown",
       };
@@ -1983,8 +2092,97 @@ export class FinanceService {
         });
       }
 
+      // A cancelled customer payment no longer settles anything: reverse the
+      // ledger row createPayment posted for it (keyed by payment id).
+      if (original.entityType === 'CUSTOMER') {
+        await this.reverseCustomerLedgerEntries(tx, {
+          referenceId: original.id,
+          referenceTypes: ['PAYMENT'],
+          note: `Reversal — Payment #${original.paymentNumber || original.id} cancelled`
+        });
+      }
+
       return { success: true };
     });
+  }
+
+  // Throws unless `batchNumber` is a sellable lot of this exact inventory item
+  // (seller's own stock) with at least `requiredBaseQty` left. The checks run
+  // most-specific first so the operator gets an actionable reason.
+  private static async assertSellableBatch(tx: any, invItem: any, prodName: string, batchNumber: string, requiredBaseQty: number, unitLabel: string) {
+    const rows = await tx.inventoryBatch.findMany({
+      where: { inventoryItemId: invItem.id, batchNumber },
+      select: { currentQty: true, status: true, expDate: true },
+    });
+    if (rows.length === 0) {
+      throw new Error(`Invalid batch number "${batchNumber}" for "${prodName}". Please select an available batch from inventory for the selected product.`);
+    }
+    const now = Date.now();
+    const sellable = rows.filter((b: any) =>
+      b.status === 'APPROVED' && b.currentQty > 0 && (!b.expDate || new Date(b.expDate).getTime() >= now));
+    if (sellable.length === 0) {
+      const withStock = rows.filter((b: any) => b.currentQty > 0);
+      if (withStock.some((b: any) => b.expDate && new Date(b.expDate).getTime() < now) || withStock.some((b: any) => b.status === 'EXPIRED')) {
+        throw new Error(`Batch "${batchNumber}" of "${prodName}" has expired and cannot be sold.`);
+      }
+      const blocked = withStock.find((b: any) => b.status !== 'APPROVED');
+      if (blocked) {
+        throw new Error(`Batch "${batchNumber}" of "${prodName}" is ${String(blocked.status).replace('_', ' ')} and cannot be sold.`);
+      }
+      throw new Error(`Batch "${batchNumber}" of "${prodName}" has no stock left. Please select an available batch.`);
+    }
+    const available = sellable.reduce((s: number, b: any) => s + b.currentQty, 0);
+    if (available + 0.0001 < requiredBaseQty) {
+      throw new Error(`Insufficient stock in batch "${batchNumber}" of "${prodName}". Available: ${available} ${unitLabel}, Required: ${requiredBaseQty} ${unitLabel}.`);
+    }
+  }
+
+  // Sellable batches for the Sale Invoice batch dropdown — resolved against
+  // the same seller inventory scope createInvoice deducts from (HQ for a
+  // Franchise-party sale, otherwise the invoicing branch), so the dropdown
+  // offers exactly the lots the server will accept.
+  static async getInvoiceBatchOptions(params: { productId: string; franchiseId: string | null; partyType?: string }) {
+    let sellerFranchiseId = params.franchiseId;
+    if (params.partyType === 'FRANCHISE' || !sellerFranchiseId) {
+      const hqRow = await prisma.franchise.findFirst({ where: { isHQ: true } });
+      if (hqRow) sellerFranchiseId = hqRow.id;
+    }
+    const scopeFranchiseId = sellerFranchiseId ? await FranchiseService.toInventoryScopeId(prisma, sellerFranchiseId) : null;
+    const hq = await FranchiseService.getHqFranchiseOrNull();
+    const isHqSeller = !scopeFranchiseId || (hq && hq.id === scopeFranchiseId);
+    const scope = isHqSeller
+      ? { OR: [{ franchiseId: null }, ...(hq ? [{ franchiseId: hq.id }] : [])] }
+      : { franchiseId: scopeFranchiseId };
+
+    const product = await prisma.product.findUnique({ where: { id: params.productId } })
+      || await prisma.product.findFirst({ where: { sku: params.productId } });
+    const invItem = product?.sku
+      ? await prisma.inventoryItem.findFirst({ where: { sku: product.sku, ...scope } })
+      : await prisma.inventoryItem.findFirst({ where: { id: params.productId, ...scope } });
+    if (!invItem) return { batchTracked: false, batches: [] };
+
+    // "Batch-tracked" = the item has lots with stock on record in any state.
+    // Items whose stock isn't held in lots keep the existing no-batch flow.
+    const trackedCount = await prisma.inventoryBatch.count({ where: { inventoryItemId: invItem.id, currentQty: { gt: 0 } } });
+    const rows = await InventoryService.getSellableBatches(prisma, invItem.id);
+
+    // One option per batch number (a lot can be split over several rows,
+    // e.g. per warehouse) with its combined sellable quantity.
+    const byNumber = new Map<string, { batchCode: string; quantity: number; expDate: Date | null; mfgDate: Date | null }>();
+    for (const r of rows) {
+      const existing = byNumber.get(r.batchNumber);
+      if (existing) {
+        existing.quantity += r.currentQty;
+        if (r.expDate && (!existing.expDate || r.expDate < existing.expDate)) existing.expDate = r.expDate;
+      } else {
+        byNumber.set(r.batchNumber, { batchCode: r.batchNumber, quantity: r.currentQty, expDate: r.expDate, mfgDate: r.mfgDate });
+      }
+    }
+    return {
+      batchTracked: trackedCount > 0,
+      unit: invItem.unit,
+      batches: [...byNumber.values()].map(b => ({ id: b.batchCode, ...b })),
+    };
   }
 
   static async createInvoice(data: {
@@ -2016,6 +2214,7 @@ export class FinanceService {
     sourceQuotationId?: string;
     sourceDeliveryChallanId?: string;
     roundOff?: number;
+    roundOffEnabled?: boolean;
     stateOfSupply?: string;
     paymentType?: string;
     termsAndConditions?: string;
@@ -2120,11 +2319,22 @@ export class FinanceService {
         orderItemQty: number;
         unitId?: string;
         product: any;
+        batchNumber?: string;
       }> = [];
+      // Base qty already claimed per "inventoryItemId|batchNumber", so two
+      // lines drawing on the same lot are checked against its combined stock.
+      const batchClaims = new Map<string, number>();
 
       for (const checkItem of data.items) {
         const checkQty = Number(checkItem.qty ?? checkItem.quantity ?? 0);
         if (checkQty <= 0) continue;
+        const checkBatch = (checkItem.batchNumber || '').trim();
+
+        // A batch can only be validated against a real inventory item — a
+        // free-text line has nothing to check it against, so it can't carry one.
+        if (!checkItem.productId && checkBatch) {
+          throw new Error(`Invalid batch number "${checkBatch}" on "${checkItem.productName || 'custom item'}". Please select an available batch from inventory for the selected product.`);
+        }
 
         if (checkItem.productId) {
           let prod = await tx.product.findUnique({ where: { id: checkItem.productId } });
@@ -2208,13 +2418,25 @@ export class FinanceService {
             );
           }
 
+          if (checkBatch) {
+            const prodName = prod?.name || checkItem.productName || invItem?.name || 'Item';
+            if (!invItem) {
+              throw new Error(`Invalid batch number "${checkBatch}" for "${prodName}". Please select an available batch from inventory for the selected product.`);
+            }
+            const claimKey = `${invItem.id}|${checkBatch}`;
+            const alreadyClaimed = batchClaims.get(claimKey) || 0;
+            await this.assertSellableBatch(tx, invItem, prodName, checkBatch, alreadyClaimed + requiredBaseQty, unitLabel);
+            batchClaims.set(claimKey, alreadyClaimed + requiredBaseQty);
+          }
+
           if (invItem) {
             itemsToDeduct.push({
               inventoryItem: invItem,
               requiredBaseQty,
               orderItemQty: checkQty,
               unitId: conversionResult.unitId,
-              product: prod || { name: invItem.name, sku: invItem.sku }
+              product: prod || { name: invItem.name, sku: invItem.sku },
+              batchNumber: checkBatch || undefined
             });
           }
         }
@@ -2320,7 +2542,7 @@ export class FinanceService {
           discountPct: discountPct,
           taxAmount: itemTax,
           totalAmount: itemTaxableAmount + itemTax,
-          batchNumber: item.batchNumber || null
+          batchNumber: (item.batchNumber || '').trim() || null
         });
       }
 
@@ -2340,16 +2562,27 @@ export class FinanceService {
       const seq = await this.nextPaymentSequence(tx, `INV_${year}`);
       const invoiceNum = data.invoiceNumber || `INV-${year}-${seq.toString().padStart(4, '0')}`;
 
+      // Round-off is derived here, once, from the server-computed total — the
+      // client only says whether it's on (roundOffEnabled). Previously the
+      // Sale Invoice form never sent it, so roundOff was always stored as 0
+      // and the saved/listed total was the pre-round-off amount. A legacy
+      // caller sending a numeric roundOff is honoured only as "on/off": the
+      // amount itself is never trusted, and is at most ±0.50 by construction.
+      const roundOffEnabled = data.roundOffEnabled !== undefined
+        ? Boolean(data.roundOffEnabled)
+        : Number(data.roundOff || 0) !== 0;
+      const preRoundTotal = Math.round(totalAmount * 100) / 100;
+      const finalAmount = roundOffEnabled ? Math.round(preRoundTotal) : preRoundTotal;
+      const roundOff = Math.round((finalAmount - preRoundTotal) * 100) / 100;
+
+      // Payment status is judged against the final payable (after round-off).
       const received = data.receivedAmount || 0;
       let paymentStatus = 'UNPAID';
-      if (received >= totalAmount - 0.01) {
+      if (received >= finalAmount - 0.01) {
         paymentStatus = 'PAID';
       } else if (received > 0) {
         paymentStatus = 'PARTIAL';
       }
-
-      const roundOff = data.roundOff || 0;
-      const finalAmount = totalAmount + roundOff;
 
       let resolvedCustomerName = (data as any).customerName || null;
       if (!resolvedCustomerName && data.partyType === 'FRANCHISE' && data.partyId) {
@@ -2534,7 +2767,10 @@ export class FinanceService {
           data: {
             customerId: data.customerId,
             type: 'DEBIT',
-            amount: totalAmount,
+            // The final payable (incl. round-off) — same figure as
+            // Invoice.finalAmount / Order.totalAmount, so the ledger and
+            // the invoice balance agree.
+            amount: finalAmount,
             paymentMode: ledgerPaymentMode,
             referenceType: 'SALE',
             referenceId: order.id,
@@ -2558,7 +2794,12 @@ export class FinanceService {
       }
 
       // Automatically deduct inventory based on the items sold
+      // A line with a selected batch is deducted from that exact lot (re-checked
+      // under row lock); lines without one keep the existing FIFO depletion.
       for (const ded of itemsToDeduct) {
+        const precalculatedFifo = ded.batchNumber
+          ? await InventoryService.depleteNamedBatch(tx, ded.inventoryItem.id, ded.batchNumber, ded.requiredBaseQty)
+          : undefined;
         await InventoryService.recordMovement(tx, {
           itemId: ded.inventoryItem.id,
           type: 'SALES_OUT',
@@ -2567,7 +2808,8 @@ export class FinanceService {
           transactionUnit: ded.unitId,
           referenceType: 'ORDER',
           referenceId: order.id,
-          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name})`
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name}${ded.batchNumber ? `, Batch: ${ded.batchNumber}` : ''})`,
+          precalculatedFifo
         });
       }
 
@@ -3962,7 +4204,7 @@ export class FinanceService {
           for (const l of ledgers) {
             rawTxns.push({
               date: l.createdAt,
-              txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : 'Payment-In',
+              txnType: l.referenceType === 'SALE' ? 'POS Sale' : l.referenceType === 'OPENING_BALANCE' ? 'Opening Balance' : l.referenceType === 'ADJUSTMENT' ? 'Reversal' : l.referenceType === 'RETURN' ? 'Sales Return' : 'Payment-In',
               particular: (l as any).description || l.note || (l.referenceType === 'SALE' ? 'Sales Invoice' : 'Customer Payment'),
               refNo: l.referenceId ? l.referenceId.slice(0, 8).toUpperCase() : '—',
               paymentType: l.paymentMode || '—',

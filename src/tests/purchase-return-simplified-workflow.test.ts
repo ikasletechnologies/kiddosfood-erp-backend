@@ -180,7 +180,9 @@ async function runTests() {
 
     check('7a. GRN Rejection return completed with status COMPLETED', completedGRNReturn?.status === 'COMPLETED');
     check('7b. GRN Rejection creates 0 RETURN_OUT stock movements (rejected stock never entered inventory)', grnMovements === 0, `Got ${grnMovements}`);
-    check('7c. GRN Rejection creates exactly 1 Vendor Ledger DEBIT entry', grnLedgers.length === 1 && grnLedgers[0].type === 'DEBIT' && grnLedgers[0].amount === 300, `Got ${grnLedgers.length}`);
+    // Rejected goods are never billed (the GRN bill covers accepted qty only), so
+    // a GRN-rejection return must not debit the vendor ledger.
+    check('7c. GRN Rejection creates 0 Vendor Ledger entries (rejected goods were never billed)', grnLedgers.length === 0, `Got ${grnLedgers.length}`);
 
     // ── 8. Decimal Precision Verification (₹51.50) ──
     const decimalReturn = await prisma.purchaseReturn.create({

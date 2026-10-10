@@ -473,6 +473,9 @@ model GoodsReceipt {
   status           GRNStatus          @default(PENDING)
   freightCost      Float              @default(0)
   unloadingCost    Float              @default(0)
+  rejectionReason  String?
+  rejectedAt       DateTime?
+  rejectedBy       String?
   procurementOrder ProcurementOrder   @relation(fields: [poId], references: [id])
   items            GoodsReceiptItem[]
   invoices         VendorInvoice[]
@@ -1438,6 +1441,7 @@ model ReturnOrder {
   sgst             Float?
   igst             Float?
   taxAmount        Float?
+  roundOffAmount   Float           @default(0)
   refundMethod     String?
   approvedBy       String?
   approvedAt       DateTime?
@@ -2115,6 +2119,8 @@ enum StockMovementType {
 enum GRNStatus {
   PENDING
   COMPLETED
+  // Fully rejected on receipt: nothing accepted, no stock or vendor bill posted.
+  REJECTED
   CANCELLED
 }
 

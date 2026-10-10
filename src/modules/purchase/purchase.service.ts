@@ -254,6 +254,13 @@ export class PurchaseService {
     });
     if (!pr) throw new Error('Purchase Return not found');
 
+    // Goods rejected at GRN were never billed — GRN approval posts the vendor
+    // bill on ACCEPTED quantity only (and a fully rejected GRN posts none).
+    // A DEBIT here would cut the payable for goods never charged (or, for a
+    // full rejection, leave the vendor owing us). These returns are tracking
+    // documents for the rejected material only.
+    if (pr.returnSource === 'GRN_REJECTION') return;
+
     const alreadyPosted = await tx.vendorLedger.findFirst({
       where: {
         vendorId: pr.vendorId,

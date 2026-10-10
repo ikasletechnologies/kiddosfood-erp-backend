@@ -10,7 +10,19 @@ export class RecallController {
   static async getEligibility(req: Request, res: Response) {
     try {
       const result = await RecallService.checkEligibility(req.params.id);
-      if (!result.batch) return res.status(404).json({ error: 'Batch not found.' });
+      if (!result.batch) {
+        // /api/production/batches also lists GRN raw-material lots
+        // (InventoryBatch). Recall acts on production batches (distribution,
+        // sales blocking, outlet returns), so say so instead of "not found".
+        const { default: prisma } = await import('../../lib/prisma');
+        const rawLot = await prisma.inventoryBatch.findUnique({ where: { id: req.params.id }, select: { lotNumber: true, batchNumber: true } });
+        if (rawLot) {
+          return res.status(422).json({
+            error: `${rawLot.lotNumber || rawLot.batchNumber || 'This lot'} is a raw-material lot received through GRN. Batch Recall applies to production batches — recall the production batches made from it, or return the lot to the vendor through Purchase Returns.`,
+          });
+        }
+        return res.status(404).json({ error: 'Batch not found.' });
+      }
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });

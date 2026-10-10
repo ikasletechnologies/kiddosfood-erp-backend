@@ -341,7 +341,7 @@ export class GRNService {
     });
   }
 
-  static async approve(grnId: string, user?: any) {
+  static async approve(grnId: string, user?: any, options: { rejectionReason?: string } = {}) {
     return prisma.$transaction(async (tx) => {
       const grn = await tx.goodsReceipt.findUnique({
         where: { id: grnId },
@@ -349,6 +349,7 @@ export class GRNService {
       });
       if (!grn) throw new Error('GRN not found');
       if (grn.status === 'COMPLETED') throw new Error('GRN already approved');
+      if (grn.status === 'REJECTED') throw new Error('GRN already finalized as fully rejected');
       if (grn.status === 'CANCELLED') throw new Error('Cannot approve a cancelled GRN');
 
       // Same row lock createFromPO takes — two GRNs against the same PO
@@ -356,6 +357,38 @@ export class GRNService {
       // have their approvals serialized too, or both could complete and
       // together push cumulative received past what was ever ordered.
       await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${grn.poId} FOR UPDATE`;
+
+      // Full rejection: goods arrived but nothing was accepted. Finalized as
+      // REJECTED with a mandatory reason — no inventory batch, stock
+      // movement or vendor bill is posted, and (since received-against-PO
+      // counts COMPLETED GRNs only) the PO quantity stays open for the
+      // vendor's replacement shipment. Every stock/finance query filters on
+      // COMPLETED, so a REJECTED GRN never reaches usable inventory.
+      const anyReceived = grn.items.some(i => i.receivedQty > 0);
+      const nothingAccepted = grn.items.every(i => !(i.acceptedQty > 0));
+      if (anyReceived && nothingAccepted) {
+        const reason = (options.rejectionReason || '').trim();
+        if (reason.length < 3) {
+          throw new Error('A rejection reason is required to finalize a fully rejected GRN.');
+        }
+        await tx.goodsReceiptItem.updateMany({ where: { grnId }, data: { qcStatus: 'REJECTED' } });
+        const rejected = await tx.goodsReceipt.update({
+          where: { id: grnId },
+          data: { status: 'REJECTED', rejectionReason: reason, rejectedAt: new Date(), rejectedBy: user?.userId || null },
+          include: { procurementOrder: { include: { vendor: true } }, items: { include: { inventoryItem: true } } }
+        });
+        await tx.auditLog.create({
+          data: {
+            module: 'GRN',
+            action: 'REJECT',
+            recordId: grnId,
+            newValue: { status: 'REJECTED', reason, rejectedQty: grn.items.reduce((s, i) => s + (i.rejectedQty || 0), 0) },
+            performedBy: user?.userId || 'SYSTEM'
+          }
+        });
+        return rejected;
+      }
+      if (nothingAccepted) throw new Error('Nothing was received on this GRN — there is nothing to approve.');
 
       // Defense in depth against exactly that: re-check cumulative received
       // (this GRN's own items + every OTHER already-COMPLETED GRN for the
@@ -598,6 +631,7 @@ export class GRNService {
     const grn = await prisma.goodsReceipt.findUnique({ where: { id: grnId } });
     if (!grn) throw new Error('GRN not found');
     if (grn.status === 'COMPLETED') throw new Error('Cannot cancel an approved GRN');
+    if (grn.status === 'REJECTED') throw new Error('Cannot cancel a GRN already finalized as fully rejected');
 
     return prisma.goodsReceipt.update({
       where: { id: grnId },

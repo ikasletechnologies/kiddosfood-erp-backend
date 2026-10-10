@@ -5,6 +5,8 @@ import { FinanceService } from '../finance/finance.service';
 import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
+import { isRealUnit } from '../../utils/order-item-unit.util';
+import { resolveSellingPrice } from '../../utils/selling-price.util';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 // Atomic, collision-safe document numbering using NumberSequence table
@@ -520,15 +522,9 @@ export class POSService {
           ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
           : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
 
-        // Channel prices default to 0 in the schema (unconfigured, not
-        // "genuinely free") — only a positive value counts as configured;
-        // otherwise fall back to the generic base price like before these
-        // channel-specific fields existed on most items.
-        const channelPrice =
-          resolvedPartyType === 'DEALER' ? inv?.dealerPrice :
-          resolvedPartyType === 'FRANCHISE' ? inv?.franchisePrice :
-          inv?.customerPrice;
-        const unitPrice = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product.basePrice || 0);
+        // Same resolver the product catalog uses for what POS search shows,
+        // so the price shown is exactly the price charged.
+        const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
         if (unitPrice <= 0) {
           throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
         }
@@ -557,7 +553,13 @@ export class POSService {
         const lineTax = Number((lineTotal * (taxPct / 100)).toFixed(2));
         const lineDiscount = Number((itemDiscountPerUnit * quantity).toFixed(2));
 
-        return { productId, quantity, unitPrice, lineTotal, lineTax, lineDiscount };
+        // Unit the line is sold (and its stock deducted) in: the unit the
+        // client sent, or — when none was sent ("NONE" = the inventory item's
+        // own unit in convertUnitToBase) — that inventory item's unit, so the
+        // saved line records a real UOM instead of the "NONE" placeholder.
+        const unit = isRealUnit(item.unit) ? item.unit.trim() : (isRealUnit(inv?.unit) ? inv!.unit.trim() : 'NONE');
+
+        return { productId, quantity, unit, unitPrice, lineTotal, lineTax, lineDiscount };
       }));
 
       const serverSubtotal = Number(resolvedLines.reduce((s, l) => s + l.lineTotal, 0).toFixed(2));
@@ -575,10 +577,25 @@ export class POSService {
       // paise first so float noise doesn't bump an already-exact total.
       const finalTotalAmount = Math.ceil(Number(Math.max(0, serverSubtotal + serverTax - finalDiscountAmount).toFixed(2)));
 
-      // Amount actually collected now. A normal counter sale is paid in full;
-      // a credit sale collects 0..total and leaves the rest outstanding.
+      // Amount actually collected now. A credit sale collects 0..total and
+      // leaves the rest outstanding. A normal counter sale must be paid in
+      // full: the cashier's Paid Amount (cash tendered may exceed the bill —
+      // the excess is change, not revenue) is required and must cover the
+      // server-computed total. Selecting a payment mode alone never counts
+      // as payment — an empty/₹0/short Paid Amount used to be booked as a
+      // full payment here, marking unpaid bills PAID with zero outstanding.
+      const requestedPaid = Number(data.paidAmount);
+      const hasPaidAmount = data.paidAmount !== undefined && data.paidAmount !== null
+        && String(data.paidAmount).trim() !== '' && Number.isFinite(requestedPaid);
+      if (!isCreditSale && (!hasPaidAmount || requestedPaid < finalTotalAmount - 0.01)) {
+        const paidLabel = hasPaidAmount ? Math.max(0, requestedPaid) : 0;
+        throw new Error(
+          `Paid amount ₹${paidLabel} is less than the bill total ₹${finalTotalAmount}. ` +
+          'Collect the full amount, or save it as a credit sale against a customer or dealer.'
+        );
+      }
       const receivedNow = isCreditSale
-        ? Math.min(Math.max(0, Number(data.paidAmount) || 0), finalTotalAmount)
+        ? Math.min(Math.max(0, hasPaidAmount ? requestedPaid : 0), finalTotalAmount)
         : finalTotalAmount;
       const paymentStatus = receivedNow >= finalTotalAmount - 0.01 ? 'PAID' : receivedNow > 0 ? 'PARTIAL' : 'UNPAID';
 
@@ -602,6 +619,7 @@ export class POSService {
             create: resolvedLines.map(l => ({
               productId: l.productId,
               quantity: l.quantity,
+              unit: l.unit,
               price: l.unitPrice,
               // Additive population of an already-existing, previously-unused
               // schema field: the per-line channel/"Customer Retail Discount"
@@ -681,12 +699,14 @@ export class POSService {
         createdBy: 'POS_CHECKOUT'
       });
 
-      // 3. Customer Ledger. A credit sale DEBITs the full bill as a SALE (what
-      // the customer owes). The part payment collected now, if any, is
+      // 3. Customer Ledger. Every sale to a real customer DEBITs the full bill
+      // as a SALE (what the customer owes). Whatever was collected now is
       // already CREDITed by FinanceService.createPayment above (entityType
-      // CUSTOMER) — writing a second CREDIT here would double-count it, so
-      // the resulting balance is exactly the unpaid remainder.
-      if (isCreditSale && hasRealCustomer && data.customerId) {
+      // CUSTOMER), so the balance is exactly the unpaid remainder: 0 for a
+      // fully paid bill, total − paid for a credit sale. (A counter sale used
+      // to write a second PAYMENT CREDIT here and no SALE DEBIT, which
+      // double-counted the payment and never showed the bill as owed.)
+      if (hasRealCustomer && data.customerId) {
         await tx.customerLedger.create({
           data: {
             customerId: data.customerId,
@@ -695,20 +715,9 @@ export class POSService {
             paymentMode: 'CASH',
             referenceType: 'SALE',
             referenceId: order.id,
-            note: `POS Credit Sale — Invoice #${order.invoiceNum}`
-          }
-        });
-      } else if (hasRealCustomer && data.customerId) {
-        await tx.customerLedger.create({
-          data: {
-            customerId: data.customerId,
-            type: 'CREDIT',
-            amount: finalTotalAmount,
-            paymentMode: (data.paymentMode as any) || 'CASH',
-            referenceType: 'PAYMENT',
-            referenceId: order.id,
-            accountId: finalAccountId,
-            note: `POS Counter Sale Payment #${order.invoiceNum}`
+            note: isCreditSale
+              ? `POS Credit Sale — Invoice #${order.invoiceNum}`
+              : `POS Counter Sale — Invoice #${order.invoiceNum}`
           }
         });
       }

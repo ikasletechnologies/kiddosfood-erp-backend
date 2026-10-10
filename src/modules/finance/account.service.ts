@@ -42,9 +42,19 @@ export class AccountService {
 
   static async getAccounts(franchiseId?: any) {
     const realFranchiseId = (typeof franchiseId === 'object' && franchiseId !== null) ? franchiseId.franchiseId : franchiseId;
-    const scopeFranchiseId = (typeof realFranchiseId === 'string' && realFranchiseId) ? realFranchiseId : ((await FranchiseService.getHqFranchiseOrNull())?.id || null);
+    const hq = await FranchiseService.getHqFranchiseOrNull();
+    const scopeFranchiseId = (typeof realFranchiseId === 'string' && realFranchiseId) ? realFranchiseId : (hq?.id || null);
+    // franchiseId null is the established "HQ-owned" convention (POS checkout
+    // falls back to `franchiseId: fid || null` accounts too), so HQ's scope
+    // includes those — otherwise an HQ Cash/Bank account stored that way never
+    // appeared and Payment-In showed "no active account" for HQ.
+    const scopeWhere = !scopeFranchiseId
+      ? {}
+      : hq && scopeFranchiseId === hq.id
+        ? { OR: [{ franchiseId: scopeFranchiseId }, { franchiseId: null }] }
+        : { franchiseId: scopeFranchiseId };
     const accounts = await prisma.account.findMany({
-      where: { ...(scopeFranchiseId ? { franchiseId: scopeFranchiseId } : {}) },
+      where: scopeWhere,
       orderBy: { name: 'asc' },
       include: {
         // Only posted, non-cancelled payments count as "activity" — same

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import prisma from '../../lib/prisma';
-import { SalesService } from './sales.service';
+import { SalesService, SalesWorkflowError } from './sales.service';
 
 export class SalesController {
   // ─── Quotations ──────────────────────────────────────────────────────────────
@@ -105,7 +105,10 @@ export class SalesController {
         customerId: req.query.customerId as string,
         search: req.query.search as string,
         startDate: req.query.startDate as string,
-        endDate: req.query.endDate as string
+        endDate: req.query.endDate as string,
+        datePreset: req.query.datePreset as string,
+        dateFrom: req.query.dateFrom as string,
+        dateTo: req.query.dateTo as string
       });
       res.json(orders);
     } catch (error) {
@@ -138,7 +141,8 @@ export class SalesController {
       const order = await SalesService.updateSalesOrder(req.params.id, req.body);
       res.json(order);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      // Invalid/repeated workflow transitions are client errors (409), not crashes.
+      res.status(error instanceof SalesWorkflowError ? 409 : 500).json({ error: (error as Error).message });
     }
   }
 
@@ -316,13 +320,21 @@ export class SalesController {
         }
       }
 
-      const returnOrder = await SalesService.createReturnOrder(req.body);
-      res.status(201).json(returnOrder);
+      // Preview runs the identical calculation (same scoping checks above)
+      // and writes nothing; only reachable through POST /returns/preview.
+      const preview = res.locals.returnPreview === true;
+      const returnOrder = await SalesService.createReturnOrder({ ...req.body, preview });
+      res.status(preview ? 200 : 201).json(returnOrder);
     } catch (error: any) {
       const msg = error?.message || 'Failed to create return order';
       const isBusinessError = /cannot return|maximum returnable|greater than zero|already returned|not found|integrity/i.test(msg);
       res.status(isBusinessError ? 400 : 500).json({ error: msg });
     }
+  }
+
+  static async previewReturnOrder(req: Request, res: Response) {
+    res.locals.returnPreview = true;
+    return SalesController.createReturnOrder(req, res);
   }
 
   static async updateReturnOrder(req: Request, res: Response) {
@@ -408,6 +420,17 @@ export class SalesController {
       res.json(challans);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  // Prefill for "Create Delivery Challan" from a Sale Invoice (Order id).
+  static async getDeliveryChallanPrefill(req: Request, res: Response) {
+    try {
+      const prefill = await SalesService.getDeliveryChallanPrefillFromInvoice(req.params.orderId, (req as any).user);
+      res.json(prefill);
+    } catch (error) {
+      const msg = (error as Error).message;
+      res.status(/not found/i.test(msg) ? 404 : /denied/i.test(msg) ? 403 : /cancelled/i.test(msg) ? 409 : 500).json({ error: msg });
     }
   }
 

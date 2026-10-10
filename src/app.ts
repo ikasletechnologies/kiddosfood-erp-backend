@@ -308,6 +308,7 @@ app.post('/api/delivery/verify', authenticate, authorizeRole(['FRANCHISE_ADMIN']
 // Financials & Reports
 app.get('/api/finance/pl', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getPL);
 app.post('/api/finance/expense', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.addExpense);
+app.get('/api/finance/invoices/outstanding', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getOutstandingInvoices);
 app.get('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.getInvoices);
 app.post('/api/finance/invoices', authenticate, authorizeRole(['FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.get('/api/finance/cash-flow', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getCashFlow);
@@ -671,11 +672,13 @@ app.post('/api/sales/proforma-invoices/:id/convert', authenticate, authorizeRole
 app.post('/api/sales/proforma-invoices/:id/convert-to-sales-order', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertProformaToSalesOrder);
 
 app.get('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoices);
+app.get('/api/sales/invoices/batch-options', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceBatchOptions);
 app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
 app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.cancelInvoice);
 
 app.get('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getReturnOrders);
+app.post('/api/sales/returns/preview', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.previewReturnOrder);
 app.post('/api/sales/returns', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createReturnOrder);
 app.patch('/api/sales/returns/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateReturnOrder);
 app.post('/api/sales/returns/:id/refund', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.refundReturnOrder);
@@ -684,6 +687,7 @@ app.get('/api/sales/analytics', authenticate, authorizeRole(['SUPER_ADMIN', 'FRA
 
 app.get('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallans);
 app.post('/api/sales/delivery-challans', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createDeliveryChallan);
+app.get('/api/sales/delivery-challans/prefill-from-invoice/:orderId', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallanPrefill);
 app.get('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getDeliveryChallan);
 app.patch('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateDeliveryChallan);
 app.delete('/api/sales/delivery-challans/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.deleteDeliveryChallan);

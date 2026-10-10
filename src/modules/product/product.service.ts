@@ -1,6 +1,7 @@
 import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
 import { FranchiseService } from '../franchise/franchise.service';
+import { resolveSellingPrices } from '../../utils/selling-price.util';
 
 // Thrown when a Product.sku collides with an existing row — distinguished
 // from other failures so callers (single create + bulk import) can report a
@@ -216,7 +217,10 @@ export class ProductService {
             gstRate: p.taxPercent,
             baseUnit: null,
             conversions: [],
-            packSize
+            packSize,
+            // Applicable selling price per channel (null = cannot be billed),
+            // from the same resolver POS checkout charges with.
+            sellingPrices: resolveSellingPrices(null, p)
           };
         }
 
@@ -241,7 +245,13 @@ export class ProductService {
           customerPrice: inv.customerPrice,
           baseUnit: inv.baseUnit,
           conversions: inv.conversions,
-          packSize
+          packSize,
+          sellingPrices: resolveSellingPrices(inv, p),
+          // SKU of the Stock Hub (Item Master) record this product resolved
+          // to — what Stock Hub displays. Lets POS show the real SKU for a
+          // legacy product whose own Product.sku is empty (matched by name).
+          // Product.sku itself is left untouched (edit forms save it back).
+          inventorySku: inv.sku || null
         };
       }).filter(Boolean) as any[];
     }

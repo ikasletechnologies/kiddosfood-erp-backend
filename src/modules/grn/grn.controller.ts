@@ -57,7 +57,7 @@ export class GRNController {
   static async approve(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const grn = await GRNService.approve(req.params.id, user);
+      const grn = await GRNService.approve(req.params.id, user, { rejectionReason: req.body?.rejectionReason });
       res.json(grn);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

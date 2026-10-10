@@ -2,6 +2,7 @@ import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
+import { businessDayRangeFilter, resolveDatePreset } from '../../utils/business-date.util';
 
 // Atomic, collision-safe document numbering. A raw `.count()`-based scheme
 // (the old approach here) lets two concurrent requests read the same N
@@ -40,7 +41,7 @@ async function resolveCustomerName(customerId?: string, customerName?: string): 
   return customer?.name;
 }
 
-function calculateTotals<T extends {
+export function calculateTotals<T extends {
   quantity: number;
   rate: number;
   taxPercent?: number;
@@ -117,6 +118,18 @@ function calculateTotals<T extends {
   const grandTotal = Math.max(0, Math.round((subTotal + taxAmount) * 100) / 100);
 
   return { computed, subTotal, taxAmount, totalDiscount, totalAmount: grandTotal };
+}
+
+// Invoice-level round-off: the document form rounds its total to the nearest
+// rupee when round-off is enabled (frontend calculateSalesDocumentTotals) and
+// sends that adjustment as roundOffAmount (0 when disabled). The client's
+// figure is only taken as "round-off on/off" — the adjustment itself is
+// recomputed from the server total, so it can be positive or negative but
+// never anything other than the true nearest-rupee correction.
+export function resolveDocumentRoundOff(requestedRoundOff: unknown, totalBeforeRound: number): number {
+  const requested = Number(requestedRoundOff);
+  if (!Number.isFinite(requested) || requested === 0) return 0;
+  return Math.round((Math.round(totalBeforeRound) - totalBeforeRound) * 100) / 100;
 }
 
 // Resolve the authoritative channel price + GST rate + "Customer Retail
@@ -242,6 +255,35 @@ async function applyAuthoritativePricing<T extends {
     return updated;
   }));
 }
+
+// Sales Order workflow: the status changes a PATCH may make, using only the
+// existing SalesOrderStatus values. DELIVERED (converted to a sale) and
+// CANCELLED are final. Conversion to a Sale/Proforma runs through its own
+// endpoints (which set status themselves), not through this table. Mirrored
+// for button visibility in the Sales Orders page (SALES_ORDER_ACTIONS).
+export const SALES_ORDER_TRANSITIONS: Record<string, string[]> = {
+  DRAFT: ['PENDING', 'CONFIRMED', 'CANCELLED'],
+  PENDING: ['CONFIRMED', 'CANCELLED'],
+  CONFIRMED: ['PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'],
+  PROCESSING: ['SHIPPED', 'DELIVERED', 'CANCELLED'],
+  SHIPPED: ['DELIVERED'],
+  DELIVERED: [],
+  CANCELLED: [],
+};
+const SALES_ORDER_LOCKED_STATUSES: string[] = ['DELIVERED', 'CANCELLED'];
+
+// Proforma Invoice workflow (ProformaInvoiceStatus). Only a DRAFT can be
+// edited; Save finalizes it to SENT. CONVERTED is set only by the convert
+// endpoints, never by a status/update request. CONVERTED and CANCELLED are final.
+export const PROFORMA_TRANSITIONS: Record<string, string[]> = {
+  DRAFT: ['SENT', 'CANCELLED'],
+  SENT: ['CANCELLED'],
+  CONVERTED: [],
+  CANCELLED: [],
+};
+
+// Invalid or repeated workflow transition on a sales document (client error).
+export class SalesWorkflowError extends Error {}
 
 export class SalesService {
   // ─── Quotations ──────────────────────────────────────────────────────────────
@@ -828,6 +870,11 @@ export class SalesService {
         if (salesOrder.status === 'DELIVERED' || (salesOrder.status as string) === 'CLOSED' || (salesOrder.status as string) === 'CONVERTED') {
           throw new Error('This Sales Order has already been converted.');
         }
+        // Same workflow table as PATCH: a draft must be confirmed first, and
+        // a cancelled order can never become a sale.
+        if (!(SALES_ORDER_TRANSITIONS[salesOrder.status] || []).includes('DELIVERED')) {
+          throw new Error(`A ${salesOrder.status} Sales Order cannot be converted to a sale${salesOrder.status === 'DRAFT' ? ' — confirm it first' : ''}.`);
+        }
 
         let franchiseId = payload?.franchiseId;
         if (!franchiseId) {
@@ -1247,13 +1294,15 @@ export class SalesService {
     createdBy?: string;
     proformaNumber?: string;
     status?: any;
+    roundOffAmount?: number;
   }) {
     const discount = data.discountAmount || 0;
     const partyType = data.partyType || 'CUSTOMER';
     // ProformaInvoice, like Quotation, has no franchise scope of its own —
     // resolve against HQ-scoped InventoryItems.
     const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, partyType);
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
+    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(pricedItems, discount);
+    const roundOff = resolveDocumentRoundOff(data.roundOffAmount, totalAmount);
     const customerId = partyType === 'CUSTOMER' ? data.customerId : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId, data.customerName) : (data.customerName || undefined);
 
@@ -1269,13 +1318,14 @@ export class SalesService {
         status: data.status || 'DRAFT',
         subTotal,
         taxAmount,
-        // A forged/negative document discount can't exceed the bill or
-        // drive the total negative — same clamp as calculateTotals' own
-        // per-line bound, applied here since this document-level discount
-        // is layered on top of calculateTotals' result rather than fed
-        // through it.
-        discountAmount: Math.max(0, Math.min(discount, totalAmount)),
-        totalAmount: Math.max(0, totalAmount - Math.max(0, Math.min(discount, totalAmount))),
+        // calculateTotals has already applied (and clamped) every discount —
+        // the document discount is distributed into the lines, or ignored
+        // when the lines carry their own. Subtracting `discount` again here
+        // (as this used to) discounted the stored total twice. Same as
+        // createQuotation: store what was actually applied.
+        discountAmount: totalDiscount,
+        // Authoritative final payable total, round-off included exactly once.
+        totalAmount: Math.max(0, Math.round((totalAmount + roundOff) * 100) / 100),
         paymentTerms: data.paymentTerms,
         notes: data.notes,
         createdBy: data.createdBy,
@@ -1311,13 +1361,21 @@ export class SalesService {
     paymentTerms?: string;
     notes?: string;
     status?: any;
+    roundOffAmount?: number;
   }) {
     const existing = await prisma.proformaInvoice.findUnique({ where: { id } });
     if (!existing) throw new Error('Proforma Invoice not found');
-    if (existing.status !== 'DRAFT') throw new Error(`Cannot update Proforma Invoice in ${existing.status} status`);
+    if (existing.status !== 'DRAFT') throw new SalesWorkflowError(`Cannot update Proforma Invoice in ${existing.status} status`);
+    // The only status an edit may set is DRAFT (stay) or a valid next step
+    // from DRAFT (Save finalizes to SENT); CONVERTED etc. never via an edit.
+    const requestedStatus = data.status || existing.status;
+    if (requestedStatus !== existing.status && !PROFORMA_TRANSITIONS[existing.status].includes(requestedStatus)) {
+      throw new SalesWorkflowError(`A Proforma Invoice cannot move from ${existing.status} to ${requestedStatus}.`);
+    }
 
     const discount = data.discountAmount || 0;
-    const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(data.items, discount);
+    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discount);
+    const roundOff = resolveDocumentRoundOff(data.roundOffAmount, totalAmount);
     const partyType = data.partyType || existing.partyType || 'CUSTOMER';
     const customerId = partyType === 'CUSTOMER' ? (data.customerId || existing.customerId) : undefined;
     const customerName = partyType === 'CUSTOMER' ? await resolveCustomerName(customerId || undefined, data.customerName) : (data.customerName || undefined);
@@ -1333,6 +1391,11 @@ export class SalesService {
     // catch/toast surfaces that as "failed to save", which is correct: the
     // save didn't happen, rather than happening twice.
     return prisma.$transaction(async (tx) => {
+      // Re-checked inside the transaction: a concurrent Save may have just
+      // finalized it to SENT after the read above.
+      const fresh = await tx.proformaInvoice.findUnique({ where: { id }, select: { status: true } });
+      if (fresh?.status !== 'DRAFT') throw new SalesWorkflowError(`Cannot update Proforma Invoice in ${fresh?.status} status`);
+
       await tx.proformaInvoiceItem.deleteMany({ where: { proformaInvoiceId: id } });
 
       return tx.proformaInvoice.update({
@@ -1343,11 +1406,13 @@ export class SalesService {
           customerId,
           customerName,
           customerPhone: data.customerPhone !== undefined ? data.customerPhone : existing.customerPhone,
-          status: data.status || existing.status,
+          status: requestedStatus,
           subTotal,
           taxAmount,
-          discountAmount: Math.max(0, Math.min(discount, totalAmount)),
-          totalAmount: Math.max(0, totalAmount - Math.max(0, Math.min(discount, totalAmount))),
+          // Same as createProformaInvoice: discount applied once (by
+          // calculateTotals), final total includes the round-off once.
+          discountAmount: totalDiscount,
+          totalAmount: Math.max(0, Math.round((totalAmount + roundOff) * 100) / 100),
           paymentTerms: data.paymentTerms !== undefined ? data.paymentTerms : existing.paymentTerms,
           stateOfSupply: data.stateOfSupply !== undefined ? (data.stateOfSupply || null) : (existing as any).stateOfSupply,
           notes: data.notes !== undefined ? data.notes : existing.notes,
@@ -1372,13 +1437,22 @@ export class SalesService {
   }
 
   static async updateProformaStatus(id: string, status: any) {
-    const existing = await prisma.proformaInvoice.findUnique({ where: { id } });
-    if (!existing) throw new Error('Proforma Invoice not found');
-    
-    return prisma.proformaInvoice.update({
-      where: { id },
-      data: { status },
-      include: { items: true, customer: true },
+    return prisma.$transaction(async (tx) => {
+      // Lock so concurrent status requests serialize (no double transition).
+      await tx.$queryRaw`SELECT id FROM "ProformaInvoice" WHERE id = ${id} FOR UPDATE`;
+      const existing = await tx.proformaInvoice.findUnique({ where: { id }, select: { status: true } });
+      if (!existing) throw new Error('Proforma Invoice not found');
+      if (status === existing.status) {
+        throw new SalesWorkflowError(`This Proforma Invoice is already ${existing.status}.`);
+      }
+      if (!(PROFORMA_TRANSITIONS[existing.status] || []).includes(status)) {
+        throw new SalesWorkflowError(`A Proforma Invoice cannot move from ${existing.status} to ${status}.`);
+      }
+      return tx.proformaInvoice.update({
+        where: { id },
+        data: { status },
+        include: { items: true, customer: true },
+      });
     });
   }
 
@@ -1469,7 +1543,7 @@ export class SalesService {
 
   // ─── Sales Orders ────────────────────────────────────────────────────────────
 
-  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string; startDate?: string; endDate?: string }) {
+  static async getSalesOrders(filters: { status?: string; customerId?: string; search?: string; startDate?: string; endDate?: string; datePreset?: string; dateFrom?: string; dateTo?: string }) {
     const where: any = {};
     if (filters.status && filters.status !== 'ALL') {
       if (filters.status === 'OPEN') {
@@ -1481,7 +1555,13 @@ export class SalesService {
       }
     }
     if (filters.customerId) where.customerId = filters.customerId;
-    if (filters.startDate || filters.endDate) {
+    if (filters.datePreset) {
+      // Business-calendar day range (Today / Yesterday / This Week / This
+      // Month / Custom), on the same createdAt the Sales Orders list shows
+      // as the order date. ALL applies no bound.
+      const range = businessDayRangeFilter(resolveDatePreset(filters.datePreset, filters.dateFrom, filters.dateTo));
+      if (range) where.createdAt = range;
+    } else if (filters.startDate || filters.endDate) {
       where.createdAt = {
         ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
         ...(filters.endDate ? { lte: new Date(filters.endDate) } : {})
@@ -1744,6 +1824,28 @@ export class SalesService {
     };
 
     return prisma.$transaction(async (tx) => {
+      // Lock the row so two concurrent requests (e.g. a double-clicked
+      // Confirm) serialize here and the second sees the first's status.
+      await tx.$queryRaw`SELECT id FROM "SalesOrder" WHERE id = ${id} FOR UPDATE`;
+      const current = await tx.salesOrder.findUnique({ where: { id }, select: { status: true } });
+      if (!current) throw new SalesWorkflowError('Sales Order not found.');
+
+      if (SALES_ORDER_LOCKED_STATUSES.includes(current.status)) {
+        throw new SalesWorkflowError(`A ${current.status} Sales Order cannot be modified.`);
+      }
+      if (updateData.status) {
+        const otherChanges = items || Object.keys(cleanSafeData).some(k => k !== 'status' && k !== 'paymentStatus');
+        if (updateData.status === current.status) {
+          // A pure status request to the status it already has is a repeat
+          // of a completed transition (e.g. confirming twice) — reject it.
+          // Alongside other edits it's simply "status unchanged".
+          if (!otherChanges) throw new SalesWorkflowError(`This Sales Order is already ${current.status}.`);
+          delete updateData.status;
+        } else if (!(SALES_ORDER_TRANSITIONS[current.status] || []).includes(updateData.status)) {
+          throw new SalesWorkflowError(`A Sales Order cannot move from ${current.status} to ${updateData.status}.`);
+        }
+      }
+
       if (items) {
         const discount = data.discountAmount || 0;
         const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(items as any[], discount);
@@ -2144,8 +2246,11 @@ export class SalesService {
     items: Array<{ productId?: string; productName: string; quantity: number; rate: number; condition?: string; discountAmount?: number; taxAmount?: number }>;
     refundMethod?: string;
     idempotencyKey?: string;
+    // Compute and return the return credit (same calculation, nothing
+    // written) so the return screen can show the server's figures.
+    preview?: boolean;
   }) {
-    if (data.idempotencyKey) {
+    if (data.idempotencyKey && !data.preview) {
       const existing = await prisma.returnOrder.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { customer: true, dealer: true, franchise: true, salesOrder: true, franchiseOrder: true, posOrder: true, items: true }
@@ -2233,6 +2338,11 @@ export class SalesService {
       let previouslyReturned: Record<string, number> = {};
       let provenanceRefs: Array<{ referenceType: string; referenceId: string }> = [];
       let provenanceScopeFranchiseId: string | null = null;
+      // POS invoice round-off context (see the round-off step below).
+      let posInvoiceNet: number | null = null;       // Order.totalAmount — the payable total, round-off included
+      let posInvoiceRoundOff = 0;                     // round-off actually applied at checkout
+      let priorReturnCredit = 0;                      // Σ refundAmount of earlier non-rejected returns on this invoice
+      let completesInvoice = false;                   // after this return every sold unit has been returned
 
       if (data.posOrderId || data.salesOrderId || data.franchiseOrderId) {
         // Phase 3: lock the original document FIRST, before reading any
@@ -2258,6 +2368,7 @@ export class SalesService {
         });
 
         for (const pr of priorReturns) {
+          priorReturnCredit += Number(pr.refundAmount) || 0;
           for (const it of pr.items) {
             const key = it.productId || it.productName;
             previouslyReturned[key] = (previouslyReturned[key] || 0) + it.quantity;
@@ -2272,6 +2383,12 @@ export class SalesService {
             originalItems = po.orderItems.map((oi: any) => ({ productId: oi.productId, productName: oi.product?.name, quantity: oi.quantity }));
             buyerState = po.stateOfSupply || null;
             sellerFranchiseIdForGst = resolvedFranchiseId || po.franchiseId || null;
+
+            // The invoice's own round-off is not stored as a field — it is
+            // whatever checkout added on top of subtotal + tax − discount to
+            // reach the payable totalAmount (POS rounds up to the rupee).
+            posInvoiceNet = Number(po.totalAmount) || 0;
+            posInvoiceRoundOff = Math.round((posInvoiceNet - ((po.subTotal || 0) + (po.taxAmount || 0) - (po.discountAmount || 0))) * 100) / 100;
 
             // Leftover bill-level discount: the cashier's ad-hoc manualDiscount
             // (see pos.service.ts checkout()) has no per-line home in the
@@ -2357,6 +2474,23 @@ export class SalesService {
               throw new Error(`Cannot return ${item.quantity} units of ${item.productName}. Original sold: ${orig.quantity}, already returned: ${already}, maximum returnable: ${returnable}.`);
             }
           }
+        }
+
+        // Does this return bring every sold unit of the POS invoice back?
+        if (data.posOrderId && posInvoiceNet !== null) {
+          const soldByKey: Record<string, number> = {};
+          for (const o of originalItems) {
+            const k = o.productId || o.productName;
+            if (k) soldByKey[k] = (soldByKey[k] || 0) + (o.quantity || 0);
+          }
+          const nowByKey: Record<string, number> = {};
+          for (const item of data.items) {
+            const k = item.productId || item.productName;
+            nowByKey[k] = (nowByKey[k] || 0) + item.quantity;
+          }
+          const soldKeys = Object.keys(soldByKey);
+          completesInvoice = soldKeys.length > 0
+            && soldKeys.every(k => (previouslyReturned[k] || 0) + (nowByKey[k] || 0) >= soldByKey[k] - 0.001);
         }
       }
 
@@ -2493,6 +2627,28 @@ export class SalesService {
       refundAmount = Math.round(refundAmount * 100) / 100;
       totalTaxableValue = Math.round(totalTaxableValue * 100) / 100;
       totalTaxAmount = Math.round(totalTaxAmount * 100) / 100;
+
+      // Round-off policy for POS invoices (credit = taxable + GST + round-off):
+      //  - A return that completes the invoice (every sold unit now returned)
+      //    reverses the invoice's round-off: its credit is exactly what is
+      //    left of the payable total after earlier returns, so all returns
+      //    together equal Order.totalAmount. The difference from the line
+      //    reversals is the original round-off (plus any paise drift from
+      //    proportional tax/discount splits on earlier partial returns).
+      //  - A partial return refunds its exact line values (paise) and
+      //    reverses no round-off — that stays with the units kept.
+      //  - Either way the credit is capped so the sum of all returns never
+      //    exceeds the invoice's payable total.
+      // GST (taxAmount) and taxable value are unaffected: round-off is not tax.
+      let roundOffAmount = 0;
+      if (posInvoiceNet !== null) {
+        const remainingCredit = Math.max(0, Math.round((posInvoiceNet - priorReturnCredit) * 100) / 100);
+        if (completesInvoice || refundAmount > remainingCredit) {
+          roundOffAmount = Math.round((remainingCredit - refundAmount) * 100) / 100;
+        }
+      }
+      refundAmount = Math.round((refundAmount + roundOffAmount) * 100) / 100;
+
       const overallGstRate = totalTaxableValue > 0 ? Number(((totalTaxAmount / totalTaxableValue) * 100).toFixed(2)) : 0;
 
       // GST split (CGST/SGST vs IGST) is established HERE, at creation, and
@@ -2501,6 +2657,24 @@ export class SalesService {
       // resolution that used to live in updateReturnOrder's backfill.
       const sellerState = await resolveSellerState(sellerFranchiseIdForGst);
       const gstSplit = splitGstAmount(totalTaxAmount, buyerState, sellerState);
+
+      if (data.preview) {
+        return {
+          preview: true,
+          items: returnItemsData.map(({ costAllocation, costReversal, costProvenance, ...line }) => line),
+          taxableValue: totalTaxableValue,
+          taxAmount: totalTaxAmount,
+          cgst: gstSplit.cgst,
+          sgst: gstSplit.sgst,
+          igst: gstSplit.igst,
+          roundOffAmount,
+          refundAmount,
+          invoiceTotal: posInvoiceNet,
+          invoiceRoundOff: posInvoiceNet !== null ? posInvoiceRoundOff : null,
+          previouslyCredited: Math.round(priorReturnCredit * 100) / 100,
+          completesInvoice
+        } as any;
+      }
 
       const returnNumber = await generateReturnNumber();
       const initialStatus = data.status || 'PENDING';
@@ -2522,6 +2696,7 @@ export class SalesService {
           sgst: gstSplit.sgst,
           igst: gstSplit.igst,
           taxAmount: totalTaxAmount,
+          roundOffAmount,
           refundMethod: data.refundMethod,
           status: initialStatus as any,
           idempotencyKey: data.idempotencyKey || undefined,
@@ -3001,8 +3176,9 @@ export class SalesService {
       let finalRefundAmount = Number(ret.refundAmount) || 0;
       const taxable = Number(ret.taxableValue) || 0;
       const tax = Number(ret.taxAmount) || 0;
+      const roundOff = Number((ret as any).roundOffAmount) || 0;
       if (tax > 0 && Math.abs(finalRefundAmount - taxable) < 0.01) {
-        finalRefundAmount = Math.round((taxable + tax) * 100) / 100;
+        finalRefundAmount = Math.round((taxable + tax + roundOff) * 100) / 100;
       }
 
       const idempotencyKey = `RETURN_REFUND_${returnId}`;
@@ -3029,71 +3205,154 @@ export class SalesService {
           throw new Error('Credit Ledger refund requires a Customer, Dealer, or Franchise party on this return.');
         }
       } else {
-        // Cash / Bank / UPI path:
-        // Settlement method was decided earlier in the sales/return flow.
-        // Auto-resolve account and payment method if not explicitly passed by UI.
-        let resolvedAccountId: string | undefined = data.accountId || undefined;
-        let resolvedMethod: string | undefined = data.method || undefined;
+        // Cash / Bank / UPI path. For a return against a POS invoice the
+        // credit is split by the invoice's payment position, never paid out
+        // blindly in cash:
+        //   1. whatever is still outstanding on the invoice is settled first
+        //      (receivable reduced, no money moves);
+        //   2. only the remainder is refunded in money, and it can never
+        //      exceed what was actually collected (confirmed PAID payments)
+        //      minus money already refunded on earlier returns.
+        // An unpaid invoice therefore gets its receivable reversed and no
+        // cash refund; a partially paid one gets both.
+        let cashRefund = finalRefundAmount;
+        let appliedToOutstanding = 0;
+        if (ret.posOrderId) {
+          const { due, order } = await SalesService._computeOrderDue(tx, ret.posOrderId);
+          appliedToOutstanding = Math.round(Math.min(finalRefundAmount, due) * 100) / 100;
+          if (appliedToOutstanding <= 0.01) appliedToOutstanding = 0;
+          cashRefund = Math.round((finalRefundAmount - appliedToOutstanding) * 100) / 100;
 
-        if (!resolvedAccountId) {
-          // 1. Try to find the original payment account from the linked POS order
-          const origPayment = ret.posOrder?.payments?.find((p: any) => p.accountId && p.status === 'PAID');
-          if (origPayment && origPayment.accountId) {
-            resolvedAccountId = origPayment.accountId;
-            if (!resolvedMethod && origPayment.paymentMode) resolvedMethod = origPayment.paymentMode;
-          }
-        }
-
-        // 2. If still no account, resolve the operating franchise's primary CASH or operating account
-        const targetFranchiseId = ret.posOrder?.franchiseId || ret.franchiseId;
-        if (!resolvedAccountId && targetFranchiseId) {
-          const cashAcc = await tx.account.findFirst({
-            where: { franchiseId: targetFranchiseId, type: 'CASH' }
+          const confirmedPaid = (FinanceService as any).sumOrderPaidWithAllocations(
+            order?.payments || [],
+            order?.invoice?.allocations,
+            (p: any) => !p.isCancelled && p.status === 'PAID'
+          );
+          const priorReturns = await tx.returnOrder.findMany({
+            where: { posOrderId: ret.posOrderId, id: { not: ret.id } },
+            select: { id: true }
           });
-          if (cashAcc) {
-            resolvedAccountId = cashAcc.id;
-          } else {
-            const anyAcc = await tx.account.findFirst({
-              where: { franchiseId: targetFranchiseId }
+          const priorRefunds = priorReturns.length
+            ? await tx.payment.aggregate({
+                where: { idempotencyKey: { in: priorReturns.map((r: any) => `RETURN_REFUND_${r.id}`) }, isCancelled: false },
+                _sum: { paidAmount: true }
+              })
+            : null;
+          const refundablePaid = Math.max(0, Math.round((confirmedPaid - (priorRefunds?._sum.paidAmount || 0)) * 100) / 100);
+          if (cashRefund > refundablePaid + 0.01) {
+            throw new Error(`Refund of ₹${cashRefund.toFixed(2)} exceeds the refundable amount actually paid on invoice #${ret.posOrder?.invoiceNum || ''} (₹${refundablePaid.toFixed(2)}).`);
+          }
+
+          if (appliedToOutstanding > 0) {
+            // Same non-cash credit application as _applyCustomerCreditLedgerRefund:
+            // status SUCCESS (no account balance movement) and, for a
+            // customer, no entityType so createPayment writes no extra
+            // ledger row — the RETURN credit below is the only one.
+            await FinanceService.createPayment({
+              tx,
+              amount: appliedToOutstanding,
+              flow: 'IN',
+              status: 'SUCCESS',
+              sourceModule: 'POS',
+              linkedDocType: 'DIRECT',
+              linkedDocId: ret.id,
+              orderId: ret.posOrderId,
+              ...(ret.dealerId ? { entityType: 'DEALER' } : {}),
+              entityId,
+              entity: `${partyLabel} (return applied to unpaid invoice)`,
+              method: 'CASH',
+              franchiseId: ret.posOrder?.franchiseId || undefined,
+              idempotencyKey: `RETURN_REFUND_${ret.id}_APPLY`,
+              createdBy: data.createdBy
             });
-            if (anyAcc) resolvedAccountId = anyAcc.id;
+          }
+
+          // The customer is credited the full return value (mirrors the sale
+          // DEBIT); the money refunded, if any, is DEBITed by createPayment
+          // below (entityType CUSTOMER, flow OUT).
+          if (ret.customerId) {
+            ledger = await tx.customerLedger.create({
+              data: {
+                customerId: ret.customerId,
+                type: 'CREDIT',
+                amount: finalRefundAmount,
+                paymentMode: 'CASH',
+                referenceType: 'RETURN',
+                referenceId: ret.id,
+                note: appliedToOutstanding > 0
+                  ? `Return #${ret.returnNumber} — ₹${appliedToOutstanding.toFixed(2)} adjusted against outstanding, ₹${cashRefund.toFixed(2)} refunded`
+                  : `Return #${ret.returnNumber} credited`
+              }
+            });
           }
         }
 
-        // 3. Fallback for Super Admin / HQ return
-        if (!resolvedAccountId) {
-          const hqCash = await tx.account.findFirst({
-            where: { franchiseId: null, type: 'CASH' }
-          }) || await tx.account.findFirst({
-            where: { franchiseId: null }
+        if (cashRefund > 0.01) {
+          // Settlement method was decided earlier in the sales/return flow.
+          // Auto-resolve account and payment method if not explicitly passed by UI.
+          let resolvedAccountId: string | undefined = data.accountId || undefined;
+          let resolvedMethod: string | undefined = data.method || undefined;
+
+          if (!resolvedAccountId) {
+            // 1. Try to find the original payment account from the linked POS order
+            const origPayment = ret.posOrder?.payments?.find((p: any) => p.accountId && p.status === 'PAID');
+            if (origPayment && origPayment.accountId) {
+              resolvedAccountId = origPayment.accountId;
+              if (!resolvedMethod && origPayment.paymentMode) resolvedMethod = origPayment.paymentMode;
+            }
+          }
+
+          // 2. If still no account, resolve the operating franchise's primary CASH or operating account
+          const targetFranchiseId = ret.posOrder?.franchiseId || ret.franchiseId;
+          if (!resolvedAccountId && targetFranchiseId) {
+            const cashAcc = await tx.account.findFirst({
+              where: { franchiseId: targetFranchiseId, type: 'CASH' }
+            });
+            if (cashAcc) {
+              resolvedAccountId = cashAcc.id;
+            } else {
+              const anyAcc = await tx.account.findFirst({
+                where: { franchiseId: targetFranchiseId }
+              });
+              if (anyAcc) resolvedAccountId = anyAcc.id;
+            }
+          }
+
+          // 3. Fallback for Super Admin / HQ return
+          if (!resolvedAccountId) {
+            const hqCash = await tx.account.findFirst({
+              where: { franchiseId: null, type: 'CASH' }
+            }) || await tx.account.findFirst({
+              where: { franchiseId: null }
+            });
+            if (hqCash) resolvedAccountId = hqCash.id;
+          }
+
+          if (!resolvedAccountId) {
+            throw new Error('Unable to resolve a settlement account for this refund. Please ensure a payment account exists for your branch.');
+          }
+
+          if (!resolvedMethod) {
+            resolvedMethod = ret.posOrder?.paymentType || 'CASH';
+          }
+
+          payment = await FinanceService.createPayment({
+            tx,
+            amount: cashRefund,
+            flow: 'OUT',
+            status: 'PAID',
+            sourceAccount: resolvedAccountId,
+            method: resolvedMethod,
+            sourceModule: 'POS',
+            linkedDocType: 'DIRECT',
+            linkedDocId: ret.id,
+            entityType,
+            entityId,
+            entity: partyLabel,
+            idempotencyKey,
+            createdBy: data.createdBy
           });
-          if (hqCash) resolvedAccountId = hqCash.id;
         }
-
-        if (!resolvedAccountId) {
-          throw new Error('Unable to resolve a settlement account for this refund. Please ensure a payment account exists for your branch.');
-        }
-
-        if (!resolvedMethod) {
-          resolvedMethod = ret.posOrder?.paymentType || 'CASH';
-        }
-
-        payment = await FinanceService.createPayment({
-          tx,
-          amount: finalRefundAmount,
-          flow: 'OUT',
-          status: 'PAID',
-          sourceAccount: resolvedAccountId,
-          method: resolvedMethod,
-          sourceModule: 'POS',
-          linkedDocType: 'DIRECT',
-          linkedDocId: ret.id,
-          entityType,
-          entityId,
-          entity: partyLabel,
-          idempotencyKey,
-          createdBy: data.createdBy
-        });
       }
 
       const updated = await tx.returnOrder.update({
@@ -3233,6 +3492,72 @@ export class SalesService {
       result[oi.productId] = { invoiceQty: oi.quantity, dispatchedQty, remaining: Math.max(0, oi.quantity - dispatchedQty) };
     }
     return result;
+  }
+
+  // Everything a new Delivery Challan needs from its source Sale Invoice
+  // (Order): the real party record for its party type (Order has no Dealer/
+  // party-Franchise relation — order.franchise is the SELLING branch, not
+  // the buyer), the invoice reference, place of supply, and one line per
+  // invoice item that still has quantity left to dispatch after every other
+  // non-cancelled challan on this invoice — the same figure
+  // createDeliveryChallan/updateDeliveryChallan enforce on dispatch.
+  // Read-only.
+  static async getDeliveryChallanPrefillFromInvoice(orderId: string, user?: { role?: string; franchiseId?: string | null }) {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { orderItems: { include: { product: true } }, customer: true, invoice: true },
+    });
+    if (!order) throw new Error('Source Sale Invoice not found.');
+    if (user && user.role !== 'SUPER_ADMIN' && order.franchiseId !== user.franchiseId) {
+      throw new Error('Access denied: this invoice belongs to another branch.');
+    }
+    if (order.status === 'CANCELLED' || order.invoice?.status === 'CANCELLED') {
+      throw new Error(`Invoice ${order.invoiceNum} is cancelled — a delivery challan cannot be created from it.`);
+    }
+
+    const partyType = (order.partyType || 'CUSTOMER') as 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    let party: any = null;
+    if (partyType === 'DEALER' && order.partyId) party = await prisma.dealer.findUnique({ where: { id: order.partyId } });
+    else if (partyType === 'FRANCHISE' && order.partyId) party = await prisma.franchise.findUnique({ where: { id: order.partyId } });
+    else if (order.customerId) party = order.customer;
+
+    const remaining = await SalesService.getRemainingInvoiceQty(orderId);
+    const { createOrderItemUnitResolver } = require('../../utils/order-item-unit.util');
+    const resolveUnit = createOrderItemUnitResolver();
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+
+    const items: any[] = [];
+    for (const oi of order.orderItems) {
+      const rem = remaining[oi.productId];
+      const gross = (oi.quantity || 0) * (oi.price || 0);
+      const taxable = gross * (1 - (oi.discountPct || 0) / 100);
+      // The rate the saved line tax was charged at (product GST, else derived).
+      const taxPercent = oi.product?.taxPercent ?? (taxable > 0 ? round2((oi.taxAmount || 0) / taxable * 100) : 0);
+      items.push({
+        orderItemId: oi.id,
+        productId: oi.productId,
+        productName: oi.product?.name || 'Item',
+        sku: oi.product?.sku || null,
+        unit: await resolveUnit(oi, order.franchiseId),
+        rate: oi.price,
+        discountPct: oi.discountPct || 0,
+        taxPercent,
+        invoiceQty: oi.quantity,
+        dispatchedQty: rem?.dispatchedQty ?? 0,
+        remainingQty: rem?.remaining ?? oi.quantity,
+        batchNumber: oi.batchNumber || null,
+      });
+    }
+
+    return {
+      invoice: { id: order.id, invoiceNum: order.invoiceNum, date: order.createdAt, sellingFranchiseId: order.franchiseId },
+      partyType,
+      party,
+      partyName: order.customerName || party?.name || null,
+      stateOfSupply: order.stateOfSupply || party?.state || null,
+      items,
+      fullyDispatched: items.length > 0 && items.every(i => i.remainingQty <= 0),
+    };
   }
 
   static async createDeliveryChallan(data: {

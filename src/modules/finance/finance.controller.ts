@@ -271,6 +271,22 @@ export class FinanceController {
   }
 
 
+  // Payment-In: a party's invoices that can still receive a payment.
+  static async getOutstandingInvoices(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
+      const invoices = await FinanceService.getOutstandingInvoicesForParty({
+        partyType: String(req.query.partyType || 'CUSTOMER'),
+        partyId: String(req.query.partyId || ''),
+        franchiseId: franchiseFilter.franchiseId || (req.query.franchiseId as string) || null,
+      });
+      res.json(invoices);
+    } catch (error: any) {
+      res.status(error?.statusCode || 500).json({ message: error.message, code: error?.code });
+    }
+  }
+
   static async getInvoices(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -317,8 +333,25 @@ export class FinanceController {
       });
       res.status(201).json(invoice);
     } catch (error: any) {
-      const isBusinessError = /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to/i.test(error.message);
+      const isBusinessError = /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to|Invalid batch|^Batch "/i.test(error.message);
       res.status(isBusinessError ? 400 : 500).json({ error: error.message });
+    }
+  }
+
+  static async getInvoiceBatchOptions(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const productId = String(req.query.productId || '');
+      if (!productId) return res.status(400).json({ error: 'productId is required' });
+      const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.query.franchiseId as string | undefined);
+      const result = await FinanceService.getInvoiceBatchOptions({
+        productId,
+        franchiseId,
+        partyType: req.query.partyType as string | undefined,
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
   }
 

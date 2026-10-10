@@ -1044,6 +1044,80 @@ export class InventoryService {
     };
   }
 
+  // Sellable lots of one item for a normal sale — the same eligibility
+  // depleteBatchesFIFO uses (APPROVED, stock left, not expired). Expired,
+  // blocked/recalled, QC-hold, rejected and returned lots are excluded.
+  static async getSellableBatches(tx: any, itemId: string) {
+    return tx.inventoryBatch.findMany({
+      where: {
+        inventoryItemId: itemId,
+        currentQty: { gt: 0 },
+        status: 'APPROVED',
+        OR: [{ expDate: null }, { expDate: { gte: new Date() } }],
+      },
+      select: { id: true, batchNumber: true, currentQty: true, expDate: true, mfgDate: true, warehouseId: true },
+      orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }],
+    });
+  }
+
+  // Deducts `quantity` from the operator-selected lot (every sellable
+  // InventoryBatch row of this item carrying that batchNumber, oldest
+  // first) instead of plain FIFO, and returns the consumption in the same
+  // shape depleteBatchesFIFO does so recordMovement can take it as
+  // precalculatedFifo. Rows are locked FOR UPDATE for the same recall-race
+  // reason as depleteBatchesFIFO. Throws — never goes negative or silently
+  // spills into other lots — when the lot can't cover the quantity.
+  static async depleteNamedBatch(tx: any, itemId: string, batchNumber: string, quantity: number): Promise<FifoConsumptionResult> {
+    const batches: Array<{ id: string; batchNumber: string; billNumber: string | null; productBatchId: string | null; currentQty: number; unitCost: number | null }> = await tx.$queryRaw(Prisma.sql`
+      SELECT id, "batchNumber", "billNumber", "productBatchId", "currentQty", "unitCost"
+      FROM "InventoryBatch"
+      WHERE "inventoryItemId" = ${itemId}
+        AND "batchNumber" = ${batchNumber}
+        AND "currentQty" > 0
+        AND status = 'APPROVED'
+        AND ("expDate" IS NULL OR "expDate" >= now())
+      ORDER BY "mfgDate" ASC, "createdAt" ASC
+      FOR UPDATE
+    `);
+
+    const available = batches.reduce((s, b) => s + b.currentQty, 0);
+    if (available + 0.0001 < quantity) {
+      throw new Error(`Batch "${batchNumber}" has insufficient stock. Available: ${available}, Required: ${quantity}.`);
+    }
+
+    let remaining = quantity;
+    let totalCost = 0;
+    const consumptions: FifoConsumption[] = [];
+    for (const batch of batches) {
+      if (remaining <= 0.0001) break;
+      const consumeQty = Math.min(batch.currentQty, remaining);
+      await tx.inventoryBatch.update({
+        where: { id: batch.id },
+        data: { currentQty: batch.currentQty - consumeQty }
+      });
+      const unitCost = batch.unitCost || 0;
+      const lineCost = consumeQty * unitCost;
+      totalCost += lineCost;
+      remaining -= consumeQty;
+      consumptions.push({
+        batchId: batch.id,
+        billNumber: batch.billNumber || batch.batchNumber,
+        productBatchId: batch.productBatchId,
+        qty: consumeQty,
+        unitCost,
+        totalCost: lineCost,
+      });
+    }
+
+    return {
+      consumptions,
+      consumedFromBatches: quantity,
+      totalCost,
+      unitCost: quantity > 0 ? totalCost / quantity : 0,
+      blockedQtyAvailable: 0,
+    };
+  }
+
   // Phase 3 (Sales/POS Return cost reversal): the inbound counterpart to
   // depleteBatchesFIFO — given a pre-computed layer allocation (batchId +
   // qty + unitCost per layer, already resolved by the caller by replaying
