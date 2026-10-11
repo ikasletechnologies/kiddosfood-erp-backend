@@ -65,7 +65,7 @@ CREATE TYPE "ItemCategory" AS ENUM ('RAW_MATERIAL', 'SEMI_FINISHED', 'FINISHED_G
 CREATE TYPE "StockMovementType" AS ENUM ('PURCHASE_IN', 'PRODUCTION_OUT', 'PRODUCTION_IN', 'SALES_OUT', 'WASTE_OUT', 'TRANSFER_IN', 'TRANSFER_OUT', 'ADJUSTMENT', 'RETURN_OUT', 'RECALL_RETURN_IN', 'RETURN_QUARANTINE_IN', 'SALES_RETURN_IN');
 
 -- CreateEnum
-CREATE TYPE "GRNStatus" AS ENUM ('PENDING', 'COMPLETED', 'CANCELLED');
+CREATE TYPE "GRNStatus" AS ENUM ('PENDING', 'COMPLETED', 'REJECTED', 'CANCELLED');
 
 -- CreateEnum
 CREATE TYPE "InvoiceStatus" AS ENUM ('PENDING', 'MATCHED', 'MISMATCH', 'APPROVED', 'PAID');
@@ -74,7 +74,7 @@ CREATE TYPE "InvoiceStatus" AS ENUM ('PENDING', 'MATCHED', 'MISMATCH', 'APPROVED
 CREATE TYPE "POStatus" AS ENUM ('DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'ORDERED', 'SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PAID', 'CLOSED', 'CANCELLED');
 
 -- CreateEnum
-CREATE TYPE "PurchaseType" AS ENUM ('RAW_MATERIAL', 'PACKAGING', 'ASSET', 'MISC');
+CREATE TYPE "PurchaseType" AS ENUM ('ALL', 'RAW_MATERIAL', 'PACKAGING', 'EQUIPMENT', 'CONSUMABLES', 'SERVICES', 'OTHERS');
 
 -- CreateEnum
 CREATE TYPE "POPaymentStatus" AS ENUM ('UNPAID', 'PARTIAL', 'PAID', 'OVERDUE');
@@ -156,6 +156,15 @@ CREATE TYPE "InventoryStockState" AS ENUM ('RECEIVED', 'QC_HOLD', 'APPROVED', 'R
 
 -- CreateEnum
 CREATE TYPE "ReservationStatus" AS ENUM ('ACTIVE', 'CONSUMED', 'RELEASED', 'PARTIAL');
+
+-- CreateEnum
+CREATE TYPE "AlertType" AS ENUM ('INVENTORY', 'ORDER', 'PAYMENT', 'DISPATCH', 'SYSTEM');
+
+-- CreateEnum
+CREATE TYPE "AlertSeverity" AS ENUM ('CRITICAL', 'WARNING', 'INFO');
+
+-- CreateEnum
+CREATE TYPE "AlertStatus" AS ENUM ('ACTIVE', 'RESOLVED');
 
 -- CreateTable
 CREATE TABLE "User" (
@@ -440,7 +449,7 @@ CREATE TABLE "Vendor" (
     "manualAdvanceAdj" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "rating" DOUBLE PRECISION DEFAULT 5.0,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "category" TEXT,
+    "category" "PurchaseType",
     "gstNumber" TEXT,
     "paymentTerms" "PaymentTerms" NOT NULL DEFAULT 'IMMEDIATE',
     "status" "VendorStatus" NOT NULL DEFAULT 'ACTIVE',
@@ -552,6 +561,9 @@ CREATE TABLE "GoodsReceipt" (
     "status" "GRNStatus" NOT NULL DEFAULT 'PENDING',
     "freightCost" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "unloadingCost" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "rejectionReason" TEXT,
+    "rejectedAt" TIMESTAMP(3),
+    "rejectedBy" TEXT,
 
     CONSTRAINT "GoodsReceipt_pkey" PRIMARY KEY ("id")
 );
@@ -1495,6 +1507,7 @@ CREATE TABLE "ReturnOrder" (
     "sgst" DOUBLE PRECISION,
     "igst" DOUBLE PRECISION,
     "taxAmount" DOUBLE PRECISION,
+    "roundOffAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "refundMethod" TEXT,
     "approvedBy" TEXT,
     "approvedAt" TIMESTAMP(3),
@@ -1973,6 +1986,145 @@ CREATE TABLE "GstinCache" (
     CONSTRAINT "GstinCache_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "Alert" (
+    "id" TEXT NOT NULL,
+    "dedupeKey" TEXT NOT NULL,
+    "type" "AlertType" NOT NULL,
+    "severity" "AlertSeverity" NOT NULL,
+    "status" "AlertStatus" NOT NULL DEFAULT 'ACTIVE',
+    "title" TEXT NOT NULL,
+    "message" TEXT NOT NULL,
+    "isRead" BOOLEAN NOT NULL DEFAULT false,
+    "entityId" TEXT,
+    "entityType" TEXT,
+    "franchiseId" TEXT,
+    "metadata" JSONB,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    "resolvedAt" TIMESTAMP(3),
+
+    CONSTRAINT "Alert_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "EWayBill" (
+    "id" TEXT NOT NULL,
+    "refNumber" TEXT NOT NULL,
+    "ewbNumber" TEXT,
+    "ewbDate" TIMESTAMP(3),
+    "validUntil" TIMESTAMP(3),
+    "status" TEXT NOT NULL DEFAULT 'DRAFT',
+    "franchiseId" TEXT,
+    "sourceType" TEXT NOT NULL DEFAULT 'MANUAL',
+    "sourceId" TEXT,
+    "supplyType" TEXT NOT NULL DEFAULT 'O',
+    "subSupplyType" TEXT NOT NULL DEFAULT '1',
+    "subSupplyDesc" TEXT,
+    "docType" TEXT NOT NULL DEFAULT 'INV',
+    "docNo" TEXT NOT NULL,
+    "docDate" TIMESTAMP(3) NOT NULL,
+    "transactionType" INTEGER NOT NULL DEFAULT 1,
+    "fromGstin" TEXT NOT NULL,
+    "fromTradeName" TEXT NOT NULL,
+    "fromAddr1" TEXT,
+    "fromAddr2" TEXT,
+    "fromPlace" TEXT,
+    "fromPincode" TEXT NOT NULL,
+    "fromStateCode" INTEGER NOT NULL,
+    "actFromStateCode" INTEGER NOT NULL,
+    "toGstin" TEXT NOT NULL,
+    "toTradeName" TEXT NOT NULL,
+    "toAddr1" TEXT,
+    "toAddr2" TEXT,
+    "toPlace" TEXT,
+    "toPincode" TEXT NOT NULL,
+    "toStateCode" INTEGER NOT NULL,
+    "actToStateCode" INTEGER NOT NULL,
+    "totalValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "cgstValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "sgstValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "igstValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "cessValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "otherValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "totInvValue" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "transMode" TEXT,
+    "transDistance" INTEGER NOT NULL DEFAULT 0,
+    "transporterId" TEXT,
+    "transporterName" TEXT,
+    "transDocNo" TEXT,
+    "transDocDate" TIMESTAMP(3),
+    "vehicleNo" TEXT,
+    "vehicleType" TEXT NOT NULL DEFAULT 'R',
+    "cancelReason" TEXT,
+    "cancelRemarks" TEXT,
+    "cancelledAt" TIMESTAMP(3),
+    "extensionCount" INTEGER NOT NULL DEFAULT 0,
+    "notes" TEXT,
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "EWayBill_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "EWayBillItem" (
+    "id" TEXT NOT NULL,
+    "ewayBillId" TEXT NOT NULL,
+    "itemNo" INTEGER NOT NULL,
+    "productName" TEXT NOT NULL,
+    "productDesc" TEXT,
+    "hsnCode" TEXT NOT NULL,
+    "quantity" DOUBLE PRECISION NOT NULL,
+    "qtyUnit" TEXT NOT NULL DEFAULT 'NOS',
+    "taxableAmount" DOUBLE PRECISION NOT NULL,
+    "cgstRate" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "sgstRate" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "igstRate" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "cessRate" DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+    CONSTRAINT "EWayBillItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "EWayBillVehicleUpdate" (
+    "id" TEXT NOT NULL,
+    "ewayBillId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL DEFAULT 'VEHICLE',
+    "vehicleNo" TEXT,
+    "transMode" TEXT,
+    "transDocNo" TEXT,
+    "transDocDate" TIMESTAMP(3),
+    "fromPlace" TEXT,
+    "fromStateCode" INTEGER,
+    "reasonCode" TEXT NOT NULL,
+    "reasonRemarks" TEXT,
+    "remainingKm" INTEGER,
+    "validUntil" TIMESTAMP(3),
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "EWayBillVehicleUpdate_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Attachment" (
+    "id" TEXT NOT NULL,
+    "entityType" TEXT NOT NULL,
+    "entityId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL DEFAULT 'DOCUMENT',
+    "fileName" TEXT NOT NULL,
+    "mimeType" TEXT NOT NULL,
+    "size" INTEGER NOT NULL,
+    "data" BYTEA NOT NULL,
+    "franchiseId" TEXT,
+    "uploadedBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "Attachment_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
@@ -2254,6 +2406,42 @@ CREATE INDEX "InventoryReservationAllocation_inventoryItemId_idx" ON "InventoryR
 
 -- CreateIndex
 CREATE UNIQUE INDEX "GstinCache_gstin_key" ON "GstinCache"("gstin");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Alert_dedupeKey_key" ON "Alert"("dedupeKey");
+
+-- CreateIndex
+CREATE INDEX "Alert_franchiseId_status_isRead_idx" ON "Alert"("franchiseId", "status", "isRead");
+
+-- CreateIndex
+CREATE INDEX "Alert_franchiseId_status_type_idx" ON "Alert"("franchiseId", "status", "type");
+
+-- CreateIndex
+CREATE INDEX "Alert_type_severity_idx" ON "Alert"("type", "severity");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "EWayBill_refNumber_key" ON "EWayBill"("refNumber");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "EWayBill_ewbNumber_key" ON "EWayBill"("ewbNumber");
+
+-- CreateIndex
+CREATE INDEX "EWayBill_franchiseId_status_idx" ON "EWayBill"("franchiseId", "status");
+
+-- CreateIndex
+CREATE INDEX "EWayBill_sourceType_sourceId_idx" ON "EWayBill"("sourceType", "sourceId");
+
+-- CreateIndex
+CREATE INDEX "EWayBill_docNo_idx" ON "EWayBill"("docNo");
+
+-- CreateIndex
+CREATE INDEX "EWayBillItem_ewayBillId_idx" ON "EWayBillItem"("ewayBillId");
+
+-- CreateIndex
+CREATE INDEX "EWayBillVehicleUpdate_ewayBillId_idx" ON "EWayBillVehicleUpdate"("ewayBillId");
+
+-- CreateIndex
+CREATE INDEX "Attachment_entityType_entityId_idx" ON "Attachment"("entityType", "entityId");
 
 -- AddForeignKey
 ALTER TABLE "User" ADD CONSTRAINT "User_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2707,3 +2895,12 @@ ALTER TABLE "InventoryReservationAllocation" ADD CONSTRAINT "InventoryReservatio
 
 -- AddForeignKey
 ALTER TABLE "InventoryReservationAllocation" ADD CONSTRAINT "InventoryReservationAllocation_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Alert" ADD CONSTRAINT "Alert_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "EWayBillItem" ADD CONSTRAINT "EWayBillItem_ewayBillId_fkey" FOREIGN KEY ("ewayBillId") REFERENCES "EWayBill"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "EWayBillVehicleUpdate" ADD CONSTRAINT "EWayBillVehicleUpdate_ewayBillId_fkey" FOREIGN KEY ("ewayBillId") REFERENCES "EWayBill"("id") ON DELETE CASCADE ON UPDATE CASCADE;
