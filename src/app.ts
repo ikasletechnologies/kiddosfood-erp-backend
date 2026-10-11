@@ -14,6 +14,7 @@ import { AnalyticsController } from './modules/analytics/analytics.controller';
 import { ProductionController } from './modules/production/production.controller';
 import { CartonController } from './modules/production/carton.controller';
 import { RecallController } from './modules/production/recall.controller';
+import { requireProductionFeature } from './modules/production/production.flags';
 import { ProcurementController } from './modules/procurement/procurement.controller';
 import { FranchiseController } from './modules/franchise/franchise.controller';
 import { FranchiseService } from './modules/franchise/franchise.service';
@@ -265,26 +266,40 @@ app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', '
 });
 app.get('/api/production/batches-all', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getAllBatches);
 app.get('/api/production/batches-pending-qc', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPendingQC);
-app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.inspectBatch);
+app.post('/api/production/batches/:id/qc', authenticate, authorizeRole(['SUPER_ADMIN']), requireProductionFeature('qc'), ProductionController.inspectBatch);
 app.post('/api/production/batches/:id/package', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPackaging);
+// Simplified workflow: one-step Packaging & Confirmation, and release of legacy
+// PENDING-QC batches to packaging while production QC is switched off.
+app.post('/api/production/batches/:id/package-confirm', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.packageAndConfirm);
+app.post('/api/production/batches/:id/release-to-packaging', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.releaseToPackaging);
 app.post('/api/production/batches/:id/waste-balance', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.wasteBalance);
 // Trigger restart
 app.post('/api/production/packagings/:id/confirm', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.confirmPackaging);
 app.post('/api/production/packagings/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.cancelPackaging);
-app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.savePackagingVerification);
+app.put('/api/production/packagings/:id/verify', authenticate, authorizeRole(['SUPER_ADMIN']), requireProductionFeature('labels'), ProductionController.savePackagingVerification);
 app.get('/api/production/packagings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getPackagings);
 // Batch Recall — eligibility/state are shared source of truth for both the
 // registry list and the inspector panel; mutation endpoints are transactional
 // and idempotent (see recall.service.ts).
 app.get('/api/production/batches/:id/recall/eligibility', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.getEligibility);
 app.get('/api/production/batches/:id/recall', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.getState);
-app.post('/api/production/batches/:id/recall/initiate', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.initiate);
+// Recall Details: batch, per-SKU quantities, locations, activity, audit trail.
+app.get('/api/production/batches/:id/recall/details', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.getDetails);
+// Decisions that change stock or end a recall are SUPER_ADMIN only.
+app.post('/api/production/batches/:id/recall/dispose', authenticate, authorizeRole(['SUPER_ADMIN']), RecallController.dispose);
+app.post('/api/production/batches/:id/recall/reconcile', authenticate, authorizeRole(['SUPER_ADMIN']), RecallController.reconcile);
+// Only STARTING a recall is gated by the feature flag. Steps on a recall that
+// is already in progress stay available so it can always be completed or
+// cancelled — gating them could leave a batch blocked from sale indefinitely.
+app.post('/api/production/batches/:id/recall/initiate', authenticate, authorizeRole(['SUPER_ADMIN']), requireProductionFeature('recall'), RecallController.initiate);
 app.post('/api/production/batches/:id/recall/locate-distribution', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.locateDistribution);
 app.post('/api/production/batches/:id/recall/block-sales', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.blockSales);
 app.post('/api/production/batches/:id/recall/generate-report', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.generateReport);
 app.post('/api/production/batches/:id/recall/collect-return', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.collectReturn);
-app.post('/api/production/batches/:id/recall/complete', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.complete);
-app.post('/api/production/batches/:id/recall/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.cancel);
+app.post('/api/production/batches/:id/recall/complete', authenticate, authorizeRole(['SUPER_ADMIN']), RecallController.complete);
+app.post('/api/production/batches/:id/recall/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), RecallController.cancel);
+app.get('/api/production/recalls', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.list);
+app.get('/api/production/recalls/quarantine-summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), RecallController.quarantineSummary);
 app.get('/api/production/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getOne);
 app.patch('/api/production/:id/status', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.updateStatus);
 // Logistics (Stock Requests & Transfers)

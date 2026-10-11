@@ -24,6 +24,8 @@ const DOCUMENT_TYPES = [
 // Entity types that may carry attachments, and how to confirm the record exists.
 const ENTITY_LOOKUP: Record<string, (id: string) => Promise<unknown>> = {
   SALES_ORDER: (id) => prisma.salesOrder.findUnique({ where: { id }, select: { id: true } }),
+  // Supporting evidence for a Batch Recall (lab report, complaint, photos).
+  BATCH_RECALL: (id) => prisma.batchRecall.findUnique({ where: { id }, select: { id: true } }),
 };
 
 type Meta = { id: string; entityType: string; entityId: string; kind: string; fileName: string; mimeType: string; size: number; createdAt: Date };
