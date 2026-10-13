@@ -343,6 +343,13 @@ export class GRNService {
 
   static async approve(grnId: string, user?: any, options: { rejectionReason?: string } = {}) {
     return prisma.$transaction(async (tx) => {
+      // Lock the GRN row BEFORE reading its status: two concurrent approvals
+      // (double-click, retry) would otherwise both read PENDING and both
+      // post lots, stock and a bill. The second waits here and then sees
+      // COMPLETED below. InventoryBatch.goodsReceiptItemId is also unique,
+      // as a DB-level backstop.
+      await tx.$queryRaw`SELECT id FROM "GoodsReceipt" WHERE id = ${grnId} FOR UPDATE`;
+
       const grn = await tx.goodsReceipt.findUnique({
         where: { id: grnId },
         include: { items: true, procurementOrder: { include: { poItems: true, vendor: { select: { state: true } } } } }
@@ -477,8 +484,19 @@ export class GRNService {
           }
         }
 
+        const alreadyPosted = await tx.inventoryBatch.findUnique({ where: { goodsReceiptItemId: item.id } });
+        if (alreadyPosted) {
+          throw new Error(`Stock for "${invItemBefore.name}" on this GRN was already posted as lot ${alreadyPosted.batchNumber}.`);
+        }
+
+        // item.price is per GRN/PO unit; the lot's unitCost must be per
+        // stock unit or lot valuation is off whenever the two differ
+        // (e.g. bought per G, stocked per KG). Same value, re-expressed.
+        const lineValue = item.acceptedQty * item.price;
+        const unitCostPerStockUnit = canonicalQty > 0 ? lineValue / canonicalQty : item.price;
+
         // 1. Create Inventory Batch (APPROVED status directly to update stock) using canonicalQty
-        await tx.inventoryBatch.create({
+        const lot = await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
             batchNumber: batchRef,
@@ -491,9 +509,16 @@ export class GRNService {
             expDate: item.expDate,
             initialQty: canonicalQty,
             currentQty: canonicalQty,
-            unitCost: item.price,
+            unitCost: unitCostPerStockUnit,
             warehouseId: item.warehouseId || null,
-            status: 'APPROVED'
+            status: 'APPROVED',
+            goodsReceiptItemId: item.id,
+            procurementOrderId: grn.poId,
+            vendorId: grn.procurementOrder.vendorId,
+            receivedAt: grn.receivedAt,
+            purchaseQty: item.acceptedQty,
+            purchaseUnit: item.unit,
+            purchasePrice: item.price
           }
         });
 
@@ -520,6 +545,8 @@ export class GRNService {
           referenceType: 'GOODS_RECEIPT',
           referenceId: grnId,
           warehouseId: item.warehouseId || undefined,
+          batchId: lot.id,
+          unitCost: unitCostPerStockUnit,
           note: `GRN Approved & Synced: ${item.acceptedQty} ${item.unit} -> ${canonicalQty} ${invItemBefore.unit}`
         });
       }

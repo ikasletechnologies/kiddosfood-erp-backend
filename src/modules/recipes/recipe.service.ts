@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
+import { FormulationService } from './formulation.service';
 
 interface RecipeItemWithInventory {
   quantityRequired: number;
@@ -104,6 +105,17 @@ export class RecipeService {
         }))
       });
 
+      // Legacy (quantity-bearing) form: keep the ingredient list and the
+      // formulation history in step with the BOM it just wrote.
+      await RecipeService.syncIngredients(tx, recipeId!, Array.from(new Set(data.items.map(i => i.inventoryItemId))));
+      if (data.items.length > 0) {
+        await FormulationService.recordLegacyFormVersion(tx, recipeId!, {
+          yieldQty: data.yieldQty,
+          yieldUnit: data.yieldUnit || 'KG',
+          items: data.items,
+        });
+      }
+
       return tx.recipe.findUnique({
         where: { id: recipeId },
         include: {
@@ -114,22 +126,113 @@ export class RecipeService {
     });
   }
 
+  /**
+   * Simplified Recipe Master save: name, category, instructions and the
+   * selected raw materials only. Never touches quantities: the legacy BOM
+   * (RecipeItem / yieldQty / yieldUnit) and formulation versions are only
+   * written by FormulationService from real, user-entered values.
+   */
+  static async saveSimplifiedRecipe(data: {
+    id?: string;
+    name: string;
+    category: string;
+    instructions?: string;
+    ingredientIds: string[];
+    productId?: string | null;
+    recipeCode?: string;
+    estimatedDurationMinutes?: number | null;
+  }) {
+    const name = (data.name || '').trim();
+    const category = (data.category || '').trim();
+    if (!name) throw new Error('Recipe name is required.');
+    if (!category) throw new Error('Category is required.');
+    const ids = (data.ingredientIds || []).filter(Boolean);
+    if (ids.length === 0) throw new Error('Select at least one ingredient.');
+    if (new Set(ids).size !== ids.length) throw new Error('Each ingredient can only be selected once.');
+
+    return prisma.$transaction(async (tx) => {
+      const found = await tx.inventoryItem.findMany({ where: { id: { in: ids } }, select: { id: true } });
+      if (found.length !== ids.length) throw new Error('One or more selected ingredients no longer exist in the Raw Material Master.');
+
+      if (data.productId) {
+        const conflict = await tx.recipe.findFirst({
+          where: { productId: data.productId, ...(data.id ? { id: { not: data.id } } : {}) },
+          include: { product: true },
+        });
+        if (conflict) {
+          throw new Error(`"${conflict.product?.name || 'this product'}" is already linked to recipe "${conflict.name}" — each product can only have one recipe.`);
+        }
+      }
+
+      let recipeId = data.id;
+      const common = {
+        name,
+        category,
+        instructions: data.instructions ?? null,
+        ...(data.productId !== undefined ? { productId: data.productId || null } : {}),
+        ...(data.estimatedDurationMinutes !== undefined ? { estimatedDurationMinutes: data.estimatedDurationMinutes ?? null } : {}),
+      };
+      if (recipeId) {
+        const exists = await tx.recipe.findUnique({ where: { id: recipeId }, select: { id: true } });
+        if (!exists) throw new Error('Recipe not found');
+        await tx.recipe.update({ where: { id: recipeId }, data: common });
+      } else {
+        const recipeCode = data.recipeCode || `RCP-${((await tx.recipe.count()) + 1).toString().padStart(4, '0')}`;
+        // yieldQty/yieldUnit get their column defaults here; they carry no
+        // meaning until a formulation is saved (which overwrites them), and
+        // Production refuses a recipe with no BOM.
+        const created = await tx.recipe.create({ data: { ...common, recipeCode } });
+        recipeId = created.id;
+      }
+
+      await RecipeService.syncIngredients(tx, recipeId!, ids);
+      return tx.recipe.findUnique({
+        where: { id: recipeId },
+        include: RecipeService.recipeInclude,
+      });
+    });
+  }
+
+  /** Replaces the recipe's ingredient selection, keeping order. */
+  static async syncIngredients(tx: any, recipeId: string, inventoryItemIds: string[]) {
+    await tx.recipeIngredient.deleteMany({ where: { recipeId, inventoryItemId: { notIn: inventoryItemIds } } });
+    for (let i = 0; i < inventoryItemIds.length; i++) {
+      await tx.recipeIngredient.upsert({
+        where: { recipeId_inventoryItemId: { recipeId, inventoryItemId: inventoryItemIds[i] } },
+        create: { recipeId, inventoryItemId: inventoryItemIds[i], sortOrder: i },
+        update: { sortOrder: i },
+      });
+    }
+  }
+
+  static recipeInclude = {
+    product: true,
+    recipeItems: { include: { inventoryItem: true } },
+    ingredients: { include: { inventoryItem: true }, orderBy: { sortOrder: 'asc' as const } },
+    formulations: {
+      where: { isActive: true },
+      include: { items: { include: { inventoryItem: true }, orderBy: { sortOrder: 'asc' as const } } },
+      take: 1,
+    },
+    _count: { select: { productions: true } },
+  };
+
+  /** Adds `activeFormulation` (or null) and drops the raw relation list. */
+  private static withActiveFormulation<T extends { formulations?: any[] }>(recipe: T) {
+    const { formulations, ...rest } = recipe as any;
+    return { ...rest, activeFormulation: formulations?.[0] ?? null };
+  }
+
   static async getRecipes() {
     const recipes = await prisma.recipe.findMany({
       orderBy: { createdAt: 'desc' },
-      include: {
-        product: true,
-        recipeItems: { include: { inventoryItem: true } },
-        _count: {
-          select: { productions: true }
-        }
-      }
+      include: RecipeService.recipeInclude,
     });
     return recipes.map((recipe) => {
       const { totalCost, breakdown } = RecipeService.computeCostBreakdown(recipe.recipeItems);
       const productionCount = recipe._count?.productions || 0;
       return {
-        ...recipe,
+        ...RecipeService.withActiveFormulation(recipe),
         totalCost,
         costPerYieldUnit: recipe.yieldQty > 0 ? totalCost / recipe.yieldQty : 0,
         costBreakdown: breakdown,
@@ -142,18 +245,12 @@ export class RecipeService {
   static async getRecipeById(id: string) {
     const recipe = await prisma.recipe.findUnique({
       where: { id },
-      include: { 
-        product: true, 
-        recipeItems: { include: { inventoryItem: true } },
-        _count: {
-          select: { productions: true }
-        }
-      }
+      include: RecipeService.recipeInclude,
     });
     if (!recipe) return null;
     const productionCount = recipe._count?.productions || 0;
     return {
-      ...recipe,
+      ...RecipeService.withActiveFormulation(recipe),
       productionCount,
       isUsedInProduction: productionCount > 0,
     };
@@ -203,6 +300,8 @@ export class RecipeService {
 
     return prisma.$transaction(async (tx) => {
       await tx.recipeItem.deleteMany({ where: { recipeId: id } });
+      await tx.recipeIngredient.deleteMany({ where: { recipeId: id } });
+      await tx.recipeFormulation.deleteMany({ where: { recipeId: id } });
       return tx.recipe.delete({ where: { id } });
     });
   }

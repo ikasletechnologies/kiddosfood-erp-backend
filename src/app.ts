@@ -204,6 +204,7 @@ app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getAll);
+app.get('/api/raw-materials/:id/lots', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getLots);
 app.get('/api/raw-materials/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getById);
 app.post('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.create);
 app.patch('/api/raw-materials/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.update);
@@ -240,15 +241,24 @@ app.get('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), Recipe
 app.delete('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.delete);
 app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getByProduct);
 app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.calculateCost);
+app.get('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getFormulations);
+app.post('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.saveFormulation);
 
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getHistory);
 app.get('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), CartonController.getAll);
 app.post('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN']), CartonController.create);
 app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startBatch);
+app.post('/api/production/plan/preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPlan);
+app.post('/api/production/plan/start', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPlanned);
 app.post('/api/production/:id/stop', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.stopBatch);
 app.patch('/api/production/:id/stage', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.advanceStage);
 app.get('/api/production/:id/stage-history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getStageHistory);
+app.get('/api/production/completion-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCompletionSettings);
+app.get('/api/production/lot-options', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.getLotOptions);
+app.get('/api/production/costing-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCostingSettings);
+app.get('/api/production/batches/:id/cost-summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getBatchCostSummary);
+app.post('/api/production/batches/:id/packaging-cost-preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPackagingCost);
 app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.approveBatch);
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {

@@ -6,6 +6,8 @@ import { Prisma, ProductionStatus } from '@prisma/client';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 import { generateSku, parseSkuPackSize, ProductService } from '../product/product.service';
 import { ProductionFlags, QC_NOT_REQUIRED, PACKAGEABLE_QC_STATUSES } from './production.flags';
+import { ProductionCostingService, LotAllocationInput } from './production-costing.service';
+import { computePackagingCosts, normalizeExpenseLines, ExpenseLineInput, r4 } from './production-costing';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -13,6 +15,10 @@ import { ProductionFlags, QC_NOT_REQUIRED, PACKAGEABLE_QC_STATUSES } from './pro
 // yieldUnit — can't be safely converted and must trigger the self-heal below,
 // not fall through to an unconverted 1:1 comparison.
 const RECOGNIZED_PACK_UNITS = ['kg', 'g', 'l', 'ml', 'pcs', 'unit'];
+
+// SystemSetting key: completing a run whose actual yield differs from plan by
+// more than this many percent requires remarks. Set via POST /api/settings.
+export const YIELD_VARIANCE_REMARKS_SETTING = 'PRODUCTION_YIELD_VARIANCE_REMARKS_PCT';
 
 // Derives the bulk SEMI_FINISHED item's name/SKU. A ProductBatch's Product
 // link is optional (bulk-manufacturing recipes like FRUITMIX have none —
@@ -52,6 +58,14 @@ type StartPackagingInput = {
   userId?: string;
 };
 
+export type AdditionalMaterialInput = {
+  inventoryItemId: string;
+  // In the material's stock unit.
+  quantity: number;
+  lots?: LotAllocationInput[];
+  note?: string;
+};
+
 type PackageRowInput = {
   packetSize: string;
   packedQty: number;
@@ -67,7 +81,18 @@ type ConfirmPackagingInput = {
   spoiledQty: number;
   productId?: string;
   userId?: string;
+  // Set by packageAndConfirm: additional expenses charged to this run (added
+  // to the bulk cost before it is spread over good packets) and the cost
+  // snapshot stored on the packaging row.
+  costing?: { extraCost: number; snapshot: any };
 };
+
+// Bulk cost a packaging run consumed: its recorded lot breakdown, or (for
+// tickets with no tracked bulk lot) its weight at the batch's unit cost.
+function bulkCostOf(bulkBreakdown: unknown, weight: number, fallbackUnitCost: number): number {
+  const rows: any[] = Array.isArray(bulkBreakdown) ? bulkBreakdown : [];
+  return rows.length ? rows.reduce((s, b) => s + (b.totalCost || 0), 0) : weight * fallbackUnitCost;
+}
 
 export class ProductionService {
   /**
@@ -95,14 +120,67 @@ export class ProductionService {
     expiryDate?: string;
     userId?: string;
     operatorId?: string;
+    // Set only by planned starts (FormulationService.buildPlannedStart):
+    // `quantity` is then the scaling factor against this formulation, which
+    // must still be the recipe's active one (and mirrored into its BOM).
+    planning?: {
+      formulationId: string;
+      plannedYieldQty: number;
+      plannedYieldUnit: string;
+      snapshot: any;
+    };
+    // Operator-selected purchase lots per material (inventoryItemId ->
+    // [{ batchId, qty in the material's stock unit }]; batchId null = stock
+    // with no lot on record). Must add up to the requirement. Materials not
+    // listed are consumed oldest-lot-first as before.
+    lotAllocations?: Record<string, LotAllocationInput[]>;
   }) {
     return prisma.$transaction(async tx => {
+      // Serializes with FormulationService.saveVersion so the formulation
+      // can't change between the check below and the deduction.
+      if (data.planning) {
+        await tx.$queryRaw`SELECT id FROM "Recipe" WHERE id = ${data.recipeId} FOR UPDATE`;
+      }
+
       // 1. Fetch recipe
       const recipe = await tx.recipe.findUnique({
         where: { id: data.recipeId },
         include: { recipeItems: { include: { inventoryItem: true } }, product: true },
       });
       if (!recipe) throw new Error('Recipe not found');
+
+      // A recipe with no BOM (e.g. a new Recipe Master entry whose formulation
+      // hasn't been saved yet) would otherwise start a run consuming nothing.
+      if (recipe.recipeItems.length === 0) {
+        throw new Error(`Recipe "${recipe.name}" has no saved formulation (ingredient quantities). Save one in Production Planning first.`);
+      }
+
+      const lotAllocations = data.lotAllocations || {};
+      for (const itemId of Object.keys(lotAllocations)) {
+        const lines = recipe.recipeItems.filter(ri => ri.inventoryItemId === itemId);
+        if (lines.length === 0) throw new Error('Lot allocation given for a material that is not in this recipe.');
+        if (lines.length > 1) throw new Error(`"${lines[0].inventoryItem.name}" appears more than once in the recipe; lots can't be allocated per line.`);
+        if (!data.warehouseId) throw new Error('Select a warehouse to allocate purchase lots.');
+      }
+
+      if (data.planning) {
+        const active = await tx.recipeFormulation.findFirst({
+          where: { recipeId: data.recipeId, isActive: true },
+          include: { items: true },
+        });
+        if (!active || active.id !== data.planning.formulationId) {
+          throw new Error('The formulation was updated since this plan was calculated. Reload Production Planning and try again.');
+        }
+        const mirrorMatches = active.items.length === recipe.recipeItems.length &&
+          Math.abs(active.yieldQty - recipe.yieldQty) < 1e-9 &&
+          active.items.every(fi => recipe.recipeItems.some(ri =>
+            ri.inventoryItemId === fi.inventoryItemId &&
+            Math.abs(ri.quantityRequired - fi.quantity) < 1e-9 &&
+            ri.unit.toUpperCase() === fi.unit.toUpperCase()));
+        if (!mirrorMatches) {
+          throw new Error('Recipe bill of materials is out of sync with its active formulation. Re-save the formulation and try again.');
+        }
+      }
 
       // franchiseId is a required column on Production (other reports still
       // key off it) but no longer a user-facing concept for production —
@@ -222,6 +300,12 @@ export class ProductionService {
           expiryDate,
           currentStage: 'QUEUED',
           stageUpdatedAt: new Date(),
+          ...(data.planning ? {
+            formulationId: data.planning.formulationId,
+            plannedYieldQty: data.planning.plannedYieldQty,
+            plannedYieldUnit: data.planning.plannedYieldUnit,
+            formulationSnapshot: data.planning.snapshot,
+          } : {}),
         },
       });
 
@@ -246,6 +330,12 @@ export class ProductionService {
           item.unit.toUpperCase() as ValidUnit,
           item.inventoryItem.unit.toUpperCase() as ValidUnit
         ).toNumber();
+        // Operator-selected lots: deduct exactly those (validated, row-locked)
+        // instead of oldest-first.
+        const allocation = lotAllocations[item.inventoryItemId];
+        const precalculatedFifo = allocation
+          ? await ProductionCostingService.depleteAllocatedLots(tx, { id: item.inventoryItemId, name: item.inventoryItem.name }, allocation, amountNeededInCanonical, data.warehouseId)
+          : undefined;
         const { fifo } = await InventoryService.recordMovement(tx, {
           itemId: item.inventoryItemId,
           type: 'PRODUCTION_OUT',
@@ -256,6 +346,7 @@ export class ProductionService {
           note: `Production started: ${recipe.name}`,
           userId: data.userId,
           warehouseId: data.warehouseId,
+          precalculatedFifo,
         });
         const amountNeeded = amountNeededInCanonical; // alias for cost section below
 
@@ -359,6 +450,10 @@ export class ProductionService {
     remarks?: string,
     expiryDate?: string,
     wastage?: { quantity: number; note?: string },
+    // Set by the Complete Production endpoint: a large planned-vs-actual
+    // variance needs remarks. Off for other callers, which keep their
+    // existing behaviour.
+    options: { requireVarianceRemarks?: boolean; additionalMaterials?: AdditionalMaterialInput[] } = {},
   ) {
     if (actualYield !== undefined && (!Number.isFinite(actualYield) || actualYield <= 0)) {
       throw new Error('Actual produced quantity must be a number greater than 0.');
@@ -404,13 +499,39 @@ export class ProductionService {
       // manufacturing recipes go Production -> QC -> Bulk -> Packaging
       // without ever needing a Product, so ProductBatch.productId is
       // likewise optional and simply mirrors whatever the recipe has.
-      const totalYield = actualYield !== undefined ? actualYield : (production.quantity * recipe.yieldQty);
+      // Planned runs carry their own planned yield (frozen at start), so a
+      // formulation saved later can't change what this run was planned to make.
+      // Planned yield for this run, in the run's unit. Runs started from a
+      // saved formulation froze it at start; older runs derive it from the
+      // recipe yield exactly as before.
+      const plannedYield = production.plannedYieldQty ?? (production.quantity * recipe.yieldQty);
+      const plannedUnit = production.plannedYieldUnit || recipe.yieldUnit || 'KG';
+      const totalYield = actualYield !== undefined ? actualYield : plannedYield;
+
+      // Yield variance vs plan. Above-plan output is allowed; an unusually
+      // large swing either way just needs an explanation.
+      const yieldVariance = this.computeYieldVariance(plannedYield, totalYield);
+      if (options.requireVarianceRemarks && actualYield !== undefined && yieldVariance.variancePct !== null) {
+        const thresholdPct = await this.getVarianceRemarksThresholdPct();
+        if (Math.abs(yieldVariance.variancePct) > thresholdPct && !(remarks || '').trim()) {
+          throw new Error(`Actual yield differs from plan by ${yieldVariance.variancePct > 0 ? '+' : ''}${yieldVariance.variancePct}% (more than ${thresholdPct}%). Add remarks explaining the difference.`);
+        }
+      }
 
       // The batch's real unit cost: whatever raw materials this specific run
       // actually consumed (FIFO lot cost, see startProduction), spread over
       // the yield. Two runs of the same recipe can land on different unit
       // costs if the second one drew from a pricier purchase lot.
-      const totalCost = production.totalCost ?? production.materialCost ?? 0;
+      // Materials actually used on top of the plan, reported by the operator.
+      // Deducted now from the chosen lots (or oldest first) and added to the
+      // run's material cost before the unit cost is worked out. Nothing is
+      // ever deducted that wasn't reported.
+      const additionalMaterialCost = await this.consumeAdditionalMaterials(tx, production, options.additionalMaterials || [], userId);
+      const materialCost = (production.materialCost ?? 0) + additionalMaterialCost;
+      const totalCost = (production.totalCost ?? production.materialCost ?? 0) + additionalMaterialCost;
+      if (additionalMaterialCost > 0) {
+        await tx.production.update({ where: { id: production.id }, data: { materialCost, totalCost } });
+      }
       const unitCost = totalYield > 0 ? totalCost / totalYield : 0;
 
       // A legacy in-progress run may predate productionBatchCode. Allocate it
@@ -458,6 +579,30 @@ export class ProductionService {
           actualYield: totalYield,
           endTime: new Date(),
           ...(remarks ? { remarks } : {}),
+          // Freeze the plan on runs that never stored one, so later recipe
+          // changes can't alter the plan this run is compared against.
+          // Never overwrites a stored plan.
+          ...(production.plannedYieldQty == null ? { plannedYieldQty: plannedYield, plannedYieldUnit: plannedUnit } : {}),
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          module: 'PRODUCTION',
+          action: 'COMPLETE',
+          recordId: production.id,
+          newValue: {
+            productionBatchCode,
+            plannedYield,
+            actualYield: totalYield,
+            unit: plannedUnit,
+            ...yieldVariance,
+            materialCost,
+            additionalMaterialCost,
+            unitCost,
+            remarks: remarks || null,
+          },
+          performedBy: userId || 'SYSTEM',
         },
       });
 
@@ -491,8 +636,93 @@ export class ProductionService {
         ? batch
         : await this.releaseToPackagingTx(tx, batch.id, userId);
 
-      return { production: completedProduction, batch: finalBatch };
+      return {
+        production: completedProduction,
+        batch: finalBatch,
+        yield: { planned: plannedYield, actual: totalYield, unit: plannedUnit, ...yieldVariance },
+        cost: {
+          materialCost: r4(materialCost),
+          additionalMaterialCost: r4(additionalMaterialCost),
+          plannedMaterialCostPerUnit: plannedYield > 0 ? r4(materialCost / plannedYield) : null,
+          actualMaterialCostPerUnit: totalYield > 0 ? r4(materialCost / totalYield) : null,
+        },
+      };
     });
+  }
+
+  /** Deducts and costs materials reported as used beyond the plan; returns their total cost. */
+  private static async consumeAdditionalMaterials(tx: any, production: any, entries: AdditionalMaterialInput[], userId?: string): Promise<number> {
+    if (!entries.length) return 0;
+    if (entries.length > 30) throw new Error('A maximum of 30 additional materials can be recorded.');
+    let total = 0;
+    for (const [i, e] of entries.entries()) {
+      const label = `Additional material ${i + 1}`;
+      const qty = Number(e?.quantity);
+      if (!e?.inventoryItemId) throw new Error(`${label}: choose the material.`);
+      if (!Number.isFinite(qty) || qty <= 0) throw new Error(`${label}: quantity must be greater than 0.`);
+      const item = await tx.inventoryItem.findUnique({ where: { id: e.inventoryItemId } });
+      if (!item) throw new Error(`${label}: material not found.`);
+      if (item.category === 'FINISHED_GOOD') throw new Error(`${label}: "${item.name}" is a finished good, not a production material.`);
+
+      if (production.warehouseId) {
+        const available = await InventoryService.computeWarehouseStock(item.id, production.warehouseId, tx);
+        if (available + 0.0005 < qty) {
+          throw new Error(`Insufficient stock for "${item.name}" (need ${r4(qty)} ${item.unit}, have ${r4(available)} ${item.unit}).`);
+        }
+      }
+      const lots = e.lots ? ProductionCostingService.normalizeAllocations(e.lots, `"${item.name}"`) : null;
+      const precalculatedFifo = lots
+        ? await ProductionCostingService.depleteAllocatedLots(tx, item, lots, qty, production.warehouseId || undefined)
+        : undefined;
+      const { fifo } = await InventoryService.recordMovement(tx, {
+        itemId: item.id,
+        type: 'PRODUCTION_OUT',
+        quantity: -qty,
+        transactionUnit: item.unit,
+        referenceType: 'PRODUCTION',
+        referenceId: production.id,
+        note: `Additional material used in ${production.productionBatchCode || 'production'}${e.note ? `: ${e.note}` : ''}`,
+        userId,
+        warehouseId: production.warehouseId || undefined,
+        precalculatedFifo,
+      });
+      const untracked = qty - (fifo?.consumedFromBatches || 0);
+      const fallbackCost = untracked > 0.0000001 ? untracked * (item.costPrice || 0) : 0;
+      const cost = (fifo?.totalCost || 0) + fallbackCost;
+      const breakdown: any[] = fifo?.consumptions ? [...fifo.consumptions] : [];
+      if (untracked > 0.0000001) {
+        breakdown.push({ batchId: null, billNumber: 'Weighted avg. (no purchase batch on record)', productBatchId: null, qty: untracked, unitCost: item.costPrice || 0, totalCost: fallbackCost });
+      }
+      await tx.productionItem.create({
+        data: {
+          productionId: production.id,
+          inventoryItemId: item.id,
+          usedQuantity: qty,
+          unitCost: qty > 0 ? cost / qty : 0,
+          totalCost: cost,
+          batchBreakdown: breakdown.length ? breakdown : undefined,
+          isAdditional: true,
+          note: e.note ? String(e.note).slice(0, 500) : null,
+        },
+      });
+      total += cost;
+    }
+    return total;
+  }
+
+  /** Difference and % vs plan, rounded to 3 dp / 2 dp. Null % when there's no plan. */
+  static computeYieldVariance(planned: number, actual: number) {
+    const difference = Math.round((actual - planned) * 1000) / 1000;
+    const variancePct = planned > 0 ? Math.round((difference / planned) * 10000) / 100 : null;
+    return { difference, variancePct };
+  }
+
+  /** |variance %| above which completion remarks are required (SystemSetting, default 20). */
+  static async getVarianceRemarksThresholdPct(): Promise<number> {
+    const { SettingsService } = require('../settings/settings.service');
+    const raw = await SettingsService.getSettingValue(YIELD_VARIANCE_REMARKS_SETTING, '20');
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 20;
   }
 
   static async inspectBatch(data: {
@@ -790,7 +1020,7 @@ export class ProductionService {
   // item for a batch and self-heals a stale generic 'unit' label so the
   // g/kg conversion below stays correct. Throws if there's no bulk item at
   // all — a batch can't be packaged (started or confirmed) without one.
-  private static async resolveBulkItem(tx: any, batch: any, franchiseId: string | null) {
+  static async resolveBulkItem(tx: any, batch: any, franchiseId: string | null) {
     const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
 
     let bulkItem = await tx.inventoryItem.findFirst({
@@ -987,7 +1217,7 @@ export class ProductionService {
       });
     }
 
-    return { packaging };
+    return { packaging, bulkBreakdown };
   }
 
   static async savePackagingVerification(data: {
@@ -1190,14 +1420,13 @@ export class ProductionService {
     // reservation time). Cost this run from what was ACTUALLY consumed,
     // not from this ProductBatch's own unitCost — otherwise the physical
     // lot consumed and the cost charged to it can silently diverge.
-    const bulkBreakdown: any[] = Array.isArray(packaging.bulkBreakdown) ? packaging.bulkBreakdown : [];
-    const allocatedBulkCost = bulkBreakdown.length
-      ? bulkBreakdown.reduce((s, b) => s + (b.totalCost || 0), 0)
-      // Fallback for packaging tickets created before bulkBreakdown existed.
-      : totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
-    // Effective unit cost per good packet (allocated bulk cost absorbed by good packets)
+    // Fallback (no breakdown): tickets created before bulkBreakdown existed.
+    const allocatedBulkCost = bulkCostOf(packaging.bulkBreakdown, totalWeightNeeded, batch.unitCost || bulkItem.costPrice || 0);
+    // Effective unit cost per good packet (allocated bulk cost plus any
+    // additional expenses, absorbed by good packets)
+    const extraCost = data.costing?.extraCost || 0;
     const effectiveRetailUnitCost = good > 0
-      ? Number((allocatedBulkCost / good).toFixed(4))
+      ? Number(((allocatedBulkCost + extraCost) / good).toFixed(4))
       : (bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0);
 
     // Only the GOOD quantity ever becomes sellable Finished Goods.
@@ -1270,6 +1499,7 @@ export class ProductionService {
         damagedQty: damaged,
         spoiledQty: spoiled,
         confirmedAt: new Date(),
+        ...(data.costing ? { costBreakdown: { ...data.costing.snapshot, stockUnitCost: effectiveRetailUnitCost } } : {}),
       },
     });
 
@@ -1299,6 +1529,8 @@ export class ProductionService {
     productId?: string;
     newProduct?: { name: string; sku?: string; basePrice: number };
     expectedPackagedQty?: number;
+    // Additional expense lines (see production-costing.ts). Optional.
+    expenses?: unknown;
     userId?: string;
   }) {
     const rows: PackageRowInput[] = data.rows?.length
@@ -1329,6 +1561,8 @@ export class ProductionService {
         throw new Error(`${label}Select the finished product, or create a new variant.`);
       }
     });
+    const expenseCategories = await ProductionCostingService.getExpenseCategories();
+    const expenseLines: ExpenseLineInput[] = normalizeExpenseLines(data.expenses, expenseCategories, rows.length);
 
     return prisma.$transaction(async tx => {
       await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${data.batchId} FOR UPDATE`;
@@ -1381,7 +1615,9 @@ export class ProductionService {
         throw new Error(`Packing ${requested.toFixed(3)} ${batchUnit} exceeds the batch's remaining ${Math.max(0, remaining).toFixed(3)} ${batchUnit}.`);
       }
 
-      const results: Awaited<ReturnType<typeof ProductionService.confirmPackagingTx>>[] = [];
+      // Pass 1: resolve each row's product and reserve its bulk (FIFO lot
+      // breakdown recorded per ticket).
+      const reserved: Array<{ packagingId: string; productId: string; bulkBreakdown: unknown; weight: number; packWeight: number; packed: number; damaged: number }> = [];
       const usedProducts = new Map<string, number>();
       for (const [i, row] of rows.entries()) {
         const label = rows.length > 1 ? `Row ${i + 1} (${row.packetSize}): ` : '';
@@ -1394,22 +1630,87 @@ export class ProductionService {
         const packed = Number(row.packedQty);
         const damaged = Number(row.damagedQty ?? 0);
 
-        const { packaging } = await this.startPackagingTx(tx, {
+        const { packaging, bulkBreakdown } = await this.startPackagingTx(tx, {
           batchId: data.batchId,
           packetSize: row.packetSize,
           quantityPackets: packed + damaged,
           productId,
           userId: data.userId,
         });
+        reserved.push({
+          packagingId: packaging.id, productId, bulkBreakdown, weight: packaging.totalWeight,
+          packWeight: packaging.totalWeight / (packed + damaged), packed, damaged,
+        });
+      }
 
+      // Cost every row: consumed bulk cost + additional expenses. PER_BATCH
+      // totals entered now are saved on the batch first, then charged by
+      // packed weight / actual yield so later sessions can't charge them again.
+      const costedBatch = await tx.productBatch.findUniqueOrThrow({
+        where: { id: data.batchId },
+        include: { product: true, production: { include: { recipe: true } } },
+      });
+      const costFranchiseId = costedBatch.franchiseId || costedBatch.production?.franchiseId;
+      if (!costFranchiseId) throw new Error('Franchise ID not found for batch');
+      const costBulkItem = await this.resolveBulkItem(tx, costedBatch, await FranchiseService.toInventoryScopeId(tx, costFranchiseId));
+      await ProductionCostingService.saveSharedTotals(tx, data.batchId, expenseLines, data.userId);
+      const shared = await ProductionCostingService.loadSharedExpenses(tx, data.batchId);
+      const yieldQty = costedBatch.approvedQty || 0;
+      const packedWeight = reserved.reduce((s, r) => s + r.weight, 0);
+      const prices = await tx.product.findMany({ where: { id: { in: reserved.map(r => r.productId) } }, select: { id: true, basePrice: true } });
+      const costing = computePackagingCosts({
+        rows: reserved.map((r, i) => ({
+          packetSize: rows[i].packetSize,
+          packWeight: r.packWeight,
+          good: r.packed,
+          damaged: r.damaged,
+          bulkCost: bulkCostOf(r.bulkBreakdown, r.weight, costedBatch.unitCost || costBulkItem.costPrice || 0),
+          sellingPrice: prices.find(p => p.id === r.productId)?.basePrice ?? null,
+        })),
+        bulkUnit: costBulkItem.unit,
+        lines: expenseLines,
+        shared,
+        yieldQty,
+        finishesBatch: (costedBatch.packagedQty || 0) + packedWeight >= yieldQty - 0.001,
+        categories: expenseCategories,
+      });
+
+      // Pass 2: confirm each row at its full cost and record its expenses.
+      const results: Awaited<ReturnType<typeof ProductionService.confirmPackagingTx>>[] = [];
+      for (const [i, r] of reserved.entries()) {
+        const rowCost = costing.rows[i];
         results.push(await this.confirmPackagingTx(tx, {
-          packagingId: packaging.id,
-          goodQty: packed,
-          damagedQty: damaged,
+          packagingId: r.packagingId,
+          goodQty: r.packed,
+          damagedQty: r.damaged,
           spoiledQty: 0,
-          productId,
+          productId: r.productId,
           userId: data.userId,
+          costing: {
+            extraCost: rowCost.expenseTotal,
+            snapshot: {
+              ...rowCost,
+              unit: costBulkItem.unit,
+              batchUnitCost: costedBatch.unitCost ?? null,
+              policy: 'Damaged packets are carried by good packets of the same row; per-batch expenses are charged by packed weight / actual yield.',
+            },
+          },
         }));
+        const expenseRows = rowCost.expenses.filter(e => e.amount > 0 || e.basis !== 'PER_BATCH');
+        if (expenseRows.length) {
+          await tx.productionExpense.createMany({
+            data: expenseRows.map(e => ({
+              productBatchId: data.batchId,
+              productPackagingId: r.packagingId,
+              category: e.category,
+              basis: e.basis,
+              rate: e.rate,
+              baseQty: e.baseQty,
+              amount: e.amount,
+              createdBy: data.userId,
+            })),
+          });
+        }
       }
 
       // Single-row callers keep the original response shape; multi-row
@@ -1421,6 +1722,8 @@ export class ProductionService {
         goodQty: r.packaging.goodQty ?? 0,
         damagedQty: r.packaging.damagedQty ?? 0,
         totalWeight: r.packaging.totalWeight,
+        // Cost each good packet was added to stock at.
+        unitCost: (r.packaging.costBreakdown as any)?.stockUnitCost ?? null,
       }));
       return { ...results[0], rows: results, summary };
     }, { timeout: 30000 });
@@ -1637,7 +1940,7 @@ export class ProductionService {
     });
   }
 
-  private static parseWeight(size: string, bulkUnit: string): number {
+  static parseWeight(size: string, bulkUnit: string): number {
     const match = size.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
     // Silently treating an unparseable size as "1 KG per packet" let a typo
     // (missing/garbled unit) produce a wrong-but-plausible stock deduction

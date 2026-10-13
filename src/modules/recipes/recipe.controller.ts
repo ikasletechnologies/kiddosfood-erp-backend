@@ -1,10 +1,15 @@
 import { Request, Response } from 'express';
 import { RecipeService } from './recipe.service';
+import { FormulationService } from './formulation.service';
 
 export class RecipeController {
   static async upsert(req: Request, res: Response) {
     try {
-      const recipe = await RecipeService.upsertRecipe(req.body);
+      // Simplified Recipe Master sends `ingredientIds` (no quantities);
+      // older clients still send quantity-bearing `items`.
+      const recipe = Array.isArray(req.body?.ingredientIds)
+        ? await RecipeService.saveSimplifiedRecipe(req.body)
+        : await RecipeService.upsertRecipe(req.body);
       res.status(201).json(recipe);
     } catch (error: any) {
       const isProductIdConflict = 
@@ -69,6 +74,24 @@ export class RecipeController {
         ? 'This recipe cannot be deleted because it is referenced in production records.' 
         : (error.message || 'Failed to delete recipe.');
       res.status(status).json({ error: message });
+    }
+  }
+
+  static async getFormulations(req: Request, res: Response) {
+    try {
+      res.json(await FormulationService.getVersions(req.params.id));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  static async saveFormulation(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const formulation = await FormulationService.saveVersion(req.params.id, req.body, user?.userId);
+      res.status(201).json(formulation);
+    } catch (error: any) {
+      res.status(error.status || 500).json({ error: error.message });
     }
   }
 

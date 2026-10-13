@@ -2,6 +2,19 @@ import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { ProcurementService } from '../procurement/procurement.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { PurchaseLotsService } from '../inventory/purchase-lots.service';
+
+type ReturnItemInput = {
+  itemName: string;
+  quantity: number;
+  unit: string;
+  rate: number;
+  // Optional: the received lot being sent back (see PurchaseLotsService).
+  inventoryBatchId?: string;
+  materialId?: string;
+  baseQty?: number;
+  unitCost?: number;
+};
 
 
 async function generateRFQNumber() {
@@ -316,13 +329,25 @@ export class PurchaseService {
     reason: string;
     returnSource?: string;
     status?: string;
-    items: Array<{ itemName: string; quantity: number; unit: string; rate: number }>;
+    items: Array<ReturnItemInput>;
   }) {
     const { Decimal } = Prisma;
     const returnSource = data.returnSource || 'MANUAL';
     const initialStatus = data.status || 'PENDING';
 
-    let resolvedItems = data.items;
+    // Lot fields are only ever set below, after server-side validation.
+    let resolvedItems: ReturnItemInput[] = data.items.map(({ itemName, quantity, unit, rate }) => ({ itemName, quantity, unit, rate }));
+
+    // Lot-linked lines (Phase 1): the lot must be one this vendor supplied
+    // for this material, and the return is capped at what that lot still
+    // holds minus what other pending returns already claim on it.
+    const lotIds = returnSource === 'MANUAL'
+      ? Array.from(new Set(data.items.map(i => i.inventoryBatchId).filter((id): id is string => !!id)))
+      : [];
+    const lots = lotIds.length ? await prisma.inventoryBatch.findMany({ where: { id: { in: lotIds } } }) : [];
+    const lotById = new Map(lots.map(l => [l.id, l]));
+    const pendingByLot = await PurchaseLotsService.getPendingReturnClaims(prisma, { batchIds: lotIds });
+    const lotRemaining = new Map(lots.map(l => [l.id, l.currentQty - (pendingByLot.get(l.id) || 0)]));
 
     // MANUAL returns must represent material actually received from this
     // vendor — never trust a client-supplied rate/quantity. Resolve both
@@ -353,8 +378,27 @@ export class PurchaseService {
           throw new Error(`Cannot return ${item.quantity} ${match.unit} of "${item.itemName}" — only ${remaining} ${match.unit} is available for return.`);
         }
         remainingByName.set(key, remaining - item.quantity);
+        if (item.inventoryBatchId) {
+          const lot = lotById.get(item.inventoryBatchId);
+          if (!lot || lot.vendorId !== data.vendorId || lot.inventoryItemId !== match.materialId) {
+            throw new Error(`The selected lot is not a lot of "${item.itemName}" received from this vendor.`);
+          }
+          const lotLabel = lot.lotNumber || lot.batchNumber;
+          if (lot.status === 'REJECTED' || lot.status === 'RETURNED') {
+            throw new Error(`Lot ${lotLabel} is ${lot.status} and cannot be returned.`);
+          }
+          const left = lotRemaining.get(lot.id) ?? 0;
+          if (item.quantity > left + 0.0001) {
+            throw new Error(`Cannot return ${item.quantity} ${match.unit} of "${item.itemName}" from lot ${lotLabel} — only ${Number(Math.max(0, left).toFixed(4))} ${match.unit} is left in that lot.`);
+          }
+          lotRemaining.set(lot.id, left - item.quantity);
+          // The returnable unit is the material's stock unit, so quantity is
+          // already the base quantity. Rate is this lot's own purchase cost.
+          const lotCost = lot.unitCost ?? match.rate;
+          return { itemName: item.itemName, quantity: item.quantity, unit: match.unit, rate: lotCost, materialId: match.materialId, inventoryBatchId: lot.id, baseQty: item.quantity, unitCost: lotCost };
+        }
         // Authoritative rate always wins over whatever the client sent.
-        return { ...item, unit: match.unit, rate: match.rate };
+        return { itemName: item.itemName, quantity: item.quantity, unit: match.unit, rate: match.rate };
       });
     }
 
@@ -386,6 +430,7 @@ export class PurchaseService {
         // specific PO/bill is known. Never re-derives from raw data.items,
         // or the quantity validation above would be silently bypassed.
         resolvedItems = await Promise.all(resolvedItems.map(async (item) => {
+          if (item.inventoryBatchId) return item; // lot-linked: keeps its own lot cost
           const material = await prisma.inventoryItem.findFirst({
             where: { name: { equals: item.itemName, mode: 'insensitive' } }
           });
@@ -417,7 +462,11 @@ export class PurchaseService {
               quantity: item.quantity,
               unit: item.unit,
               rate: item.rate,
-              totalAmount: new Decimal(item.quantity).times(item.rate).toDecimalPlaces(4).toNumber()
+              totalAmount: new Decimal(item.quantity).times(item.rate).toDecimalPlaces(4).toNumber(),
+              materialId: item.materialId ?? null,
+              inventoryBatchId: item.inventoryBatchId ?? null,
+              baseQty: item.baseQty ?? null,
+              unitCost: item.unitCost ?? null
             }))
           }
         },
@@ -426,23 +475,7 @@ export class PurchaseService {
 
       if (initialStatus === 'COMPLETED') {
         if (returnSource !== 'GRN_REJECTION') {
-          for (const item of created.items) {
-            const material = await tx.inventoryItem.findFirst({
-              where: { name: { equals: item.itemName, mode: 'insensitive' } }
-            });
-
-            if (material) {
-              await InventoryService.recordMovement(tx, {
-                itemId: material.id,
-                type: 'RETURN_OUT',
-                quantity: -item.quantity,
-                transactionUnit: item.unit,
-                referenceType: 'PURCHASE_RETURN',
-                referenceId: created.id,
-                note: `Purchase Return ${created.returnNumber} to ${created.vendor.name}`
-              });
-            }
-          }
+          await this.postReturnStock(tx, created);
         }
 
         await this.backfillPurchaseReturnTax(tx, created.id);
@@ -451,6 +484,51 @@ export class PurchaseService {
 
       return created;
     });
+  }
+
+  /**
+   * Takes a completed return's goods out of stock. Lot-linked lines come out
+   * of exactly that lot at its own cost; legacy name-only lines keep the
+   * previous FIFO behaviour unchanged.
+   */
+  private static async postReturnStock(tx: any, pr: { id: string; returnNumber: string; vendor: { name: string }; items: any[] }) {
+    for (const item of pr.items) {
+      const note = `Purchase Return ${pr.returnNumber} to ${pr.vendor.name}`;
+
+      if (item.inventoryBatchId && item.materialId) {
+        const baseQty = Number(item.baseQty ?? item.quantity);
+        const lot = await tx.inventoryBatch.findUnique({ where: { id: item.inventoryBatchId }, select: { warehouseId: true } });
+        const fifo = await PurchaseLotsService.depleteLot(tx, item.inventoryBatchId, item.materialId, baseQty);
+        await InventoryService.recordMovement(tx, {
+          itemId: item.materialId,
+          type: 'RETURN_OUT',
+          quantity: -item.quantity,
+          baseQty: -baseQty,
+          transactionUnit: item.unit,
+          referenceType: 'PURCHASE_RETURN',
+          referenceId: pr.id,
+          warehouseId: lot?.warehouseId || undefined,
+          precalculatedFifo: fifo,
+          note
+        });
+        continue;
+      }
+
+      const material = await tx.inventoryItem.findFirst({
+        where: { name: { equals: item.itemName, mode: 'insensitive' } }
+      });
+      if (material) {
+        await InventoryService.recordMovement(tx, {
+          itemId: material.id,
+          type: 'RETURN_OUT',
+          quantity: -item.quantity,
+          transactionUnit: item.unit,
+          referenceType: 'PURCHASE_RETURN',
+          referenceId: pr.id,
+          note
+        });
+      }
+    }
   }
 
   static async updatePurchaseReturn(id: string, data: { status: string }) {
@@ -500,23 +578,7 @@ export class PurchaseService {
         }
 
         if (existing.returnSource !== 'GRN_REJECTION') {
-          for (const item of existing.items) {
-            const material = await tx.inventoryItem.findFirst({
-              where: { name: { equals: item.itemName, mode: 'insensitive' } }
-            });
-
-            if (material) {
-              await InventoryService.recordMovement(tx, {
-                itemId: material.id,
-                type: 'RETURN_OUT',
-                quantity: -item.quantity,
-                transactionUnit: item.unit,
-                referenceType: 'PURCHASE_RETURN',
-                referenceId: id,
-                note: `Purchase Return ${existing.returnNumber} to ${existing.vendor.name}`
-              });
-            }
-          }
+          await this.postReturnStock(tx, existing);
         }
 
         // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor) and GST breakdown
