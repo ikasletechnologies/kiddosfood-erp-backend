@@ -2,9 +2,10 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { WasteService } from '../waste/waste.service';
 import { FranchiseService } from '../franchise/franchise.service';
-import { ProductionStatus } from '@prisma/client';
+import { Prisma, ProductionStatus } from '@prisma/client';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
-import { generateSku } from '../product/product.service';
+import { generateSku, parseSkuPackSize, ProductService } from '../product/product.service';
+import { ProductionFlags, QC_NOT_REQUIRED, PACKAGEABLE_QC_STATUSES } from './production.flags';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -41,6 +42,32 @@ function resolveBulkIdentity(
 
   return { bulkSku: 'RECIPE-BULK', bulkName: 'RECIPE - Bulk' };
 }
+
+type StartPackagingInput = {
+  batchId: string;
+  packetSize: string;
+  quantityPackets: number;
+  productId?: string;
+  newProduct?: { name: string; sku?: string; basePrice: number };
+  userId?: string;
+};
+
+type PackageRowInput = {
+  packetSize: string;
+  packedQty: number;
+  damagedQty?: number;
+  productId?: string;
+  newProduct?: { name: string; sku?: string; basePrice: number };
+};
+
+type ConfirmPackagingInput = {
+  packagingId: string;
+  goodQty: number;
+  damagedQty: number;
+  spoiledQty: number;
+  productId?: string;
+  userId?: string;
+};
 
 export class ProductionService {
   /**
@@ -325,7 +352,21 @@ export class ProductionService {
     });
   }
 
-  static async approveProduction(id: string, userId?: string, actualYield?: number, remarks?: string, expiryDate?: string) {
+  static async approveProduction(
+    id: string,
+    userId?: string,
+    actualYield?: number,
+    remarks?: string,
+    expiryDate?: string,
+    wastage?: { quantity: number; note?: string },
+  ) {
+    if (actualYield !== undefined && (!Number.isFinite(actualYield) || actualYield <= 0)) {
+      throw new Error('Actual produced quantity must be a number greater than 0.');
+    }
+    const wastageQty = wastage?.quantity ?? 0;
+    if (!Number.isFinite(wastageQty) || wastageQty < 0) {
+      throw new Error('Production wastage cannot be negative.');
+    }
     return prisma.$transaction(async tx => {
       // Row-lock the production row first. Without this, two concurrent
       // Complete Production calls for the same run (a double-click, a
@@ -419,7 +460,38 @@ export class ProductionService {
           ...(remarks ? { remarks } : {}),
         },
       });
-      return { production: completedProduction, batch };
+
+      // Production wastage (yield loss) reported at completion. It never
+      // entered stock, so — like a QC rejection in inspectBatch — it is a
+      // WasteEntry for reporting only, with no stock movement. Its cost is
+      // the share of this run's material cost it represents; the remaining
+      // output already carries the full cost via unitCost above.
+      if (wastageQty > 0) {
+        const { targetItem } = await this.ensureBulkItem(
+          tx,
+          { product: recipe.product, production: { recipe } },
+          production.franchiseId,
+        );
+        await tx.wasteEntry.create({
+          data: {
+            inventoryItemId: targetItem.id,
+            franchiseId: production.franchiseId,
+            warehouseId: production.warehouseId || undefined,
+            quantity: wastageQty,
+            reason: 'YIELD_LOSS',
+            note: wastage?.note || `Production wastage recorded at completion of batch ${productionBatchCode}`,
+            costAtTime: totalCost > 0 ? (totalCost * wastageQty) / (totalYield + wastageQty) : 0,
+          },
+        });
+      }
+
+      // Simplified workflow: with production QC switched off, a completed run
+      // goes straight to Ready for Packaging in this same transaction.
+      const finalBatch = ProductionFlags.qcEnabled
+        ? batch
+        : await this.releaseToPackagingTx(tx, batch.id, userId);
+
+      return { production: completedProduction, batch: finalBatch };
     });
   }
 
@@ -479,39 +551,7 @@ export class ProductionService {
       if (needsTargetItem) {
         const franchiseId = batch.franchiseId || batch.production?.franchiseId;
         if (!franchiseId) throw new Error('Franchise ID not found for batch');
-        const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
-        const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
-
-        const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
-
-        let targetItem = await tx.inventoryItem.findFirst({
-          where: {
-            franchiseId: invFranchiseId,
-            OR: [
-              { sku: bulkSku },
-              { name: bulkName },
-            ],
-          },
-        });
-
-        if (!targetItem) {
-          targetItem = await tx.inventoryItem.create({
-            data: {
-              name: bulkName,
-              sku: bulkSku,
-              category: 'SEMI_FINISHED',
-              currentStock: 0,
-              unit: finishedGoodUnit,
-              minimumStock: 5,
-              franchiseId: invFranchiseId,
-            },
-          });
-        } else if (!RECOGNIZED_PACK_UNITS.includes(targetItem.unit.toLowerCase()) && RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
-          targetItem = await tx.inventoryItem.update({
-            where: { id: targetItem.id },
-            data: { unit: finishedGoodUnit },
-          });
-        }
+        const { targetItem, finishedGoodUnit } = await this.ensureBulkItem(tx, batch, franchiseId);
 
         if (approvedQty > 0) {
           // Credits approved bulk stock carrying the effective cost (total batch cost / approvedQty)
@@ -552,6 +592,147 @@ export class ProductionService {
 
       return updatedBatch;
     });
+  }
+
+  // Finds (or creates) the SEMI_FINISHED bulk inventory item a batch's output
+  // is credited to, self-healing a stale unit label. Shared by QC acceptance
+  // (inspectBatch) and the no-QC release path (releaseToPackagingTx) so both
+  // credit exactly the same item.
+  private static async ensureBulkItem(
+    tx: any,
+    batch: { product?: any; production?: { recipe?: any } | null },
+    franchiseId: string,
+  ) {
+    const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
+    const finishedGoodUnit = batch.production?.recipe?.yieldUnit || 'KG';
+
+    const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
+
+    let targetItem = await tx.inventoryItem.findFirst({
+      where: {
+        franchiseId: invFranchiseId,
+        OR: [
+          { sku: bulkSku },
+          { name: bulkName },
+        ],
+      },
+    });
+
+    if (!targetItem) {
+      targetItem = await tx.inventoryItem.create({
+        data: {
+          name: bulkName,
+          sku: bulkSku,
+          category: 'SEMI_FINISHED',
+          currentStock: 0,
+          unit: finishedGoodUnit,
+          minimumStock: 5,
+          franchiseId: invFranchiseId,
+        },
+      });
+    } else if (!RECOGNIZED_PACK_UNITS.includes(targetItem.unit.toLowerCase()) && RECOGNIZED_PACK_UNITS.includes(finishedGoodUnit.toLowerCase())) {
+      targetItem = await tx.inventoryItem.update({
+        where: { id: targetItem.id },
+        data: { unit: finishedGoodUnit },
+      });
+    }
+
+    return { targetItem, invFranchiseId, finishedGoodUnit };
+  }
+
+  // No-QC path: moves a completed batch's full produced quantity straight to
+  // Ready for Packaging. Mirrors the stock credit inspectBatch performs on QC
+  // acceptance (same bulk item, same PRODUCTION_IN movement, same lot), but
+  // marks the batch QC_NOT_REQUIRED instead of fabricating an APPROVED result.
+  // Guarded so the credit can only ever happen once per batch: the row lock
+  // serialises concurrent calls and the PENDING check rejects every repeat.
+  private static async releaseToPackagingTx(tx: any, batchId: string, userId?: string) {
+    await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${batchId} FOR UPDATE`;
+    const batch = await tx.productBatch.findUnique({
+      where: { id: batchId },
+      include: { product: true, production: { include: { recipe: true } } },
+    });
+    if (!batch) throw new Error('Product batch not found');
+    if (batch.qcStatus !== 'PENDING') {
+      throw new Error(`Batch ${batch.batchCode} has already been released (status: ${batch.qcStatus}). Stock was credited once at that time and cannot be re-applied.`);
+    }
+
+    const releasedQty = batch.quantity || 0;
+    if (!(releasedQty > 0)) {
+      throw new Error(`Batch ${batch.batchCode} has no produced quantity to release to packaging.`);
+    }
+
+    const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+    if (!franchiseId) throw new Error('Franchise ID not found for batch');
+
+    const totalBatchCost = batch.totalCost || batch.production?.totalCost || batch.production?.materialCost || 0;
+    const unitCost = Number((totalBatchCost / releasedQty).toFixed(4));
+
+    const updatedBatch = await tx.productBatch.update({
+      where: { id: batch.id },
+      data: {
+        qcStatus: QC_NOT_REQUIRED,
+        approvedQty: releasedQty,
+        rejectionQty: 0,
+        unitCost,
+      },
+    });
+
+    const { targetItem, finishedGoodUnit } = await this.ensureBulkItem(tx, batch, franchiseId);
+
+    await InventoryService.recordMovement(tx, {
+      itemId: targetItem.id,
+      type: 'PRODUCTION_IN',
+      quantity: releasedQty,
+      transactionUnit: finishedGoodUnit,
+      referenceType: 'PRODUCTION',
+      referenceId: batch.productionId || batch.id,
+      note: `Released to packaging (production QC not required): ${batch.batchCode} (${releasedQty} ${finishedGoodUnit} at unit cost ₹${unitCost.toFixed(4)})`,
+      userId,
+      warehouseId: batch.production?.warehouseId || undefined,
+      receiveAtCost: {
+        unitCost,
+        batchNumber: batch.batchCode || undefined,
+        mfgDate: batch.mfgDate,
+        expDate: batch.expiryDate,
+        productBatchId: batch.id,
+      },
+    });
+
+    return updatedBatch;
+  }
+
+  // Why a PENDING batch may NOT be released to packaging automatically, or
+  // null if it may. Cancelled/unfinished runs, recalled, expired and empty
+  // batches are never auto-released. Rejected batches never reach here — they
+  // are not PENDING.
+  private static autoReleaseBlocker(batch: {
+    quantity: number | null;
+    expiryDate: Date | null;
+    production?: { status: string } | null;
+    recall?: { status: string } | null;
+  }): string | null {
+    if (ProductionFlags.qcEnabled) return 'production QC is enabled, so it must pass QC inspection first.';
+    if (batch.production && batch.production.status !== 'COMPLETED') {
+      return `its production run is ${batch.production.status.toLowerCase().replace('_', ' ')}, not completed.`;
+    }
+    if (batch.recall && (batch.recall.status === 'IN_PROGRESS' || batch.recall.status === 'COMPLETED')) {
+      return 'it is under recall.';
+    }
+    if (batch.expiryDate && batch.expiryDate.getTime() < Date.now()) return 'it has expired.';
+    if (!((batch.quantity || 0) > 0)) return 'it has no produced quantity.';
+    return null;
+  }
+
+  // For batches completed before production QC was switched off: they are
+  // still PENDING QC, with no bulk stock credited. The active workflow no
+  // longer calls this (packageAndConfirm releases automatically); the API is
+  // kept for compatibility.
+  static async releaseBatchToPackaging(batchId: string, userId?: string) {
+    if (ProductionFlags.qcEnabled) {
+      throw new Error('Production QC is enabled — this batch must pass QC inspection before packaging.');
+    }
+    return prisma.$transaction(tx => this.releaseToPackagingTx(tx, batchId, userId));
   }
 
   // Derives the retail FINISHED_GOOD item's name/SKU from the bulk item plus
@@ -646,165 +827,167 @@ export class ProductionService {
   // sellable Finished Goods stock the instant this button was clicked —
   // before a single physical label had been printed or a single packet
   // inspected.
-  static async startPackaging(data: {
-    batchId: string;
-    packetSize: string;
-    quantityPackets: number;
-    productId?: string;
-    newProduct?: { name: string; sku?: string; basePrice: number };
-    userId?: string;
-  }) {
-    return prisma.$transaction(async tx => {
-      const batch = await tx.productBatch.findUnique({
-        where: { id: data.batchId },
-        include: { product: true, production: { include: { recipe: true } } },
-      });
-      if (!batch) throw new Error('Product batch not found');
+  static async startPackaging(data: StartPackagingInput) {
+    return prisma.$transaction(tx => this.startPackagingTx(tx, data));
+  }
 
-      // Allow both APPROVED and PARTIALLY_APPROVED — both have legitimate
-      // approved bulk stock equal to batch.approvedQty.
-      if (batch.qcStatus !== 'APPROVED' && batch.qcStatus !== 'PARTIALLY_APPROVED') {
-        throw new Error('Batch must be QC approved (or partially approved) before packaging.');
-      }
-
-      const recall = await tx.batchRecall.findUnique({ where: { productBatchId: data.batchId } });
-      if (recall?.status === 'IN_PROGRESS') {
-        throw new Error('Packaging blocked — batch is under recall.');
-      }
-
-      let targetProductId = data.productId;
-
-      if (data.newProduct) {
-        if (data.newProduct.sku) {
-          const existing = await tx.product.findUnique({ where: { sku: data.newProduct.sku } });
-          if (existing) {
-            throw new Error(`A product with SKU "${data.newProduct.sku}" already exists`);
-          }
-        }
-        
-        const createdProduct = await tx.product.create({
-          data: {
-            name: data.newProduct.name,
-            sku: data.newProduct.sku || undefined,
-            basePrice: data.newProduct.basePrice || 0,
-            category: 'FINISHED_GOOD',
-            productType: 'FINISHED_GOOD',
-            is_menu_item: true,
-            isVeg: true,
-            isActive: true,
-          }
-        });
-        targetProductId = createdProduct.id;
-      }
-
-      if (targetProductId) {
-        const chosen = await tx.product.findUnique({ where: { id: targetProductId } });
-        if (chosen) {
-          await tx.productBatch.update({
-            where: { id: batch.id },
-            data: { productId: chosen.id },
-          });
-        }
-      }
-
-      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
-      if (!franchiseId) throw new Error('Franchise ID not found for batch');
-      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
-
-      let bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
-
-      // Row-lock the bulk item so two concurrent Start Packaging calls for
-      // this batch (a double-click, two tabs, two operators) can't both read
-      // the same currentStock, both pass the check below, and both reserve
-      // against stock that only really covers one of them. Re-read after the
-      // lock is acquired — resolveBulkItem's read above may now be stale.
-      await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${bulkItem.id} FOR UPDATE`;
-      bulkItem = await tx.inventoryItem.findUniqueOrThrow({ where: { id: bulkItem.id } });
-
-      const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
-      const totalWeightNeeded = data.quantityPackets * unitMultiplier;
-
-      // This check and the reservation deduction below are the single
-      // authoritative point where bulk availability is enforced — the lock
-      // above makes it safe against concurrent Start Packaging calls, and
-      // confirmPackaging deliberately does not re-check (see the comment
-      // there): re-checking against currentStock post-reservation would
-      // compare against a pool that already has this run's own reservation
-      // subtracted from it, failing every confirm with a phantom shortage.
-      if (bulkItem.currentStock < totalWeightNeeded) {
-        const shortage = totalWeightNeeded - bulkItem.currentStock;
-        throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
-      }
-
-      // Cap against this batch's own QC-approved quantity minus both already-confirmed
-      // packaging runs AND any in-flight pending packaging runs.
-      const confirmedWeight = batch.packagedQty || 0;
-      const pendingRuns = await tx.productPackaging.findMany({
-        where: {
-          batchId: batch.id,
-          status: 'AWAITING_CONFIRMATION',
-        },
-        select: { totalWeight: true },
-      });
-      const pendingWeight = pendingRuns.reduce((sum, r) => sum + (r.totalWeight || 0), 0);
-      const remainingAvailable = (batch.approvedQty || 0) - confirmedWeight - pendingWeight;
-
-      if (batch.packagingStatus === 'PACKAGED' || remainingAvailable <= 0.001) {
-        throw new Error('This batch is already fully packaged (or all remaining bulk is reserved by pending packaging runs).');
-      }
-      if (totalWeightNeeded > remainingAvailable + 0.001) {
-        throw new Error(`Cannot package more than the batch's available approved quantity (${Math.max(0, remainingAvailable).toFixed(2)} ${bulkItem.unit} available; ${pendingWeight.toFixed(2)} ${bulkItem.unit} is already reserved in pending runs).`);
-      }
-
-      const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
-      const packaging = await tx.productPackaging.create({
-        data: {
-          batchId: batch.id,
-          packetSize: data.packetSize,
-          quantityPackets: data.quantityPackets,
-          totalWeight: totalWeightNeeded,
-          barcode,
-          printedLabels: false,
-          status: 'AWAITING_CONFIRMATION',
-        },
-      });
-
-      // Reserve the required bulk stock immediately against this run.
-      // This ensures it cannot be consumed by other concurrent packaging runs
-      // and acts as the transactional deduction.
-      const { fifo } = await InventoryService.recordMovement(tx, {
-        itemId: bulkItem.id,
-        type: 'PRODUCTION_OUT',
-        quantity: -totalWeightNeeded,
-        referenceType: 'PACKAGING',
-        referenceId: batch.id,
-        note: `Packaging started: Reserved bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
-        userId: data.userId,
-      });
-
-      // The bulk pool is shared across every ProductBatch of this recipe —
-      // FIFO can draw from an older/cheaper (or newer/pricier) batch than
-      // the one being packaged here. Record exactly which lot(s) it actually
-      // consumed so confirmPackaging() can cost this run from the real
-      // consumption instead of just this ProductBatch's own unitCost, and so
-      // recall traceability can follow material across batch boundaries.
-      const bulkBreakdown = fifo?.consumptions?.map(c => ({
-        batchId: c.batchId,
-        productBatchId: c.productBatchId,
-        billNumber: c.billNumber,
-        qty: c.qty,
-        unitCost: c.unitCost,
-        totalCost: c.totalCost,
-      })) ?? [];
-      if (bulkBreakdown.length) {
-        await tx.productPackaging.update({
-          where: { id: packaging.id },
-          data: { bulkBreakdown },
-        });
-      }
-
-      return { packaging };
+  private static async startPackagingTx(tx: Prisma.TransactionClient, data: StartPackagingInput) {
+    const batch = await tx.productBatch.findUnique({
+      where: { id: data.batchId },
+      include: { product: true, production: { include: { recipe: true } } },
     });
+    if (!batch) throw new Error('Product batch not found');
+
+    // APPROVED / PARTIALLY_APPROVED (QC passed) and QC_NOT_REQUIRED (QC
+    // switched off) all have real bulk stock credited equal to
+    // batch.approvedQty.
+    if (!PACKAGEABLE_QC_STATUSES.includes(batch.qcStatus || '')) {
+      throw new Error(
+        ProductionFlags.qcEnabled
+          ? 'Batch must be QC approved (or partially approved) before packaging.'
+          : 'Batch has not been released to packaging yet.'
+      );
+    }
+
+    const recall = await tx.batchRecall.findUnique({ where: { productBatchId: data.batchId } });
+    // A closed (COMPLETED) recall keeps the batch out of packaging too —
+    // closing documents the recall, it never makes recalled bulk usable.
+    if (recall?.status === 'IN_PROGRESS' || recall?.status === 'COMPLETED') {
+      throw new Error('Packaging blocked — batch is under recall.');
+    }
+
+    let targetProductId = data.productId;
+
+    if (data.newProduct) {
+      if (data.newProduct.sku) {
+        const existing = await tx.product.findUnique({ where: { sku: data.newProduct.sku } });
+        if (existing) {
+          throw new Error(`A product with SKU "${data.newProduct.sku}" already exists`);
+        }
+      }
+      
+      const createdProduct = await tx.product.create({
+        data: {
+          name: data.newProduct.name,
+          sku: data.newProduct.sku || undefined,
+          basePrice: data.newProduct.basePrice || 0,
+          category: 'FINISHED_GOOD',
+          productType: 'FINISHED_GOOD',
+          is_menu_item: true,
+          isVeg: true,
+          isActive: true,
+        }
+      });
+      targetProductId = createdProduct.id;
+    }
+
+    if (targetProductId) {
+      const chosen = await tx.product.findUnique({ where: { id: targetProductId } });
+      if (chosen) {
+        await tx.productBatch.update({
+          where: { id: batch.id },
+          data: { productId: chosen.id },
+        });
+      }
+    }
+
+    const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+    if (!franchiseId) throw new Error('Franchise ID not found for batch');
+    const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
+
+    let bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
+
+    // Row-lock the bulk item so two concurrent Start Packaging calls for
+    // this batch (a double-click, two tabs, two operators) can't both read
+    // the same currentStock, both pass the check below, and both reserve
+    // against stock that only really covers one of them. Re-read after the
+    // lock is acquired — resolveBulkItem's read above may now be stale.
+    await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${bulkItem.id} FOR UPDATE`;
+    bulkItem = await tx.inventoryItem.findUniqueOrThrow({ where: { id: bulkItem.id } });
+
+    const unitMultiplier = this.parseWeight(data.packetSize, bulkItem.unit);
+    const totalWeightNeeded = data.quantityPackets * unitMultiplier;
+
+    // This check and the reservation deduction below are the single
+    // authoritative point where bulk availability is enforced — the lock
+    // above makes it safe against concurrent Start Packaging calls, and
+    // confirmPackaging deliberately does not re-check (see the comment
+    // there): re-checking against currentStock post-reservation would
+    // compare against a pool that already has this run's own reservation
+    // subtracted from it, failing every confirm with a phantom shortage.
+    if (bulkItem.currentStock < totalWeightNeeded) {
+      const shortage = totalWeightNeeded - bulkItem.currentStock;
+      throw new Error(`Insufficient bulk stock. Required: ${totalWeightNeeded.toFixed(2)} ${bulkItem.unit}, Available: ${bulkItem.currentStock.toFixed(2)} ${bulkItem.unit}, Shortage: ${shortage.toFixed(2)} ${bulkItem.unit}`);
+    }
+
+    // Cap against this batch's own QC-approved quantity minus both already-confirmed
+    // packaging runs AND any in-flight pending packaging runs.
+    const confirmedWeight = batch.packagedQty || 0;
+    const pendingRuns = await tx.productPackaging.findMany({
+      where: {
+        batchId: batch.id,
+        status: 'AWAITING_CONFIRMATION',
+      },
+      select: { totalWeight: true },
+    });
+    const pendingWeight = pendingRuns.reduce((sum, r) => sum + (r.totalWeight || 0), 0);
+    const remainingAvailable = (batch.approvedQty || 0) - confirmedWeight - pendingWeight;
+
+    if (batch.packagingStatus === 'PACKAGED' || remainingAvailable <= 0.001) {
+      throw new Error('This batch is already fully packaged (or all remaining bulk is reserved by pending packaging runs).');
+    }
+    if (totalWeightNeeded > remainingAvailable + 0.001) {
+      throw new Error(`Cannot package more than the batch's available approved quantity (${Math.max(0, remainingAvailable).toFixed(2)} ${bulkItem.unit} available; ${pendingWeight.toFixed(2)} ${bulkItem.unit} is already reserved in pending runs).`);
+    }
+
+    const barcode = `PKG-${batch.batchCode}-${data.packetSize.toUpperCase()}-${Date.now().toString().substring(8)}`;
+    const packaging = await tx.productPackaging.create({
+      data: {
+        batchId: batch.id,
+        packetSize: data.packetSize,
+        quantityPackets: data.quantityPackets,
+        totalWeight: totalWeightNeeded,
+        barcode,
+        printedLabels: false,
+        status: 'AWAITING_CONFIRMATION',
+      },
+    });
+
+    // Reserve the required bulk stock immediately against this run.
+    // This ensures it cannot be consumed by other concurrent packaging runs
+    // and acts as the transactional deduction.
+    const { fifo } = await InventoryService.recordMovement(tx, {
+      itemId: bulkItem.id,
+      type: 'PRODUCTION_OUT',
+      quantity: -totalWeightNeeded,
+      referenceType: 'PACKAGING',
+      referenceId: batch.id,
+      note: `Packaging started: Reserved bulk stock for ${data.quantityPackets} x ${data.packetSize} packs`,
+      userId: data.userId,
+    });
+
+    // The bulk pool is shared across every ProductBatch of this recipe —
+    // FIFO can draw from an older/cheaper (or newer/pricier) batch than
+    // the one being packaged here. Record exactly which lot(s) it actually
+    // consumed so confirmPackaging() can cost this run from the real
+    // consumption instead of just this ProductBatch's own unitCost, and so
+    // recall traceability can follow material across batch boundaries.
+    const bulkBreakdown = fifo?.consumptions?.map(c => ({
+      batchId: c.batchId,
+      productBatchId: c.productBatchId,
+      billNumber: c.billNumber,
+      qty: c.qty,
+      unitCost: c.unitCost,
+      totalCost: c.totalCost,
+    })) ?? [];
+    if (bulkBreakdown.length) {
+      await tx.productPackaging.update({
+        where: { id: packaging.id },
+        data: { bulkBreakdown },
+      });
+    }
+
+    return { packaging };
   }
 
   static async savePackagingVerification(data: {
@@ -842,260 +1025,496 @@ export class ProductionService {
   // and spoiled quantities never touch Finished Goods at all, mirroring how
   // a QC-rejected batch quantity never touches inventory either (see the
   // rejection-qty WasteEntry a few lines up in inspectBatch).
-  static async confirmPackaging(data: {
-    packagingId: string;
-    goodQty: number;
-    damagedQty: number;
-    spoiledQty: number;
-    productId?: string;
-    userId?: string;
-  }) {
-    return prisma.$transaction(async tx => {
-      // Row-lock the packaging ticket first. Without this, two concurrent
-      // Confirm calls for the same ticket (a double-click, a retried
-      // request) can both read status AWAITING_CONFIRMATION before either
-      // commits its status update, both pass the guard below, and both
-      // create Finished Goods stock + waste entries — the exact
-      // double-deduction/duplicate-entry the status guard is meant to
-      // prevent. The lock forces the second call to wait, then see the
-      // first call's committed CONFIRMED status.
-      await tx.$queryRaw`SELECT id FROM "ProductPackaging" WHERE id = ${data.packagingId} FOR UPDATE`;
-      const packaging = await tx.productPackaging.findUnique({
-        where: { id: data.packagingId },
-        include: {
-          batch: {
-            include: { product: true, production: { include: { recipe: true } }, recall: true },
-          },
+  static async confirmPackaging(data: ConfirmPackagingInput) {
+    return prisma.$transaction(tx => this.confirmPackagingTx(tx, data));
+  }
+
+  private static async confirmPackagingTx(tx: Prisma.TransactionClient, data: ConfirmPackagingInput) {
+    // Row-lock the packaging ticket first. Without this, two concurrent
+    // Confirm calls for the same ticket (a double-click, a retried
+    // request) can both read status AWAITING_CONFIRMATION before either
+    // commits its status update, both pass the guard below, and both
+    // create Finished Goods stock + waste entries — the exact
+    // double-deduction/duplicate-entry the status guard is meant to
+    // prevent. The lock forces the second call to wait, then see the
+    // first call's committed CONFIRMED status.
+    await tx.$queryRaw`SELECT id FROM "ProductPackaging" WHERE id = ${data.packagingId} FOR UPDATE`;
+    const packaging = await tx.productPackaging.findUnique({
+      where: { id: data.packagingId },
+      include: {
+        batch: {
+          include: { product: true, production: { include: { recipe: true } }, recall: true },
         },
-      });
-      if (!packaging) throw new Error('Packaging run not found');
-      // The ticket-status guard is what makes "confirm twice" and "bulk
-      // deducted twice" impossible — a second confirm attempt fails right
-      // here, before anything is touched.
-      if (packaging.status !== 'AWAITING_CONFIRMATION') {
-        throw new Error(`This packaging run is already ${packaging.status.toLowerCase().replace('_', ' ')} and cannot be confirmed again.`);
-      }
+      },
+    });
+    if (!packaging) throw new Error('Packaging run not found');
+    // The ticket-status guard is what makes "confirm twice" and "bulk
+    // deducted twice" impossible — a second confirm attempt fails right
+    // here, before anything is touched.
+    if (packaging.status !== 'AWAITING_CONFIRMATION') {
+      throw new Error(`This packaging run is already ${packaging.status.toLowerCase().replace('_', ' ')} and cannot be confirmed again.`);
+    }
 
-      const batch = packaging.batch;
+    const batch = packaging.batch;
 
-      // Re-check recall — a recall could have been initiated in the gap
-      // between Start Packaging and Confirm, a gap that didn't exist under
-      // the old one-shot flow.
-      if (batch.recall?.status === 'IN_PROGRESS') {
-        throw new Error('Cannot confirm — batch is under recall.');
-      }
+    // Re-check recall — a recall could have been initiated in the gap
+    // between Start Packaging and Confirm, a gap that didn't exist under
+    // the old one-shot flow.
+    if (batch.recall?.status === 'IN_PROGRESS' || batch.recall?.status === 'COMPLETED') {
+      throw new Error('Cannot confirm — batch is under recall.');
+    }
 
-      const good = Number(data.goodQty) || 0;
-      const damaged = Number(data.damagedQty) || 0;
-      const spoiled = Number(data.spoiledQty) || 0;
-      if (good < 0 || damaged < 0 || spoiled < 0) {
-        throw new Error('Quantities cannot be negative.');
-      }
-      if (good + damaged + spoiled !== packaging.quantityPackets) {
-        throw new Error(`Good + Damaged + Spoiled (${good + damaged + spoiled}) must equal the planned packaging quantity (${packaging.quantityPackets}).`);
-      }
+    const good = Number(data.goodQty) || 0;
+    const damaged = Number(data.damagedQty) || 0;
+    const spoiled = Number(data.spoiledQty) || 0;
+    if (good < 0 || damaged < 0 || spoiled < 0) {
+      throw new Error('Quantities cannot be negative.');
+    }
+    if (good + damaged + spoiled !== packaging.quantityPackets) {
+      throw new Error(`Good + Damaged + Spoiled (${good + damaged + spoiled}) must equal the planned packaging quantity (${packaging.quantityPackets}).`);
+    }
 
-      let selectedProduct: any = null;
-      if (data.productId) {
-        selectedProduct = await tx.product.findUnique({ where: { id: data.productId } });
-        if (!selectedProduct) {
-          // If not found by primary ID, try looking up by SKU or exact Name
-          selectedProduct = await tx.product.findFirst({
-            where: {
-              OR: [
-                { sku: data.productId },
-                { name: { equals: data.productId, mode: 'insensitive' } },
-              ],
-            },
-          });
-        }
-        if (!selectedProduct) {
-          // If data.productId was actually a Recipe ID, check if that recipe links to a real Product
-          const recipe = await tx.recipe.findUnique({
-            where: { id: data.productId },
-            include: { product: true },
-          });
-          if (recipe?.product) {
-            selectedProduct = recipe.product;
-          }
-        }
-        if (selectedProduct && selectedProduct.isActive === false) {
-          throw new Error('Selected sellable product is inactive.');
-        }
-        if (selectedProduct) {
-          await tx.productBatch.update({
-            where: { id: batch.id },
-            data: { productId: selectedProduct.id },
-          });
+    let selectedProduct: any = null;
+    if (data.productId) {
+      selectedProduct = await tx.product.findUnique({ where: { id: data.productId } });
+      if (!selectedProduct) {
+        // If not found by primary ID, try looking up by SKU or exact Name
+        selectedProduct = await tx.product.findFirst({
+          where: {
+            OR: [
+              { sku: data.productId },
+              { name: { equals: data.productId, mode: 'insensitive' } },
+            ],
+          },
+        });
+      }
+      if (!selectedProduct) {
+        // If data.productId was actually a Recipe ID, check if that recipe links to a real Product
+        const recipe = await tx.recipe.findUnique({
+          where: { id: data.productId },
+          include: { product: true },
+        });
+        if (recipe?.product) {
+          selectedProduct = recipe.product;
         }
       }
-
-      const franchiseId = batch.franchiseId || batch.production?.franchiseId;
-      if (!franchiseId) throw new Error('Franchise ID not found for batch');
-      const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
-
-      const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
-
-      const unitMultiplier = this.parseWeight(packaging.packetSize, bulkItem.unit);
-      const totalWeightNeeded = packaging.quantityPackets * unitMultiplier;
-
-      // The authoritative check and bulk deduction have already occurred in
-      // startPackaging (which acts as a reservation). We do not re-check
-      // bulkItem.currentStock here to avoid double-deducting or failing when
-      // the reservation is the only reason stock is "short".
-
-      const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
-      if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
-        throw new Error('This batch is already fully packaged.');
+      if (selectedProduct && selectedProduct.isActive === false) {
+        throw new Error('Selected sellable product is inactive.');
       }
-      if (totalWeightNeeded > remainingInBatch + 0.001) {
-        throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
+      if (selectedProduct) {
+        await tx.productBatch.update({
+          where: { id: batch.id },
+          data: { productId: selectedProduct.id },
+        });
       }
+    }
 
-      const linkedProduct = selectedProduct || (batch as any).product || (batch as any).production?.recipe?.product;
-      let retailSku: string;
-      let retailName: string;
+    const franchiseId = batch.franchiseId || batch.production?.franchiseId;
+    if (!franchiseId) throw new Error('Franchise ID not found for batch');
+    const invFranchiseId = await FranchiseService.toInventoryScopeId(tx, franchiseId);
 
-      if (linkedProduct?.sku) {
-        retailSku = linkedProduct.sku;
-        retailName = linkedProduct.name;
-      } else {
-        const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
-        retailSku = generateSku('FINISHED_GOOD', baseName, packaging.packetSize);
-        const packetSizeMatch = packaging.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
-        const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : packaging.packetSize;
-        retailName = baseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
-          ? baseName
-          : `${baseName} ${formattedPacketSize}`;
+    const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
 
-        // Idempotent automatic catalog Product creation for unlinked recipe
-        let product = await tx.product.findUnique({ where: { sku: retailSku } });
-        if (!product) {
-          product = await tx.product.create({
-            data: {
-              name: retailName,
-              sku: retailSku,
-              category: 'FINISHED_GOOD',
-              productType: 'FINISHED_GOOD',
-              basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
-              taxPercent: 5,
-              isActive: true,
-            },
-          });
-        }
-      }
+    const unitMultiplier = this.parseWeight(packaging.packetSize, bulkItem.unit);
+    const totalWeightNeeded = packaging.quantityPackets * unitMultiplier;
 
-      let retailItem = await tx.inventoryItem.findFirst({
-        where: { franchiseId: invFranchiseId, sku: retailSku },
-      });
-      if (!retailItem) {
-        retailItem = await tx.inventoryItem.create({
+    // The authoritative check and bulk deduction have already occurred in
+    // startPackaging (which acts as a reservation). We do not re-check
+    // bulkItem.currentStock here to avoid double-deducting or failing when
+    // the reservation is the only reason stock is "short".
+
+    const remainingInBatch = (batch.approvedQty || 0) - (batch.packagedQty || 0);
+    if (batch.packagingStatus === 'PACKAGED' || remainingInBatch <= 0.001) {
+      throw new Error('This batch is already fully packaged.');
+    }
+    if (totalWeightNeeded > remainingInBatch + 0.001) {
+      throw new Error(`Cannot confirm — exceeds the batch's remaining approved quantity (${remainingInBatch.toFixed(2)} ${bulkItem.unit} left).`);
+    }
+
+    const linkedProduct = selectedProduct || (batch as any).product || (batch as any).production?.recipe?.product;
+    let retailSku: string;
+    let retailName: string;
+
+    if (linkedProduct?.sku) {
+      retailSku = linkedProduct.sku;
+      retailName = linkedProduct.name;
+    } else {
+      const baseName = bulkItem.name.replace(/\s+-\s+Bulk$/i, '').replace(/\s+\(Bulk\)$/i, '');
+      retailSku = generateSku('FINISHED_GOOD', baseName, packaging.packetSize);
+      const packetSizeMatch = packaging.packetSize.match(/^(\d+(\.\d+)?)\s*(g|kg|l|ml|pcs|unit)$/i);
+      const formattedPacketSize = packetSizeMatch ? `${packetSizeMatch[1]} ${packetSizeMatch[3].toUpperCase()}` : packaging.packetSize;
+      retailName = baseName.toLowerCase().includes(formattedPacketSize.toLowerCase())
+        ? baseName
+        : `${baseName} ${formattedPacketSize}`;
+
+      // Idempotent automatic catalog Product creation for unlinked recipe
+      let product = await tx.product.findUnique({ where: { sku: retailSku } });
+      if (!product) {
+        product = await tx.product.create({
           data: {
             name: retailName,
             sku: retailSku,
             category: 'FINISHED_GOOD',
-            currentStock: 0,
-            unit: 'packet',
-            minimumStock: 10,
-            franchiseId: invFranchiseId,
+            productType: 'FINISHED_GOOD',
             basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
-            costPrice: bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0,
+            taxPercent: 5,
+            isActive: true,
           },
         });
       }
+    }
 
-      // Total bulk cost allocated to this packaging run. The bulk pool is
-      // shared across every ProductBatch of this recipe, so FIFO in
-      // startPackaging() may have drawn from a different batch's lot than
-      // the one being packaged here (see bulkBreakdown, recorded there at
-      // reservation time). Cost this run from what was ACTUALLY consumed,
-      // not from this ProductBatch's own unitCost — otherwise the physical
-      // lot consumed and the cost charged to it can silently diverge.
-      const bulkBreakdown: any[] = Array.isArray(packaging.bulkBreakdown) ? packaging.bulkBreakdown : [];
-      const allocatedBulkCost = bulkBreakdown.length
-        ? bulkBreakdown.reduce((s, b) => s + (b.totalCost || 0), 0)
-        // Fallback for packaging tickets created before bulkBreakdown existed.
-        : totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
-      // Effective unit cost per good packet (allocated bulk cost absorbed by good packets)
-      const effectiveRetailUnitCost = good > 0
-        ? Number((allocatedBulkCost / good).toFixed(4))
-        : (bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0);
-
-      // Only the GOOD quantity ever becomes sellable Finished Goods.
-      // Credited at effectiveRetailUnitCost so good packets absorb packaging rejection.
-      if (good > 0) {
-        await InventoryService.recordMovement(tx, {
-          itemId: retailItem.id,
-          type: 'PRODUCTION_IN',
-          quantity: good,
-          referenceType: 'PACKAGING',
-          referenceId: batch.id,
-          note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode} at effective unit cost ₹${effectiveRetailUnitCost.toFixed(4)}`,
-          userId: data.userId,
-          warehouseId: batch.production?.warehouseId || undefined,
-          receiveAtCost: {
-            unitCost: effectiveRetailUnitCost,
-            batchNumber: batch.batchCode || undefined,
-            mfgDate: batch.mfgDate,
-            expDate: batch.expiryDate,
-            productBatchId: batch.id,
-          },
-        });
-      }
-
-      const wasteEntries: any[] = [];
-      if (damaged > 0) {
-        wasteEntries.push(await WasteService.createFromProductionReject(tx, {
-          inventoryItemId: retailItem.id,
-          franchiseId,
-          warehouseId: batch.production?.warehouseId || undefined,
-          quantity: damaged,
-          reason: 'DAMAGED',
-          note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
-          productPackagingId: packaging.id,
-          unitCost: effectiveRetailUnitCost || undefined,
-        }));
-      }
-      if (spoiled > 0) {
-        wasteEntries.push(await WasteService.createFromProductionReject(tx, {
-          inventoryItemId: retailItem.id,
-          franchiseId,
-          warehouseId: batch.production?.warehouseId || undefined,
-          quantity: spoiled,
-          reason: 'SPOILAGE',
-          note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
-          productPackagingId: packaging.id,
-          unitCost: effectiveRetailUnitCost || undefined,
-        }));
-      }
-
-      // A batch can be packaged across multiple confirmed runs — only mark
-      // it fully PACKAGED once the cumulative confirmed weight covers the
-      // batch quantity, otherwise it's PARTIALLY_PACKED.
-      const newPackagedQty = (batch.packagedQty || 0) + totalWeightNeeded;
-      const newPackagingStatus = newPackagedQty >= (batch.approvedQty || 0) - 0.001 ? 'PACKAGED' : 'PARTIALLY_PACKED';
-
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: {
-          packagingStatus: newPackagingStatus,
-          packagedQty: newPackagedQty,
-        },
-      });
-
-      const confirmedPackaging = await tx.productPackaging.update({
-        where: { id: packaging.id },
-        data: {
-          status: 'CONFIRMED',
-          goodQty: good,
-          damagedQty: damaged,
-          spoiledQty: spoiled,
-          confirmedAt: new Date(),
-        },
-      });
-
-      return { packaging: confirmedPackaging, retailItem, bulkItem, wasteEntries };
+    let retailItem = await tx.inventoryItem.findFirst({
+      where: { franchiseId: invFranchiseId, sku: retailSku },
     });
+    if (!retailItem) {
+      retailItem = await tx.inventoryItem.create({
+        data: {
+          name: retailName,
+          sku: retailSku,
+          category: 'FINISHED_GOOD',
+          currentStock: 0,
+          unit: 'packet',
+          minimumStock: 10,
+          franchiseId: invFranchiseId,
+          basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
+          costPrice: bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0,
+        },
+      });
+    }
+
+    // Total bulk cost allocated to this packaging run. The bulk pool is
+    // shared across every ProductBatch of this recipe, so FIFO in
+    // startPackaging() may have drawn from a different batch's lot than
+    // the one being packaged here (see bulkBreakdown, recorded there at
+    // reservation time). Cost this run from what was ACTUALLY consumed,
+    // not from this ProductBatch's own unitCost — otherwise the physical
+    // lot consumed and the cost charged to it can silently diverge.
+    const bulkBreakdown: any[] = Array.isArray(packaging.bulkBreakdown) ? packaging.bulkBreakdown : [];
+    const allocatedBulkCost = bulkBreakdown.length
+      ? bulkBreakdown.reduce((s, b) => s + (b.totalCost || 0), 0)
+      // Fallback for packaging tickets created before bulkBreakdown existed.
+      : totalWeightNeeded * (batch.unitCost || bulkItem.costPrice || 0);
+    // Effective unit cost per good packet (allocated bulk cost absorbed by good packets)
+    const effectiveRetailUnitCost = good > 0
+      ? Number((allocatedBulkCost / good).toFixed(4))
+      : (bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0);
+
+    // Only the GOOD quantity ever becomes sellable Finished Goods.
+    // Credited at effectiveRetailUnitCost so good packets absorb packaging rejection.
+    if (good > 0) {
+      await InventoryService.recordMovement(tx, {
+        itemId: retailItem.id,
+        type: 'PRODUCTION_IN',
+        quantity: good,
+        referenceType: 'PACKAGING',
+        referenceId: batch.id,
+        note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode} at effective unit cost ₹${effectiveRetailUnitCost.toFixed(4)}`,
+        userId: data.userId,
+        warehouseId: batch.production?.warehouseId || undefined,
+        receiveAtCost: {
+          unitCost: effectiveRetailUnitCost,
+          batchNumber: batch.batchCode || undefined,
+          mfgDate: batch.mfgDate,
+          expDate: batch.expiryDate,
+          productBatchId: batch.id,
+        },
+      });
+    }
+
+    const wasteEntries: any[] = [];
+    if (damaged > 0) {
+      wasteEntries.push(await WasteService.createFromProductionReject(tx, {
+        inventoryItemId: retailItem.id,
+        franchiseId,
+        warehouseId: batch.production?.warehouseId || undefined,
+        quantity: damaged,
+        reason: 'DAMAGED',
+        note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
+        productPackagingId: packaging.id,
+        unitCost: effectiveRetailUnitCost || undefined,
+      }));
+    }
+    if (spoiled > 0) {
+      wasteEntries.push(await WasteService.createFromProductionReject(tx, {
+        inventoryItemId: retailItem.id,
+        franchiseId,
+        warehouseId: batch.production?.warehouseId || undefined,
+        quantity: spoiled,
+        reason: 'SPOILAGE',
+        note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
+        productPackagingId: packaging.id,
+        unitCost: effectiveRetailUnitCost || undefined,
+      }));
+    }
+
+    // A batch can be packaged across multiple confirmed runs — only mark
+    // it fully PACKAGED once the cumulative confirmed weight covers the
+    // batch quantity, otherwise it's PARTIALLY_PACKED.
+    const newPackagedQty = (batch.packagedQty || 0) + totalWeightNeeded;
+    const newPackagingStatus = newPackagedQty >= (batch.approvedQty || 0) - 0.001 ? 'PACKAGED' : 'PARTIALLY_PACKED';
+
+    await tx.productBatch.update({
+      where: { id: batch.id },
+      data: {
+        packagingStatus: newPackagingStatus,
+        packagedQty: newPackagedQty,
+      },
+    });
+
+    const confirmedPackaging = await tx.productPackaging.update({
+      where: { id: packaging.id },
+      data: {
+        status: 'CONFIRMED',
+        goodQty: good,
+        damagedQty: damaged,
+        spoiledQty: spoiled,
+        confirmedAt: new Date(),
+      },
+    });
+
+    return { packaging: confirmedPackaging, retailItem, bulkItem, wasteEntries };
+  }
+
+  // Simplified workflow: Packaging Queue + Confirm Packaging as ONE action,
+  // for one or more pack sizes / SKUs of the same batch.
+  //
+  // Each row runs the existing phase-1 reservation (startPackagingTx) and
+  // phase-2 confirmation (confirmPackagingTx), all inside a single
+  // transaction: either every row's bulk deduction, Finished Goods credit
+  // (per SKU, in packets) and damage wastage happen together, or none do —
+  // no dangling AWAITING_CONFIRMATION ticket, no half-packed request.
+  //
+  // Duplicate protection: the batch row is locked for the whole operation and
+  // the caller sends the packagedQty it last saw. A double-click or retried
+  // request waits on the lock, then sees packagedQty already moved and is
+  // rejected before any stock is touched.
+  static async packageAndConfirm(data: {
+    batchId: string;
+    rows?: PackageRowInput[];
+    // Single-row form (kept for compatibility).
+    packetSize?: string;
+    packedQty?: number;
+    damagedQty?: number;
+    productId?: string;
+    newProduct?: { name: string; sku?: string; basePrice: number };
+    expectedPackagedQty?: number;
+    userId?: string;
+  }) {
+    const rows: PackageRowInput[] = data.rows?.length
+      ? data.rows
+      : [{
+          packetSize: data.packetSize || '',
+          packedQty: Number(data.packedQty),
+          damagedQty: Number(data.damagedQty) || 0,
+          productId: data.productId,
+          newProduct: data.newProduct,
+        }];
+
+    if (rows.length > 20) throw new Error('A maximum of 20 pack sizes can be confirmed at once.');
+    rows.forEach((row, i) => {
+      const label = rows.length > 1 ? `Row ${i + 1}: ` : '';
+      const packed = Number(row.packedQty);
+      const damaged = Number(row.damagedQty ?? 0);
+      if (!row.packetSize || !String(row.packetSize).trim()) throw new Error(`${label}Choose a pack size.`);
+      const sizeMatch = String(row.packetSize).trim().match(/^(\d+(?:\.\d+)?)\s*[a-zA-Z]+$/);
+      if (!sizeMatch || !(Number(sizeMatch[1]) > 0)) {
+        throw new Error(`${label}Pack size "${row.packetSize}" must be a number greater than 0 with a unit, e.g. 500g or 1kg.`);
+      }
+      if (!Number.isInteger(packed) || packed < 0 || !Number.isInteger(damaged) || damaged < 0) {
+        throw new Error(`${label}Good and damaged packets must be whole numbers of 0 or more.`);
+      }
+      if (packed + damaged <= 0) throw new Error(`${label}Enter at least one good or damaged packet.`);
+      if (!row.productId && !row.newProduct?.name?.trim()) {
+        throw new Error(`${label}Select the finished product, or create a new variant.`);
+      }
+    });
+
+    return prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${data.batchId} FOR UPDATE`;
+      const current = await tx.productBatch.findUnique({
+        where: { id: data.batchId },
+        select: {
+          packagedQty: true,
+          qcStatus: true,
+          quantity: true,
+          expiryDate: true,
+          batchCode: true,
+          production: { select: { status: true, recipe: { select: { yieldUnit: true } } } },
+          recall: { select: { status: true } },
+        },
+      });
+      if (!current) throw new Error('Product batch not found');
+      if (
+        data.expectedPackagedQty !== undefined &&
+        Math.abs((current.packagedQty || 0) - data.expectedPackagedQty) > 0.0001
+      ) {
+        throw new Error('This batch was just updated by another packaging entry. Refresh and check the remaining quantity before confirming again.');
+      }
+
+      // A completed batch still at PENDING (finished while QC was required,
+      // or by a server predating the QC switch) needs no separate Release step
+      // with production QC off: it is released here, in this same transaction,
+      // right before packing. That only moves its output into the bulk pool;
+      // Finished Goods are still credited solely by confirmPackagingTx below.
+      if ((current.qcStatus || 'PENDING') === 'PENDING') {
+        const blocked = this.autoReleaseBlocker(current);
+        if (blocked) throw new Error(`${current.batchCode} cannot be packed: ${blocked}`);
+        await this.releaseToPackagingTx(tx, data.batchId, data.userId);
+      }
+
+      // Whole-request capacity check up front, so the operator gets one clear
+      // message instead of a failure on whichever row happens to overflow.
+      // startPackagingTx still re-checks every row as the authoritative guard.
+      const batchUnit = current.production?.recipe?.yieldUnit || 'KG';
+      const released = await tx.productBatch.findUniqueOrThrow({
+        where: { id: data.batchId },
+        select: { approvedQty: true, packagedQty: true, packagings: { where: { status: 'AWAITING_CONFIRMATION' }, select: { totalWeight: true } } },
+      });
+      const remaining = (released.approvedQty || 0) - (released.packagedQty || 0)
+        - released.packagings.reduce((sum, p) => sum + (p.totalWeight || 0), 0);
+      const requested = rows.reduce(
+        (sum, row) => sum + (Number(row.packedQty) + Number(row.damagedQty ?? 0)) * this.parseWeight(row.packetSize, batchUnit),
+        0,
+      );
+      if (requested > remaining + 0.001) {
+        throw new Error(`Packing ${requested.toFixed(3)} ${batchUnit} exceeds the batch's remaining ${Math.max(0, remaining).toFixed(3)} ${batchUnit}.`);
+      }
+
+      const results: Awaited<ReturnType<typeof ProductionService.confirmPackagingTx>>[] = [];
+      const usedProducts = new Map<string, number>();
+      for (const [i, row] of rows.entries()) {
+        const label = rows.length > 1 ? `Row ${i + 1} (${row.packetSize}): ` : '';
+        const productId = await this.resolvePackagingProduct(tx, row, batchUnit, label);
+        const dupRow = usedProducts.get(productId);
+        if (dupRow !== undefined) {
+          throw new Error(`${label}Same finished product as row ${dupRow + 1}. Combine them into one row.`);
+        }
+        usedProducts.set(productId, i);
+        const packed = Number(row.packedQty);
+        const damaged = Number(row.damagedQty ?? 0);
+
+        const { packaging } = await this.startPackagingTx(tx, {
+          batchId: data.batchId,
+          packetSize: row.packetSize,
+          quantityPackets: packed + damaged,
+          productId,
+          userId: data.userId,
+        });
+
+        results.push(await this.confirmPackagingTx(tx, {
+          packagingId: packaging.id,
+          goodQty: packed,
+          damagedQty: damaged,
+          spoiledQty: 0,
+          productId,
+          userId: data.userId,
+        }));
+      }
+
+      // Single-row callers keep the original response shape; multi-row
+      // callers get every row plus a per-SKU summary.
+      const summary = results.map((r, i) => ({
+        packetSize: rows[i].packetSize,
+        sku: r.retailItem.sku,
+        productName: r.retailItem.name,
+        goodQty: r.packaging.goodQty ?? 0,
+        damagedQty: r.packaging.damagedQty ?? 0,
+        totalWeight: r.packaging.totalWeight,
+      }));
+      return { ...results[0], rows: results, summary };
+    }, { timeout: 30000 });
+  }
+
+  // Resolves the finished product a packaging row stocks into, never creating
+  // a duplicate: an existing product is validated (active, has a SKU, SKU
+  // pack size agrees with the row), and a "new variant" request reuses any
+  // product already carrying that name or SKU before creating one through the
+  // same Product fields startPackaging has always used.
+  private static async resolvePackagingProduct(
+    tx: Prisma.TransactionClient,
+    row: PackageRowInput,
+    batchUnit: string,
+    label: string,
+  ): Promise<string> {
+    const rowWeight = this.parseWeight(row.packetSize, batchUnit);
+    const assertSizeMatches = (product: { name: string; sku: string | null }) => {
+      const skuSize = parseSkuPackSize(product.sku);
+      if (!skuSize) return;
+      let skuWeight: number;
+      try {
+        skuWeight = this.parseWeight(`${skuSize.qty}${skuSize.unit === 'PC' ? 'pcs' : skuSize.unit}`, batchUnit);
+      } catch {
+        return; // SKU size in a unit this batch can't express — nothing to compare.
+      }
+      if (Math.abs(skuWeight - rowWeight) > 0.000001) {
+        throw new Error(`${label}"${product.name}" (${product.sku}) is a ${skuSize.qty}${skuSize.unit} product — it does not match pack size ${row.packetSize}.`);
+      }
+    };
+
+    if (row.productId) {
+      const product = await tx.product.findUnique({ where: { id: row.productId } });
+      if (!product) throw new Error(`${label}Selected finished product was not found.`);
+      if (product.isActive === false) throw new Error(`${label}"${product.name}" is inactive.`);
+      if (!product.sku) throw new Error(`${label}"${product.name}" has no SKU. Add one in Product Master before packing into it.`);
+      assertSizeMatches(product);
+      return product.id;
+    }
+
+    const name = row.newProduct!.name.trim();
+    const price = Number(row.newProduct!.basePrice);
+    if (name.length < 2 || name.length > 120) throw new Error(`${label}Enter a product name (2–120 characters) for the new variant.`);
+    if (!Number.isFinite(price) || price <= 0) throw new Error(`${label}Enter a selling price greater than ₹0 for "${name}".`);
+    const requestedSku = row.newProduct!.sku?.trim().toUpperCase() || "";
+    if (requestedSku && !/^[A-Z0-9][A-Z0-9-]{1,63}$/.test(requestedSku)) {
+      throw new Error(`${label}SKU "${requestedSku}" may only contain letters, numbers and hyphens.`);
+    }
+
+    const reuse = (existing: { id: string; name: string; sku: string | null; isActive: boolean }) => {
+      if (existing.isActive === false) throw new Error(`${label}"${existing.name}" already exists but is inactive.`);
+      if (!existing.sku) throw new Error(`${label}"${existing.name}" already exists but has no SKU. Add one in Product Master.`);
+      assertSizeMatches(existing);
+      return existing.id; // existing price is left untouched
+    };
+
+    // Never create a duplicate: an operator-entered SKU that already exists is
+    // only accepted if it is this very variant (same name); a product with
+    // this name is reused as-is.
+    if (requestedSku) {
+      const bySku = await tx.product.findUnique({ where: { sku: requestedSku } });
+      if (bySku) {
+        if (bySku.name.trim().toLowerCase() === name.toLowerCase()) return reuse(bySku);
+        throw new Error(`${label}SKU ${requestedSku} already belongs to "${bySku.name}". Choose a different SKU or select that product.`);
+      }
+    }
+    const byName = await tx.product.findFirst({ where: { name: { equals: name, mode: "insensitive" } } });
+    if (byName) return reuse(byName);
+
+    // No SKU given: generate one in the Product Master format, keeping the
+    // pack size as the last segment (parseSkuPackSize relies on it):
+    // FG-VEGD-500G taken by another product -> FG-VEGD2-500G, FG-VEGD3-500G, ...
+    let sku = requestedSku;
+    if (!sku) {
+      const base = generateSku("FINISHED_GOOD", name, row.packetSize);
+      const sizeSplit = base.match(/^(.*)-(d+(?:.d+)?(?:KG|G|ML|L|PCS|PC))$/i);
+      sku = base;
+      for (let n = 2; await tx.product.findUnique({ where: { sku } }); n++) {
+        sku = sizeSplit ? `${sizeSplit[1]}${n}-${sizeSplit[2]}` : `${base}-${n}`;
+      }
+    }
+    assertSizeMatches({ name, sku });
+
+    // Same creation path as Product Master (Product + synced HQ Finished Good
+    // stock item), inside this packaging transaction.
+    const created = await ProductService.createInTx(tx, {
+      name,
+      sku,
+      basePrice: price,
+      category: "FINISHED_GOOD",
+      productType: "FINISHED_GOOD",
+      isVeg: true,
+    });
+    return created.id;
   }
 
   static async cancelPackaging(data: { packagingId: string; userId?: string; reason?: string }) {

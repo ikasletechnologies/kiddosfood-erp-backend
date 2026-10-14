@@ -1,5 +1,27 @@
 import prisma from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
+import { ProductionFlags } from './production.flags';
+
+// Recall severity (food-safety classification), captured at initiation.
+export const RECALL_SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+
+// A recall disposal is an ordinary WASTE_OUT movement (referenceType 'WASTE',
+// so the existing wasted-quantity figures in getBatchQuantities keep
+// reconciling) whose referenceId is the recall — that is what tells it apart
+// from an everyday damage/spoilage write-off.
+const DISPOSAL_REFERENCE_TYPE = 'WASTE';
+
+// Business lifecycle shown to users, derived from existing columns + the
+// immutable event log (no new enum values):
+//   INITIATED   status IN_PROGRESS, step INITIATED
+//   IN_PROGRESS status IN_PROGRESS, distribution located / blocking / recovery under way
+//   RECONCILED  status IN_PROGRESS with a reconciliation still matching current stock
+//   CLOSED      status COMPLETED
+//   CANCELLED   status CANCELLED (quarantine released by an authorised, noted decision)
+export type RecallLifecycle = 'INITIATED' | 'IN_PROGRESS' | 'RECONCILED' | 'CLOSED' | 'CANCELLED';
+
+// Rounds away float noise so reconciliation snapshots compare reliably.
+const r3 = (n: number) => Math.round((n || 0) * 1000) / 1000;
 
 // Reasons the UI is allowed to submit — kept in sync with the frontend's
 // dropdown. "Other" additionally requires reasonNotes (enforced below).
@@ -17,7 +39,10 @@ const VALID_REASONS = [
 // finished-goods stock. PENDING/REWORK never entered inventory (see
 // inspectBatch in production.service.ts — stock is only credited on this
 // same transition), and REJECTED batches had approvedQty forced to 0.
-const QC_ELIGIBLE_STATUSES = ['APPROVED', 'PARTIALLY_APPROVED'];
+// QC_NOT_REQUIRED batches (released to packaging with production QC switched
+// off — see production.flags.ts) are distributable stock too and must stay
+// recallable for food-safety traceability.
+const QC_ELIGIBLE_STATUSES = ['APPROVED', 'PARTIALLY_APPROVED', 'QC_NOT_REQUIRED'];
 
 // StockMovement.referenceType values that represent stock genuinely leaving
 // the warehouse to an external party (a customer, a franchise outlet,
@@ -38,10 +63,18 @@ export class RecallService {
   private static evaluateEligibility(batch: {
     qcStatus: string | null;
     approvedQty: number | null;
+    quantity?: number | null;
   }, existingRecall: { status: string } | null): string[] {
     const reasons: string[] = [];
 
-    if (!QC_ELIGIBLE_STATUSES.includes(batch.qcStatus || '')) {
+    // With production QC switched off, a completed batch can still be at
+    // PENDING simply because nothing has been packed from it yet (it is
+    // released inside its first Confirm Packaging). Recalling it is valid —
+    // there is no stock to quarantine yet, but the recall keeps its bulk out
+    // of packaging.
+    const unreleasedWithoutQc = (batch.qcStatus || 'PENDING') === 'PENDING' && !ProductionFlags.qcEnabled;
+
+    if (!QC_ELIGIBLE_STATUSES.includes(batch.qcStatus || '') && !unreleasedWithoutQc) {
       if (batch.qcStatus === 'PENDING') {
         reasons.push('This batch is still pending QC inspection and has not been released to distributable stock.');
       } else if (batch.qcStatus === 'REJECTED') {
@@ -51,7 +84,8 @@ export class RecallService {
       }
     }
 
-    if ((batch.approvedQty || 0) <= 0) {
+    const outputQty = unreleasedWithoutQc ? (batch.quantity || 0) : (batch.approvedQty || 0);
+    if (outputQty <= 0) {
       reasons.push('This batch has no approved/output quantity available for recall.');
     }
 
@@ -246,13 +280,36 @@ export class RecallService {
     return recall;
   }
 
-  static async initiateRecall(productBatchId: string, data: { reason: string; reasonNotes?: string; userId?: string }) {
+  // RCL-<year>-<seq>, allocated atomically inside the initiating transaction.
+  private static async nextRecallNumber(tx: any): Promise<string> {
+    const year = new Date().getFullYear();
+    const seq = await tx.numberSequence.upsert({
+      where: { key: `RECALL_${year}` },
+      create: { key: `RECALL_${year}`, value: 1 },
+      update: { value: { increment: 1 } },
+    });
+    return `RCL-${year}-${String(seq.value).padStart(4, '0')}`;
+  }
+
+  static async initiateRecall(productBatchId: string, data: {
+    reason: string;
+    reasonNotes?: string;
+    severity?: string;
+    description?: string;
+    userId?: string;
+  }) {
     if (!VALID_REASONS.includes(data.reason)) {
       throw new Error(`Invalid recall reason. Must be one of: ${VALID_REASONS.join(', ')}`);
     }
-    if (data.reason === 'Other' && !data.reasonNotes?.trim()) {
+    if (data.severity !== undefined && !RECALL_SEVERITIES.includes(data.severity)) {
+      throw new Error(`Invalid severity. Must be one of: ${RECALL_SEVERITIES.join(', ')}`);
+    }
+    // The description doubles as the reason notes for "Other".
+    const notes = (data.description ?? data.reasonNotes ?? '').trim() || undefined;
+    if (data.reason === 'Other' && !notes) {
       throw new Error('Notes are required when recall reason is "Other".');
     }
+    data = { ...data, reasonNotes: notes };
 
     return prisma.$transaction(async (tx) => {
       const batch = await tx.productBatch.findUnique({
@@ -397,6 +454,8 @@ export class RecallService {
           + ' Any quantity already dispatched before this recall is tracked separately as distributed.'
         : 'No warehouse stock remained for this batch — nothing available to quarantine.';
 
+      const recallNumber = await this.nextRecallNumber(tx);
+
       await tx.batchRecallEvent.create({
         data: {
           recallId: recall.id,
@@ -405,6 +464,9 @@ export class RecallService {
           actor: data.userId || 'system',
           affectedQty: blockedQty + crossBlockedQty,
           details: {
+            recallNumber,
+            severity: data.severity || null,
+            description: data.reasonNotes || null,
             reason: data.reason,
             reasonNotes: data.reasonNotes || null,
             blockedInventoryBatchIds: blockable.map((b) => b.id),
@@ -415,7 +477,7 @@ export class RecallService {
         },
       });
 
-      return recall;
+      return { ...recall, recallNumber, severity: data.severity || null };
     });
   }
 
@@ -681,7 +743,17 @@ export class RecallService {
     });
   }
 
-  static async collectReturn(productBatchId: string, returnedQty: number, userId?: string) {
+  static async collectReturn(
+    productBatchId: string,
+    returnedQty: number,
+    userId?: string,
+    opts?: { inventoryBatchId?: string; warehouseId?: string; note?: string },
+  ) {
+    // Per-SKU recovery (Recall Details screen): credited to its own
+    // quarantined lot for the SKU that actually came back.
+    if (opts?.inventoryBatchId) {
+      return this.collectReturnForLot(productBatchId, { inventoryBatchId: opts.inventoryBatchId, quantity: returnedQty, warehouseId: opts.warehouseId, note: opts.note }, userId);
+    }
     return prisma.$transaction(async (tx) => {
       const recall = await tx.batchRecall.findUnique({ where: { productBatchId } });
       if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
@@ -744,12 +816,21 @@ export class RecallService {
     });
   }
 
-  static async completeRecall(productBatchId: string, userId?: string) {
+  // Closing never happens just because stock was blocked: it needs a
+  // reconciliation that still matches the current stock picture, nothing
+  // outstanding, and a closure note. Quarantined stock stays quarantined.
+  static async completeRecall(productBatchId: string, userId?: string, closureNote?: string) {
+    const note = (closureNote || '').trim();
+    if (note.length < 10) throw new Error('A closure note is required (at least 10 characters).');
     return prisma.$transaction(async (tx) => {
-      const recall = await tx.batchRecall.findUnique({ where: { productBatchId } });
-      if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
-      if (recall.distributedQty > 0 && recall.returnedQty < recall.distributedQty - 0.001) {
-        throw new Error(`Cannot complete recall — ${(recall.distributedQty - recall.returnedQty).toFixed(2)} unit(s) are still pending return.`);
+      const recall = await this.activeRecallTx(tx, productBatchId);
+      const trace = await this.traceBatch(tx, productBatchId);
+      const events = await tx.batchRecallEvent.findMany({ where: { recallId: recall.id }, orderBy: { createdAt: 'asc' } });
+      const summary = this.summarise(recall, events, trace!.skus);
+      if (!summary.reconciliation) throw new Error('Reconcile the recall (recovered, disposed, unavailable and outstanding quantities) before closing it.');
+      if (!summary.reconciliation.current) throw new Error('Stock has changed since the last reconciliation. Reconcile again before closing.');
+      if ((summary.reconciliation.outstandingTotal || 0) > 0) {
+        throw new Error(`Cannot close — ${summary.reconciliation.outstandingTotal} unit(s) are still outstanding in the reconciliation.`);
       }
 
       const updated = await tx.batchRecall.update({
@@ -758,26 +839,51 @@ export class RecallService {
       });
 
       await tx.batchRecallEvent.create({
-        data: { recallId: recall.id, event: 'RECALL_COMPLETED', status: 'SUCCESS', actor: userId || 'system' },
+        data: {
+          recallId: recall.id, event: 'RECALL_COMPLETED', status: 'SUCCESS', actor: userId || 'system',
+          details: { note, recallNumber: summary.recallNumber, reconciledAt: summary.reconciliation.at, quarantinedRemaining: trace!.skus.map(s => ({ sku: s.sku, unit: s.unit, qty: s.quarantinedQty })) } as any,
+        },
       });
 
       return updated;
     });
   }
 
+  // Cancelling releases blocked stock back to sale, so it is a separately
+  // authorised decision (SUPER_ADMIN route) that must be documented.
   static async cancelRecall(productBatchId: string, note: string | undefined, userId?: string) {
+    if ((note || '').trim().length < 10) throw new Error('A documented reason (at least 10 characters) is required to cancel a recall and release its stock.');
     return prisma.$transaction(async (tx) => {
-      const recall = await tx.batchRecall.findUnique({ where: { productBatchId } });
-      if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
+      const recall = await this.activeRecallTx(tx, productBatchId);
 
       // Release whatever this recall blocked back to sellable stock. Lots
       // that received returned stock (status RETURNED) are left as-is —
       // cancelling a recall shouldn't silently make physically-quarantined
       // returned goods sellable again.
-      await tx.inventoryBatch.updateMany({
+      const released = await tx.inventoryBatch.updateMany({
         where: { productBatchId, status: 'BLOCKED' },
         data: { status: 'APPROVED' },
       });
+
+      // Initiation also blocked lots of OTHER batches whose packaging drew on
+      // this batch's bulk (see findCrossBatchAffectedIds). Release those too —
+      // unless that batch is itself under its own recall.
+      const batch = await tx.productBatch.findUnique({ where: { id: productBatchId }, include: { production: true } });
+      const crossIds = await this.findCrossBatchAffectedIds(tx, productBatchId, batch?.production?.recipeId);
+      let crossReleased = 0;
+      if (crossIds.length) {
+        const ownRecalls = await tx.batchRecall.findMany({
+          where: { productBatchId: { in: crossIds }, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+          select: { productBatchId: true },
+        });
+        const releasable = crossIds.filter(id => !ownRecalls.some(r => r.productBatchId === id));
+        if (releasable.length) {
+          crossReleased = (await tx.inventoryBatch.updateMany({
+            where: { productBatchId: { in: releasable }, status: 'BLOCKED' },
+            data: { status: 'APPROVED' },
+          })).count;
+        }
+      }
 
       const updated = await tx.batchRecall.update({
         where: { productBatchId },
@@ -785,10 +891,510 @@ export class RecallService {
       });
 
       await tx.batchRecallEvent.create({
-        data: { recallId: recall.id, event: 'RECALL_CANCELLED', status: 'SUCCESS', actor: userId || 'system', details: note ? ({ note } as any) : undefined },
+        data: {
+          recallId: recall.id, event: 'RECALL_CANCELLED', status: 'SUCCESS', actor: userId || 'system',
+          details: { note: note!.trim(), releasedLots: released.count, crossReleasedLots: crossReleased, message: `Recall cancelled — ${released.count + crossReleased} blocked lot(s) released to sale. Returned (quarantined) stock stays quarantined.` } as any,
+        },
       });
 
       return updated;
+    });
+  }
+
+  // ── Traceability, recovery, disposal, reconciliation ───────────────────
+  //
+  // Everything below is derived from real rows only: every InventoryBatch lot
+  // tagged with this production batch (bulk, every packed SKU, recall-return
+  // lots, and lots of other batches that drew on this batch's bulk via the
+  // shared pool), and the StockMovement ledger against those lots. Nothing is
+  // estimated, and no figure is ever converted between SKUs/units — each SKU
+  // is reported in its own stock unit.
+
+  // Per-lot and per-SKU traceability for a production batch (works with or
+  // without a recall, so the Initiate screen can preview affected stock).
+  static async traceBatch(tx: any, productBatchId: string) {
+    const batch = await tx.productBatch.findUnique({
+      where: { id: productBatchId },
+      include: {
+        product: true,
+        production: { include: { recipe: true } },
+        packagings: { orderBy: { createdAt: 'asc' } },
+        recall: true,
+      },
+    });
+    if (!batch) return null;
+
+    const crossBatchIds = await this.findCrossBatchAffectedIds(tx, productBatchId, batch.production?.recipeId);
+    const lots = await tx.inventoryBatch.findMany({
+      where: { productBatchId: { in: [productBatchId, ...crossBatchIds] } },
+      include: {
+        inventoryItem: { include: { franchise: { select: { id: true, name: true } } } },
+        warehouse: { select: { id: true, name: true } },
+        productBatch: { select: { id: true, batchCode: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    const lotIds = lots.map((l: any) => l.id);
+    const lotIdSet = new Set<string>(lotIds);
+    const itemIds = Array.from(new Set<string>(lots.map((l: any) => l.inventoryItemId)));
+
+    // Movements against these lots: single-lot movements carry batchId;
+    // multi-lot ones carry a consumptionBreakdown — take only this scope's share.
+    const tagged = lotIds.length
+      ? await tx.stockMovement.findMany({ where: { batchId: { in: lotIds } }, include: { warehouse: { select: { name: true } } } })
+      : [];
+    const spanning = itemIds.length
+      ? await tx.stockMovement.findMany({
+          where: { batchId: null, itemId: { in: itemIds }, consumptionBreakdown: { not: Prisma.JsonNull } },
+          include: { warehouse: { select: { name: true } } },
+        })
+      : [];
+    type Mv = { id: string; lotId: string; qty: number; referenceType: string | null; referenceId: string | null; movementType: string; note: string | null; createdAt: Date; createdBy: string | null; warehouseName: string | null };
+    const mvs: Mv[] = [];
+    for (const m of tagged) {
+      mvs.push({ id: m.id, lotId: m.batchId, qty: m.baseQty ?? m.quantity, referenceType: m.referenceType, referenceId: m.referenceId, movementType: m.movementType, note: m.note, createdAt: m.createdAt, createdBy: m.createdBy, warehouseName: m.warehouse?.name || null });
+    }
+    for (const m of spanning) {
+      const parts: any[] = Array.isArray(m.consumptionBreakdown) ? m.consumptionBreakdown : [];
+      for (const c of parts) {
+        if (!lotIdSet.has(c.batchId)) continue;
+        mvs.push({ id: `${m.id}:${c.batchId}`, lotId: c.batchId, qty: -Math.abs(Number(c.qty) || 0), referenceType: m.referenceType, referenceId: m.referenceId, movementType: m.movementType, note: m.note, createdAt: m.createdAt, createdBy: m.createdBy, warehouseName: m.warehouse?.name || null });
+      }
+    }
+    mvs.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+    const recallId: string | null = batch.recall?.id || null;
+    const isDistribution = (m: Mv) => m.qty < 0 && GENUINE_DISTRIBUTION_REFERENCE_TYPES.includes(m.referenceType || '');
+    const isRecovery = (m: Mv) => m.qty > 0 && m.referenceType === 'RECALL';
+    const isDisposal = (m: Mv) => m.qty < 0 && m.referenceType === DISPOSAL_REFERENCE_TYPE && !!recallId && m.referenceId === recallId;
+    // A transfer between two lots of this same scope (e.g. HQ -> franchise
+    // warehouse) moves stock, it doesn't distribute it out of reach.
+    const isInternalTransferIn = (m: Mv) => m.qty > 0 && m.referenceType === 'TRANSFER';
+    // Ordinary damage/spoilage write-offs (not recall disposals).
+    const isWaste = (m: Mv) => m.qty < 0 && m.referenceType === 'WASTE' && !isDisposal(m);
+
+    // Human-readable destinations for outbound movements.
+    const orderIds = Array.from(new Set(mvs.filter(m => isDistribution(m) && m.referenceType === 'ORDER').map(m => m.referenceId).filter(Boolean))) as string[];
+    const foIds = Array.from(new Set(mvs.filter(m => isDistribution(m) && m.referenceType === 'FRANCHISE_ORDER').map(m => m.referenceId).filter(Boolean))) as string[];
+    const dcIds = Array.from(new Set(mvs.filter(m => isDistribution(m) && m.referenceType === 'DELIVERY_CHALLAN').map(m => m.referenceId).filter(Boolean))) as string[];
+    const orders = orderIds.length ? await tx.order.findMany({ where: { id: { in: orderIds } }, select: { id: true, invoiceNum: true, franchise: { select: { name: true } } } }) : [];
+    const fos = foIds.length ? await tx.franchiseOrder.findMany({ where: { id: { in: foIds } }, select: { id: true, orderNumber: true, franchise: { select: { name: true } } } }) : [];
+    const dcs = dcIds.length ? await tx.deliveryChallan.findMany({ where: { id: { in: dcIds } }, select: { id: true, challanNumber: true } }) : [];
+    const destinationOf = (m: Mv): { type: string; label: string } => {
+      if (m.referenceType === 'ORDER') {
+        const o = orders.find((x: any) => x.id === m.referenceId);
+        return { type: 'POS_SALE', label: o ? `POS Sale ${o.invoiceNum} (${o.franchise?.name || 'HQ'})` : 'POS Sale' };
+      }
+      if (m.referenceType === 'FRANCHISE_ORDER') {
+        const fo = fos.find((x: any) => x.id === m.referenceId);
+        return { type: 'FRANCHISE_DISPATCH', label: fo ? `Franchise ${fo.franchise?.name} (Order ${fo.orderNumber})` : 'Franchise Dispatch' };
+      }
+      if (m.referenceType === 'DELIVERY_CHALLAN') {
+        const dc = dcs.find((x: any) => x.id === m.referenceId);
+        return { type: 'DELIVERY_CHALLAN', label: dc ? `Delivery Challan ${dc.challanNumber}` : 'Delivery Challan' };
+      }
+      if (m.referenceType === 'TRANSFER') return { type: 'TRANSFER', label: `Stock Transfer${m.warehouseName ? ` from ${m.warehouseName}` : ''}` };
+      return { type: m.referenceType || 'OTHER', label: (m.referenceType || 'Other').replace(/_/g, ' ') };
+    };
+
+    const isReturnLot = (l: any) => l.status === 'RETURNED' && /(-RETURN$|^RECALL-RETURN-)/.test(l.batchNumber || '');
+    const lotRows = lots.map((l: any) => {
+      const lm = mvs.filter(m => m.lotId === l.id);
+      const sum = (f: (m: Mv) => boolean) => r3(lm.filter(f).reduce((s, m) => s + Math.abs(m.qty), 0));
+      const quarantined = l.status === 'BLOCKED' || l.status === 'RETURNED' ? r3(l.currentQty) : 0;
+      return {
+        id: l.id,
+        lotNumber: l.batchNumber || l.lotNumber || null,
+        productBatchId: l.productBatchId,
+        productBatchCode: l.productBatch?.batchCode || null,
+        crossBatch: l.productBatchId !== productBatchId,
+        returnLot: isReturnLot(l),
+        inventoryItemId: l.inventoryItemId,
+        sku: l.inventoryItem?.sku || null,
+        name: l.inventoryItem?.name || 'Item',
+        unit: l.inventoryItem?.unit || 'PC',
+        category: l.inventoryItem?.category || null,
+        scope: l.inventoryItem?.franchise ? `Franchise: ${l.inventoryItem.franchise.name}` : 'HQ',
+        warehouse: l.warehouse?.name || null,
+        status: l.status,
+        initialQty: r3(l.initialQty),
+        currentQty: r3(l.currentQty),
+        quarantinedQty: quarantined,
+        sellableQty: l.status === 'APPROVED' ? r3(l.currentQty) : 0,
+        distributedQty: sum(isDistribution),
+        transferredInQty: sum(isInternalTransferIn),
+        recoveredQty: sum(isRecovery),
+        disposedQty: sum(isDisposal),
+        wastedQty: sum(isWaste),
+      };
+    });
+
+    // Per SKU (inventory item) — never summed across SKUs/units.
+    const skuMap = new Map<string, any>();
+    for (const l of lotRows) {
+      const s = skuMap.get(l.inventoryItemId) || {
+        inventoryItemId: l.inventoryItemId, sku: l.sku, name: l.name, unit: l.unit, category: l.category,
+        crossBatch: false, packedQty: 0, distributedQty: 0, recoveredQty: 0, disposedQty: 0, wastedQty: 0,
+        quarantinedQty: 0, sellableQty: 0, onHandQty: 0, locations: [] as any[], destinations: [] as any[],
+        _transferIn: 0,
+      };
+      s.crossBatch = s.crossBatch || l.crossBatch;
+      if (!l.returnLot) s.packedQty += l.initialQty;
+      s.distributedQty += l.distributedQty;
+      s._transferIn += l.transferredInQty;
+      s.recoveredQty += l.recoveredQty;
+      s.disposedQty += l.disposedQty;
+      s.wastedQty += l.wastedQty;
+      s.quarantinedQty += l.quarantinedQty;
+      s.sellableQty += l.sellableQty;
+      s.onHandQty += l.currentQty;
+      if (l.currentQty > 0 || l.quarantinedQty > 0) {
+        s.locations.push({ lotId: l.id, lotNumber: l.lotNumber, scope: l.scope, warehouse: l.warehouse, status: l.status, qty: l.currentQty, returnLot: l.returnLot, crossBatch: l.crossBatch, productBatchCode: l.productBatchCode });
+      }
+      skuMap.set(l.inventoryItemId, s);
+    }
+    for (const m of mvs.filter(isDistribution)) {
+      const lot = lotRows.find(l => l.id === m.lotId);
+      if (!lot) continue;
+      const s = skuMap.get(lot.inventoryItemId);
+      const d = destinationOf(m);
+      const existing = s.destinations.find((x: any) => x.label === d.label);
+      if (existing) existing.qty = r3(existing.qty + Math.abs(m.qty));
+      else s.destinations.push({ ...d, qty: r3(Math.abs(m.qty)) });
+    }
+    const skus = Array.from(skuMap.values()).map((s: any) => {
+      // Distributed out of reach = outbound minus what landed back in a lot
+      // of this same scope via an internal transfer.
+      const distributed = r3(Math.max(0, s.distributedQty - s._transferIn));
+      const { _transferIn, ...rest } = s;
+      return {
+        ...rest,
+        packedQty: r3(s.packedQty),
+        distributedQty: distributed,
+        recoveredQty: r3(s.recoveredQty),
+        disposedQty: r3(s.disposedQty),
+        wastedQty: r3(s.wastedQty),
+        quarantinedQty: r3(s.quarantinedQty),
+        sellableQty: r3(s.sellableQty),
+        onHandQty: r3(s.onHandQty),
+        outstandingQty: r3(Math.max(0, distributed - s.recoveredQty)),
+      };
+    });
+
+    const activity = mvs
+      .filter(m => isDistribution(m) || isRecovery(m) || isDisposal(m) || m.referenceType === 'RETURN' || m.movementType === 'SALES_RETURN_IN' || m.movementType === 'RETURN_QUARANTINE_IN')
+      .map(m => {
+        const lot = lotRows.find(l => l.id === m.lotId);
+        const kind = isDistribution(m) ? 'DISTRIBUTED' : isRecovery(m) ? 'RECOVERED' : isDisposal(m) ? 'DISPOSED' : 'RETURNED';
+        return {
+          id: m.id, at: m.createdAt, kind, qty: r3(Math.abs(m.qty)), unit: lot?.unit, sku: lot?.sku, name: lot?.name,
+          reference: kind === 'DISTRIBUTED' ? destinationOf(m).label : (m.note || m.referenceType || ''),
+          warehouse: m.warehouseName, by: m.createdBy,
+        };
+      });
+
+    return { batch, crossBatchIds, lots: lotRows, skus, activity };
+  }
+
+  // Fingerprint of the stock picture a reconciliation was made against. A
+  // closure is only accepted while the current picture still matches.
+  private static snapshotOf(skus: any[]) {
+    return skus
+      .map(s => [s.inventoryItemId, s.distributedQty, s.recoveredQty, s.disposedQty, s.quarantinedQty].join(':'))
+      .sort()
+      .join('|');
+  }
+
+  private static async userNames(tx: any, ids: (string | null | undefined)[]) {
+    const unique = Array.from(new Set(ids.filter((x): x is string => !!x && x !== 'system')));
+    if (!unique.length) return {} as Record<string, string>;
+    const users = await tx.user.findMany({ where: { id: { in: unique } }, select: { id: true, fullName: true } });
+    return Object.fromEntries(users.map((u: any) => [u.id, u.fullName])) as Record<string, string>;
+  }
+
+  // Recall number / severity / description from the latest initiation event,
+  // the latest reconciliation, and the derived business lifecycle.
+  private static summarise(recall: any, events: any[], skus: any[] | null) {
+    const initiated = [...events].reverse().find(e => e.event === 'RECALL_INITIATED');
+    const sinceInit = events.filter(e => !initiated || e.createdAt >= initiated.createdAt);
+    const reconciliation = [...sinceInit].reverse().find(e => e.event === 'RECALL_RECONCILED') || null;
+    const reconciliationCurrent = !!reconciliation && !!skus && reconciliation.details?.snapshot === this.snapshotOf(skus);
+    let lifecycle: RecallLifecycle;
+    if (recall.status === 'COMPLETED') lifecycle = 'CLOSED';
+    else if (recall.status === 'CANCELLED') lifecycle = 'CANCELLED';
+    else if (recall.step === 'INITIATED') lifecycle = 'INITIATED';
+    else lifecycle = reconciliationCurrent ? 'RECONCILED' : 'IN_PROGRESS';
+    return {
+      recallNumber: initiated?.details?.recallNumber || `RCL-${recall.id.slice(0, 8).toUpperCase()}`,
+      severity: initiated?.details?.severity || null,
+      description: initiated?.details?.description || recall.reasonNotes || null,
+      lifecycle,
+      reconciliation: reconciliation ? { at: reconciliation.createdAt, by: reconciliation.actor, current: reconciliationCurrent, ...reconciliation.details } : null,
+    };
+  }
+
+  // Full Recall Details: batch, per-SKU quantities, locations, activity and
+  // audit history. Also used (without a recall) to preview affected stock.
+  static async getRecallDetails(productBatchId: string) {
+    const trace = await this.traceBatch(prisma, productBatchId);
+    if (!trace) return null;
+    const { batch } = trace;
+    const recall = batch.recall;
+    const events = recall
+      ? await prisma.batchRecallEvent.findMany({ where: { recallId: recall.id }, orderBy: { createdAt: 'asc' } })
+      : [];
+    const names = await this.userNames(prisma, [recall?.initiatedBy, ...events.map(e => e.actor), ...trace.activity.map(a => a.by)]);
+    const attachments = recall
+      ? await prisma.attachment.findMany({
+          where: { entityType: 'BATCH_RECALL', entityId: recall.id },
+          select: { id: true, fileName: true, mimeType: true, size: true, kind: true, createdAt: true },
+          orderBy: { createdAt: 'asc' },
+        })
+      : [];
+
+    return {
+      batch: {
+        id: batch.id,
+        batchCode: batch.batchCode,
+        productName: batch.product?.name || batch.production?.recipe?.name,
+        recipeName: batch.production?.recipe?.name || null,
+        unit: batch.production?.recipe?.yieldUnit || 'KG',
+        mfgDate: batch.mfgDate || batch.production?.startTime || batch.createdAt,
+        expiryDate: batch.expiryDate || batch.production?.expiryDate || null,
+        producedQty: batch.quantity || 0,
+        releasedQty: batch.approvedQty || 0,
+        rejectedQty: batch.rejectionQty || 0,
+        packagedQty: batch.packagedQty || 0,
+        qcStatus: batch.qcStatus,
+        packagingStatus: batch.packagingStatus,
+      },
+      packagings: batch.packagings
+        .filter((p: any) => p.status === 'CONFIRMED')
+        .map((p: any) => ({ id: p.id, packetSize: p.packetSize, goodQty: p.goodQty ?? 0, damagedQty: p.damagedQty ?? 0, totalWeight: p.totalWeight, confirmedAt: p.confirmedAt })),
+      skus: trace.skus,
+      lots: trace.lots,
+      activity: trace.activity.map(a => ({ ...a, by: a.by ? names[a.by] || a.by : null })),
+      crossBatchCount: trace.crossBatchIds.length,
+      recall: recall
+        ? {
+            id: recall.id,
+            status: recall.status,
+            step: recall.step,
+            reason: recall.reason,
+            initiatedAt: recall.initiatedAt,
+            initiatedBy: recall.initiatedBy ? names[recall.initiatedBy] || recall.initiatedBy : null,
+            completedAt: recall.completedAt,
+            cancelledAt: recall.cancelledAt,
+            ...this.summarise(recall, events, trace.skus),
+          }
+        : null,
+      events: events.map(e => ({ ...e, actorName: e.actor ? names[e.actor] || e.actor : null })),
+      attachments,
+    };
+  }
+
+  // Active Recalls / Recall History list.
+  static async listRecalls() {
+    const recalls = await prisma.batchRecall.findMany({
+      include: {
+        productBatch: { include: { product: true, production: { include: { recipe: true } } } },
+        events: { where: { event: { in: ['RECALL_INITIATED', 'RECALL_RECONCILED'] } }, orderBy: { createdAt: 'asc' } },
+      },
+      orderBy: { initiatedAt: 'desc' },
+    });
+    const quarantine = await prisma.inventoryBatch.findMany({
+      where: { productBatchId: { in: recalls.map(r => r.productBatchId) }, status: { in: ['BLOCKED', 'RETURNED'] }, currentQty: { gt: 0 } },
+      select: { productBatchId: true, currentQty: true, inventoryItem: { select: { unit: true } } },
+    });
+    return recalls.map(r => {
+      const byUnit: Record<string, number> = {};
+      for (const q of quarantine.filter(x => x.productBatchId === r.productBatchId)) {
+        const u = q.inventoryItem?.unit || 'PC';
+        byUnit[u] = r3((byUnit[u] || 0) + q.currentQty);
+      }
+      // Cheap list view: no per-SKU snapshot, so a reconciled recall shows as
+      // IN_PROGRESS here; the details endpoint verifies RECONCILED properly.
+      const s = this.summarise(r, r.events, null);
+      return {
+        id: r.id,
+        productBatchId: r.productBatchId,
+        batchCode: r.productBatch.batchCode,
+        productName: r.productBatch.product?.name || r.productBatch.production?.recipe?.name,
+        status: r.status,
+        lifecycle: s.lifecycle,
+        recallNumber: s.recallNumber,
+        severity: s.severity,
+        reason: r.reason,
+        initiatedAt: r.initiatedAt,
+        completedAt: r.completedAt,
+        cancelledAt: r.cancelledAt,
+        quarantinedByUnit: byUnit,
+      };
+    });
+  }
+
+  // Quarantined (BLOCKED/RETURNED) quantity per inventory item, for Stock Hub.
+  static async quarantineSummary() {
+    const lots = await prisma.inventoryBatch.findMany({
+      where: { status: { in: ['BLOCKED', 'RETURNED'] }, currentQty: { gt: 0 } },
+      select: { inventoryItemId: true, currentQty: true, inventoryItem: { select: { sku: true, name: true, unit: true, franchiseId: true } } },
+    });
+    const map = new Map<string, any>();
+    for (const l of lots) {
+      const e = map.get(l.inventoryItemId) || { inventoryItemId: l.inventoryItemId, sku: l.inventoryItem?.sku, name: l.inventoryItem?.name, unit: l.inventoryItem?.unit, franchiseId: l.inventoryItem?.franchiseId ?? null, quarantinedQty: 0 };
+      e.quarantinedQty = r3(e.quarantinedQty + l.currentQty);
+      map.set(l.inventoryItemId, e);
+    }
+    return Array.from(map.values());
+  }
+
+  private static async activeRecallTx(tx: any, productBatchId: string) {
+    // Row lock: every recall mutation on this batch is serialised.
+    await tx.$queryRaw`SELECT id FROM "BatchRecall" WHERE "productBatchId" = ${productBatchId} FOR UPDATE`;
+    const recall = await tx.batchRecall.findUnique({ where: { productBatchId } });
+    if (!recall || recall.status !== 'IN_PROGRESS') throw new Error('No active recall in progress for this batch.');
+    return recall;
+  }
+
+  // Records recovered stock for ONE SKU: the units physically come back as
+  // their own RETURNED (quarantined, never sellable) lot through the same
+  // path organic recall returns already use. Capped per SKU at what was
+  // distributed and not yet recovered.
+  private static async collectReturnForLot(productBatchId: string, data: { inventoryBatchId: string; quantity: number; warehouseId?: string; note?: string }, userId?: string) {
+    const qty = Number(data.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) throw new Error('Recovered quantity must be greater than 0.');
+    return prisma.$transaction(async (tx) => {
+      const recall = await this.activeRecallTx(tx, productBatchId);
+      if (recall.step === 'INITIATED') throw new Error('Locate distribution before recording recovered stock.');
+      const trace = await this.traceBatch(tx, productBatchId);
+      const lot = trace!.lots.find(l => l.id === data.inventoryBatchId);
+      if (!lot) throw new Error('That stock lot is not part of this recall.');
+      const sku = trace!.skus.find(s => s.inventoryItemId === lot.inventoryItemId)!;
+      if (qty > sku.outstandingQty + 0.0001) {
+        throw new Error(`Only ${sku.outstandingQty} ${sku.unit} of ${sku.name} is distributed and not yet recovered.`);
+      }
+      await this.recordRecallAffectedReturn(tx, {
+        recallId: recall.id,
+        productBatchId: lot.productBatchId,
+        inventoryItemId: lot.inventoryItemId,
+        quantity: qty,
+        warehouseId: data.warehouseId || null,
+        userId,
+        source: 'RECALL_RECOVERY',
+        sourceId: recall.id,
+        note: data.note?.trim() || `Recovered ${qty} ${sku.unit} of ${sku.name} for recall`,
+      });
+      if (recall.step === 'REPORT_GENERATED') {
+        await tx.batchRecall.update({ where: { id: recall.id }, data: { step: 'RETURN_COLLECTED' } });
+      }
+      const after = await this.traceBatch(tx, productBatchId);
+      return { sku: after!.skus.find(s => s.inventoryItemId === lot.inventoryItemId) };
+    });
+  }
+
+  // Authorised disposal of QUARANTINED stock only (destroyed, not sellable).
+  // Never automatic. Deducts the lot and the item's stock once, logs a
+  // WASTE_OUT movement referencing the recall and a waste entry at lot cost.
+  static async disposeStock(productBatchId: string, data: { inventoryBatchId: string; quantity: number; note: string }, userId?: string) {
+    const qty = Number(data.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) throw new Error('Disposed quantity must be greater than 0.');
+    const note = (data.note || '').trim();
+    if (note.length < 5) throw new Error('Describe how the stock was disposed (at least 5 characters).');
+
+    return prisma.$transaction(async (tx) => {
+      const recall = await this.activeRecallTx(tx, productBatchId);
+      const trace = await this.traceBatch(tx, productBatchId);
+      const scope = trace!.lots.find(l => l.id === data.inventoryBatchId);
+      if (!scope) throw new Error('That stock lot is not part of this recall.');
+
+      const [lot]: Array<{ id: string; status: string; currentQty: number; inventoryItemId: string; warehouseId: string | null; unitCost: number | null }> = await tx.$queryRaw(
+        Prisma.sql`SELECT id, status, "currentQty", "inventoryItemId", "warehouseId", "unitCost" FROM "InventoryBatch" WHERE id = ${data.inventoryBatchId} FOR UPDATE`
+      );
+      if (lot.status !== 'BLOCKED' && lot.status !== 'RETURNED') throw new Error('Only quarantined (blocked or returned) recall stock can be disposed.');
+      if (qty > lot.currentQty + 0.0001) throw new Error(`Only ${r3(lot.currentQty)} ${scope.unit} is quarantined in this lot.`);
+
+      const item = await tx.inventoryItem.findUniqueOrThrow({ where: { id: lot.inventoryItemId } });
+      const unitCost = lot.unitCost ?? item.costPrice ?? 0;
+
+      await tx.inventoryBatch.update({ where: { id: lot.id }, data: { currentQty: { decrement: qty } } });
+      await tx.inventoryItem.update({ where: { id: lot.inventoryItemId }, data: { currentStock: { decrement: qty } } });
+      await tx.stockMovement.create({
+        data: {
+          itemId: lot.inventoryItemId,
+          movementType: 'WASTE_OUT',
+          quantity: -qty,
+          baseQty: -qty,
+          referenceType: DISPOSAL_REFERENCE_TYPE,
+          referenceId: recall.id,
+          batchId: lot.id,
+          unitCost,
+          note: `Recall disposal: ${note}`,
+          createdBy: userId,
+          warehouseId: lot.warehouseId,
+        },
+      });
+      await tx.wasteEntry.create({
+        data: {
+          inventoryItemId: lot.inventoryItemId,
+          franchiseId: item.franchiseId,
+          warehouseId: lot.warehouseId || undefined,
+          quantity: qty,
+          reason: 'RECALL_DISPOSAL',
+          note,
+          costAtTime: qty * unitCost,
+        },
+      });
+      await tx.batchRecallEvent.create({
+        data: {
+          recallId: recall.id,
+          event: 'STOCK_DISPOSED',
+          status: 'SUCCESS',
+          actor: userId || 'system',
+          affectedQty: qty,
+          details: { inventoryBatchId: lot.id, inventoryItemId: lot.inventoryItemId, sku: scope.sku, unit: scope.unit, note, message: `Disposed ${qty} ${scope.unit} of ${scope.name}` } as any,
+        },
+      });
+      return { disposedQty: qty, remainingInLot: r3(lot.currentQty - qty) };
+    });
+  }
+
+  // Documented reconciliation, required before closure. Per SKU the user
+  // states how much distributed stock is unavailable (sold and consumed, not
+  // recoverable); outstanding = distributed − recovered − unavailable. The
+  // stock picture it was made against is fingerprinted, so any later recovery
+  // or disposal makes it stale and closure demands a fresh reconciliation.
+  static async reconcileRecall(productBatchId: string, data: { lines?: Array<{ inventoryItemId: string; unavailableQty: number }>; notes: string }, userId?: string) {
+    const notes = (data.notes || '').trim();
+    if (notes.length < 10) throw new Error('Reconciliation notes are required (at least 10 characters).');
+    return prisma.$transaction(async (tx) => {
+      const recall = await this.activeRecallTx(tx, productBatchId);
+      if (recall.step === 'INITIATED') throw new Error('Locate distribution before reconciling the recall.');
+      const trace = await this.traceBatch(tx, productBatchId);
+      const lines = trace!.skus.map(s => {
+        const input = data.lines?.find(l => l.inventoryItemId === s.inventoryItemId);
+        const unavailable = r3(Number(input?.unavailableQty ?? 0));
+        if (!Number.isFinite(unavailable) || unavailable < 0) throw new Error(`${s.name}: unavailable quantity cannot be negative.`);
+        if (unavailable > s.outstandingQty + 0.0001) {
+          throw new Error(`${s.name}: unavailable (${unavailable}) cannot exceed distributed-but-unrecovered stock (${s.outstandingQty} ${s.unit}).`);
+        }
+        return {
+          inventoryItemId: s.inventoryItemId, sku: s.sku, name: s.name, unit: s.unit,
+          distributedQty: s.distributedQty, recoveredQty: s.recoveredQty, disposedQty: s.disposedQty,
+          quarantinedQty: s.quarantinedQty, unavailableQty: unavailable,
+          outstandingQty: r3(Math.max(0, s.outstandingQty - unavailable)),
+        };
+      });
+      const outstandingTotal = r3(lines.reduce((t, l) => t + l.outstandingQty, 0));
+      const event = await tx.batchRecallEvent.create({
+        data: {
+          recallId: recall.id,
+          event: 'RECALL_RECONCILED',
+          status: 'SUCCESS',
+          actor: userId || 'system',
+          details: { lines, notes, outstandingTotal, snapshot: this.snapshotOf(trace!.skus), message: outstandingTotal > 0 ? `Reconciled — ${outstandingTotal} still outstanding` : 'Reconciled — nothing outstanding' } as any,
+        },
+      });
+      return { reconciliationId: event.id, lines, outstandingTotal, readyToClose: outstandingTotal === 0 };
     });
   }
 

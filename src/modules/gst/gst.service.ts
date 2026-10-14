@@ -2,9 +2,49 @@ import axios from 'axios';
 import prisma from '../../lib/prisma';
 
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
-const GSTVERIFY_BASE_URL = 'https://gstverify.co.in/api/v1/verify';
+const GSTVERIFY_BASE_URL = process.env.GSTVERIFY_BASE_URL || 'https://gstverify.co.in/api/v1/verify';
 const SANDBOX_PRODUCTION_URL = 'https://api.sandbox.co.in';
 const SANDBOX_TEST_URL = 'https://test-api.sandbox.co.in';
+const SANDBOX_BASE_URL = process.env.SANDBOX_BASE_URL || 'https://api.sandbox.co.in';
+
+const GST_STATE_MAP: Record<string, string> = {
+  '01': 'Jammu and Kashmir',
+  '02': 'Himachal Pradesh',
+  '03': 'Punjab',
+  '04': 'Chandigarh',
+  '05': 'Uttarakhand',
+  '06': 'Haryana',
+  '07': 'Delhi',
+  '08': 'Rajasthan',
+  '09': 'Uttar Pradesh',
+  '10': 'Bihar',
+  '11': 'Sikkim',
+  '12': 'Arunachal Pradesh',
+  '13': 'Nagaland',
+  '14': 'Manipur',
+  '15': 'Mizoram',
+  '16': 'Tripura',
+  '17': 'Meghalaya',
+  '18': 'Assam',
+  '19': 'West Bengal',
+  '20': 'Jharkhand',
+  '21': 'Odisha',
+  '22': 'Chhattisgarh',
+  '23': 'Madhya Pradesh',
+  '24': 'Gujarat',
+  '26': 'Dadra and Nagar Haveli and Daman and Diu',
+  '27': 'Maharashtra',
+  '29': 'Karnataka',
+  '30': 'Goa',
+  '31': 'Lakshadweep',
+  '32': 'Kerala',
+  '33': 'Tamil Nadu',
+  '34': 'Puducherry',
+  '35': 'Andaman and Nicobar Islands',
+  '36': 'Telangana',
+  '37': 'Andhra Pradesh',
+  '38': 'Ladakh',
+};
 
 export interface GstinDetails {
   gstin: string;
@@ -17,14 +57,12 @@ export interface GstinDetails {
   pan: string;
   address: string;
   state: string;
-  // GSTVerify only returns one combined address string, no structured
-  // city/pinCode — derived from it on read so we don't need to store them.
   city: string;
   pinCode: string;
   natureOfBusiness: string[];
 }
 
-// Non-2xx statuses GSTVerify documents explicitly; anything else surfaces as a generic upstream failure.
+// Non-2xx statuses upstream documents explicitly; anything else surfaces as a generic upstream failure.
 class GstVerifyError extends Error {
   constructor(message: string, public status: number) {
     super(message);
@@ -45,6 +83,53 @@ type CachedRow = {
   natureOfBusiness: unknown;
 };
 
+// In-memory token cache for Sandbox.co.in API (valid for 24h)
+class SandboxAuth {
+  private static cachedToken: string | null = null;
+  private static tokenExpiresAt = 0;
+
+  static async getAccessToken(apiKey: string, apiSecret: string): Promise<string> {
+    const now = Date.now();
+    if (this.cachedToken && this.tokenExpiresAt > now + 60_000) {
+      return this.cachedToken;
+    }
+
+    try {
+      const response = await axios.post(
+        `${SANDBOX_BASE_URL}/authenticate`,
+        {},
+        {
+          headers: {
+            'x-api-key': apiKey,
+            'x-api-secret': apiSecret,
+            'x-api-version': '1.0.0',
+            'Content-Type': 'application/json',
+          },
+          validateStatus: () => true,
+        }
+      );
+
+      if (response.status !== 200 || !response.data?.data?.access_token) {
+        const errorMsg =
+          response.data?.message ||
+          response.data?.error ||
+          `Sandbox authentication failed (HTTP ${response.status})`;
+        throw new GstVerifyError(errorMsg, response.status === 401 ? 401 : 502);
+      }
+
+      this.cachedToken = response.data.data.access_token as string;
+      this.tokenExpiresAt = now + 23 * 60 * 60 * 1000; // cache for 23 hours
+      return this.cachedToken;
+    } catch (err: any) {
+      if (err instanceof GstVerifyError) throw err;
+      throw new GstVerifyError(
+        `Failed to authenticate with Sandbox API: ${err.message}`,
+        502
+      );
+    }
+  }
+}
+
 export class GstService {
   private static sandboxToken: { value: string; expiresAt: number } | null = null;
 
@@ -52,12 +137,16 @@ export class GstService {
     return GSTIN_REGEX.test(gstin);
   }
 
-  // GSTVerify itself also caches, but our own row means repeat lookups (any
-  // user, any franchise) never spend a credit at all.
-  static async verify(gstinRaw: string, forceRefresh = false): Promise<{ details: GstinDetails; cached: boolean }> {
+  static async verify(
+    gstinRaw: string,
+    forceRefresh = false
+  ): Promise<{ details: GstinDetails; cached: boolean }> {
     const gstin = gstinRaw.trim().toUpperCase();
     if (!this.isValidGstin(gstin)) {
-      throw new GstVerifyError('Invalid GSTIN format. Must be a 15-character alphanumeric code.', 400);
+      throw new GstVerifyError(
+        'Invalid GSTIN format. Must be a 15-character alphanumeric code.',
+        400
+      );
     }
 
     if (!forceRefresh) {
@@ -67,29 +156,43 @@ export class GstService {
       }
     }
 
-    const raw = await this.fetchGstin(gstin, forceRefresh);
-    const sandboxAddress = raw.pradr?.addr;
-    const address = raw.address || this.formatSandboxAddress(sandboxAddress);
-    const state = raw.state || raw.stateName || sandboxAddress?.stcd || '';
+    const apiKey = process.env.GSTVERIFY_API_KEY;
+    if (!apiKey) {
+      throw new GstVerifyError('GSTVERIFY_API_KEY is not configured on the server.', 500);
+    }
+
+    const response = await axios.get(`${GSTVERIFY_BASE_URL}/${gstin}`, {
+      headers: { 'X-API-Key': apiKey },
+      validateStatus: () => true,
+    });
+
+    if (response.status !== 200 || !response.data?.success) {
+      const message = response.data?.error || `GSTVerify lookup failed (${response.status})`;
+      // 429 (rate limit) is worth surfacing as-is; everything else (bad/expired
+      // key, no credits, upstream GST outage) is a server-side problem, not
+      // the caller's, so it comes back as a generic upstream failure.
+      throw new GstVerifyError(message, response.status === 429 ? 429 : 502);
+    }
+
+    const raw = response.data.data || {};
+    const address = raw.address || '';
+    const state = raw.state || '';
     const details: GstinDetails = {
       gstin: raw.gstin || gstin,
-      legalName: raw.legal_name || raw.lgnm || raw.legalName || raw.trade_name || raw.tradeNam || 'Unknown Business',
-      tradeName: raw.trade_name || raw.tradeNam || raw.legal_name || raw.lgnm || raw.legalName || '',
-      status: raw.status || raw.sts || 'UNKNOWN',
-      constitution: raw.constitution || raw.ctb || '',
-      taxpayerType: raw.taxpayer_type || raw.dty || 'Regular',
-      registrationDate: raw.registration_date || raw.rgdt || raw.regStartDate || '',
+      legalName: raw.legal_name || raw.trade_name || 'Unknown Business',
+      tradeName: raw.trade_name || raw.legal_name || '',
+      status: raw.status || 'UNKNOWN',
+      constitution: raw.constitution || '',
+      taxpayerType: raw.taxpayer_type || 'Regular',
+      registrationDate: raw.registration_date || '',
       pan: raw.pan || '',
       address,
       state,
-      city: sandboxAddress?.loc || sandboxAddress?.dst || this.deriveLocation(address, state).city,
-      pinCode: String(sandboxAddress?.pncd || this.deriveLocation(address, state).pinCode),
-      natureOfBusiness: Array.isArray(raw.nature_of_business)
-        ? raw.nature_of_business
-        : Array.isArray(raw.nba) ? raw.nba : raw.bussNature ? [raw.bussNature] : [],
+      ...this.deriveLocation(address, state),
+      natureOfBusiness: Array.isArray(raw.nature_of_business) ? raw.nature_of_business : [],
     };
 
-    // city/pinCode are derived, not persisted — only store what GSTVerify actually returned.
+    // Save to gstinCache for instant subsequent hits
     const { gstin: _gstin, city: _city, pinCode: _pinCode, ...persisted } = details;
     await prisma.gstinCache.upsert({
       where: { gstin },
@@ -100,89 +203,11 @@ export class GstService {
     return { details, cached: false };
   }
 
-  private static async fetchGstin(gstin: string, forceRefresh: boolean): Promise<any> {
-    if (process.env.SANDBOX_API_KEY && process.env.SANDBOX_SECRET) {
-      return this.fetchFromSandbox(gstin, forceRefresh);
-    }
-
-    const apiKey = process.env.GSTVERIFY_API_KEY;
-    if (!apiKey) {
-      throw new GstVerifyError(
-        'GST verification is not configured. Set SANDBOX_API_KEY and SANDBOX_SECRET on the server.',
-        503,
-      );
-    }
-
-    const response = await axios.get(`${GSTVERIFY_BASE_URL}/${gstin}`, {
-      headers: { 'X-API-Key': apiKey },
-      validateStatus: () => true,
-    });
-    if (response.status !== 200 || !response.data?.success) {
-      const message = response.data?.error || `GST verification lookup failed (${response.status})`;
-      throw new GstVerifyError(message, response.status === 429 ? 429 : 502);
-    }
-    return response.data.data || {};
-  }
-
-  private static sandboxBaseUrl(): string {
-    if (process.env.SANDBOX_API_BASE_URL) return process.env.SANDBOX_API_BASE_URL.replace(/\/$/, '');
-    return process.env.SANDBOX_API_KEY?.startsWith('key_test') ? SANDBOX_TEST_URL : SANDBOX_PRODUCTION_URL;
-  }
-
-  private static async sandboxAccessToken(): Promise<string> {
-    if (this.sandboxToken && this.sandboxToken.expiresAt > Date.now()) return this.sandboxToken.value;
-
-    const response = await axios.post(`${this.sandboxBaseUrl()}/authenticate`, undefined, {
-      headers: {
-        'x-api-key': process.env.SANDBOX_API_KEY,
-        'x-api-secret': process.env.SANDBOX_SECRET,
-        'x-api-version': '1.0',
-      },
-      validateStatus: () => true,
-    });
-    const token = response.data?.data?.access_token;
-    if (response.status !== 200 || !token) {
-      throw new GstVerifyError('GST verification provider authentication failed.', 502);
-    }
-
-    this.sandboxToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
-    return token;
-  }
-
-  private static async fetchFromSandbox(gstin: string, forceRefresh: boolean): Promise<any> {
-    const token = await this.sandboxAccessToken();
-    const response = await axios.post(
-      `${this.sandboxBaseUrl()}/gst/compliance/public/gstin/search`,
-      { gstin },
-      {
-        headers: {
-          authorization: token,
-          'x-api-key': process.env.SANDBOX_API_KEY,
-          'x-api-version': '1.0.0',
-          'x-accept-cache': String(!forceRefresh),
-        },
-        validateStatus: () => true,
-      },
-    );
-    const raw = response.data?.data?.data;
-    if (response.status !== 200 || response.data?.data?.status_cd !== '1' || !raw) {
-      const message = response.data?.data?.error?.message || response.data?.message || 'GSTIN could not be verified.';
-      throw new GstVerifyError(message, response.status === 429 ? 429 : 502);
-    }
-    return raw;
-  }
-
-  private static formatSandboxAddress(address: any): string {
-    if (!address) return '';
-    return [address.flno, address.bno, address.bnm, address.st, address.landMark, address.loc, address.dst, address.stcd, address.pncd]
-      .map((part) => String(part || '').trim())
-      .filter(Boolean)
-      .join(', ');
-  }
-
   private static toDetails(cached: CachedRow): GstinDetails {
     const address = cached.address || '';
-    const state = cached.state || '';
+    const state = cached.state || GST_STATE_MAP[cached.gstin.substring(0, 2)] || '';
+    const derived = this.deriveLocation(address, state);
+
     return {
       gstin: cached.gstin,
       legalName: cached.legalName || 'Unknown Business',
@@ -191,18 +216,21 @@ export class GstService {
       constitution: cached.constitution || '',
       taxpayerType: cached.taxpayerType || 'Regular',
       registrationDate: cached.registrationDate || '',
-      pan: cached.pan || '',
+      pan: cached.pan || (cached.gstin.length >= 12 ? cached.gstin.substring(2, 12) : ''),
       address,
       state,
-      ...this.deriveLocation(address, state),
-      natureOfBusiness: Array.isArray(cached.natureOfBusiness) ? (cached.natureOfBusiness as string[]) : [],
+      city: derived.city,
+      pinCode: derived.pinCode,
+      natureOfBusiness: Array.isArray(cached.natureOfBusiness)
+        ? (cached.natureOfBusiness as string[])
+        : [],
     };
   }
 
-  // GSTN addresses are free-text and messy, so this is a best-effort parse:
-  // pincode is the trailing 6-digit number; city is the last comma-separated
-  // segment left after stripping the pincode and the state name.
-  private static deriveLocation(address: string, state: string): { city: string; pinCode: string } {
+  private static deriveLocation(
+    address: string,
+    state: string
+  ): { city: string; pinCode: string } {
     if (!address) return { city: '', pinCode: '' };
 
     const pinMatches = address.match(/\d{6}(?!\d)/g);

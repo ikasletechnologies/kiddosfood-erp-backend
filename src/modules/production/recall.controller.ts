@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { RecallService } from './recall.service';
+import { RecallService, RECALL_SEVERITIES } from './recall.service';
 
 // All mutation endpoints return 400 for known business-rule rejections
 // (bad eligibility, out-of-order step, invalid quantity) — these are
@@ -41,8 +41,16 @@ export class RecallController {
   static async initiate(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const { reason, reasonNotes } = req.body;
-      const recall = await RecallService.initiateRecall(req.params.id, { reason, reasonNotes, userId: user?.userId });
+      const { reason, reasonNotes, severity, description } = req.body;
+      // The Batch Recall screen always sends severity + description; both are
+      // mandatory for a recall raised through the API.
+      if (!RECALL_SEVERITIES.includes(severity)) {
+        return res.status(400).json({ error: `Select a severity: ${RECALL_SEVERITIES.join(', ')}.` });
+      }
+      if (typeof description !== 'string' || description.trim().length < 10) {
+        return res.status(400).json({ error: 'Describe the issue (at least 10 characters).' });
+      }
+      const recall = await RecallService.initiateRecall(req.params.id, { reason, reasonNotes, severity, description, userId: user?.userId });
       res.status(201).json(recall);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
@@ -82,8 +90,8 @@ export class RecallController {
   static async collectReturn(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const { returnedQty } = req.body;
-      const result = await RecallService.collectReturn(req.params.id, Number(returnedQty), user?.userId);
+      const { returnedQty, inventoryBatchId, warehouseId, note } = req.body;
+      const result = await RecallService.collectReturn(req.params.id, Number(returnedQty), user?.userId, inventoryBatchId ? { inventoryBatchId: String(inventoryBatchId), warehouseId: warehouseId || undefined, note } : undefined);
       res.json(result);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
@@ -93,7 +101,58 @@ export class RecallController {
   static async complete(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const result = await RecallService.completeRecall(req.params.id, user?.userId);
+      const result = await RecallService.completeRecall(req.params.id, user?.userId, req.body?.note);
+      res.json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getDetails(req: Request, res: Response) {
+    try {
+      const result = await RecallService.getRecallDetails(req.params.id);
+      if (!result) return res.status(404).json({ error: 'Batch not found.' });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async list(_req: Request, res: Response) {
+    try {
+      res.json(await RecallService.listRecalls());
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async quarantineSummary(_req: Request, res: Response) {
+    try {
+      res.json(await RecallService.quarantineSummary());
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async dispose(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { inventoryBatchId, quantity, note } = req.body || {};
+      const result = await RecallService.disposeStock(req.params.id, { inventoryBatchId: String(inventoryBatchId || ''), quantity: Number(quantity), note }, user?.userId);
+      res.json(result);
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  static async reconcile(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const { lines, notes } = req.body || {};
+      const result = await RecallService.reconcileRecall(req.params.id, {
+        lines: Array.isArray(lines) ? lines.map((l: any) => ({ inventoryItemId: String(l?.inventoryItemId || ''), unavailableQty: Number(l?.unavailableQty) || 0 })) : [],
+        notes,
+      }, user?.userId);
       res.json(result);
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });

@@ -82,8 +82,19 @@ export class ProductionController {
   static async approveBatch(req: Request, res: Response) {
     try {
       const userId = (req as any).user?.userId;
-      const { actualYield, remarks, expiryDate } = req.body;
-      const result = await ProductionService.approveProduction(req.params.id, userId, actualYield ? Number(actualYield) : undefined, remarks, expiryDate || undefined);
+      const { actualYield, remarks, expiryDate, wastageQty, wastageNote } = req.body;
+      // An explicit 0 / negative / non-numeric yield is passed through so the
+      // service rejects it — previously a 0 silently became the expected yield.
+      const hasYield = actualYield !== undefined && actualYield !== null && actualYield !== '';
+      const hasWastage = wastageQty !== undefined && wastageQty !== null && wastageQty !== '';
+      const result = await ProductionService.approveProduction(
+        req.params.id,
+        userId,
+        hasYield ? Number(actualYield) : undefined,
+        remarks,
+        expiryDate || undefined,
+        hasWastage ? { quantity: Number(wastageQty), note: wastageNote || undefined } : undefined,
+      );
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
@@ -173,6 +184,54 @@ export class ProductionController {
         productId: productId ? String(productId) : undefined,
         userId: user?.userId
       });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  // Simplified workflow: pick pack size + product, enter packed and damaged
+  // packets, confirm once — reserves bulk, credits Finished Goods and records
+  // damage wastage in one transaction.
+  static async packageAndConfirm(req: Request, res: Response) {
+    try {
+      const { rows, packetSize, packedQty, damagedQty, productId, newProduct, expectedPackagedQty } = req.body;
+      const user = (req as any).user;
+      if (rows !== undefined && !Array.isArray(rows)) {
+        return res.status(400).json({ error: 'rows must be an array of pack sizes.' });
+      }
+      const result = await ProductionService.packageAndConfirm({
+        batchId: req.params.id,
+        // Multi-size form: one entry per pack size / SKU.
+        rows: Array.isArray(rows)
+          ? rows.map((r: any) => ({
+              packetSize: String(r?.packetSize ?? ''),
+              packedQty: Number(r?.packedQty),
+              damagedQty: Number(r?.damagedQty) || 0,
+              productId: r?.productId ? String(r.productId) : undefined,
+              newProduct: r?.newProduct,
+            }))
+          : undefined,
+        packetSize,
+        packedQty: Number(packedQty),
+        damagedQty: Number(damagedQty) || 0,
+        productId: productId ? String(productId) : undefined,
+        newProduct,
+        expectedPackagedQty: expectedPackagedQty !== undefined && expectedPackagedQty !== null ? Number(expectedPackagedQty) : undefined,
+        userId: user?.userId,
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  // Releases a legacy batch (completed while QC was still required, never
+  // inspected) to packaging now that production QC is switched off.
+  static async releaseToPackaging(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const result = await ProductionService.releaseBatchToPackaging(req.params.id, user?.userId);
       res.json(result);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

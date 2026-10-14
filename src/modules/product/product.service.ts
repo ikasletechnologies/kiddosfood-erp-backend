@@ -301,8 +301,6 @@ export class ProductService {
    * Create a new product
    */
   static async create(data: any) {
-    const productType: ProductType = data.productType ?? ProductType.FINISHED_GOOD;
-
     // Pre-check rather than letting the DB's unique constraint on `sku`
     // surface as a raw Prisma P2002 — callers (single create + bulk import)
     // need a clean, catchable "already exists" instead of an opaque 500.
@@ -311,31 +309,40 @@ export class ProductService {
       if (existing) throw new DuplicateProductError(data.sku);
     }
 
-    return prisma.$transaction(async (tx) => {
-      const product = await tx.product.create({
-        data: {
-          name: data.name,
-          sku: data.sku,
-          description: data.description,
-          basePrice: data.basePrice,
-          category: data.category,
-          taxPercent: data.taxPercent || 5,
-          isActive: true,
-          emoji: data.emoji,
-          isVeg: data.isVeg ?? true,
-          productType,
-          shelfLifeDays: data.shelfLifeDays !== undefined && data.shelfLifeDays !== null && data.shelfLifeDays !== ''
-            ? Number(data.shelfLifeDays)
-            : null,
-        },
-        include: {
-          recipe: true
-        }
-      });
+    return prisma.$transaction(tx => ProductService.createInTx(tx, data));
+  }
 
-      await syncInventoryItemForProduct(tx, product);
-      return product;
+  /**
+   * The body of create(), runnable inside a caller's transaction — so another
+   * workflow (e.g. Packaging & Confirmation creating a new pack-size variant)
+   * gets exactly the same Product + synced HQ InventoryItem, and rolls back
+   * together with the rest of its work. Callers do their own duplicate check.
+   */
+  static async createInTx(tx: any, data: any) {
+    const productType: ProductType = data.productType ?? ProductType.FINISHED_GOOD;
+    const product = await tx.product.create({
+      data: {
+        name: data.name,
+        sku: data.sku,
+        description: data.description,
+        basePrice: data.basePrice,
+        category: data.category,
+        taxPercent: data.taxPercent || 5,
+        isActive: true,
+        emoji: data.emoji,
+        isVeg: data.isVeg ?? true,
+        productType,
+        shelfLifeDays: data.shelfLifeDays !== undefined && data.shelfLifeDays !== null && data.shelfLifeDays !== ''
+          ? Number(data.shelfLifeDays)
+          : null,
+      },
+      include: {
+        recipe: true
+      }
     });
+
+    await syncInventoryItemForProduct(tx, product);
+    return product;
   }
 
   /**
