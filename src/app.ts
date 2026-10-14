@@ -53,6 +53,7 @@ import SetupRoutes from './modules/setup/setup.routes';
 import AlertRoutes from './modules/alerts/alert.routes';
 import EWayBillRoutes from './modules/eway-bill/ewaybill.routes';
 import AttachmentRoutes from './modules/attachments/attachment.routes';
+import ChatRoutes from './modules/chat/chat.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -68,12 +69,18 @@ app.use('/api/attachments', express.json({ limit: '8mb' }));
 app.use(express.json());
 
 // Advanced API Flow Logger
-const REDACTED_KEYS = ['password', 'accessToken', 'refreshToken', 'token'];
-function redact(obj: any) {
-  if (!obj || typeof obj !== 'object') return obj;
-  const copy: any = Array.isArray(obj) ? [...obj] : { ...obj };
+const REDACTED_KEYS = ['password', 'dashboardPassword', 'accessToken', 'refreshToken', 'token', 'aadhaarNumber'];
+// Recursive so nested secrets (e.g. adminUser.password on franchise create)
+// are masked too. Only plain objects/arrays are walked, so Dates, Decimals
+// etc. still serialise normally.
+function redact(obj: any, depth = 0): any {
+  if (!obj || typeof obj !== 'object' || depth > 5) return obj;
+  if (Array.isArray(obj)) return obj.map((v) => redact(v, depth + 1));
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) return obj;
+  const copy: any = { ...obj };
   for (const key of Object.keys(copy)) {
-    if (REDACTED_KEYS.includes(key)) copy[key] = '********';
+    copy[key] = REDACTED_KEYS.includes(key) ? '********' : redact(copy[key], depth + 1);
   }
   return copy;
 }
@@ -108,7 +115,9 @@ app.use((req, res, next) => {
 
   console.log(`\n🚀 [${icon} ${req.method}] ${req.url} (ID: ${requestId})`);
   if (req.query && Object.keys(req.query).length > 0) console.log(`   🔸 Query:`, req.query);
-  if (req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
+  // Chat message text and history are never written to the server log.
+  const isChat = req.url.startsWith('/api/chat');
+  if (!isChat && req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
     console.log(`   🔸 Body:`, redact(req.body));
   }
 
@@ -123,7 +132,7 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
     const statusIcon = res.statusCode >= 400 ? '❌' : '✅';
     console.log(`${statusIcon} [RESPONSE] ${res.statusCode} - ${duration}ms (ID: ${requestId})`);
-    if (responseBody !== undefined) console.log(`   🔹 Response:`, formatBody(responseBody));
+    if (responseBody !== undefined && !isChat) console.log(`   🔹 Response:`, formatBody(responseBody));
   });
 
   next();
@@ -204,6 +213,7 @@ app.get('/api/inventory/movements', authenticate, authorizeRole(['SUPER_ADMIN', 
 
 // Raw Materials (Phase 3 requested endpoints)
 app.get('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getAll);
+app.get('/api/raw-materials/:id/lots', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getLots);
 app.get('/api/raw-materials/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.getById);
 app.post('/api/raw-materials', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.create);
 app.patch('/api/raw-materials/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RawMaterialsController.update);
@@ -240,15 +250,24 @@ app.get('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), Recipe
 app.delete('/api/recipes/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.delete);
 app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getByProduct);
 app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.calculateCost);
+app.get('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getFormulations);
+app.post('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.saveFormulation);
 
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getHistory);
 app.get('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), CartonController.getAll);
 app.post('/api/production/cartons', authenticate, authorizeRole(['SUPER_ADMIN']), CartonController.create);
 app.post('/api/production/batch', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startBatch);
+app.post('/api/production/plan/preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPlan);
+app.post('/api/production/plan/start', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.startPlanned);
 app.post('/api/production/:id/stop', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.stopBatch);
 app.patch('/api/production/:id/stage', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.advanceStage);
 app.get('/api/production/:id/stage-history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getStageHistory);
+app.get('/api/production/completion-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCompletionSettings);
+app.get('/api/production/lot-options', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.getLotOptions);
+app.get('/api/production/costing-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCostingSettings);
+app.get('/api/production/batches/:id/cost-summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getBatchCostSummary);
+app.post('/api/production/batches/:id/packaging-cost-preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPackagingCost);
 app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.approveBatch);
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {
@@ -585,6 +604,9 @@ app.use('/api/eway-bills', EWayBillRoutes);
 
 // File attachments (Sales Order Image / Document, …)
 app.use('/api/attachments', AttachmentRoutes);
+
+// Super Admin ⇄ Franchise chat (real-time part lives on the /chat socket namespace)
+app.use('/api/chat', ChatRoutes);
 
 // System Setup — first-run HQ/warehouse setup status
 app.use('/api/setup', SetupRoutes);

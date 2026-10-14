@@ -1,6 +1,20 @@
 import { Request, Response } from 'express';
 import { ProductionService } from './production.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { FormulationService } from '../recipes/formulation.service';
+import { ProductionCostingService } from './production-costing.service';
+import { EXPENSE_BASES } from './production-costing';
+
+// { inventoryItemId: [{ batchId, qty }] } from the request body, validated.
+function parseLotAllocations(raw: unknown) {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('lotAllocations must map each material to its lots.');
+  const out: Record<string, ReturnType<typeof ProductionCostingService.normalizeAllocations>> = {};
+  for (const [itemId, list] of Object.entries(raw as Record<string, unknown>)) {
+    out[itemId] = ProductionCostingService.normalizeAllocations(list, 'Lot allocation');
+  }
+  return out;
+}
 
 export class ProductionController {
   static async startBatch(req: Request, res: Response) {
@@ -23,6 +37,49 @@ export class ProductionController {
       res.status(201).json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Read-only: scaled requirements + warehouse stock for a target yield. */
+  static async previewPlan(req: Request, res: Response) {
+    try {
+      const { recipeId, targetQty, targetUnit, warehouseId } = req.body;
+      res.json(await FormulationService.preview({ recipeId, targetQty: Number(targetQty), targetUnit, warehouseId: warehouseId || undefined }));
+    } catch (error: any) {
+      res.status(error.status || 500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Starts a run from the recipe's saved formulation scaled to a target
+   * yield. Resolves to the same startProduction call (quantity = scaling
+   * factor) with a frozen snapshot; stock is re-validated server-side there.
+   */
+  static async startPlanned(req: Request, res: Response) {
+    try {
+      const { recipeId, formulationId, targetQty, targetUnit, franchiseId, warehouseId, customerId, productionType, expiryDate, operatorId } = req.body;
+      if (!warehouseId) return res.status(400).json({ error: 'Select a source warehouse.' });
+      const user = (req as any).user;
+      const enforcedFranchiseId = await IsolationUtil.enforceFranchiseMatch(user, franchiseId);
+      const lotAllocations = parseLotAllocations(req.body.lotAllocations);
+      const planned = await FormulationService.buildPlannedStart({ recipeId, formulationId, targetQty: Number(targetQty), targetUnit });
+
+      const result = await ProductionService.startProduction({
+        recipeId,
+        quantity: planned.quantity,
+        franchiseId: enforcedFranchiseId || undefined,
+        warehouseId,
+        customerId,
+        productionType: productionType || 'FINISHED_GOOD',
+        expiryDate,
+        userId: user?.userId,
+        operatorId,
+        planning: planned.planning,
+        lotAllocations,
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      res.status(error.status || 500).json({ error: error.message });
     }
   }
 
@@ -86,6 +143,8 @@ export class ProductionController {
       // An explicit 0 / negative / non-numeric yield is passed through so the
       // service rejects it — previously a 0 silently became the expected yield.
       const hasYield = actualYield !== undefined && actualYield !== null && actualYield !== '';
+      // Completing from the UI must state what was actually produced.
+      if (!hasYield) return res.status(400).json({ error: 'Actual produced quantity is required to complete production.' });
       const hasWastage = wastageQty !== undefined && wastageQty !== null && wastageQty !== '';
       const result = await ProductionService.approveProduction(
         req.params.id,
@@ -94,10 +153,67 @@ export class ProductionController {
         remarks,
         expiryDate || undefined,
         hasWastage ? { quantity: Number(wastageQty), note: wastageNote || undefined } : undefined,
+        {
+          requireVarianceRemarks: true,
+          additionalMaterials: Array.isArray(req.body.additionalMaterials) ? req.body.additionalMaterials : undefined,
+        },
       );
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Settings the completion dialog needs (variance % above which remarks are required). */
+  static async getCompletionSettings(_req: Request, res: Response) {
+    try {
+      res.json({ varianceRemarksThresholdPct: await ProductionService.getVarianceRemarksThresholdPct() });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Production-eligible lots per material in a warehouse (?warehouseId=&itemIds=a,b). */
+  static async getLotOptions(req: Request, res: Response) {
+    try {
+      const warehouseId = String(req.query.warehouseId || '');
+      if (!warehouseId) return res.status(400).json({ error: 'warehouseId is required.' });
+      const itemIds = String(req.query.itemIds || '').split(',').map(s => s.trim()).filter(Boolean);
+      res.json(await ProductionCostingService.getLotOptions(itemIds, warehouseId));
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Expense categories and bases for packaging cost entry. */
+  static async getCostingSettings(_req: Request, res: Response) {
+    try {
+      res.json({ categories: await ProductionCostingService.getExpenseCategories(), bases: EXPENSE_BASES });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  static async getBatchCostSummary(req: Request, res: Response) {
+    try {
+      res.json(await ProductionCostingService.getBatchCostSummary(req.params.id));
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Read-only cost of a packaging request (same calculation as Confirm). */
+  static async previewPackagingCost(req: Request, res: Response) {
+    try {
+      const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+      res.json(await ProductionCostingService.previewPackagingCost(
+        req.params.id,
+        { rows, expenses: req.body.expenses },
+        (size, unit) => ProductionService.parseWeight(size, unit),
+        (tx, batch, franchiseId) => ProductionService.resolveBulkItem(tx, batch, franchiseId),
+      ));
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 
@@ -218,6 +334,7 @@ export class ProductionController {
         productId: productId ? String(productId) : undefined,
         newProduct,
         expectedPackagedQty: expectedPackagedQty !== undefined && expectedPackagedQty !== null ? Number(expectedPackagedQty) : undefined,
+        expenses: req.body.expenses,
         userId: user?.userId,
       });
       res.json(result);

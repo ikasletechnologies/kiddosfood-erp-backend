@@ -2,6 +2,7 @@ import 'dotenv/config';
 import app from './app';
 import { createServer } from 'http';
 import SocketService from './lib/socket';
+import { initChatSocket } from './modules/chat/chat.socket';
 
 const PORT = process.env.PORT || 5000;
 
@@ -10,6 +11,8 @@ const httpServer = createServer(app);
 
 // Initialize WebSockets
 SocketService.init(httpServer);
+// Authenticated /chat namespace (Super Admin ⇄ Franchise chat)
+initChatSocket(SocketService.io);
 
 // Restarting server to pick up controller changes //
 httpServer.listen(PORT, () => {

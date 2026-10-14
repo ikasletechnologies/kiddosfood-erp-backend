@@ -21,6 +21,8 @@ model User {
   activityLogs  ActivityLog[]
   employee      Employee?
   refreshTokens RefreshToken[]
+  chatMessages   ChatMessage[]
+  chatReadStates ChatReadState[]
   franchise     Franchise?     @relation(fields: [franchiseId], references: [id])
 }
 
@@ -159,6 +161,12 @@ model Franchise {
   outstandingAmount  Float              @default(0)
   walletBalance      Float              @default(0)
   primaryWarehouseId String?
+  // Optional KYC. Aadhaar is AES-256-GCM encrypted (src/lib/field-crypto.ts);
+  // only the last 4 digits are kept in clear for masked display.
+  // aadhaarEncrypted is globally omitted from queries (src/lib/prisma.ts).
+  aadhaarEncrypted   String?
+  aadhaarLast4       String?
+  panNumber          String?
   accounts           Account[]
   activityLogs       ActivityLog[]
   businessPartners   BusinessPartner[]
@@ -186,6 +194,7 @@ model Franchise {
   wasteEntries       WasteEntry[]
   workflowRequests   WorkflowRequest[]
   alerts             Alert[]
+  chatConversations  ChatConversation[]
 }
 
 model DailySettlement {
@@ -262,6 +271,8 @@ model InventoryItem {
   productionItems                 ProductionItem[]
   purchaseRequestItems            PurchaseRequestItem[]
   recipeItems                     RecipeItem[]
+  recipeIngredients               RecipeIngredient[]
+  recipeFormulationItems          RecipeFormulationItem[]
   movements                       StockMovement[]
   requestItems                    StockRequestItem[]
   transferItems                   StockTransferItem[]
@@ -355,6 +366,7 @@ model Vendor {
   paymentReminderEnabled Boolean            @default(false)
   paymentReminderDays    Int                @default(1)
   items                  InventoryItem[]
+  inventoryBatches       InventoryBatch[]
   orders                 ProcurementOrder[]
   purchaseReturns        PurchaseReturn[]
   invoices               VendorInvoice[]
@@ -434,6 +446,7 @@ model ProcurementOrder {
   discountAmount       Float                  @default(0)
   expenses             Expense[]
   goodsReceipts        GoodsReceipt[]
+  inventoryBatches     InventoryBatch[]
   franchise            Franchise?             @relation(fields: [franchiseId], references: [id])
   vendor               Vendor                 @relation(fields: [vendorId], references: [id])
   warehouse            Warehouse?             @relation(fields: [warehouseId], references: [id])
@@ -509,6 +522,7 @@ model GoodsReceiptItem {
   warehouseBin        WarehouseBin?     @relation(fields: [warehouseBinId], references: [id])
   warehouse           Warehouse?        @relation(fields: [warehouseId], references: [id])
   inspection          InspectionRecord?
+  inventoryBatch      InventoryBatch?
 }
 
 model VendorInvoice {
@@ -585,6 +599,61 @@ model Recipe {
   productions              Production[]
   product                  Product?     @relation(fields: [productId], references: [id])
   recipeItems              RecipeItem[]
+  ingredients              RecipeIngredient[]
+  formulations             RecipeFormulation[]
+}
+
+// Recipe Master ingredient selection: WHICH raw materials a recipe uses, with
+// no quantities. Quantities live in RecipeFormulation versions.
+model RecipeIngredient {
+  id              String        @id @default(uuid())
+  recipeId        String
+  inventoryItemId String
+  sortOrder       Int           @default(0)
+  createdAt       DateTime      @default(now())
+  recipe          Recipe        @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([recipeId, inventoryItemId])
+}
+
+// Versioned reference formulation: "these ingredient quantities make
+// yieldQty yieldUnit". One version per recipe is active; saving a new one
+// deactivates the previous and mirrors it into the legacy Recipe.yieldQty /
+// yieldUnit + RecipeItem rows that POS, finance, franchise planning and
+// Production read. Old versions are kept for history.
+model RecipeFormulation {
+  id          String                  @id @default(uuid())
+  recipeId    String
+  version     Int
+  yieldQty    Float
+  yieldUnit   String
+  notes       String?
+  // PLANNING (saved in Production Planning), RECIPE_FORM (legacy recipe form
+  // with quantities), LEGACY (backfilled from the pre-existing recipe BOM).
+  source      String                  @default("PLANNING")
+  isActive    Boolean                 @default(true)
+  createdBy   String?
+  createdAt   DateTime                @default(now())
+  recipe      Recipe                  @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  items       RecipeFormulationItem[]
+  productions Production[]
+
+  @@unique([recipeId, version])
+  @@index([recipeId, isActive])
+}
+
+model RecipeFormulationItem {
+  id              String            @id @default(uuid())
+  formulationId   String
+  inventoryItemId String
+  quantity        Float
+  unit            String
+  sortOrder       Int               @default(0)
+  formulation     RecipeFormulation @relation(fields: [formulationId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem     @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@index([formulationId])
 }
 
 model RecipeCategory {
@@ -628,6 +697,16 @@ model Production {
   overheadCost        Float?               @default(0)
   totalCost           Float?
   warehouseId         String?
+  // Planned runs (Production Planning with a saved formulation). Null on
+  // legacy runs started from the recipe BOM directly. plannedYieldQty is in
+  // plannedYieldUnit (= the formulation's reference yield unit) and is kept
+  // separate from actualYield. formulationSnapshot freezes the formulation
+  // version, target and scaled requirements the run was started with.
+  formulationId       String?
+  plannedYieldQty     Float?
+  plannedYieldUnit    String?
+  formulationSnapshot Json?
+  formulation         RecipeFormulation?   @relation(fields: [formulationId], references: [id])
   batches             ProductBatch?
   customer            Customer?            @relation(fields: [customerId], references: [id])
   franchise           Franchise            @relation(fields: [franchiseId], references: [id])
@@ -677,6 +756,7 @@ model ProductBatch {
   product          Product?           @relation(fields: [productId], references: [id])
   production       Production?        @relation(fields: [productionId], references: [id])
   packagings       ProductPackaging[]
+  expenses         ProductionExpense[]
 
   @@index([franchiseId, expiryDate])
 }
@@ -755,8 +835,39 @@ model ProductPackaging {
   // the bulk pool can be shared across multiple ProductBatches at different
   // costs and FIFO may not select the batch open on screen.
   bulkBreakdown   Json?
+  // Cost snapshot written at confirmation (packageAndConfirm): bulk material
+  // cost, additional expenses by category/basis, cost per packet and per
+  // good packet, selling price and margin. Null on older runs.
+  costBreakdown   Json?
   batch           ProductBatch       @relation(fields: [batchId], references: [id], onDelete: Cascade)
   wasteEntries    WasteEntry[]
+  expenses        ProductionExpense[]
+}
+
+// Additional production expenses charged to finished goods at packaging.
+// basis: PER_BATCH | PER_KG | PER_PACKET.
+// Rows with productPackagingId = null are a batch's shared PER_BATCH totals
+// (one per category). Rows with productPackagingId set are the amounts
+// actually charged to that packaging run; a PER_BATCH total is charged in
+// proportion to packed weight / actual yield, so packaging one batch over
+// several sessions never charges it more than once.
+model ProductionExpense {
+  id                 String            @id @default(uuid())
+  productBatchId     String
+  productPackagingId String?
+  category           String
+  basis              String
+  rate               Float
+  baseQty            Float             @default(0)
+  amount             Float
+  createdBy          String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  productBatch       ProductBatch      @relation(fields: [productBatchId], references: [id], onDelete: Cascade)
+  productPackaging   ProductPackaging? @relation(fields: [productPackagingId], references: [id], onDelete: Cascade)
+
+  @@index([productBatchId])
+  @@index([productPackagingId])
 }
 
 model FranchiseOrder {
@@ -812,6 +923,10 @@ model ProductionItem {
   unitCost        Float?
   totalCost       Float?
   batchBreakdown  Json?
+  // True for material reported as actually used on top of the plan when the
+  // run was completed (consumed at completion, not at start).
+  isAdditional    Boolean       @default(false)
+  note            String?
   inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   production      Production    @relation(fields: [productionId], references: [id])
 }
@@ -1656,14 +1771,26 @@ model PurchaseReturn {
 }
 
 model PurchaseReturnItem {
-  id          String         @id @default(uuid())
-  returnId    String
-  itemName    String
-  quantity    Float
-  unit        String
-  rate        Float
-  totalAmount Float
-  return      PurchaseReturn @relation(fields: [returnId], references: [id])
+  id               String          @id @default(uuid())
+  returnId         String
+  itemName         String
+  quantity         Float
+  unit             String
+  rate             Float
+  totalAmount      Float
+  // Lot-linked returns (Phase 1 batch tracking): the exact received lot
+  // being sent back. Null on legacy/name-only returns, which keep the old
+  // FIFO deduction path. baseQty is `quantity` in the material's stock unit;
+  // unitCost is that lot's own inventory cost, captured so the return
+  // leaves stock at the cost it came in at.
+  materialId       String?
+  inventoryBatchId String?
+  baseQty          Float?
+  unitCost         Float?
+  return           PurchaseReturn  @relation(fields: [returnId], references: [id])
+  inventoryBatch   InventoryBatch? @relation(fields: [inventoryBatchId], references: [id])
+
+  @@index([inventoryBatchId])
 }
 
 model ActivityLog {
@@ -1824,11 +1951,30 @@ model InventoryBatch {
   createdAt                       DateTime                         @default(now())
   updatedAt                       DateTime                         @updatedAt
   status                          InventoryStockState              @default(QC_HOLD)
+  // Purchase-lot provenance (Phase 1 batch tracking), set only on lots
+  // created by GRN approval; null for production/QC/packaging lots and for
+  // purchase lots that predate these columns and couldn't be backfilled.
+  // goodsReceiptItemId is unique: one GRN line can post at most one lot,
+  // which is the DB-level guard against a GRN being stocked twice.
+  // purchaseQty/purchaseUnit/purchasePrice are the receipt as entered on
+  // the GRN (e.g. 10 KG @ ₹100); initialQty/unitCost above are the same
+  // receipt in the item's stock unit.
+  goodsReceiptItemId              String?                          @unique
+  procurementOrderId              String?
+  vendorId                        String?
+  receivedAt                      DateTime?
+  purchaseQty                     Float?
+  purchaseUnit                    String?
+  purchasePrice                   Float?
   inventoryItem                   InventoryItem                    @relation(fields: [inventoryItemId], references: [id])
   productBatch                    ProductBatch?                    @relation(fields: [productBatchId], references: [id])
   warehouse                       Warehouse?                       @relation(fields: [warehouseId], references: [id])
+  goodsReceiptItem                GoodsReceiptItem?                @relation(fields: [goodsReceiptItemId], references: [id])
+  procurementOrder                ProcurementOrder?                @relation(fields: [procurementOrderId], references: [id])
+  vendor                          Vendor?                          @relation(fields: [vendorId], references: [id])
   stockMovements                  StockMovement[]
   inventoryReservationAllocations InventoryReservationAllocation[]
+  purchaseReturnItems             PurchaseReturnItem[]
 
   // Every recall query (getBatchQuantities, locateDistribution,
   // findCrossBatchAffectedIds' block/unblock updates) filters by
@@ -1837,6 +1983,8 @@ model InventoryBatch {
   // Neither had an index before.
   @@index([productBatchId])
   @@index([inventoryItemId, status])
+  @@index([vendorId])
+  @@index([procurementOrderId])
 }
 
 model NumberSequence {
@@ -2595,4 +2743,68 @@ model Attachment {
   createdAt   DateTime @default(now())
 
   @@index([entityType, entityId])
+}
+
+// ─── Super Admin ⇄ Franchise chat ────────────────────────────────────────────
+// One private conversation per (franchise, type). Access is decided server-side
+// from the authenticated user's DB franchiseId (src/modules/chat/chat.service.ts)
+// and never from a client-supplied franchise id.
+model ChatConversation {
+  id            String               @id @default(uuid())
+  franchiseId   String
+  type          ChatConversationType @default(FRANCHISE_SUPPORT)
+  lastMessageAt DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+  franchise     Franchise            @relation(fields: [franchiseId], references: [id], onDelete: Cascade)
+  messages      ChatMessage[]
+  readStates    ChatReadState[]
+
+  @@unique([franchiseId, type])
+  @@index([lastMessageAt])
+}
+
+model ChatMessage {
+  id              String           @id @default(uuid())
+  conversationId  String
+  // Nullable only so deleting an ERP user (UserService.delete) keeps working;
+  // the history stays and the sender shows as a former user.
+  senderUserId    String?
+  senderRole      UserRole
+  messageType     ChatMessageType  @default(TEXT)
+  content         String
+  // Client-generated id for retry idempotency; unique per sender.
+  clientMessageId String?
+  createdAt       DateTime         @default(now())
+  editedAt        DateTime?
+  deletedAt       DateTime?
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender          User?            @relation(fields: [senderUserId], references: [id], onDelete: SetNull)
+
+  @@unique([senderUserId, clientMessageId])
+  @@index([conversationId, createdAt])
+}
+
+// Per-user read position in a conversation. Unread counts and read receipts
+// are derived from it (messages by someone else created after lastReadAt).
+model ChatReadState {
+  id                String           @id @default(uuid())
+  conversationId    String
+  userId            String
+  lastReadAt        DateTime
+  lastReadMessageId String?
+  updatedAt         DateTime         @updatedAt
+  conversation      ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+}
+
+enum ChatConversationType {
+  FRANCHISE_SUPPORT
+}
+
+enum ChatMessageType {
+  TEXT
 }

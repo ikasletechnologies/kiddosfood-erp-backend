@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { PurchaseLotsService } from '../inventory/purchase-lots.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
 import { computeGstFromRate, resolveSellerState } from '../../utils/gst-tax.util';
@@ -254,6 +255,10 @@ export class ProcurementService {
       }
     }
 
+    // Received lots still holding stock, so a return can name the exact lot
+    // it sends back (see PurchaseService.createPurchaseReturn).
+    const lotsByMaterial = await PurchaseLotsService.getReturnableLotsForVendor(vendorId);
+
     return materials
       .map(m => {
         const key = (m.material?.name || '').toLowerCase().trim();
@@ -265,7 +270,8 @@ export class ProcurementService {
           sku: m.material?.sku as string | undefined,
           unit: m.material?.unit as string,
           rate: m.price,
-          availableQty
+          availableQty,
+          lots: lotsByMaterial.get(m.materialId) || []
         };
       })
       .filter(m => m.availableQty > 0);

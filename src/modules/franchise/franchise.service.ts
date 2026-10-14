@@ -1,6 +1,14 @@
 import { WarehouseService } from '../warehouse/warehouse.service';
 import prisma from '../../lib/prisma';
 import { AuthService } from '../auth/auth.service';
+import { encryptField } from '../../lib/field-crypto';
+import {
+  FieldValidationError,
+  maskAadhaar,
+  validateEmail,
+  validateKycFields,
+  validatePassword,
+} from './franchise.validation';
 
 export class FranchiseService {
   // Enforces the "exactly one HQ" invariant getHqFranchise[OrNull] already
@@ -20,51 +28,110 @@ export class FranchiseService {
   }
 
   static async create(input: any) {
-    const { adminUser, ...franchiseData } = input;
+    const { adminUser, aadhaarNumber, panNumber, ...franchiseData } = input;
 
-    return prisma.$transaction(async (tx) => {
-      await FranchiseService.assertSingleHQ(tx, franchiseData.isHQ);
+    // Headquarters Setup (/setup) posts isHQ: true with no admin account — it
+    // keeps its original behaviour untouched. The Add Franchise rules below
+    // (mandatory admin Email ID + Password, optional Aadhaar/PAN) apply only
+    // to branch (non-HQ) creation.
+    const isBranch = franchiseData.isHQ !== true;
+    let kycColumns: Record<string, string | null> = {};
+    let adminEmail = '';
+    if (isBranch) {
+      const { data: kyc, errors } = validateKycFields({ aadhaarNumber, panNumber });
+      adminEmail = typeof adminUser?.email === 'string' ? adminUser.email.trim() : '';
+      const emailError = validateEmail(adminEmail);
+      if (emailError) errors.email = emailError;
+      const passwordError = validatePassword(adminUser?.password);
+      if (passwordError) errors.password = passwordError;
+      if (Object.keys(errors).length) throw new FieldValidationError(errors);
 
-      // 1. Create Franchise with sanitized data
-      // Hash the dashboard password if provided
-      const dashboardPasswordHash = franchiseData.dashboardPassword
-        ? await AuthService.hashPassword(franchiseData.dashboardPassword)
-        : null;
+      kycColumns = {
+        panNumber: kyc.panNumber ?? null,
+        aadhaarEncrypted: kyc.aadhaarNumber ? encryptField(kyc.aadhaarNumber) : null,
+        aadhaarLast4: kyc.aadhaarNumber ? kyc.aadhaarNumber.slice(-4) : null,
+      };
+    }
 
-      const franchise = await tx.franchise.create({
-        data: {
-          name: franchiseData.name,
-          location: franchiseData.location,
-          ownerName: franchiseData.ownerName,
-          contactNum: franchiseData.contactNum,
-          status: franchiseData.status || 'ACTIVE',
-          isHQ: franchiseData.isHQ ?? false,
-          dashboardPassword: dashboardPasswordHash
+    try {
+      return await prisma.$transaction(async (tx) => {
+        await FranchiseService.assertSingleHQ(tx, franchiseData.isHQ);
+
+        // Duplicate admin email. User.email is @unique but case-sensitive in
+        // Postgres, so also guard against case variants of an existing login.
+        if (isBranch) {
+          const emailOwner = await tx.user.findFirst({
+            where: { email: { equals: adminEmail, mode: 'insensitive' } },
+            select: { id: true }
+          });
+          if (emailOwner) {
+            throw new FieldValidationError({ email: 'This email address is already registered' }, 409);
+          }
         }
-      });
 
-      // 2. Create Franchise Admin User if provided (requires email or phone)
-      if (adminUser && (adminUser.email || franchiseData.contactNum)) {
-        const passwordHash = await AuthService.hashPassword(adminUser.password || 'franchise123');
+        // 1. Create Franchise with sanitized data
+        // Hash the dashboard password if provided
+        const dashboardPasswordHash = franchiseData.dashboardPassword
+          ? await AuthService.hashPassword(franchiseData.dashboardPassword)
+          : null;
 
-        await tx.user.create({
+        const franchise = await tx.franchise.create({
           data: {
-            fullName: adminUser.fullName || franchiseData.ownerName,
-            email: adminUser.email || null,
-            phone: franchiseData.contactNum,
-            passwordHash,
-            role: 'FRANCHISE_ADMIN',
-            franchiseId: franchise.id,
-            is_active: true
+            name: franchiseData.name,
+            location: franchiseData.location,
+            ownerName: franchiseData.ownerName,
+            contactNum: franchiseData.contactNum,
+            status: franchiseData.status || 'ACTIVE',
+            isHQ: franchiseData.isHQ ?? false,
+            dashboardPassword: dashboardPasswordHash,
+            ...kycColumns
           }
         });
-      }
 
-      return franchise;
-    });
+        // 2. Create Franchise Admin User if provided (requires email or phone).
+        // Branches always reach here with a validated email + password.
+        if (adminUser && (adminUser.email || franchiseData.contactNum)) {
+          const passwordHash = await AuthService.hashPassword(adminUser.password || 'franchise123');
+
+          await tx.user.create({
+            data: {
+              fullName: adminUser.fullName || franchiseData.ownerName,
+              email: (isBranch ? adminEmail : adminUser.email) || null,
+              phone: franchiseData.contactNum,
+              passwordHash,
+              role: 'FRANCHISE_ADMIN',
+              franchiseId: franchise.id,
+              is_active: true
+            }
+          });
+        }
+
+        return isBranch ? FranchiseService.toSafeFranchise(franchise) : franchise;
+      });
+    } catch (err: any) {
+      // Unique-index races / clashes → clear field errors instead of a raw 500.
+      if (err?.code === 'P2002') {
+        const target = String(err?.meta?.target ?? '');
+        if (target.includes('email')) throw new FieldValidationError({ email: 'This email address is already registered' }, 409);
+        if (target.includes('phone')) throw new FieldValidationError({ contactNum: 'This contact number is already registered to another user' }, 409);
+      }
+      throw err;
+    }
   }
 
-  static async getAll(franchiseId?: string) {
+  // Strips stored secrets; Aadhaar is only ever exposed masked, and only when
+  // includeAadhaar is set (Super Admin callers).
+  static toSafeFranchise<T extends Record<string, any>>(franchise: T, opts: { includeAadhaar?: boolean } = { includeAadhaar: true }) {
+    const { dashboardPassword: _dp, aadhaarEncrypted: _ae, aadhaarLast4, ...rest } = franchise as any;
+    return {
+      ...rest,
+      aadhaarMasked: opts.includeAadhaar ? maskAadhaar(aadhaarLast4) : null,
+      hasAadhaar: Boolean(aadhaarLast4),
+    };
+  }
+
+  // includeAadhaar: only Super Admins see the (masked) Aadhaar.
+  static async getAll(franchiseId?: string, opts: { includeAadhaar?: boolean } = {}) {
     const where: any = {
       status: { not: 'DELETED' }
     };
@@ -79,6 +146,8 @@ export class FranchiseService {
         location: true,
         ownerName: true,
         contactNum: true,
+        panNumber: true,
+        aadhaarLast4: true,
         status: true,
         outstandingAmount: true,
         creditLimit: true,
@@ -91,7 +160,7 @@ export class FranchiseService {
           select: { users: true, orders: true, inventory: true }
         }
       }
-    });
+    }).then((rows) => rows.map((f) => FranchiseService.toSafeFranchise(f, opts)));
   }
 
   // The single source of truth for "which franchise is HQ" — replaces the
@@ -133,7 +202,7 @@ export class FranchiseService {
     return franchise?.isHQ ? null : franchiseId;
   }
 
-  static async getById(id: string) {
+  static async getById(id: string, opts: { includeAadhaar?: boolean } = {}) {
     const franchise = await prisma.franchise.findUnique({
       where: { id },
       include: { 
@@ -147,8 +216,7 @@ export class FranchiseService {
     });
 
     if (franchise) {
-      const { dashboardPassword, ...safeFranchise } = franchise;
-      return safeFranchise;
+      return FranchiseService.toSafeFranchise(franchise, opts);
     }
     return null;
   }

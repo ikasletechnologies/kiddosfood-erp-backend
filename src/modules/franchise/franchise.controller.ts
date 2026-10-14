@@ -3,6 +3,17 @@ import { Request, Response } from 'express';
 import { FranchiseService } from './franchise.service';
 import { LogisticsService } from './logistics.service';
 import prisma from '../../lib/prisma';
+import { encryptField } from '../../lib/field-crypto';
+import { FieldValidationError, validateKycFields } from './franchise.validation';
+
+// Field-specific validation errors (400, or 409 for a duplicate email) carry a
+// fieldErrors map the Add/Edit Franchise form shows next to each input.
+function sendFranchiseError(res: Response, error: any) {
+  if (error instanceof FieldValidationError) {
+    return res.status(error.statusCode).json({ error: error.message, fieldErrors: error.fieldErrors });
+  }
+  return res.status(500).json({ error: error.message });
+}
 
 export class FranchiseController {
   static async create(req: Request, res: Response) {
@@ -10,7 +21,7 @@ export class FranchiseController {
       const franchise = await FranchiseService.create(req.body);
       res.status(201).json(franchise);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      sendFranchiseError(res, error);
     }
   }
 
@@ -18,7 +29,7 @@ export class FranchiseController {
     try {
       const user = (req as any).user;
       const franchiseId = user && user.role !== 'SUPER_ADMIN' ? user.franchiseId : undefined;
-      const franchises = await FranchiseService.getAll(franchiseId);
+      const franchises = await FranchiseService.getAll(franchiseId, { includeAadhaar: user?.role === 'SUPER_ADMIN' });
       res.json(franchises);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -31,7 +42,7 @@ export class FranchiseController {
       if (user && user.role !== 'SUPER_ADMIN' && user.franchiseId && user.franchiseId !== req.params.id) {
         return res.status(403).json({ error: 'Access denied to other franchise details' });
       }
-      const franchise = await FranchiseService.getById(req.params.id);
+      const franchise = await FranchiseService.getById(req.params.id, { includeAadhaar: user?.role === 'SUPER_ADMIN' });
       if (!franchise) return res.status(404).json({ error: 'Franchise not found' });
       res.json(franchise);
     } catch (error: any) {
@@ -49,13 +60,29 @@ export class FranchiseController {
       if (contactNum !== undefined) updateData.contactNum = contactNum;
       if (status !== undefined) updateData.status = status;
 
-      const franchise = await prisma.franchise.update({ 
-        where: { id: req.params.id }, 
-        data: updateData 
+      // Optional Aadhaar / PAN. Omitted or empty Aadhaar keeps the stored
+      // value (the edit form can't pre-fill it); null removes it.
+      const kycInput: any = {};
+      if (req.body.aadhaarNumber !== undefined) kycInput.aadhaarNumber = req.body.aadhaarNumber;
+      if (req.body.panNumber !== undefined) kycInput.panNumber = req.body.panNumber;
+      const { data: kyc, errors } = validateKycFields(kycInput);
+      if (Object.keys(errors).length) throw new FieldValidationError(errors);
+      if (kyc.panNumber !== undefined) updateData.panNumber = kyc.panNumber;
+      if (kyc.aadhaarNumber === null) {
+        updateData.aadhaarEncrypted = null;
+        updateData.aadhaarLast4 = null;
+      } else if (kyc.aadhaarNumber) {
+        updateData.aadhaarEncrypted = encryptField(kyc.aadhaarNumber);
+        updateData.aadhaarLast4 = kyc.aadhaarNumber.slice(-4);
+      }
+
+      const franchise = await prisma.franchise.update({
+        where: { id: req.params.id },
+        data: updateData
       });
-      res.json(franchise);
+      res.json(FranchiseService.toSafeFranchise(franchise));
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      sendFranchiseError(res, error);
     }
   }
 

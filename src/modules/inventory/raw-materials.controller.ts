@@ -1,6 +1,7 @@
 import { IsolationUtil as DataIsolator } from '../../utils/isolation.util';
 import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
+import { PurchaseLotsService } from './purchase-lots.service';
 import prisma from '../../lib/prisma';
 import { FranchiseService } from '../franchise/franchise.service';
 
@@ -56,13 +57,31 @@ export class RawMaterialsController {
       // StockMovement on every read, instead of trusting the cached column
       // directly the way a plain findMany() here previously did.
       const items = await InventoryService.getInventory(franchiseId as any, includeInactive, excludeCategories);
-      res.json(items);
+      // Additive: lot-based valuation for Stock Hub (existing fields untouched).
+      const lotSummaries = await PurchaseLotsService.getLotSummaries(items.map((i: any) => i.id));
+      res.json(items.map((i: any) => ({
+        ...i,
+        lotSummary: PurchaseLotsService.summarize(i.currentStock || 0, i.costPrice || 0, lotSummaries.get(i.id)),
+      })));
     } catch (error) {
       console.error('[RawMaterialsController.getAll] Error:', error);
       res.status(500).json({ 
         error: (error as Error).message,
         stack: process.env.NODE_ENV === 'development' ? (error as Error).stack : undefined 
       });
+    }
+  }
+
+  /**
+   * GET /api/raw-materials/:id/lots — purchase lots of one material for
+   * Stock Hub's expandable batch details.
+   */
+  static async getLots(req: Request, res: Response) {
+    try {
+      res.json(await PurchaseLotsService.getMaterialLots(req.params.id));
+    } catch (error) {
+      const message = (error as Error).message;
+      res.status(message === 'Material not found' ? 404 : 500).json({ error: message });
     }
   }
 
