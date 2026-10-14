@@ -21,6 +21,8 @@ model User {
   activityLogs  ActivityLog[]
   employee      Employee?
   refreshTokens RefreshToken[]
+  chatMessages   ChatMessage[]
+  chatReadStates ChatReadState[]
   franchise     Franchise?     @relation(fields: [franchiseId], references: [id])
 }
 
@@ -159,6 +161,12 @@ model Franchise {
   outstandingAmount  Float              @default(0)
   walletBalance      Float              @default(0)
   primaryWarehouseId String?
+  // Optional KYC. Aadhaar is AES-256-GCM encrypted (src/lib/field-crypto.ts);
+  // only the last 4 digits are kept in clear for masked display.
+  // aadhaarEncrypted is globally omitted from queries (src/lib/prisma.ts).
+  aadhaarEncrypted   String?
+  aadhaarLast4       String?
+  panNumber          String?
   accounts           Account[]
   activityLogs       ActivityLog[]
   businessPartners   BusinessPartner[]
@@ -186,6 +194,7 @@ model Franchise {
   wasteEntries       WasteEntry[]
   workflowRequests   WorkflowRequest[]
   alerts             Alert[]
+  chatConversations  ChatConversation[]
 }
 
 model DailySettlement {
@@ -2734,4 +2743,68 @@ model Attachment {
   createdAt   DateTime @default(now())
 
   @@index([entityType, entityId])
+}
+
+// ─── Super Admin ⇄ Franchise chat ────────────────────────────────────────────
+// One private conversation per (franchise, type). Access is decided server-side
+// from the authenticated user's DB franchiseId (src/modules/chat/chat.service.ts)
+// and never from a client-supplied franchise id.
+model ChatConversation {
+  id            String               @id @default(uuid())
+  franchiseId   String
+  type          ChatConversationType @default(FRANCHISE_SUPPORT)
+  lastMessageAt DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+  franchise     Franchise            @relation(fields: [franchiseId], references: [id], onDelete: Cascade)
+  messages      ChatMessage[]
+  readStates    ChatReadState[]
+
+  @@unique([franchiseId, type])
+  @@index([lastMessageAt])
+}
+
+model ChatMessage {
+  id              String           @id @default(uuid())
+  conversationId  String
+  // Nullable only so deleting an ERP user (UserService.delete) keeps working;
+  // the history stays and the sender shows as a former user.
+  senderUserId    String?
+  senderRole      UserRole
+  messageType     ChatMessageType  @default(TEXT)
+  content         String
+  // Client-generated id for retry idempotency; unique per sender.
+  clientMessageId String?
+  createdAt       DateTime         @default(now())
+  editedAt        DateTime?
+  deletedAt       DateTime?
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender          User?            @relation(fields: [senderUserId], references: [id], onDelete: SetNull)
+
+  @@unique([senderUserId, clientMessageId])
+  @@index([conversationId, createdAt])
+}
+
+// Per-user read position in a conversation. Unread counts and read receipts
+// are derived from it (messages by someone else created after lastReadAt).
+model ChatReadState {
+  id                String           @id @default(uuid())
+  conversationId    String
+  userId            String
+  lastReadAt        DateTime
+  lastReadMessageId String?
+  updatedAt         DateTime         @updatedAt
+  conversation      ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+}
+
+enum ChatConversationType {
+  FRANCHISE_SUPPORT
+}
+
+enum ChatMessageType {
+  TEXT
 }

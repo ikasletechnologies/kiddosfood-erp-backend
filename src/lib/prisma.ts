@@ -6,7 +6,9 @@ import { Pool } from 'pg';
 const prismaClientSingleton = () => {
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   const adapter = new PrismaPg(pool);
-  const client = new PrismaClient({ adapter });
+  // Franchise.aadhaarEncrypted is omitted from every query result by default so
+  // the ciphertext never leaks through an `include: { franchise: true }`.
+  const client = new PrismaClient({ adapter, omit: { franchise: { aadhaarEncrypted: true } } });
 
   // Globally increase interactive transaction timeouts to prevent expiration errors
   const originalTransaction = client.$transaction.bind(client);

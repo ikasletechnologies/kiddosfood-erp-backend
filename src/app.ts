@@ -53,6 +53,7 @@ import SetupRoutes from './modules/setup/setup.routes';
 import AlertRoutes from './modules/alerts/alert.routes';
 import EWayBillRoutes from './modules/eway-bill/ewaybill.routes';
 import AttachmentRoutes from './modules/attachments/attachment.routes';
+import ChatRoutes from './modules/chat/chat.routes';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -68,12 +69,18 @@ app.use('/api/attachments', express.json({ limit: '8mb' }));
 app.use(express.json());
 
 // Advanced API Flow Logger
-const REDACTED_KEYS = ['password', 'accessToken', 'refreshToken', 'token'];
-function redact(obj: any) {
-  if (!obj || typeof obj !== 'object') return obj;
-  const copy: any = Array.isArray(obj) ? [...obj] : { ...obj };
+const REDACTED_KEYS = ['password', 'dashboardPassword', 'accessToken', 'refreshToken', 'token', 'aadhaarNumber'];
+// Recursive so nested secrets (e.g. adminUser.password on franchise create)
+// are masked too. Only plain objects/arrays are walked, so Dates, Decimals
+// etc. still serialise normally.
+function redact(obj: any, depth = 0): any {
+  if (!obj || typeof obj !== 'object' || depth > 5) return obj;
+  if (Array.isArray(obj)) return obj.map((v) => redact(v, depth + 1));
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) return obj;
+  const copy: any = { ...obj };
   for (const key of Object.keys(copy)) {
-    if (REDACTED_KEYS.includes(key)) copy[key] = '********';
+    copy[key] = REDACTED_KEYS.includes(key) ? '********' : redact(copy[key], depth + 1);
   }
   return copy;
 }
@@ -108,7 +115,9 @@ app.use((req, res, next) => {
 
   console.log(`\n🚀 [${icon} ${req.method}] ${req.url} (ID: ${requestId})`);
   if (req.query && Object.keys(req.query).length > 0) console.log(`   🔸 Query:`, req.query);
-  if (req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
+  // Chat message text and history are never written to the server log.
+  const isChat = req.url.startsWith('/api/chat');
+  if (!isChat && req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
     console.log(`   🔸 Body:`, redact(req.body));
   }
 
@@ -123,7 +132,7 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
     const statusIcon = res.statusCode >= 400 ? '❌' : '✅';
     console.log(`${statusIcon} [RESPONSE] ${res.statusCode} - ${duration}ms (ID: ${requestId})`);
-    if (responseBody !== undefined) console.log(`   🔹 Response:`, formatBody(responseBody));
+    if (responseBody !== undefined && !isChat) console.log(`   🔹 Response:`, formatBody(responseBody));
   });
 
   next();
@@ -595,6 +604,9 @@ app.use('/api/eway-bills', EWayBillRoutes);
 
 // File attachments (Sales Order Image / Document, …)
 app.use('/api/attachments', AttachmentRoutes);
+
+// Super Admin ⇄ Franchise chat (real-time part lives on the /chat socket namespace)
+app.use('/api/chat', ChatRoutes);
 
 // System Setup — first-run HQ/warehouse setup status
 app.use('/api/setup', SetupRoutes);
