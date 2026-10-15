@@ -7,7 +7,12 @@ import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 import { generateSku, parseSkuPackSize, ProductService } from '../product/product.service';
 import { ProductionFlags, QC_NOT_REQUIRED, PACKAGEABLE_QC_STATUSES } from './production.flags';
 import { ProductionCostingService, LotAllocationInput } from './production-costing.service';
-import { computePackagingCosts, normalizeExpenseLines, ExpenseLineInput, r4 } from './production-costing';
+import { PRICED, PRICING_PENDING } from '../../utils/selling-price.util';
+import { roundRequirement } from './requirement-rounding';
+import {
+  computePackagingCosts, normalizeExpenseLines, ExpenseLineInput, r4,
+  buildExpenseSnapshot, computeManufacturingExpenses, packagingPerBatchTotals, snapshotExpenses, snapshotPackagingLines, weightForPerKg,
+} from './production-costing';
 
 // Units parseWeight() knows how to convert between (kg<->g, l<->ml) or treat
 // as identity (pcs, unit). Anything outside this set — a stray label like
@@ -54,7 +59,7 @@ type StartPackagingInput = {
   packetSize: string;
   quantityPackets: number;
   productId?: string;
-  newProduct?: { name: string; sku?: string; basePrice: number };
+  newProduct?: { name: string; sku?: string; basePrice?: number };
   userId?: string;
 };
 
@@ -71,7 +76,7 @@ type PackageRowInput = {
   packedQty: number;
   damagedQty?: number;
   productId?: string;
-  newProduct?: { name: string; sku?: string; basePrice: number };
+  newProduct?: { name: string; sku?: string; basePrice?: number };
 };
 
 type ConfirmPackagingInput = {
@@ -155,6 +160,17 @@ export class ProductionService {
         throw new Error(`Recipe "${recipe.name}" has no saved formulation (ingredient quantities). Save one in Production Planning first.`);
       }
 
+      // The recipe's Additional Expenses as they are now, frozen on the run:
+      // later Recipe Master edits never change what this batch is charged.
+      const expenseSnapshot = buildExpenseSnapshot(recipe, await ProductionCostingService.getExpenseCategories());
+      const outputUnit = data.planning?.plannedYieldUnit || recipe.yieldUnit || 'KG';
+      const perKg = expenseSnapshot.expenses.find(e => e.basis === 'PER_KG');
+      if (perKg) {
+        try { weightForPerKg(1, outputUnit); } catch {
+          throw new Error(`${perKg.label} is set Per KG in the recipe, but this recipe is produced in ${outputUnit}. Change its calculation basis in Recipe Master.`);
+        }
+      }
+
       const lotAllocations = data.lotAllocations || {};
       for (const itemId of Object.keys(lotAllocations)) {
         const lines = recipe.recipeItems.filter(ri => ri.inventoryItemId === itemId);
@@ -197,6 +213,14 @@ export class ProductionService {
       // Calculate scalar based on batches (frontend sends number of batches/runs)
       // If recipe yield is 5 and we run it 2 times, scalar is 2.
       const scalar = data.quantity;
+      // A planned start consumes each ingredient's requirement under the
+      // Production Planning rounding policy (weights below 1 KG up to the
+      // next whole gram) — the same quantity the plan showed, allocated
+      // lots against, and costed. Other starts use the exact scaled amount.
+      const requiredQty = (item: { quantityRequired: number; unit: string }) => {
+        const exact = item.quantityRequired * scalar;
+        return data.planning ? roundRequirement(exact, item.unit) : exact;
+      };
 
       // 2. Check ingredients. Stock is a warehouse concept, not a franchise
       // one — when a warehouse is given, availability is checked against
@@ -222,7 +246,7 @@ export class ProductionService {
         let amountNeededInCanonical: number;
         try {
           amountNeededInCanonical = convertMeasurement(
-            item.quantityRequired * scalar,
+            requiredQty(item),
             item.unit.toUpperCase() as ValidUnit,
             item.inventoryItem.unit.toUpperCase() as ValidUnit
           ).toNumber();
@@ -300,6 +324,7 @@ export class ProductionService {
           expiryDate,
           currentStage: 'QUEUED',
           stageUpdatedAt: new Date(),
+          expenseSnapshot: expenseSnapshot as any,
           ...(data.planning ? {
             formulationId: data.planning.formulationId,
             plannedYieldQty: data.planning.plannedYieldQty,
@@ -323,7 +348,7 @@ export class ProductionService {
         // internally, storing transactionUnit on the ledger row for audit
         // traceability. We do NOT pre-convert here — the single source of
         // truth for conversion is @businessgroupikasle/erp-units inside recordMovement.
-        const rawQty = item.quantityRequired * scalar; // in item.unit (e.g. 500 g)
+        const rawQty = requiredQty(item); // in item.unit (e.g. 500 g)
         // Also compute the canonical amount for cost calculations below
         const amountNeededInCanonical = convertMeasurement(
           rawQty,
@@ -528,9 +553,26 @@ export class ProductionService {
       // ever deducted that wasn't reported.
       const additionalMaterialCost = await this.consumeAdditionalMaterials(tx, production, options.additionalMaterials || [], userId);
       const materialCost = (production.materialCost ?? 0) + additionalMaterialCost;
-      const totalCost = (production.totalCost ?? production.materialCost ?? 0) + additionalMaterialCost;
-      if (additionalMaterialCost > 0) {
-        await tx.production.update({ where: { id: production.id }, data: { materialCost, totalCost } });
+      // Manufacturing expenses from the run's frozen recipe snapshot, on the
+      // actual output: Per Batch once, Per KG × actual KG. Per Packet waits for
+      // packaging (no packet count yet). Runs without a snapshot (started
+      // before expenses moved to Recipe Master) are costed exactly as before.
+      // The production row lock + status guard above make this happen once.
+      const snapshotList = production.expenseSnapshot ? snapshotExpenses(production.expenseSnapshot) : [];
+      const manufacturing = production.expenseSnapshot
+        ? computeManufacturingExpenses(snapshotList, totalYield, plannedUnit)
+        : { lines: [], deferred: [], total: 0 };
+      const totalCost = (production.totalCost ?? production.materialCost ?? 0) + additionalMaterialCost + manufacturing.total;
+      if (additionalMaterialCost > 0 || manufacturing.lines.length > 0) {
+        const manpower = manufacturing.lines.filter(l => l.category === 'MANPOWER').reduce((s, l) => s + l.amount, 0);
+        await tx.production.update({
+          where: { id: production.id },
+          data: {
+            materialCost,
+            totalCost,
+            ...(manufacturing.lines.length ? { laborCost: r4(manpower), overheadCost: r4(manufacturing.total - manpower) } : {}),
+          },
+        });
       }
       const unitCost = totalYield > 0 ? totalCost / totalYield : 0;
 
@@ -569,6 +611,19 @@ export class ProductionService {
         },
       });
 
+      // Expense records for the batch. MANUFACTURING rows are already inside
+      // the batch cost above; a per-batch Packaging Materials amount is stored
+      // as the batch's shared total, charged once across packaging sessions.
+      if (production.expenseSnapshot) {
+        const rows = [
+          ...manufacturing.lines.map(l => ({ category: l.category, basis: l.basis, stage: 'MANUFACTURING', rate: l.rate, baseQty: l.baseQty, amount: l.amount })),
+          ...packagingPerBatchTotals(snapshotList).map(t => ({ category: t.category, basis: 'PER_BATCH', stage: 'PACKAGING', rate: t.total, baseQty: 0, amount: t.total })),
+        ];
+        if (rows.length) {
+          await tx.productionExpense.createMany({ data: rows.map(r => ({ ...r, productBatchId: batch.id, createdBy: userId })) });
+        }
+      }
+
       // Finalize status and record actual yield. endTime previously only
       // ever got set by stopProduction (a pause) — a run that finished
       // normally had no recorded completion time at all.
@@ -599,6 +654,9 @@ export class ProductionService {
             ...yieldVariance,
             materialCost,
             additionalMaterialCost,
+            manufacturingExpenses: manufacturing.lines as any,
+            manufacturingExpenseTotal: manufacturing.total,
+            totalCost,
             unitCost,
             remarks: remarks || null,
           },
@@ -645,6 +703,12 @@ export class ProductionService {
           additionalMaterialCost: r4(additionalMaterialCost),
           plannedMaterialCostPerUnit: plannedYield > 0 ? r4(materialCost / plannedYield) : null,
           actualMaterialCostPerUnit: totalYield > 0 ? r4(materialCost / totalYield) : null,
+          manufacturingExpenses: manufacturing.lines,
+          manufacturingExpenseTotal: r4(manufacturing.total),
+          // Per-packet manufacturing expenses, charged at packaging.
+          deferredToPackaging: manufacturing.deferred.map(e => ({ category: e.category, label: e.label, basis: e.basis, rate: e.rate })),
+          totalManufacturingCost: r4(materialCost + manufacturing.total),
+          manufacturingCostPerUnit: totalYield > 0 ? r4((materialCost + manufacturing.total) / totalYield) : null,
         },
       };
     });
@@ -1527,7 +1591,7 @@ export class ProductionService {
     packedQty?: number;
     damagedQty?: number;
     productId?: string;
-    newProduct?: { name: string; sku?: string; basePrice: number };
+    newProduct?: { name: string; sku?: string; basePrice?: number };
     expectedPackagedQty?: number;
     // Additional expense lines (see production-costing.ts). Optional.
     expenses?: unknown;
@@ -1562,7 +1626,19 @@ export class ProductionService {
       }
     });
     const expenseCategories = await ProductionCostingService.getExpenseCategories();
-    const expenseLines: ExpenseLineInput[] = normalizeExpenseLines(data.expenses, expenseCategories, rows.length);
+    // Runs started with a recipe expense snapshot are charged from it (set in
+    // Recipe Master, never at packaging). Older runs keep packaging-entered
+    // expenses exactly as before. The snapshot never changes after start.
+    const recipeSnapshot = (await prisma.productBatch.findUnique({
+      where: { id: data.batchId },
+      select: { production: { select: { expenseSnapshot: true } } },
+    }))?.production?.expenseSnapshot ?? null;
+    if (recipeSnapshot && Array.isArray(data.expenses) && data.expenses.length > 0) {
+      throw new Error("This batch's additional expenses come from its recipe and can't be changed during packaging. Edit them in Recipe Master for future batches.");
+    }
+    const expenseLines: ExpenseLineInput[] = recipeSnapshot
+      ? snapshotPackagingLines(snapshotExpenses(recipeSnapshot), rows)
+      : normalizeExpenseLines(data.expenses, expenseCategories, rows.length);
 
     return prisma.$transaction(async tx => {
       await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${data.batchId} FOR UPDATE`;
@@ -1574,11 +1650,12 @@ export class ProductionService {
           quantity: true,
           expiryDate: true,
           batchCode: true,
-          production: { select: { status: true, recipe: { select: { yieldUnit: true } } } },
+          production: { select: { status: true, recipeId: true, recipe: { select: { yieldUnit: true } } } },
           recall: { select: { status: true } },
         },
       });
       if (!current) throw new Error('Product batch not found');
+      const batchRecipeId = current.production?.recipeId ?? null;
       if (
         data.expectedPackagedQty !== undefined &&
         Math.abs((current.packagedQty || 0) - data.expectedPackagedQty) > 0.0001
@@ -1621,7 +1698,7 @@ export class ProductionService {
       const usedProducts = new Map<string, number>();
       for (const [i, row] of rows.entries()) {
         const label = rows.length > 1 ? `Row ${i + 1} (${row.packetSize}): ` : '';
-        const productId = await this.resolvePackagingProduct(tx, row, batchUnit, label);
+        const productId = await this.resolvePackagingProduct(tx, row, batchUnit, label, batchRecipeId);
         const dupRow = usedProducts.get(productId);
         if (dupRow !== undefined) {
           throw new Error(`${label}Same finished product as row ${dupRow + 1}. Combine them into one row.`);
@@ -1692,7 +1769,10 @@ export class ProductionService {
               ...rowCost,
               unit: costBulkItem.unit,
               batchUnitCost: costedBatch.unitCost ?? null,
-              policy: 'Damaged packets are carried by good packets of the same row; per-batch expenses are charged by packed weight / actual yield.',
+              expenseSource: recipeSnapshot ? 'RECIPE_SNAPSHOT' : 'PACKAGING_ENTRY',
+              policy: recipeSnapshot
+                ? 'Bulk cost includes raw materials and manufacturing expenses (recipe snapshot). Packaging Materials and per-packet expenses are charged per packet / KG at the pack-size rate; per-batch amounts by packed weight / actual yield, once. Damaged packets are carried by good packets of the same row.'
+                : 'Damaged packets are carried by good packets of the same row; per-batch expenses are charged by packed weight / actual yield.',
             },
           },
         }));
@@ -1739,8 +1819,18 @@ export class ProductionService {
     row: PackageRowInput,
     batchUnit: string,
     label: string,
+    recipeId: string | null = null,
   ): Promise<string> {
     const rowWeight = this.parseWeight(row.packetSize, batchUnit);
+    // A finished product belongs to at most one recipe (RecipeProduct). Never
+    // pack this batch into another recipe's variant.
+    const assertNotOtherRecipe = async (product: { id: string; name: string }) => {
+      if (!recipeId) return;
+      const link = await tx.recipeProduct.findUnique({ where: { productId: product.id }, include: { recipe: { select: { name: true } } } });
+      if (link && link.recipeId !== recipeId) {
+        throw new Error(`${label}"${product.name}" is a variant of recipe "${link.recipe.name}", not of this batch's recipe.`);
+      }
+    };
     const assertSizeMatches = (product: { name: string; sku: string | null }) => {
       const skuSize = parseSkuPackSize(product.sku);
       if (!skuSize) return;
@@ -1761,22 +1851,32 @@ export class ProductionService {
       if (product.isActive === false) throw new Error(`${label}"${product.name}" is inactive.`);
       if (!product.sku) throw new Error(`${label}"${product.name}" has no SKU. Add one in Product Master before packing into it.`);
       assertSizeMatches(product);
+      await assertNotOtherRecipe(product);
       return product.id;
     }
 
     const name = row.newProduct!.name.trim();
-    const price = Number(row.newProduct!.basePrice);
+    // Packaging records production cost only. A new variant is created
+    // Pricing Pending (no selling price) unless a caller still sends a real
+    // price; its price is set later in Product Master. Never a made-up price.
+    const sentPrice = Number(row.newProduct!.basePrice);
+    const price = Number.isFinite(sentPrice) && sentPrice > 0 ? sentPrice : null;
     if (name.length < 2 || name.length > 120) throw new Error(`${label}Enter a product name (2–120 characters) for the new variant.`);
-    if (!Number.isFinite(price) || price <= 0) throw new Error(`${label}Enter a selling price greater than ₹0 for "${name}".`);
     const requestedSku = row.newProduct!.sku?.trim().toUpperCase() || "";
     if (requestedSku && !/^[A-Z0-9][A-Z0-9-]{1,63}$/.test(requestedSku)) {
       throw new Error(`${label}SKU "${requestedSku}" may only contain letters, numbers and hyphens.`);
     }
+    // The pack size and its unit are recorded as the SKU's last segment
+    // (FG-THEN-500G), which parseSkuPackSize and variant matching rely on.
+    if (requestedSku && !parseSkuPackSize(requestedSku)) {
+      throw new Error(`${label}SKU "${requestedSku}" must end with the pack size, e.g. -${row.packetSize.toUpperCase().replace(/\s+/g, '')}.`);
+    }
 
-    const reuse = (existing: { id: string; name: string; sku: string | null; isActive: boolean }) => {
+    const reuse = async (existing: { id: string; name: string; sku: string | null; isActive: boolean }) => {
       if (existing.isActive === false) throw new Error(`${label}"${existing.name}" already exists but is inactive.`);
       if (!existing.sku) throw new Error(`${label}"${existing.name}" already exists but has no SKU. Add one in Product Master.`);
       assertSizeMatches(existing);
+      await assertNotOtherRecipe(existing);
       return existing.id; // existing price is left untouched
     };
 
@@ -1799,7 +1899,7 @@ export class ProductionService {
     let sku = requestedSku;
     if (!sku) {
       const base = generateSku("FINISHED_GOOD", name, row.packetSize);
-      const sizeSplit = base.match(/^(.*)-(d+(?:.d+)?(?:KG|G|ML|L|PCS|PC))$/i);
+      const sizeSplit = base.match(/^(.*)-(\d+(?:\.\d+)?(?:KG|G|ML|L|PCS|PC))$/i);
       sku = base;
       for (let n = 2; await tx.product.findUnique({ where: { sku } }); n++) {
         sku = sizeSplit ? `${sizeSplit[1]}${n}-${sizeSplit[2]}` : `${base}-${n}`;
@@ -1812,12 +1912,38 @@ export class ProductionService {
     const created = await ProductService.createInTx(tx, {
       name,
       sku,
-      basePrice: price,
+      // Required column: 0 is stored only as "not configured" while pricingStatus is PENDING.
+      basePrice: price ?? 0,
+      pricingStatus: price ? PRICED : PRICING_PENDING,
       category: "FINISHED_GOOD",
       productType: "FINISHED_GOOD",
       isVeg: true,
     });
+    // The new variant belongs to the batch's recipe, so later batches of it
+    // reuse this product automatically instead of creating another.
+    if (recipeId) {
+      await tx.recipeProduct.create({ data: { recipeId, productId: created.id } });
+    }
     return created.id;
+  }
+
+  /**
+   * Read-only SKU check for Packaging's Create New Variant: whether the SKU is
+   * free, and if not which product holds it. The confirm transaction re-checks.
+   */
+  static async checkSkuAvailability(rawSku: string) {
+    const sku = String(rawSku || '').trim().toUpperCase();
+    if (!sku) return { sku, available: false, reason: 'EMPTY' as const, product: null };
+    const product = await prisma.product.findUnique({
+      where: { sku },
+      select: { id: true, name: true, sku: true, isActive: true, recipeLink: { select: { recipeId: true } } },
+    });
+    return {
+      sku,
+      available: !product,
+      reason: product ? ('TAKEN' as const) : null,
+      product: product ? { id: product.id, name: product.name, sku: product.sku, isActive: product.isActive, recipeId: product.recipeLink?.recipeId ?? null } : null,
+    };
   }
 
   static async cancelPackaging(data: { packagingId: string; userId?: string; reason?: string }) {
@@ -2206,7 +2332,9 @@ export class ProductionService {
         franchise: true,
         production: {
           include: {
-            recipe: true,
+            // productLinks: finished-goods variants linked to the recipe, so
+            // Packaging can offer those SKUs first.
+            recipe: { include: { productLinks: { select: { productId: true } } } },
             items: { include: { inventoryItem: true } },
             stageLogs: { orderBy: { enteredAt: 'asc' } },
           },

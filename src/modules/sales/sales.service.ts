@@ -3,6 +3,8 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { businessDayRangeFilter, resolveDatePreset } from '../../utils/business-date.util';
+import { SalesProfitabilityService } from './sales-profitability.service';
+import { assertBillablePrice } from '../../utils/selling-price.util';
 
 // Atomic, collision-safe document numbering. A raw `.count()`-based scheme
 // (the old approach here) lets two concurrent requests read the same N
@@ -161,7 +163,7 @@ async function resolveItemChannelPricing(
   productName: string | undefined,
   scopeFranchiseId: string | null,
   partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE'
-): Promise<{ rate: number; taxPercent: number; discountType: string; discountValue: number } | null> {
+): Promise<{ rate: number; taxPercent: number; discountType: string; discountValue: number; product: { name: string; pricingStatus: string } | null } | null> {
   if (!productId) return null;
 
   let product = await tx.product.findUnique({ where: { id: productId } });
@@ -192,7 +194,7 @@ async function resolveItemChannelPricing(
   const discountType = inv?.discountType || product?.discountType || 'PERCENT';
   const discountValue = partyType === 'CUSTOMER' ? Number(inv?.discountValue ?? product?.discountValue ?? 0) : 0;
 
-  return { rate, taxPercent, discountType, discountValue };
+  return { rate, taxPercent, discountType, discountValue, product: product ? { name: product.name, pricingStatus: product.pricingStatus } : null };
 }
 
 // Overrides rate/taxPercent in place for every line with a resolvable
@@ -208,7 +210,7 @@ async function resolveItemChannelPricing(
 // frontend's own auto-fill or a manually negotiated adjustment) is never
 // overwritten; calculateTotals' existing bounds ([0, gross]) still apply
 // to it either way.
-async function applyAuthoritativePricing<T extends {
+export async function applyAuthoritativePricing<T extends {
   productId?: string;
   productName?: string;
   rate: number;
@@ -233,6 +235,9 @@ async function applyAuthoritativePricing<T extends {
   return Promise.all(items.map(async (item) => {
     const resolved = await resolveItemChannelPricing(tx, item.productId, item.productName, scopeFranchiseId, partyType);
     if (!resolved) return item;
+    // Priced documents never bill a Pricing Pending product at ₹0 (a
+    // Delivery Challan — applyDiscount=false — carries no price and is exempt).
+    if (applyDiscount) assertBillablePrice(resolved.product, resolved.rate);
     if (!applyDiscount) return { ...item, rate: resolved.rate, taxPercent: resolved.taxPercent };
 
     const hasExplicitDiscount =
@@ -1704,6 +1709,9 @@ export class SalesService {
     // exist here.
     const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, 'CUSTOMER');
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
+    // Estimated cost/profit frozen with the order (server-calculated, never
+    // from the client; an estimate until stock is issued on fulfilment).
+    const estimate = await SalesProfitabilityService.salesOrderEstimateFields(computed);
 
     try {
       return await prisma.$transaction(async (tx) => tx.salesOrder.create({
@@ -1724,8 +1732,9 @@ export class SalesService {
         deliveryAddress: data.deliveryAddress,
         notes: data.notes,
         createdBy: data.createdBy,
+        ...estimate.order,
         items: {
-          create: computed.map((item) => ({
+          create: computed.map((item, i) => ({
             productId: item.productId,
             productName: item.productName,
             quantity: item.quantity,
@@ -1735,7 +1744,8 @@ export class SalesService {
             discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
-            totalAmount: item.totalAmount
+            totalAmount: item.totalAmount,
+            ...estimate.items[i],
           }))
         }
       },
@@ -1861,8 +1871,12 @@ export class SalesService {
         // upsert/sync against — delete and recreate inside the transaction.
         await tx.salesOrderItem.deleteMany({ where: { salesOrderId: id } });
 
+        // Re-estimate cost/profit for the new lines (server-side; an estimate only).
+        const estimate = await SalesProfitabilityService.salesOrderEstimateFields(computed);
+        Object.assign(updateData, estimate.order);
+
         updateData.items = {
-          create: computed.map((item) => ({
+          create: computed.map((item, i) => ({
             productId: item.productId,
             productName: item.productName,
             quantity: item.quantity,
@@ -1872,7 +1886,8 @@ export class SalesService {
             discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
-            totalAmount: item.totalAmount
+            totalAmount: item.totalAmount,
+            ...estimate.items[i],
           }))
         };
       }

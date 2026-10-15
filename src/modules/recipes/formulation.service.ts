@@ -2,6 +2,9 @@ import { Prisma } from '@prisma/client';
 import { UNITS, convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { ProductionCostingService } from '../production/production-costing.service';
+import { computeManufacturingExpenses, isPackagingCategory, readRecipeExpenses } from '../production/production-costing';
+import { REQUIREMENT_ROUNDING_POLICY, roundRequirement } from '../production/requirement-rounding';
 
 /**
  * Reference formulations for recipes (Recipe Master holds only WHICH
@@ -33,6 +36,9 @@ export interface ScaledLine {
   name: string;
   referenceQty: number;
   unit: string;
+  /** Scaled exactly from the reference, before the rounding policy. */
+  calculatedQty: number;
+  /** What the run consumes: calculatedQty under REQUIREMENT_ROUNDING_POLICY. */
   requiredQty: number;
   stockUnit: string;
   requiredInStockUnit: number;
@@ -140,6 +146,12 @@ export class FormulationService {
       if (!clean.some((i) => i.quantity > 0)) throw new FormulationError('At least one ingredient must have a quantity greater than zero.');
 
       const last = await tx.recipeFormulation.findFirst({ where: { recipeId }, orderBy: { version: 'desc' }, select: { version: true } });
+      // An imported formulation's output stage, unresolved ("As Required")
+      // lines and source ingredient names carry over when it is re-saved here.
+      const previous = await tx.recipeFormulation.findFirst({
+        where: { recipeId, isActive: true },
+        select: { outputStage: true, unresolvedItems: true, items: { select: { inventoryItemId: true, sourceName: true, sourceText: true } } },
+      });
       await tx.recipeFormulation.updateMany({ where: { recipeId, isActive: true }, data: { isActive: false } });
       const created = await tx.recipeFormulation.create({
         data: {
@@ -151,7 +163,14 @@ export class FormulationService {
           source: 'PLANNING',
           isActive: true,
           createdBy: userId || null,
-          items: { create: clean },
+          outputStage: previous?.outputStage ?? null,
+          unresolvedItems: previous?.unresolvedItems ?? undefined,
+          items: {
+            create: clean.map((c) => {
+              const src = previous?.items.find((p) => p.inventoryItemId === c.inventoryItemId);
+              return { ...c, sourceName: src?.sourceName ?? null, sourceText: src?.sourceText ?? null };
+            }),
+          },
         },
         include: { items: { include: { inventoryItem: true }, orderBy: { sortOrder: 'asc' } } },
       });
@@ -202,12 +221,15 @@ export class FormulationService {
     const targetInRefUnit = convertQty(targetQty, targetUnit, f.yieldUnit);
     const factor = targetInRefUnit.dividedBy(f.yieldQty);
     const lines: ScaledLine[] = f.items.map((i) => {
-      const required = new Decimal(i.quantity).times(factor);
+      const calculated = new Decimal(i.quantity).times(factor);
+      // Same rule ProductionService.startProduction deducts by.
+      const required = new Decimal(roundRequirement(calculated.toNumber(), i.unit));
       return {
         inventoryItemId: i.inventoryItemId,
         name: i.inventoryItem.name,
         referenceQty: i.quantity,
         unit: i.unit,
+        calculatedQty: round(calculated),
         requiredQty: round(required),
         stockUnit: i.inventoryItem.unit,
         requiredInStockUnit: round(convertQty(required, i.unit, i.inventoryItem.unit)),
@@ -241,12 +263,58 @@ export class FormulationService {
       return { ...l, available: available === null ? null : round(available), shortage, sufficient: shortage === null ? null : shortage <= 0.000001 };
     }));
     return {
-      formulation: { id: f.id, version: f.version, yieldQty: f.yieldQty, yieldUnit: f.yieldUnit },
+      formulation: {
+        id: f.id, version: f.version, yieldQty: f.yieldQty, yieldUnit: f.yieldUnit,
+        source: f.source, outputStage: f.outputStage ?? null,
+        // Lines with no quantity to scale ("As Required"): shown, never calculated.
+        unresolvedItems: f.unresolvedItems ?? [],
+      },
       targetQty: Number(params.targetQty),
       targetUnit: normalizeUnit(params.targetUnit),
       factor: scaled.factor,
       lines,
       readyToProduce: !!params.warehouseId && lines.every((l) => l.sufficient),
+      costEstimate: await this.estimateCost(recipe, f, scaled),
+    };
+  }
+
+  /**
+   * Estimated production cost for the plan: raw materials at each
+   * material's average cost (the lot panel refines this with the chosen
+   * lots) plus the recipe's manufacturing expenses on the planned output.
+   * Read-only: nothing is deducted or posted.
+   */
+  private static async estimateCost(
+    recipe: { expenseConfig: unknown; expenseConfigVersion: number },
+    f: { yieldUnit: string; items: Array<{ inventoryItemId: string; inventoryItem: { costPrice?: number | null } }> },
+    scaled: { targetInRefUnit: number; lines: ScaledLine[] },
+  ) {
+    const categories = await ProductionCostingService.getExpenseCategories();
+    const enabled = readRecipeExpenses(recipe.expenseConfig, categories).filter((e) => e.enabled);
+    const materialCost = scaled.lines.reduce((sum, l) => {
+      const unitCost = f.items.find((i) => i.inventoryItemId === l.inventoryItemId)?.inventoryItem.costPrice || 0;
+      return sum.plus(new Decimal(l.requiredInStockUnit).times(unitCost));
+    }, new Decimal(0));
+    let manufacturing: ReturnType<typeof computeManufacturingExpenses> = { lines: [], deferred: [], total: 0 };
+    let expenseError: string | null = null;
+    try {
+      manufacturing = computeManufacturingExpenses(enabled, scaled.targetInRefUnit, f.yieldUnit);
+    } catch (e: any) {
+      expenseError = e.message;
+    }
+    const total = materialCost.plus(manufacturing.total);
+    return {
+      configVersion: recipe.expenseConfigVersion ?? 0,
+      materialCost: materialCost.toDecimalPlaces(4).toNumber(),
+      materialCostBasis: 'AVERAGE_COST' as const,
+      manufacturingExpenses: manufacturing.lines,
+      manufacturingExpenseTotal: manufacturing.total,
+      // Charged at packaging, once pack sizes and packet counts are known.
+      deferredToPackaging: manufacturing.deferred,
+      packagingExpenses: enabled.filter((e) => isPackagingCategory(e.category)),
+      estimatedProductionCost: total.toDecimalPlaces(4).toNumber(),
+      estimatedCostPerUnit: scaled.targetInRefUnit > 0 ? total.dividedBy(scaled.targetInRefUnit).toDecimalPlaces(4).toNumber() : null,
+      expenseError,
     };
   }
 
@@ -278,9 +346,12 @@ export class FormulationService {
           formulationVersion: f.version,
           referenceYieldQty: f.yieldQty,
           referenceYieldUnit: f.yieldUnit,
+          outputStage: f.outputStage ?? null,
+          unresolvedItems: f.unresolvedItems ?? [],
           targetQty: Number(params.targetQty),
           targetUnit: normalizeUnit(params.targetUnit),
           scalingFactor: scaled.factor,
+          quantityRounding: REQUIREMENT_ROUNDING_POLICY,
           ingredients: scaled.lines,
         },
       },

@@ -5,6 +5,7 @@
  *   DATABASE_URL=<test db> npx tsx src/tests/production/lot-wise-production-costing.test.ts
  */
 import prisma from '../../lib/prisma';
+import { Prisma } from '@prisma/client';
 import { RecipeService } from '../../modules/recipes/recipe.service';
 import { FormulationService } from '../../modules/recipes/formulation.service';
 import { ProductionService } from '../../modules/production/production.service';
@@ -51,12 +52,16 @@ async function run() {
 
   const recipe = await RecipeService.saveSimplifiedRecipe({ name: `Rice Batter ${ts}`, category: 'Batters', ingredientIds: [rice.id] });
   const f = await FormulationService.saveVersion(recipe!.id, { yieldQty: 10, yieldUnit: 'KG', items: [{ inventoryItemId: rice.id, quantity: 10, unit: 'KG' }] });
+  // Runs here use packaging-entered expenses, i.e. runs started before
+  // expenses moved to Recipe Master (no expense snapshot). Recipe-snapshot
+  // costing is covered by recipe-additional-expenses.test.ts.
   const start = async (lotAllocations?: Record<string, Array<{ batchId: string | null; qty: number }>>, target = 10) => {
     const planned = await FormulationService.buildPlannedStart({ recipeId: recipe!.id, formulationId: f.id, targetQty: target, targetUnit: 'KG' });
-    return ProductionService.startProduction({
+    const run = await ProductionService.startProduction({
       recipeId: recipe!.id, quantity: planned.quantity, warehouseId: wh.id, productionType: 'FINISHED_GOOD',
       expiryDate: '2027-12-31', planning: planned.planning, lotAllocations, userId,
     });
+    return prisma.production.update({ where: { id: run.id }, data: { expenseSnapshot: Prisma.DbNull } });
   };
   const qtyOf = async (id: string) => (await prisma.inventoryBatch.findUnique({ where: { id } }))!.currentQty;
 

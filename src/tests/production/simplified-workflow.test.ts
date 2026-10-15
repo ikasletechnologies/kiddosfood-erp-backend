@@ -3,6 +3,7 @@
 //   Planning -> Start -> Complete (auto Ready for Packaging) -> Package & Confirm -> Finished Goods
 // Run: npx tsx src/tests/production/simplified-workflow.test.ts
 import prisma from '../../lib/prisma';
+import { assertBillablePrice, PRICING_PENDING } from '../../utils/selling-price.util';
 import { ProductionService } from '../../modules/production/production.service';
 import { InventoryService } from '../../modules/inventory/inventory.service';
 import { FranchiseService } from '../../modules/franchise/franchise.service';
@@ -264,8 +265,10 @@ async function runTest() {
     // ── 9. Variant validation ──
     console.log('\n9️⃣ Variant validation');
     const snap = (await prisma.productBatch.findUniqueOrThrow({ where: { id: multi.id } })).packagedQty || 0;
-    await expectReject('New variant without a selling price is refused', () =>
-      ProductionService.packageAndConfirm({ batchId: multi.id, expectedPackagedQty: snap, rows: [{ packetSize: '5kg', packedQty: 1, newProduct: { name: `Test Packed ${testId} 5kg`, basePrice: 0 } }] }));
+    // Packaging creates a new variant without a selling price as Pricing
+    // Pending; it can't then be billed at ₹0 until priced in Product Master.
+    check('A Pricing Pending product is not billable at ₹0', (() => { try { assertBillablePrice({ name: 'Pending', pricingStatus: PRICING_PENDING }, 0); return false; } catch { return true; } })());
+    check('A Pricing Pending product is billable once it has a price', (() => { try { assertBillablePrice({ name: 'Pending', pricingStatus: PRICING_PENDING }, 45); return true; } catch { return false; } })());
     await expectReject('SKU already owned by a different product is refused', () =>
       ProductionService.packageAndConfirm({ batchId: multi.id, expectedPackagedQty: snap, rows: [{ packetSize: '250g', packedQty: 1, newProduct: { name: `Test Other ${testId} 250g`, sku: p250.sku!, basePrice: 10 } }] }));
     await expectReject('Two rows for the same product are refused', () =>

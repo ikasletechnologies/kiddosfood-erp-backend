@@ -164,6 +164,7 @@ function resolveOrderItemCost(
   }
   return { cost: 0, source: 'UNAVAILABLE' };
 }
+import { assertBillablePrice } from '../../utils/selling-price.util';
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
@@ -2488,6 +2489,7 @@ export class FinanceService {
               resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
                 inv?.customerPrice;
           rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+          assertBillablePrice(product, rate);
           gst = inv?.gstRate ?? product?.taxPercent ?? 0;
           if (resolvedInvoicePartyType === 'CUSTOMER') {
             autoDiscountType = inv?.discountType || product?.discountType || 'PERCENT';

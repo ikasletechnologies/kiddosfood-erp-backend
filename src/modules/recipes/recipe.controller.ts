@@ -8,7 +8,7 @@ export class RecipeController {
       // Simplified Recipe Master sends `ingredientIds` (no quantities);
       // older clients still send quantity-bearing `items`.
       const recipe = Array.isArray(req.body?.ingredientIds)
-        ? await RecipeService.saveSimplifiedRecipe(req.body)
+        ? await RecipeService.saveSimplifiedRecipe(req.body, (req as any).user?.userId)
         : await RecipeService.upsertRecipe(req.body);
       res.status(201).json(recipe);
     } catch (error: any) {

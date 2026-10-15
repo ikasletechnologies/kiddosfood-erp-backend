@@ -11,6 +11,7 @@ import { FranchiseService } from '../franchise/franchise.service';
 import {
   DEFAULT_EXPENSE_CATEGORIES, EXPENSE_CATEGORIES_SETTING, ExpenseCategory, ExpenseLineInput,
   SharedExpenseState, computePackagingCosts, normalizeExpenseLines, r4, simulateFifoCost,
+  isPackagingCategory, snapshotExpenses, snapshotPackagingLines,
 } from './production-costing';
 
 const QTY_EPS = 0.0005;
@@ -205,7 +206,8 @@ export class ProductionCostingService {
   // ── Packaging: expenses & cost ─────────────────────────────────────────
   /** PER_BATCH totals for a batch and what earlier sessions already absorbed. */
   static async loadSharedExpenses(tx: any, batchId: string): Promise<SharedExpenseState[]> {
-    const rows = await tx.productionExpense.findMany({ where: { productBatchId: batchId, basis: 'PER_BATCH' } });
+    // MANUFACTURING rows are already inside the batch cost; never share them again.
+    const rows = await tx.productionExpense.findMany({ where: { productBatchId: batchId, basis: 'PER_BATCH', stage: 'PACKAGING' } });
     const totals = rows.filter((r: any) => !r.productPackagingId);
     return totals.map((t: any) => ({
       category: t.category,
@@ -229,11 +231,11 @@ export class ProductionCostingService {
   static async saveSharedTotals(tx: any, batchId: string, lines: ExpenseLineInput[], userId?: string) {
     for (const l of lines.filter((x) => x.basis === 'PER_BATCH')) {
       const existing = await tx.productionExpense.findFirst({
-        where: { productBatchId: batchId, productPackagingId: null, basis: 'PER_BATCH', category: l.category },
+        where: { productBatchId: batchId, productPackagingId: null, basis: 'PER_BATCH', stage: 'PACKAGING', category: l.category },
       });
       if (existing) {
         const allocated = (await tx.productionExpense.aggregate({
-          where: { productBatchId: batchId, productPackagingId: { not: null }, basis: 'PER_BATCH', category: l.category },
+          where: { productBatchId: batchId, productPackagingId: { not: null }, basis: 'PER_BATCH', stage: 'PACKAGING', category: l.category },
           _sum: { amount: true },
         }))._sum.amount || 0;
         if (l.rate + 0.005 < allocated) {
@@ -269,6 +271,16 @@ export class ProductionCostingService {
     const additionalMaterialCost = r4(items.filter((i) => i.isAdditional).reduce((s, i) => s + (i.totalCost || 0), 0));
     const shared = await this.loadSharedExpenses(prisma, batchId);
     const categories = await this.getExpenseCategories();
+    const labelOf = (code: string) => categories.find((c) => c.code === code)?.label || code;
+
+    // Recipe expense snapshot (runs started after expenses moved to Recipe
+    // Master) vs packaging-entered expenses (older runs, unchanged).
+    const snapshot = p?.expenseSnapshot ?? null;
+    const snapshotList = snapshotExpenses(snapshot);
+    const expenseRows = await prisma.productionExpense.findMany({ where: { productBatchId: batchId }, orderBy: { createdAt: 'asc' } });
+    const manufacturingRows = expenseRows.filter((e) => e.stage === 'MANUFACTURING');
+    const manufacturingExpenseTotal = r4(manufacturingRows.reduce((s, e) => s + e.amount, 0));
+    const totalManufacturingCost = r4(snapshot ? materialCost + manufacturingExpenseTotal : (p?.totalCost ?? materialCost));
 
     return {
       batchId: batch.id,
@@ -308,6 +320,21 @@ export class ProductionCostingService {
         cost: pk.costBreakdown ?? null,
       })),
       categories,
+      expenseSource: snapshot ? 'RECIPE_SNAPSHOT' : 'LEGACY',
+      expenseSnapshot: snapshot
+        ? { configVersion: (snapshot as any).configVersion ?? null, capturedAt: (snapshot as any).capturedAt ?? null, expenses: snapshotList.map((e) => ({ ...e, label: e.label || labelOf(e.category) })) }
+        : null,
+      manufacturingExpenses: manufacturingRows.map((e) => ({
+        category: e.category, label: labelOf(e.category), basis: e.basis, rate: r4(e.rate), baseQty: r4(e.baseQty), amount: r4(e.amount),
+      })),
+      manufacturingExpenseTotal,
+      totalManufacturingCost,
+      manufacturingCostPerUnit: actualYield && actualYield > 0 ? r4(totalManufacturingCost / actualYield) : null,
+      // Charged at packaging from the snapshot: Packaging Materials and any per-packet manufacturing expense.
+      packagingExpenses: snapshotList
+        .filter((e) => isPackagingCategory(e.category) || e.basis === 'PER_PACKET')
+        .map((e) => ({ ...e, label: e.label || labelOf(e.category) })),
+      packagingExpenseCharged: r4(expenseRows.filter((e) => e.stage === 'PACKAGING' && e.productPackagingId).reduce((s, e) => s + e.amount, 0)),
     };
   }
 
@@ -329,7 +356,11 @@ export class ProductionCostingService {
     if (!franchiseId) throw new Error('Franchise ID not found for batch');
     const categories = await this.getExpenseCategories();
     const rowsIn = Array.isArray(input.rows) ? input.rows.slice(0, 20) : [];
-    const lines = normalizeExpenseLines(input.expenses, categories, rowsIn.length);
+    // Same rule as packageAndConfirm: a recipe snapshot decides the expenses.
+    const snapshot = batch.production?.expenseSnapshot ?? null;
+    const lines = snapshot
+      ? snapshotPackagingLines(snapshotExpenses(snapshot), rowsIn.map((r) => ({ packetSize: String(r.packetSize || '') })))
+      : normalizeExpenseLines(input.expenses, categories, rowsIn.length);
     const yieldUnit = batch.production?.recipe?.yieldUnit || 'KG';
 
     // Bulk lots in the order startPackaging draws them. A batch still
@@ -375,6 +406,6 @@ export class ProductionCostingService {
     const finishesBatch = (batch.packagedQty || 0) + requested >= yieldQty - 0.001;
     const shared = this.mergeShared(await this.loadSharedExpenses(prisma, batchId), lines);
     const result = computePackagingCosts({ rows: costRows, bulkUnit, lines, shared, yieldQty, finishesBatch, categories });
-    return { unit: bulkUnit, rows: result.rows, finishesBatch, shared };
+    return { unit: bulkUnit, rows: result.rows, finishesBatch, shared, expenseSource: snapshot ? 'RECIPE_SNAPSHOT' : 'LEGACY' };
   }
 }

@@ -1,3 +1,4 @@
+import { assertBillablePrice } from '../../utils/selling-price.util';
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, FranchiseOrderFulfillment, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { InventoryReservationService } from '../inventory/inventory-reservation.service';
@@ -264,6 +265,7 @@ export class FranchiseOrderService {
         // MADE_TO_ORDER products, and any item on a REQUEST order → allowed without stock check
 
         const unitPrice   = product.basePrice;
+        assertBillablePrice(product, unitPrice);
         const totalAmount = unitPrice * reqItem.quantity;
         orderItems.push({
           productId: product.id,
