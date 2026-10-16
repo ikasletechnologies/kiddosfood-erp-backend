@@ -81,20 +81,63 @@ export class GRNService {
    * `approve()`'s own `status: 'COMPLETED'` filter.
    */
   private static async getCumulativeReceived(tx: any, poId: string, excludeGrnId?: string): Promise<Map<string, number>> {
-    const completedItems = await tx.goodsReceiptItem.findMany({
-      where: {
-        grn: {
-          poId,
-          status: 'COMPLETED',
-          ...(excludeGrnId ? { id: { not: excludeGrnId } } : {})
-        }
-      },
-      select: { materialId: true, receivedQty: true }
-    });
+    // A PO line is fulfilled by usable stock accepted through completed GRNs
+    // plus rejected stock whose GRN Purchase Return has been completed. Using
+    // raw receivedQty here left returned/damaged balances open forever and
+    // made the same PO reappear in New Receipt.
+    const [completedItems, completedReturns, poItems] = await Promise.all([
+      tx.goodsReceiptItem.findMany({
+        where: {
+          grn: {
+            poId,
+            status: 'COMPLETED',
+            ...(excludeGrnId ? { id: { not: excludeGrnId } } : {})
+          }
+        },
+        select: { materialId: true, acceptedQty: true }
+      }),
+      tx.purchaseReturn.findMany({
+        where: {
+          procurementOrderId: poId,
+          returnSource: 'GRN_REJECTION',
+          status: 'COMPLETED'
+        },
+        include: { items: true }
+      }),
+      tx.procurementOrderItem.findMany({
+        where: { poId },
+        include: { inventoryItem: { select: { name: true } } }
+      })
+    ]);
+
     const map = new Map<string, number>();
     for (const item of completedItems) {
       if (!item.materialId) continue;
-      map.set(item.materialId, (map.get(item.materialId) || 0) + item.receivedQty);
+      map.set(item.materialId, (map.get(item.materialId) || 0) + item.acceptedQty);
+    }
+
+    const materialByName = new Map<string, string>();
+    for (const item of poItems) {
+      if (!item.inventoryItemId) continue;
+      const name = (item.itemName || item.inventoryItem?.name || '').toLowerCase().trim();
+      if (name) materialByName.set(name, item.inventoryItemId);
+    }
+    // Historical duplicate documents must not over-fulfil a line. Cap the
+    // completed-return contribution at the ordered balance after accepted qty.
+    const returnedByMaterial = new Map<string, number>();
+    for (const purchaseReturn of completedReturns) {
+      for (const item of purchaseReturn.items) {
+        const materialId = materialByName.get((item.itemName || '').toLowerCase().trim());
+        if (!materialId) continue;
+        returnedByMaterial.set(materialId, (returnedByMaterial.get(materialId) || 0) + item.quantity);
+      }
+    }
+    for (const poItem of poItems) {
+      if (!poItem.inventoryItemId) continue;
+      const accepted = map.get(poItem.inventoryItemId) || 0;
+      const returnQty = returnedByMaterial.get(poItem.inventoryItemId) || 0;
+      const returnNeeded = Math.max(0, poItem.quantity - accepted);
+      map.set(poItem.inventoryItemId, accepted + Math.min(returnNeeded, returnQty));
     }
     return map;
   }
@@ -610,9 +653,9 @@ export class GRNService {
       
       const receivedMap = new Map();
       // Add previous GRNs
-      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
-      // Add current GRN
-      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.receivedQty));
+      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty));
+      // Rejected units are fulfilled only after the linked Purchase Return is submitted.
+      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty));
 
       for (const poItem of grn.procurementOrder.poItems) {
          const totalRcvd = receivedMap.get(poItem.inventoryItemId) || 0;

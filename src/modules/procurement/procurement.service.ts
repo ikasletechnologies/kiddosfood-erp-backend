@@ -1290,6 +1290,7 @@ export class ProcurementService {
         vendor: true,
         poItems: { include: { inventoryItem: true } },
         goodsReceipts: { include: { items: true } },
+        purchaseReturns: { where: { status: 'COMPLETED', returnSource: 'GRN_REJECTION' }, include: { items: true } },
         warehouse: true,
         franchise: true,
         invoices: { include: { payments: true } }
@@ -1312,13 +1313,45 @@ export class ProcurementService {
         totalItemsCount = po.items.reduce((sum: number, item: any) => sum + (Number(item.quantity) || 0), 0);
       }
 
-      const receivedItemsCount = (po.goodsReceipts || []).reduce((sum: number, grn: any) => {
-        const grnTotal = (grn.items || []).reduce((s: number, i: any) => s + (i.receivedQty || 0), 0);
-        return sum + grnTotal;
-      }, 0);
+      let receivedItemsCount = 0;
+      let allFulfilled = false;
+      if (po.poItems && po.poItems.length > 0) {
+        const acceptedByMaterial = new Map<string, number>();
+        for (const grn of (po.goodsReceipts || [])) {
+          if (grn.status !== 'COMPLETED') continue;
+          for (const item of (grn.items || [])) {
+            if (!item.materialId) continue;
+            acceptedByMaterial.set(item.materialId, (acceptedByMaterial.get(item.materialId) || 0) + (item.acceptedQty || 0));
+          }
+        }
+        const returnedByName = new Map<string, number>();
+        for (const purchaseReturn of (po.purchaseReturns || [])) {
+          for (const item of (purchaseReturn.items || [])) {
+            const key = (item.itemName || '').toLowerCase().trim();
+            if (key) returnedByName.set(key, (returnedByName.get(key) || 0) + (item.quantity || 0));
+          }
+        }
+        allFulfilled = po.poItems.every((item: any) => {
+          const accepted = acceptedByMaterial.get(item.inventoryItemId) || 0;
+          const key = (item.itemName || item.inventoryItem?.name || '').toLowerCase().trim();
+          const returned = returnedByName.get(key) || 0;
+          const fulfilled = Math.min(item.quantity || 0, accepted + returned);
+          receivedItemsCount += fulfilled;
+          return fulfilled + 0.0001 >= (item.quantity || 0);
+        });
+      } else {
+        receivedItemsCount = (po.goodsReceipts || []).reduce((sum: number, grn: any) => {
+          const grnTotal = (grn.items || []).reduce((lineSum: number, item: any) => lineSum + (item.acceptedQty || 0), 0);
+          return sum + grnTotal;
+        }, 0);
+        allFulfilled = totalItemsCount > 0 && receivedItemsCount + 0.0001 >= totalItemsCount;
+      }
 
+      const effectiveStatus = allFulfilled && !['CANCELLED', 'CLOSED'].includes(po.status) ? 'RECEIVED' : po.status;
       return {
         ...po,
+        status: effectiveStatus,
+        received: allFulfilled || po.received,
         paid: livePaid,
         balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2))),
         totalItemsCount,
@@ -1335,6 +1368,7 @@ export class ProcurementService {
         vendor: true,
         poItems: { include: { inventoryItem: true } },
         goodsReceipts: { include: { items: true } },
+        purchaseReturns: { where: { status: 'COMPLETED', returnSource: 'GRN_REJECTION' }, include: { items: true } },
         warehouse: true,
         franchise: true,
         invoices: { include: { payments: true } }
@@ -1472,7 +1506,10 @@ export class ProcurementService {
       });
 
       for (const pr of completedReturns) {
-        const returnAmount = Number(pr.refundAmount) || 0;
+        const taxableReturnAmount = Number(pr.taxableValue ?? pr.refundAmount) || 0;
+        const returnTaxAmount = Number(pr.taxAmount) ||
+          (Number(pr.cgst) || 0) + (Number(pr.sgst) || 0) + (Number(pr.igst) || 0);
+        const returnAmount = taxableReturnAmount + returnTaxAmount;
         if (returnAmount <= 0) continue;
 
         const alreadyPosted = await prisma.vendorLedger.findFirst({

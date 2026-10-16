@@ -267,12 +267,22 @@ export class PurchaseService {
     });
     if (!pr) throw new Error('Purchase Return not found');
 
-    // Goods rejected at GRN were never billed — GRN approval posts the vendor
-    // bill on ACCEPTED quantity only (and a fully rejected GRN posts none).
-    // A DEBIT here would cut the payable for goods never charged (or, for a
-    // full rejection, leave the vendor owing us). These returns are tracking
-    // documents for the rejected material only.
-    if (pr.returnSource === 'GRN_REJECTION') return;
+    const taxableReturnAmount = Number(pr.taxableValue ?? pr.refundAmount) || pr.items.reduce(
+      (sum: number, item: any) => sum + (Number(item.quantity) || 0) * (Number(item.rate) || 0),
+      0
+    );
+    const returnTaxAmount = Number(pr.taxAmount) ||
+      (Number(pr.cgst) || 0) + (Number(pr.sgst) || 0) + (Number(pr.igst) || 0);
+    const returnAmount = taxableReturnAmount + returnTaxAmount;
+    if (returnAmount <= 0) return pr;
+
+    let invoiceId: string | undefined = undefined;
+    let billRefNote = '';
+    const linkedInvoice = pr.procurementOrder?.invoices?.[0];
+    if (linkedInvoice) {
+      invoiceId = linkedInvoice.id;
+      billRefNote = ` against Purchase Bill ${linkedInvoice.invoiceNumber}`;
+    }
 
     const alreadyPosted = await tx.vendorLedger.findFirst({
       where: {
@@ -284,10 +294,28 @@ export class PurchaseService {
         ]
       }
     });
-    if (alreadyPosted) return pr;
-
-    const returnAmount = Number(pr.refundAmount) || 0;
-    if (returnAmount <= 0) return pr;
+    if (alreadyPosted) {
+      // Repair historical GRN return audit rows that were intentionally saved
+      // with amount 0. Apply only the missing delta and carry it forward to
+      // later running balances, keeping retries idempotent.
+      const delta = returnAmount - (Number(alreadyPosted.amount) || 0);
+      if (Math.abs(delta) > 0.0001) {
+        await tx.vendorLedger.update({
+          where: { id: alreadyPosted.id },
+          data: {
+            amount: returnAmount,
+            balanceAfterTransaction: (alreadyPosted.balanceAfterTransaction || 0) - delta,
+            invoiceId,
+            note: `Purchase Return ${pr.returnNumber}${billRefNote}: ${pr.reason}`
+          }
+        });
+        await tx.vendorLedger.updateMany({
+          where: { vendorId: pr.vendorId, createdAt: { gt: alreadyPosted.createdAt } },
+          data: { balanceAfterTransaction: { decrement: delta } }
+        });
+      }
+      return pr;
+    }
 
     const lastEntry = await tx.vendorLedger.findFirst({
       where: { vendorId: pr.vendorId },
@@ -295,14 +323,6 @@ export class PurchaseService {
     });
     const currentBalance = lastEntry ? lastEntry.balanceAfterTransaction : 0;
     const nextBalance = currentBalance - returnAmount;
-
-    let invoiceId: string | undefined = undefined;
-    let billRefNote = '';
-    const linkedInvoice = pr.procurementOrder?.invoices?.[0];
-    if (linkedInvoice) {
-      invoiceId = linkedInvoice.id;
-      billRefNote = ` against Purchase Bill ${linkedInvoice.invoiceNumber}`;
-    }
 
     await tx.vendorLedger.create({
       data: {
@@ -313,9 +333,9 @@ export class PurchaseService {
         sourceModule: 'PROCUREMENT',
         referenceType: 'RETURN',
         referenceId: pr.returnNumber,
-        invoiceId: invoiceId,
+        invoiceId,
         paymentMode: 'CASH',
-        note: `Purchase Return ${pr.returnNumber}${billRefNote}`,
+        note: `Purchase Return ${pr.returnNumber}${billRefNote}: ${pr.reason}`,
         createdAt: pr.createdAt || new Date()
       }
     });
@@ -447,6 +467,30 @@ export class PurchaseService {
       new Decimal(s).plus(new Decimal(i.quantity).times(i.rate)).toNumber(), 0);
 
     return prisma.$transaction(async (tx) => {
+      // A GRN approval can be retried by the client after a slow response.
+      // Serialize on the PO and return the existing equivalent document so
+      // the same rejected products never create duplicate Purchase Returns.
+      if (returnSource === 'GRN_REJECTION' && data.procurementOrderId) {
+        await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${data.procurementOrderId} FOR UPDATE`;
+        const existingReturns = await tx.purchaseReturn.findMany({
+          where: {
+            procurementOrderId: data.procurementOrderId,
+            vendorId: data.vendorId,
+            returnSource: 'GRN_REJECTION',
+            status: { not: 'CANCELLED' }
+          },
+          include: { vendor: true, items: true, procurementOrder: true },
+          orderBy: { createdAt: 'desc' }
+        });
+        const signature = (items: Array<{ itemName: string; quantity: number }>) => items
+          .map(item => `${(item.itemName || '').toLowerCase().trim()}:${Number(item.quantity)}`)
+          .sort()
+          .join('|');
+        const requestedSignature = signature(resolvedItems);
+        const duplicate = existingReturns.find((purchaseReturn: any) => signature(purchaseReturn.items) === requestedSignature);
+        if (duplicate) return duplicate;
+      }
+
       const created = await tx.purchaseReturn.create({
         data: {
           returnNumber: await generateReturnNumber(),
@@ -531,7 +575,7 @@ export class PurchaseService {
     }
   }
 
-  static async updatePurchaseReturn(id: string, data: { status: string }) {
+  static async updatePurchaseReturn(id: string, data: { status: string; reason?: string }) {
     const { status } = data;
     if (status === 'APPROVED') {
       throw new Error('APPROVED status is no longer supported. Use COMPLETED instead.');
@@ -546,6 +590,10 @@ export class PurchaseService {
         include: { items: true, vendor: true }
       });
       if (!existing) throw new Error('Purchase Return not found');
+      const submittedReason = data.reason?.trim();
+      if (status === 'COMPLETED' && existing.returnSource === 'GRN_REJECTION' && !submittedReason && existing.reason === 'PENDING_RETURN_REASON') {
+        throw new Error('Return reason is required before submitting this GRN product return.');
+      }
 
       // Double-completion protection / Idempotency:
       if (existing.status === 'COMPLETED' && status === 'COMPLETED') {
@@ -561,7 +609,7 @@ export class PurchaseService {
         // concurrent request already updated status to COMPLETED.
         const claimed = await tx.purchaseReturn.updateMany({
           where: { id, status: 'PENDING' },
-          data: { status: 'COMPLETED' }
+          data: { status: 'COMPLETED', ...(submittedReason ? { reason: submittedReason } : {}) }
         });
 
         if (claimed.count === 0) {
@@ -584,6 +632,56 @@ export class PurchaseService {
         // B. Update Vendor Ledger (DEBIT reduces what we owe the vendor) and GST breakdown
         await this.backfillPurchaseReturnTax(tx, id);
         await this.recognizeReturn(tx, id);
+
+        // A GRN rejection closes the PO balance only after the operator enters
+        // the reason and submits the product return. Fulfilment is accepted
+        // stock plus completed GRN-return quantity, so rejected goods cannot
+        // keep reappearing on the GRN ready-to-receive screen.
+        if (existing.returnSource === 'GRN_REJECTION' && existing.procurementOrderId) {
+          const po = await tx.procurementOrder.findUnique({
+            where: { id: existing.procurementOrderId },
+            include: {
+              poItems: { include: { inventoryItem: true } },
+              goodsReceipts: {
+                where: { status: 'COMPLETED' },
+                include: { items: { include: { inventoryItem: true } } }
+              },
+              purchaseReturns: {
+                where: { status: 'COMPLETED', returnSource: 'GRN_REJECTION' },
+                include: { items: true }
+              }
+            }
+          });
+
+          if (po) {
+            const fulfilledByName = new Map<string, number>();
+            for (const receipt of po.goodsReceipts) {
+              for (const item of receipt.items) {
+                const key = (item.inventoryItem?.name || '').toLowerCase().trim();
+                if (key) fulfilledByName.set(key, (fulfilledByName.get(key) || 0) + (item.acceptedQty || 0));
+              }
+            }
+            for (const purchaseReturn of po.purchaseReturns) {
+              for (const item of purchaseReturn.items) {
+                const key = (item.itemName || '').toLowerCase().trim();
+                if (key) fulfilledByName.set(key, (fulfilledByName.get(key) || 0) + (item.quantity || 0));
+              }
+            }
+
+            const allFulfilled = po.poItems.every((item: any) => {
+              const key = (item.itemName || item.inventoryItem?.name || '').toLowerCase().trim();
+              return (fulfilledByName.get(key) || 0) + 0.0001 >= item.quantity;
+            });
+            const anyFulfilled = Array.from(fulfilledByName.values()).some(quantity => quantity > 0);
+            await tx.procurementOrder.update({
+              where: { id: po.id },
+              data: {
+                status: allFulfilled ? 'RECEIVED' : (anyFulfilled ? 'PARTIALLY_RECEIVED' : po.status),
+                received: allFulfilled
+              }
+            });
+          }
+        }
 
         return tx.purchaseReturn.findUnique({
           where: { id },

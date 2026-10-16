@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { InventoryService } from './inventory.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 import { WarehouseService } from '../warehouse/warehouse.service';
+import { FranchiseService } from '../franchise/franchise.service';
 import prisma from '../../lib/prisma';
 
 function normalizeWarehouseName(s: string) {
@@ -177,10 +178,10 @@ export class InventoryController {
       res.status(500).json({ error: error.message });
     }
   }
-  // SUPER_ADMIN: every active warehouse, globally, each tagged with the
-  // franchise it's primary for (if any) — Warehouse has no franchiseId
-  // column, so this is derived via the reverse "primary warehouse of"
-  // relation, not assumed from the warehouse's name/code.
+  // SUPER_ADMIN: general selectors resolve only the HQ primary warehouse.
+  // Dedicated monitoring may explicitly request scope=FRANCHISE and receives
+  // only non-HQ franchise primary warehouses. Warehouse has no franchiseId
+  // column, so both scopes are derived through the reverse primary relation.
   // FRANCHISE_ADMIN: only their own franchise's primary warehouse (or an
   // empty list if none is set) — resolved from the authenticated user via
   // IsolationUtil, never from a client-supplied franchiseId.
@@ -189,6 +190,7 @@ export class InventoryController {
       const user = (req as any).user;
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const includeInactive = req.query.includeInactive === 'true' || req.query.all === 'true';
+      const scope = (req.query.scope as string || '').toUpperCase();
 
       if (franchiseFilter.franchiseId) {
         const franchise = await prisma.franchise.findUnique({
@@ -243,7 +245,6 @@ export class InventoryController {
         orderBy: { createdAt: 'desc' }
       });
 
-      const scope = (req.query.scope as string || '').toUpperCase();
       const forGRN = req.query.forGRN === 'true';
 
       const result = warehouses
@@ -259,14 +260,14 @@ export class InventoryController {
             movementsCount: _count?.movements || 0,
             franchiseId: owner?.id ?? null,
             franchiseName: owner?.name ?? null,
-            isFranchise: !!nonHqOwner
+            isFranchise: !!nonHqOwner,
+            isCentral: !!hqOwner,
           };
         })
         .filter((w: any) => {
-          if (forGRN || scope === 'HQ') {
-            return !w.isFranchise;
-          }
-          return true;
+          if (scope === 'FRANCHISE') return w.isFranchise;
+          if (forGRN || scope === 'HQ' || !scope) return w.isCentral;
+          return false;
         });
 
       res.json(result);
@@ -296,6 +297,9 @@ export class InventoryController {
   static async createWarehouse(req: Request, res: Response) {
     try {
       const user = (req as any).user;
+      if (user?.role === 'SUPER_ADMIN') {
+        return res.status(403).json({ error: 'Super Admin warehouse creation is disabled. Manage the existing Central Warehouse instead.' });
+      }
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const { name, location, type, code, status } = req.body;
       let franchiseId = req.body.franchiseId;
@@ -316,6 +320,11 @@ export class InventoryController {
   static async updateWarehouse(req: Request, res: Response) {
     try {
       const { id } = req.params;
+      const user = (req as any).user;
+      if (user?.role === 'SUPER_ADMIN') {
+        const hq = await FranchiseService.getHqFranchise();
+        if (hq.primaryWarehouseId !== id) return res.status(403).json({ error: 'Only the Central Warehouse can be managed here.' });
+      }
       const { name, location, type, status } = req.body;
 
       let nameKey: string | undefined;
@@ -360,6 +369,12 @@ export class InventoryController {
   static async deleteWarehouse(req: Request, res: Response) {
     try {
       const { id } = req.params;
+      const user = (req as any).user;
+      if (user?.role === 'SUPER_ADMIN') {
+        const hq = await FranchiseService.getHqFranchise();
+        if (hq.primaryWarehouseId !== id) return res.status(403).json({ error: 'Only the Central Warehouse can be managed here.' });
+        return res.status(400).json({ error: 'The configured Central Warehouse cannot be deleted.' });
+      }
       await prisma.warehouse.delete({
         where: { id }
       });

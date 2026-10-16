@@ -18,6 +18,103 @@ async function assertWarehouseAccess(user: any, warehouseId: string) {
 }
 
 export class WarehouseController {
+  static async getCentralWarehouse(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.getCentralWarehouse());
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async updateCentralWarehouse(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.updateCentralWarehouse(req.body));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async getCentralFunds(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.getCentralFunds());
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async addCentralFund(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      res.status(201).json(await WarehouseService.addCentralFund({
+        ...req.body,
+        createdBy: user?.fullName || user?.email || user?.id || 'Super Admin',
+      }));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async updateCentralFund(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      res.json(await WarehouseService.updateCentralFund(req.params.paymentId, {
+        ...req.body,
+        updatedBy: user?.fullName || user?.email || user?.id || 'Super Admin',
+      }));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async createCentralBin(req: Request, res: Response) {
+    try {
+      res.status(201).json(await WarehouseService.createCentralBin(req.body));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async updateCentralBin(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.updateCentralBin(req.params.binId, req.body));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async deleteCentralBin(req: Request, res: Response) {
+    try {
+      await WarehouseService.deleteCentralBin(req.params.binId);
+      res.status(204).send();
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async centralStockIn(req: Request, res: Response) {
+    try {
+      res.status(201).json(await WarehouseService.centralStockIn({ ...req.body, userId: (req as any).user?.id }));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async centralStockOut(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.centralStockOut({ ...req.body, userId: (req as any).user?.id }));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
+  static async moveCentralStock(req: Request, res: Response) {
+    try {
+      res.json(await WarehouseService.moveCentralStock({ ...req.body, userId: (req as any).user?.id }));
+    } catch (error: any) {
+      res.status(error.status || 400).json({ error: error.message });
+    }
+  }
+
   static async previewCode(req: Request, res: Response) {
     try {
       const code = await WarehouseService.previewNextWarehouseCode();

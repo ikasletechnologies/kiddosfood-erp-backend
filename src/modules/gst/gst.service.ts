@@ -3,6 +3,8 @@ import prisma from '../../lib/prisma';
 
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 const GSTVERIFY_BASE_URL = process.env.GSTVERIFY_BASE_URL || 'https://gstverify.co.in/api/v1/verify';
+const SANDBOX_PRODUCTION_URL = 'https://api.sandbox.co.in';
+const SANDBOX_TEST_URL = 'https://test-api.sandbox.co.in';
 const SANDBOX_BASE_URL = process.env.SANDBOX_BASE_URL || 'https://api.sandbox.co.in';
 
 const GST_STATE_MAP: Record<string, string> = {
@@ -129,6 +131,8 @@ class SandboxAuth {
 }
 
 export class GstService {
+  private static sandboxToken: { value: string; expiresAt: number } | null = null;
+
   static isValidGstin(gstin: string): boolean {
     return GSTIN_REGEX.test(gstin);
   }
@@ -152,34 +156,41 @@ export class GstService {
       }
     }
 
-    // Check credentials for Sandbox.co.in and GSTVerify.co.in
-    const sandboxKey = process.env.SANDBOX_API_KEY || process.env.GST_API_KEY;
-    const sandboxSecret = process.env.SANDBOX_API_SECRET || process.env.GST_API_SECRET;
-    const gstverifyKey = process.env.GSTVERIFY_API_KEY;
-
-    let raw: any = null;
-
-    if (sandboxKey) {
-      // Use Sandbox.co.in Tax API
-      raw = await this.fetchFromSandbox(gstin, sandboxKey, sandboxSecret);
-    } else if (gstverifyKey) {
-      // Use GSTVerify.co.in API
-      raw = await this.fetchFromGstVerify(gstin, gstverifyKey);
-    } else {
-      // Neither API key is configured
-      // If dev fallback is enabled via GST_MOCK_FALLBACK=true or in local dev without keys
-      if (process.env.GST_MOCK_FALLBACK === 'true') {
-        const derivedDetails = this.createFallbackDetails(gstin);
-        return { details: derivedDetails, cached: false };
-      }
-
-      throw new GstVerifyError(
-        'GST API credentials are not configured on the server. Please configure SANDBOX_API_KEY and SANDBOX_API_SECRET (for Sandbox.co.in) or GSTVERIFY_API_KEY in the backend .env file.',
-        500
-      );
+    const apiKey = process.env.GSTVERIFY_API_KEY;
+    if (!apiKey) {
+      throw new GstVerifyError('GSTVERIFY_API_KEY is not configured on the server.', 500);
     }
 
-    const details = this.normalizeDetails(gstin, raw);
+    const response = await axios.get(`${GSTVERIFY_BASE_URL}/${gstin}`, {
+      headers: { 'X-API-Key': apiKey },
+      validateStatus: () => true,
+    });
+
+    if (response.status !== 200 || !response.data?.success) {
+      const message = response.data?.error || `GSTVerify lookup failed (${response.status})`;
+      // 429 (rate limit) is worth surfacing as-is; everything else (bad/expired
+      // key, no credits, upstream GST outage) is a server-side problem, not
+      // the caller's, so it comes back as a generic upstream failure.
+      throw new GstVerifyError(message, response.status === 429 ? 429 : 502);
+    }
+
+    const raw = response.data.data || {};
+    const address = raw.address || '';
+    const state = raw.state || '';
+    const details: GstinDetails = {
+      gstin: raw.gstin || gstin,
+      legalName: raw.legal_name || raw.trade_name || 'Unknown Business',
+      tradeName: raw.trade_name || raw.legal_name || '',
+      status: raw.status || 'UNKNOWN',
+      constitution: raw.constitution || '',
+      taxpayerType: raw.taxpayer_type || 'Regular',
+      registrationDate: raw.registration_date || '',
+      pan: raw.pan || '',
+      address,
+      state,
+      ...this.deriveLocation(address, state),
+      natureOfBusiness: Array.isArray(raw.nature_of_business) ? raw.nature_of_business : [],
+    };
 
     // Save to gstinCache for instant subsequent hits
     const { gstin: _gstin, city: _city, pinCode: _pinCode, ...persisted } = details;
@@ -190,164 +201,6 @@ export class GstService {
     });
 
     return { details, cached: false };
-  }
-
-  private static async fetchFromSandbox(
-    gstin: string,
-    apiKey: string,
-    apiSecret?: string
-  ): Promise<any> {
-    if (!apiSecret) {
-      throw new GstVerifyError(
-        'SANDBOX_API_SECRET is required when using Sandbox.co.in. Please add SANDBOX_API_SECRET to .env',
-        500
-      );
-    }
-
-    const accessToken = await SandboxAuth.getAccessToken(apiKey, apiSecret);
-
-    const response = await axios.post(
-      `${SANDBOX_BASE_URL}/gst/compliance/public/gstin/search`,
-      { gstin },
-      {
-        headers: {
-          'x-api-key': apiKey,
-          authorization: accessToken,
-          'x-api-version': '1.0',
-          'Content-Type': 'application/json',
-        },
-        validateStatus: () => true,
-      }
-    );
-
-    if (response.status !== 200 || !response.data) {
-      const msg =
-        response.data?.message ||
-        response.data?.error ||
-        `Sandbox GST lookup failed (${response.status})`;
-      throw new GstVerifyError(msg, response.status === 429 ? 429 : response.status >= 400 && response.status < 500 ? response.status : 502);
-    }
-
-    return response.data?.data?.data || response.data?.data || response.data;
-  }
-
-  private static async fetchFromGstVerify(gstin: string, apiKey: string): Promise<any> {
-    const response = await axios.get(`${GSTVERIFY_BASE_URL}/${gstin}`, {
-      headers: { 'X-API-Key': apiKey },
-      validateStatus: () => true,
-    });
-
-    if (response.status !== 200 || !response.data?.success) {
-      const message = response.data?.error || `GSTVerify lookup failed (${response.status})`;
-      throw new GstVerifyError(message, response.status === 429 ? 429 : 502);
-    }
-
-    return response.data?.data || {};
-  }
-
-  private static normalizeDetails(gstin: string, raw: any): GstinDetails {
-    const legalName =
-      raw.legal_name ||
-      raw.lgnm ||
-      raw.trade_name ||
-      raw.tradeNam ||
-      'Unknown Business';
-
-    const tradeName =
-      raw.trade_name ||
-      raw.tradeNam ||
-      raw.legal_name ||
-      raw.lgnm ||
-      '';
-
-    const status = raw.status || raw.sts || 'UNKNOWN';
-    const constitution = raw.constitution || raw.ctb || '';
-    const taxpayerType = raw.taxpayer_type || raw.dty || 'Regular';
-    const registrationDate = raw.registration_date || raw.rgdt || '';
-    const pan = raw.pan || (gstin.length >= 12 ? gstin.substring(2, 12) : '');
-
-    let address = raw.address || '';
-    let state = raw.state || '';
-    let city = raw.city || '';
-    let pinCode = raw.pinCode || raw.pincode || '';
-
-    // Handle GSTN structured address (e.g. from Sandbox / government format)
-    if (raw.pradr?.addr) {
-      const a = raw.pradr.addr;
-      const parts = [
-        a.bno,
-        a.flno,
-        a.st,
-        a.loc,
-        a.city || a.dst,
-        a.stcd,
-        a.pncd,
-      ].filter(Boolean);
-      address = parts.join(', ');
-      state = a.stcd || state;
-      city = a.city || a.dst || city;
-      pinCode = a.pncd || pinCode;
-    }
-
-    // Fallback state lookup from 2-digit GST state code
-    if (!state) {
-      const stateCode = gstin.substring(0, 2);
-      state = GST_STATE_MAP[stateCode] || '';
-    }
-
-    // Best-effort derive city and pinCode from freeform address if missing
-    if (!city || !pinCode) {
-      const derived = this.deriveLocation(address, state);
-      if (!city) city = derived.city;
-      if (!pinCode) pinCode = derived.pinCode;
-    }
-
-    // Nature of business normalization
-    let natureOfBusiness: string[] = [];
-    if (Array.isArray(raw.nature_of_business)) {
-      natureOfBusiness = raw.nature_of_business;
-    } else if (Array.isArray(raw.nba)) {
-      natureOfBusiness = raw.nba;
-    } else if (raw.pradr?.ntr) {
-      natureOfBusiness = [raw.pradr.ntr];
-    }
-
-    return {
-      gstin: raw.gstin || gstin,
-      legalName,
-      tradeName,
-      status,
-      constitution,
-      taxpayerType,
-      registrationDate,
-      pan,
-      address,
-      state,
-      city,
-      pinCode,
-      natureOfBusiness,
-    };
-  }
-
-  private static createFallbackDetails(gstin: string): GstinDetails {
-    const stateCode = gstin.substring(0, 2);
-    const state = GST_STATE_MAP[stateCode] || 'Unknown';
-    const pan = gstin.substring(2, 12);
-    return {
-      gstin,
-      legalName: `Business (${gstin})`,
-      tradeName: `Business (${gstin})`,
-      status: 'ACTIVE',
-      constitution: 'Regular',
-      taxpayerType: 'Regular',
-      registrationDate: new Date().toISOString().split('T')[0],
-      pan,
-      address: `${state}, India`,
-      state,
-      city: '',
-      pinCode: '',
-      natureOfBusiness: [],
-    };
   }
 
   private static toDetails(cached: CachedRow): GstinDetails {
