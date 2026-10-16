@@ -106,13 +106,29 @@ export class RecipeImportService {
   static async listSessions() {
     const sessions = await prisma.recipeImportSession.findMany({ orderBy: { updatedAt: 'desc' }, take: 20 });
     return sessions.map((s) => {
-      const states = Object.values((s.status || {}) as unknown as Record<string, RecipeStatus>).map((x) => x.state);
+      const status = (s.status || {}) as unknown as Record<string, RecipeStatus>;
+      const parsed = s.parsed as unknown as ParsedRecipe[];
+      const titleByKey = new Map(parsed.map((recipe) => [recipe.key, recipe.title]));
+      const states = Object.values(status).map((x) => x.state);
       return {
         id: s.id, fileName: s.fileName, createdAt: s.createdAt, updatedAt: s.updatedAt,
         total: states.length,
         imported: states.filter((x) => x === 'IMPORTED' || x === 'UNCHANGED').length,
         skipped: states.filter((x) => x === 'SKIPPED').length,
         pending: states.filter((x) => x === 'PENDING').length,
+        // The session status already owns the durable Recipe id assigned by
+        // confirm(). Expose that relationship so Recipe Master can show
+        // import history without filename/title guessing or duplicate data.
+        recipes: Object.entries(status)
+          .filter(([, item]) => !!item.recipeId)
+          .map(([key, item]) => ({
+            key,
+            recipeId: item.recipeId!,
+            title: titleByKey.get(key) || null,
+            state: item.state,
+            importedAt: item.at || s.updatedAt,
+            version: item.version || null,
+          })),
       };
     });
   }

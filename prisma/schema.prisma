@@ -1996,6 +1996,7 @@ model WarehouseBin {
   warehouseId String
   code        String
   description String?
+  capacity    Float?
   grnItems    GoodsReceiptItem[]
   movements   StockMovement[]
   warehouse   Warehouse          @relation(fields: [warehouseId], references: [id])

@@ -575,7 +575,7 @@ export class PurchaseService {
     }
   }
 
-  static async updatePurchaseReturn(id: string, data: { status: string }) {
+  static async updatePurchaseReturn(id: string, data: { status: string; reason?: string }) {
     const { status } = data;
     if (status === 'APPROVED') {
       throw new Error('APPROVED status is no longer supported. Use COMPLETED instead.');
