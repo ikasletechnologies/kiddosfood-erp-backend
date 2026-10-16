@@ -34,6 +34,7 @@ import { EmployeeController } from './modules/employee/employee.controller';
 import { PayrollController } from './modules/payroll/payroll.controller';
 import { SalesController } from './modules/sales/sales.controller';
 import { ProfitabilityController } from './modules/sales/profitability.controller';
+import { LotPricingController } from './modules/sales/lot-pricing.controller';
 import { PurchaseController } from './modules/purchase/purchase.controller';
 import { RawMaterialsController } from './modules/inventory/raw-materials.controller';
 import { UserController } from './modules/users/user.controller';
@@ -725,6 +726,11 @@ app.post('/api/sales/proforma-invoices/:id/convert-to-sales-order', authenticate
 
 app.get('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoices);
 app.get('/api/sales/invoices/batch-options', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceBatchOptions);
+// Production > Set Price (finished-goods lot pricing) and lot selection for sales / POS.
+app.get('/api/sales/set-price/lots', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.listLots);
+app.get('/api/sales/set-price/lots/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.getLot);
+app.put('/api/sales/set-price/lots/:id/price', authenticate, authorizeRole(['SUPER_ADMIN']), LotPricingController.setPrice);
+app.get('/api/sales/lot-options', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.saleLotOptions);
 app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
 app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.cancelInvoice);

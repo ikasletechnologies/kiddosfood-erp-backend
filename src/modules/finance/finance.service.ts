@@ -171,9 +171,11 @@ import { AccountService } from './account.service';
 import { POSService } from '../pos/pos.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { LotPricingService } from '../sales/lot-pricing.service';
 import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
+import { isLotExpired } from '../inventory/lot-eligibility';
 
 
 // Shared Category Resolver
@@ -2118,12 +2120,11 @@ export class FinanceService {
     if (rows.length === 0) {
       throw new Error(`Invalid batch number "${batchNumber}" for "${prodName}". Please select an available batch from inventory for the selected product.`);
     }
-    const now = Date.now();
     const sellable = rows.filter((b: any) =>
-      b.status === 'APPROVED' && b.currentQty > 0 && (!b.expDate || new Date(b.expDate).getTime() >= now));
+      b.status === 'APPROVED' && b.currentQty > 0 && !isLotExpired(b.expDate));
     if (sellable.length === 0) {
       const withStock = rows.filter((b: any) => b.currentQty > 0);
-      if (withStock.some((b: any) => b.expDate && new Date(b.expDate).getTime() < now) || withStock.some((b: any) => b.status === 'EXPIRED')) {
+      if (withStock.some((b: any) => isLotExpired(b.expDate)) || withStock.some((b: any) => b.status === 'EXPIRED')) {
         throw new Error(`Batch "${batchNumber}" of "${prodName}" has expired and cannot be sold.`);
       }
       const blocked = withStock.find((b: any) => b.status !== 'APPROVED');
@@ -2205,6 +2206,9 @@ export class FinanceService {
       discountPct?: number;
       discountAmount?: number;
       batchNumber?: string;
+      // Finished-goods lot (Set Price) this line sells from; its price and
+      // the exact lot deduction replace the master price / named batch.
+      inventoryBatchId?: string | null;
     }[];
     receivedAmount?: number;
     paymentMode?: any;
@@ -2263,6 +2267,8 @@ export class FinanceService {
         taxAmount: number;
         totalAmount: number;
         batchNumber: string | null;
+        inventoryBatchId: string | null;
+        lotNumber: string | null;
       }[] = [];
 
       // Trust boundary: this was the least-guarded financially-significant
@@ -2321,15 +2327,34 @@ export class FinanceService {
         unitId?: string;
         product: any;
         batchNumber?: string;
+        inventoryBatchId?: string;
+        lotNumber?: string;
       }> = [];
       // Base qty already claimed per "inventoryItemId|batchNumber", so two
       // lines drawing on the same lot are checked against its combined stock.
       const batchClaims = new Map<string, number>();
 
-      for (const checkItem of data.items) {
+      // Lines naming a finished-goods lot: resolved once (belongs to the
+      // product, held by the seller, sellable, priced), indexed by line.
+      const lotLines = new Map<number, Awaited<ReturnType<typeof LotPricingService.resolveSaleLot>>>();
+      const lotClaims = new Map<string, { qty: number; label: string }>();
+      for (const [idx, item] of data.items.entries()) {
+        const lotId = (item.inventoryBatchId || '').trim();
+        if (!lotId || Number(item.qty ?? item.quantity ?? 0) <= 0) continue;
+        const lot = await LotPricingService.resolveSaleLot(tx, { productId: item.productId, productName: item.productName, inventoryBatchId: lotId, unit: item.unit }, { franchiseId: sellerFranchiseId });
+        lotLines.set(idx, lot);
+        const prior = lotClaims.get(lotId);
+        lotClaims.set(lotId, { qty: (prior?.qty || 0) + Number(item.qty ?? item.quantity ?? 0) * lot.factor, label: lot.lotNumber });
+      }
+      if (lotClaims.size) await LotPricingService.assertLotStock(tx, lotClaims);
+
+      for (const [lineIdx, checkItem] of data.items.entries()) {
         const checkQty = Number(checkItem.qty ?? checkItem.quantity ?? 0);
         if (checkQty <= 0) continue;
-        const checkBatch = (checkItem.batchNumber || '').trim();
+        const lotLine = lotLines.get(lineIdx);
+        // A lot line is checked and deducted by its lot (above / below),
+        // not by a free-typed batch number.
+        const checkBatch = lotLine ? '' : (checkItem.batchNumber || '').trim();
 
         // A batch can only be validated against a real inventory item — a
         // free-text line has nothing to check it against, so it can't carry one.
@@ -2437,13 +2462,19 @@ export class FinanceService {
               orderItemQty: checkQty,
               unitId: conversionResult.unitId,
               product: prod || { name: invItem.name, sku: invItem.sku },
-              batchNumber: checkBatch || undefined
+              batchNumber: checkBatch || undefined,
+              inventoryBatchId: lotLine?.lotId,
+              lotNumber: lotLine?.lotNumber,
             });
+            if (lotLine && lotLine.inventoryItemId !== invItem.id) {
+              throw new Error(`Lot ${lotLine.lotNumber} is not held in the seller's stock of "${prod?.name || invItem.name}".`);
+            }
           }
         }
       }
 
-      for (const item of data.items) {
+      for (const [lineIdx, item] of data.items.entries()) {
+        const lotLine = lotLines.get(lineIdx);
         const qty = Number(item.qty ?? item.quantity ?? 0);
         let rate = Number(item.rate ?? item.price ?? 0);
         let gst = Number(item.gst ?? item.taxPercent ?? 0);
@@ -2489,8 +2520,14 @@ export class FinanceService {
               resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
                 inv?.customerPrice;
           rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
-          assertBillablePrice(product, rate);
           gst = inv?.gstRate ?? product?.taxPercent ?? 0;
+          if (lotLine) {
+            // The lot's own Set Price (excl. GST) replaces the master price.
+            rate = lotLine.rate;
+            gst = lotLine.taxPercent;
+          } else {
+            assertBillablePrice(product, rate);
+          }
           if (resolvedInvoicePartyType === 'CUSTOMER') {
             autoDiscountType = inv?.discountType || product?.discountType || 'PERCENT';
             autoDiscountValue = Number(inv?.discountValue ?? product?.discountValue ?? 0);
@@ -2544,7 +2581,9 @@ export class FinanceService {
           discountPct: discountPct,
           taxAmount: itemTax,
           totalAmount: itemTaxableAmount + itemTax,
-          batchNumber: (item.batchNumber || '').trim() || null
+          batchNumber: lotLine ? lotLine.batchNumber : ((item.batchNumber || '').trim() || null),
+          inventoryBatchId: lotLine?.lotId ?? null,
+          lotNumber: lotLine?.lotNumber ?? null,
         });
       }
 
@@ -2799,9 +2838,11 @@ export class FinanceService {
       // A line with a selected batch is deducted from that exact lot (re-checked
       // under row lock); lines without one keep the existing FIFO depletion.
       for (const ded of itemsToDeduct) {
-        const precalculatedFifo = ded.batchNumber
-          ? await InventoryService.depleteNamedBatch(tx, ded.inventoryItem.id, ded.batchNumber, ded.requiredBaseQty)
-          : undefined;
+        const precalculatedFifo = ded.inventoryBatchId
+          ? await InventoryService.depleteLot(tx, ded.inventoryItem.id, ded.inventoryBatchId, ded.requiredBaseQty)
+          : ded.batchNumber
+            ? await InventoryService.depleteNamedBatch(tx, ded.inventoryItem.id, ded.batchNumber, ded.requiredBaseQty)
+            : undefined;
         await InventoryService.recordMovement(tx, {
           itemId: ded.inventoryItem.id,
           type: 'SALES_OUT',
@@ -2810,7 +2851,7 @@ export class FinanceService {
           transactionUnit: ded.unitId,
           referenceType: 'ORDER',
           referenceId: order.id,
-          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name}${ded.batchNumber ? `, Batch: ${ded.batchNumber}` : ''})`,
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name}${ded.lotNumber ? `, Lot: ${ded.lotNumber}` : ded.batchNumber ? `, Batch: ${ded.batchNumber}` : ''})`,
           precalculatedFifo
         });
       }

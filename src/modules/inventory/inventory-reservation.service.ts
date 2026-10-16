@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient } from '@prisma/client';
+import { expiryCutoff } from './lot-eligibility';
 
 export class InventoryReservationService {
 
@@ -53,7 +54,7 @@ export class InventoryReservationService {
             WHERE br."productBatchId" = "InventoryBatch"."productBatchId"
               AND br.status IN ('IN_PROGRESS', 'COMPLETED')
           )
-          AND ("expDate" IS NULL OR "expDate" >= now())
+          AND ("expDate" IS NULL OR "expDate" >= ${expiryCutoff()})
           ${warehouseFilter}
         ORDER BY "mfgDate" ASC, "createdAt" ASC
         FOR UPDATE

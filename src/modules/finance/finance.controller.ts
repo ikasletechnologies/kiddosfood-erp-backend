@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { FinanceService } from './finance.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { LotPricingError } from '../sales/lot-pricing.service';
 
 export class FinanceController {
   static async getPL(req: Request, res: Response) {
@@ -333,7 +334,7 @@ export class FinanceController {
       });
       res.status(201).json(invoice);
     } catch (error: any) {
-      const isBusinessError = /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to|Invalid batch|^Batch "/i.test(error.message);
+      const isBusinessError = error instanceof LotPricingError || /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to|Invalid batch|^Batch "|^Lot /i.test(error.message);
       res.status(isBusinessError ? 400 : 500).json({ error: error.message });
     }
   }

@@ -154,7 +154,9 @@ export class ProductionController {
         expiryDate || undefined,
         hasWastage ? { quantity: Number(wastageQty), note: wastageNote || undefined } : undefined,
         {
-          requireVarianceRemarks: true,
+          // The completion dialog no longer has a remarks field, so a large
+          // yield variance must not block completion on missing remarks.
+          requireVarianceRemarks: false,
           additionalMaterials: Array.isArray(req.body.additionalMaterials) ? req.body.additionalMaterials : undefined,
         },
       );

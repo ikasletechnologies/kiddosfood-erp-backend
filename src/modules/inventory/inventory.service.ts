@@ -4,6 +4,8 @@ import prisma from
   '../../lib/prisma';
 import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
 import { areUnitsEquivalent, normalizeUnit, convertUnit, areUnitsConvertible } from '../../lib/conversion';
+import { expiryCutoff, isLotExpired } from './lot-eligibility';
+import { PurchaseLotsService } from './purchase-lots.service';
 
 export interface FifoConsumption {
   batchId: string;
@@ -801,6 +803,10 @@ export class InventoryService {
         mfgDate?: Date | null;
         expDate?: Date | null;
         productBatchId?: string;
+        // Finished-goods lots from Packaging: the confirmed run that created
+        // the lot, and its Set Price status (always pending at creation).
+        productPackagingId?: string;
+        pricingStatus?: string;
       };
       // Explicit passthrough for callers that already know the batch/cost
       // (e.g. an adjustment against a specific lot). Ignored when the FIFO
@@ -915,6 +921,8 @@ export class InventoryService {
           productBatchId: data.receiveAtCost.productBatchId,
           warehouseId: data.warehouseId || null,
           status: 'APPROVED',
+          ...(data.receiveAtCost.productPackagingId ? { productPackagingId: data.receiveAtCost.productPackagingId } : {}),
+          ...(data.receiveAtCost.pricingStatus ? { pricingStatus: data.receiveAtCost.pricingStatus } : {}),
         },
       });
       movementBatchId = newBatch.id;
@@ -981,7 +989,7 @@ export class InventoryService {
       WHERE "inventoryItemId" = ${itemId}
         AND "currentQty" > 0
         AND status = 'APPROVED'
-        AND ("expDate" IS NULL OR "expDate" >= now())
+        AND ("expDate" IS NULL OR "expDate" >= ${expiryCutoff()})
         ${warehouseFilter}
       ORDER BY "mfgDate" ASC, "createdAt" ASC
       FOR UPDATE
@@ -1053,7 +1061,7 @@ export class InventoryService {
         inventoryItemId: itemId,
         currentQty: { gt: 0 },
         status: 'APPROVED',
-        OR: [{ expDate: null }, { expDate: { gte: new Date() } }],
+        OR: [{ expDate: null }, { expDate: { gte: expiryCutoff() } }],
       },
       select: { id: true, batchNumber: true, currentQty: true, expDate: true, mfgDate: true, warehouseId: true },
       orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }],
@@ -1075,7 +1083,7 @@ export class InventoryService {
         AND "batchNumber" = ${batchNumber}
         AND "currentQty" > 0
         AND status = 'APPROVED'
-        AND ("expDate" IS NULL OR "expDate" >= now())
+        AND ("expDate" IS NULL OR "expDate" >= ${expiryCutoff()})
       ORDER BY "mfgDate" ASC, "createdAt" ASC
       FOR UPDATE
     `);
@@ -1114,6 +1122,66 @@ export class InventoryService {
       consumedFromBatches: quantity,
       totalCost,
       unitCost: quantity > 0 ? totalCost / quantity : 0,
+      blockedQtyAvailable: 0,
+    };
+  }
+
+  // Quantity of each lot held by ACTIVE franchise-order reservations
+  // (reserved − consumed − released). Reserved stock is never sellable from
+  // a lot selection, so lot availability is currentQty minus this.
+  static async reservedQtyByLot(tx: any, lotIds: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (!lotIds.length) return out;
+    const rows = await tx.inventoryReservationAllocation.groupBy({
+      by: ['inventoryBatchId'],
+      where: { inventoryBatchId: { in: lotIds }, reservation: { status: 'ACTIVE' } },
+      _sum: { reservedQty: true, consumedQty: true, releasedQty: true },
+    });
+    for (const r of rows) {
+      out.set(r.inventoryBatchId, Math.max(0, (r._sum.reservedQty || 0) - (r._sum.consumedQty || 0) - (r._sum.releasedQty || 0)));
+    }
+    return out;
+  }
+
+  // Deducts `quantity` from one operator-selected finished-goods lot (a
+  // single InventoryBatch row, by id) and returns the consumption in the
+  // depleteBatchesFIFO shape, for recordMovement's precalculatedFifo — so the
+  // movement carries this lot's id and cost and a later return restores to
+  // it. The row is locked FOR UPDATE (same recall race as depleteBatchesFIFO)
+  // and re-checked under the lock: it must belong to `itemId`, be APPROVED,
+  // unexpired, and cover the quantity net of active reservations. Never goes
+  // negative and never spills into another lot.
+  static async depleteLot(tx: any, itemId: string, lotId: string, quantity: number): Promise<FifoConsumptionResult> {
+    const rows: Array<{ id: string; inventoryItemId: string; batchNumber: string; lotNumber: string | null; billNumber: string | null; productBatchId: string | null; currentQty: number; unitCost: number | null; status: string; expDate: Date | null }> = await tx.$queryRaw(Prisma.sql`
+      SELECT id, "inventoryItemId", "batchNumber", "lotNumber", "billNumber", "productBatchId", "currentQty", "unitCost", status::text AS status, "expDate"
+      FROM "InventoryBatch"
+      WHERE id = ${lotId}
+      FOR UPDATE
+    `);
+    const lot = rows[0];
+    const label = lot ? (lot.lotNumber || lot.batchNumber) : lotId;
+    if (!lot || lot.inventoryItemId !== itemId) throw new Error(`Lot ${label} does not belong to this product's stock.`);
+    if (lot.status !== 'APPROVED') throw new Error(`Lot ${label} is ${lot.status.replace(/_/g, ' ')} and cannot be sold.`);
+    if (isLotExpired(lot.expDate)) throw new Error(`Lot ${label} has expired and cannot be sold.`);
+    const reserved = (await this.reservedQtyByLot(tx, [lot.id])).get(lot.id) || 0;
+    const available = Math.max(0, lot.currentQty - reserved);
+    if (available + 0.0001 < quantity) {
+      throw new Error(`Lot ${label} has insufficient stock. Available: ${Math.round(available * 1000) / 1000}${reserved > 0 ? ` (after ${reserved} reserved)` : ''}, Required: ${quantity}.`);
+    }
+    await tx.inventoryBatch.update({ where: { id: lot.id }, data: { currentQty: lot.currentQty - quantity } });
+    const unitCost = lot.unitCost || 0;
+    return {
+      consumptions: [{
+        batchId: lot.id,
+        billNumber: lot.billNumber || lot.batchNumber,
+        productBatchId: lot.productBatchId,
+        qty: quantity,
+        unitCost,
+        totalCost: quantity * unitCost,
+      }],
+      consumedFromBatches: quantity,
+      totalCost: quantity * unitCost,
+      unitCost,
       blockedQtyAvailable: 0,
     };
   }
@@ -1330,6 +1398,9 @@ export class InventoryService {
 
     const thirtyDaysFromNow = new Date();
     thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
+    // Expired / held lot stock in this warehouse — counted in the ledger but
+    // never usable, so not part of usableStock (what Production checks).
+    const unusable = await PurchaseLotsService.getUnusableLotQty(itemIds, warehouseId);
 
     const summary = await Promise.all(items.map(async item => {
       const itemMovements = movementsByItem.get(item.id) || [];
@@ -1398,6 +1469,12 @@ export class InventoryService {
         minimumStock: item.minimumStock,
         costPrice: item.costPrice || 0,
         availableStock,
+        // Stock that can actually be used: ledger stock minus expired and
+        // held (QC hold / blocked / returned) lot stock. Expiry date D means
+        // expired from D itself (see lot-eligibility.ts).
+        usableStock: ((u) => (u < 0.0005 ? 0 : u))(availableStock - (unusable.get(item.id)?.expired || 0) - (unusable.get(item.id)?.held || 0)),
+        expiredStock: unusable.get(item.id)?.expired || 0,
+        heldStock: unusable.get(item.id)?.held || 0,
         reservedStock,
         nearExpiryStock,
         damagedStock,

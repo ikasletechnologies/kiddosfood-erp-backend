@@ -59,3 +59,8 @@ export function businessDayRangeFilter(range: { from?: string; to?: string }): {
     ...(range.to ? { lt: new Date(start(range.to).getTime() + 86_400_000) } : {})
   };
 }
+
+/** Start of the current business-calendar day (00:00 in the business timezone) as an instant. */
+export function startOfBusinessDay(now: Date = new Date()): Date {
+  return new Date(businessDay(now).getTime() - offsetMs());
+}

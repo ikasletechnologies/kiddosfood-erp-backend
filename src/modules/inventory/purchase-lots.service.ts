@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import type { FifoConsumptionResult } from './inventory.service';
+import { expiryCutoff, isLotExpired, productionLotIssue } from './lot-eligibility';
 
 // Lots that still physically hold stock. REJECTED lots never entered usable
 // inventory, so they're left out of quantity/value everywhere here.
@@ -15,6 +16,10 @@ export interface LotSummary {
   activeLots: number;
   lotQty: number;
   lotValue: number;
+  /** Quantity in lots production can use now (approved, not expired) — same rule as Production Planning. */
+  usableQty: number;
+  /** Approved lot stock past its expiry date (expired ON the expiry date). */
+  expiredQty: number;
 }
 
 /**
@@ -28,11 +33,13 @@ export class PurchaseLotsService {
     const map = new Map<string, LotSummary>();
     if (itemIds.length === 0) return map;
 
-    const rows: Array<{ inventoryItemId: string; activeLots: number; lotQty: number; lotValue: number }> = await prisma.$queryRaw(Prisma.sql`
+    const rows: Array<{ inventoryItemId: string; activeLots: number; lotQty: number; lotValue: number; usableQty: number; expiredQty: number }> = await prisma.$queryRaw(Prisma.sql`
       SELECT "inventoryItemId",
              COUNT(*)::int                                   AS "activeLots",
              COALESCE(SUM("currentQty"), 0)::float8          AS "lotQty",
-             COALESCE(SUM("currentQty" * COALESCE("unitCost", 0)), 0)::float8 AS "lotValue"
+             COALESCE(SUM("currentQty" * COALESCE("unitCost", 0)), 0)::float8 AS "lotValue",
+             COALESCE(SUM(CASE WHEN status::text = 'APPROVED' AND ("expDate" IS NULL OR "expDate" >= ${expiryCutoff()}) THEN "currentQty" ELSE 0 END), 0)::float8 AS "usableQty",
+             COALESCE(SUM(CASE WHEN status::text = 'APPROVED' AND "expDate" < ${expiryCutoff()} THEN "currentQty" ELSE 0 END), 0)::float8 AS "expiredQty"
       FROM "InventoryBatch"
       WHERE "inventoryItemId" IN (${Prisma.join(itemIds)})
         AND "currentQty" > 0.0001
@@ -40,8 +47,34 @@ export class PurchaseLotsService {
       GROUP BY "inventoryItemId"
     `);
     for (const r of rows) {
-      map.set(r.inventoryItemId, { activeLots: r.activeLots, lotQty: r.lotQty, lotValue: r.lotValue });
+      map.set(r.inventoryItemId, { activeLots: r.activeLots, lotQty: r.lotQty, lotValue: r.lotValue, usableQty: r.usableQty, expiredQty: r.expiredQty });
     }
+    return map;
+  }
+
+  /**
+   * Lot stock that can't be used now, per item: `expired` (approved lots past
+   * expiry) and `held` (QC hold, blocked, returned, … — not approved). With a
+   * warehouse, only lots in it (or with no warehouse on record), matching how
+   * warehouse stock is counted. Stock records are untouched; this only tells
+   * screens what not to count as available.
+   */
+  static async getUnusableLotQty(itemIds: string[], warehouseId?: string): Promise<Map<string, { expired: number; held: number }>> {
+    const map = new Map<string, { expired: number; held: number }>();
+    if (itemIds.length === 0) return map;
+    const cutoff = expiryCutoff();
+    const rows: Array<{ inventoryItemId: string; expired: number; held: number }> = await prisma.$queryRaw(Prisma.sql`
+      SELECT "inventoryItemId",
+             COALESCE(SUM(CASE WHEN status::text = 'APPROVED' AND "expDate" < ${cutoff} THEN "currentQty" ELSE 0 END), 0)::float8 AS expired,
+             COALESCE(SUM(CASE WHEN status::text <> 'APPROVED' THEN "currentQty" ELSE 0 END), 0)::float8 AS held
+      FROM "InventoryBatch"
+      WHERE "inventoryItemId" IN (${Prisma.join(itemIds)})
+        AND "currentQty" > 0.0001
+        AND status::text NOT IN (${Prisma.join([...HELD_STATUSES_EXCLUDED])})
+        ${warehouseId ? Prisma.sql`AND ("warehouseId" = ${warehouseId} OR "warehouseId" IS NULL)` : Prisma.empty}
+      GROUP BY "inventoryItemId"
+    `);
+    for (const r of rows) map.set(r.inventoryItemId, { expired: r.expired, held: r.held });
     return map;
   }
 
@@ -63,6 +96,13 @@ export class PurchaseLotsService {
       activeLots: lots?.activeLots || 0,
       lotQty: round(lotQty, 4),
       lotValue: round(lotValue, 2),
+      // Lot stock production can use now; the rest (expired / held) is shown
+      // in stock but flagged, never offered as usable for production.
+      usableLotQty: round(lots?.usableQty || 0, 4),
+      expiredQty: round(lots?.expiredQty || 0, 4),
+      // Stock Hub's available figure: ledger stock minus lot stock that can't
+      // be used (expired or held). Nothing is written; the ledger is unchanged.
+      usableStock: ((u) => (u < 0.0005 ? 0 : round(u, 4)))(ledgerStock - Math.max(0, lotQty - (lots?.usableQty || 0))),
       untrackedQty: round(untrackedQty, 4),
       untrackedValue: round(untrackedValue, 2),
       totalValue: round(totalValue, 2),
@@ -92,11 +132,14 @@ export class PurchaseLotsService {
       this.getPendingReturnClaims(prisma, { inventoryItemId: itemId }),
     ]);
 
+    const now = new Date();
     return {
       item,
       lots: lots.map((lot) => {
         const unitCost = lot.unitCost || 0;
         const pending = pendingClaims.get(lot.id) || 0;
+        // Same eligibility Production Planning applies (any warehouse).
+        const issue = lot.currentQty > 0 ? productionLotIssue(lot, { now }) : null;
         return {
           id: lot.id,
           lotNumber: lot.lotNumber || lot.batchNumber,
@@ -122,6 +165,9 @@ export class PurchaseLotsService {
           expDate: lot.expDate,
           status: lot.status,
           warehouse: lot.warehouse,
+          expired: isLotExpired(lot.expDate, now),
+          productionUsable: lot.currentQty > 0 && !issue,
+          productionIssue: issue?.message || null,
         };
       }),
     };

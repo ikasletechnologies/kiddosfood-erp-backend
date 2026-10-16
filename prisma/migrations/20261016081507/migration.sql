@@ -166,6 +166,12 @@ CREATE TYPE "AlertSeverity" AS ENUM ('CRITICAL', 'WARNING', 'INFO');
 -- CreateEnum
 CREATE TYPE "AlertStatus" AS ENUM ('ACTIVE', 'RESOLVED');
 
+-- CreateEnum
+CREATE TYPE "ChatConversationType" AS ENUM ('FRANCHISE_SUPPORT');
+
+-- CreateEnum
+CREATE TYPE "ChatMessageType" AS ENUM ('TEXT');
+
 -- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
@@ -315,6 +321,9 @@ CREATE TABLE "Franchise" (
     "outstandingAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "walletBalance" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "primaryWarehouseId" TEXT,
+    "aadhaarEncrypted" TEXT,
+    "aadhaarLast4" TEXT,
+    "panNumber" TEXT,
 
     CONSTRAINT "Franchise_pkey" PRIMARY KEY ("id")
 );
@@ -628,6 +637,7 @@ CREATE TABLE "Product" (
     "sku" TEXT,
     "description" TEXT,
     "basePrice" DOUBLE PRECISION NOT NULL,
+    "pricingStatus" TEXT NOT NULL DEFAULT 'PRICED',
     "category" TEXT,
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 5,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
@@ -657,10 +667,82 @@ CREATE TABLE "Recipe" (
     "yieldUnit" TEXT NOT NULL DEFAULT 'KG',
     "instructions" TEXT,
     "estimatedDurationMinutes" INTEGER,
+    "expenseConfig" JSONB,
+    "expenseConfigVersion" INTEGER NOT NULL DEFAULT 0,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "Recipe_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "RecipeIngredient" (
+    "id" TEXT NOT NULL,
+    "recipeId" TEXT NOT NULL,
+    "inventoryItemId" TEXT NOT NULL,
+    "sortOrder" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "RecipeIngredient_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "RecipeFormulation" (
+    "id" TEXT NOT NULL,
+    "recipeId" TEXT NOT NULL,
+    "version" INTEGER NOT NULL,
+    "yieldQty" DOUBLE PRECISION NOT NULL,
+    "yieldUnit" TEXT NOT NULL,
+    "notes" TEXT,
+    "source" TEXT NOT NULL DEFAULT 'PLANNING',
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "outputStage" TEXT,
+    "outputStages" JSONB,
+    "sourceReference" JSONB,
+    "unresolvedItems" JSONB,
+
+    CONSTRAINT "RecipeFormulation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "RecipeProduct" (
+    "id" TEXT NOT NULL,
+    "recipeId" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "RecipeProduct_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "RecipeImportSession" (
+    "id" TEXT NOT NULL,
+    "fileName" TEXT NOT NULL,
+    "fileHash" TEXT NOT NULL,
+    "parsed" JSONB NOT NULL,
+    "status" JSONB NOT NULL,
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "RecipeImportSession_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "RecipeFormulationItem" (
+    "id" TEXT NOT NULL,
+    "formulationId" TEXT NOT NULL,
+    "inventoryItemId" TEXT NOT NULL,
+    "quantity" DOUBLE PRECISION NOT NULL,
+    "unit" TEXT NOT NULL,
+    "sortOrder" INTEGER NOT NULL DEFAULT 0,
+    "sourceName" TEXT,
+    "sourceText" TEXT,
+
+    CONSTRAINT "RecipeFormulationItem_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -709,6 +791,11 @@ CREATE TABLE "Production" (
     "overheadCost" DOUBLE PRECISION DEFAULT 0,
     "totalCost" DOUBLE PRECISION,
     "warehouseId" TEXT,
+    "formulationId" TEXT,
+    "plannedYieldQty" DOUBLE PRECISION,
+    "plannedYieldUnit" TEXT,
+    "formulationSnapshot" JSONB,
+    "expenseSnapshot" JSONB,
 
     CONSTRAINT "Production_pkey" PRIMARY KEY ("id")
 );
@@ -820,8 +907,27 @@ CREATE TABLE "ProductPackaging" (
     "confirmedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "bulkBreakdown" JSONB,
+    "costBreakdown" JSONB,
 
     CONSTRAINT "ProductPackaging_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProductionExpense" (
+    "id" TEXT NOT NULL,
+    "productBatchId" TEXT NOT NULL,
+    "productPackagingId" TEXT,
+    "category" TEXT NOT NULL,
+    "basis" TEXT NOT NULL,
+    "stage" TEXT NOT NULL DEFAULT 'PACKAGING',
+    "rate" DOUBLE PRECISION NOT NULL,
+    "baseQty" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "amount" DOUBLE PRECISION NOT NULL,
+    "createdBy" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "ProductionExpense_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -873,6 +979,8 @@ CREATE TABLE "ProductionItem" (
     "unitCost" DOUBLE PRECISION,
     "totalCost" DOUBLE PRECISION,
     "batchBreakdown" JSONB,
+    "isAdditional" BOOLEAN NOT NULL DEFAULT false,
+    "note" TEXT,
 
     CONSTRAINT "ProductionItem_pkey" PRIMARY KEY ("id")
 );
@@ -967,6 +1075,8 @@ CREATE TABLE "OrderItem" (
     "batchNumber" TEXT,
     "unitCost" DOUBLE PRECISION,
     "totalCost" DOUBLE PRECISION,
+    "inventoryBatchId" TEXT,
+    "lotNumber" TEXT,
 
     CONSTRAINT "OrderItem_pkey" PRIMARY KEY ("id")
 );
@@ -1391,6 +1501,9 @@ CREATE TABLE "QuotationItem" (
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "inventoryBatchId" TEXT,
+    "lotNumber" TEXT,
+    "lotUnitCost" DOUBLE PRECISION,
 
     CONSTRAINT "QuotationItem_pkey" PRIMARY KEY ("id")
 );
@@ -1425,6 +1538,11 @@ CREATE TABLE "SalesOrder" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "paymentStatus" TEXT NOT NULL DEFAULT 'UNPAID',
+    "estimatedCostOfGoods" DOUBLE PRECISION,
+    "estimatedGrossProfit" DOUBLE PRECISION,
+    "estimatedMarginPct" DOUBLE PRECISION,
+    "costUnavailableLines" INTEGER,
+    "costEstimatedAt" TIMESTAMP(3),
 
     CONSTRAINT "SalesOrder_pkey" PRIMARY KEY ("id")
 );
@@ -1443,6 +1561,12 @@ CREATE TABLE "SalesOrderItem" (
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "estimatedUnitCost" DOUBLE PRECISION,
+    "estimatedCostOfGoods" DOUBLE PRECISION,
+    "estimatedProfit" DOUBLE PRECISION,
+    "inventoryBatchId" TEXT,
+    "lotNumber" TEXT,
+    "lotUnitCost" DOUBLE PRECISION,
 
     CONSTRAINT "SalesOrderItem_pkey" PRIMARY KEY ("id")
 );
@@ -1487,6 +1611,9 @@ CREATE TABLE "ProformaInvoiceItem" (
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "inventoryBatchId" TEXT,
+    "lotNumber" TEXT,
+    "lotUnitCost" DOUBLE PRECISION,
 
     CONSTRAINT "ProformaInvoiceItem_pkey" PRIMARY KEY ("id")
 );
@@ -1589,6 +1716,9 @@ CREATE TABLE "DeliveryChallanItem" (
     "taxPercent" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "taxAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "totalAmount" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "inventoryBatchId" TEXT,
+    "lotNumber" TEXT,
+    "lotUnitCost" DOUBLE PRECISION,
 
     CONSTRAINT "DeliveryChallanItem_pkey" PRIMARY KEY ("id")
 );
@@ -1658,6 +1788,10 @@ CREATE TABLE "PurchaseReturnItem" (
     "unit" TEXT NOT NULL,
     "rate" DOUBLE PRECISION NOT NULL,
     "totalAmount" DOUBLE PRECISION NOT NULL,
+    "materialId" TEXT,
+    "inventoryBatchId" TEXT,
+    "baseQty" DOUBLE PRECISION,
+    "unitCost" DOUBLE PRECISION,
 
     CONSTRAINT "PurchaseReturnItem_pkey" PRIMARY KEY ("id")
 );
@@ -1818,8 +1952,38 @@ CREATE TABLE "InventoryBatch" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "status" "InventoryStockState" NOT NULL DEFAULT 'QC_HOLD',
+    "goodsReceiptItemId" TEXT,
+    "procurementOrderId" TEXT,
+    "vendorId" TEXT,
+    "receivedAt" TIMESTAMP(3),
+    "purchaseQty" DOUBLE PRECISION,
+    "purchaseUnit" TEXT,
+    "purchasePrice" DOUBLE PRECISION,
+    "productPackagingId" TEXT,
+    "sellingPrice" DOUBLE PRECISION,
+    "priceTaxInclusive" BOOLEAN NOT NULL DEFAULT false,
+    "pricingStatus" TEXT,
+    "pricedAt" TIMESTAMP(3),
+    "pricedBy" TEXT,
 
     CONSTRAINT "InventoryBatch_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "FinishedGoodsLotPriceHistory" (
+    "id" TEXT NOT NULL,
+    "inventoryBatchId" TEXT NOT NULL,
+    "previousPrice" DOUBLE PRECISION,
+    "previousTaxInclusive" BOOLEAN,
+    "newPrice" DOUBLE PRECISION NOT NULL,
+    "taxInclusive" BOOLEAN NOT NULL DEFAULT false,
+    "unitCostAtChange" DOUBLE PRECISION,
+    "belowCost" BOOLEAN NOT NULL DEFAULT false,
+    "reason" TEXT,
+    "changedBy" TEXT,
+    "effectiveAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "FinishedGoodsLotPriceHistory_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -2125,6 +2289,46 @@ CREATE TABLE "Attachment" (
     CONSTRAINT "Attachment_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "ChatConversation" (
+    "id" TEXT NOT NULL,
+    "franchiseId" TEXT NOT NULL,
+    "type" "ChatConversationType" NOT NULL DEFAULT 'FRANCHISE_SUPPORT',
+    "lastMessageAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "ChatConversation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ChatMessage" (
+    "id" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "senderUserId" TEXT,
+    "senderRole" "UserRole" NOT NULL,
+    "messageType" "ChatMessageType" NOT NULL DEFAULT 'TEXT',
+    "content" TEXT NOT NULL,
+    "clientMessageId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "editedAt" TIMESTAMP(3),
+    "deletedAt" TIMESTAMP(3),
+
+    CONSTRAINT "ChatMessage_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ChatReadState" (
+    "id" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "lastReadAt" TIMESTAMP(3) NOT NULL,
+    "lastReadMessageId" TEXT,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "ChatReadState_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
@@ -2201,6 +2405,27 @@ CREATE UNIQUE INDEX "Recipe_productId_key" ON "Recipe"("productId");
 CREATE UNIQUE INDEX "Recipe_recipeCode_key" ON "Recipe"("recipeCode");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "RecipeIngredient_recipeId_inventoryItemId_key" ON "RecipeIngredient"("recipeId", "inventoryItemId");
+
+-- CreateIndex
+CREATE INDEX "RecipeFormulation_recipeId_isActive_idx" ON "RecipeFormulation"("recipeId", "isActive");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "RecipeFormulation_recipeId_version_key" ON "RecipeFormulation"("recipeId", "version");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "RecipeProduct_productId_key" ON "RecipeProduct"("productId");
+
+-- CreateIndex
+CREATE INDEX "RecipeProduct_recipeId_idx" ON "RecipeProduct"("recipeId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "RecipeImportSession_fileHash_key" ON "RecipeImportSession"("fileHash");
+
+-- CreateIndex
+CREATE INDEX "RecipeFormulationItem_formulationId_idx" ON "RecipeFormulationItem"("formulationId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "RecipeCategory_name_key" ON "RecipeCategory"("name");
 
 -- CreateIndex
@@ -2223,6 +2448,12 @@ CREATE UNIQUE INDEX "Carton_cartonCode_key" ON "Carton"("cartonCode");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ProductPackaging_barcode_key" ON "ProductPackaging"("barcode");
+
+-- CreateIndex
+CREATE INDEX "ProductionExpense_productBatchId_idx" ON "ProductionExpense"("productBatchId");
+
+-- CreateIndex
+CREATE INDEX "ProductionExpense_productPackagingId_idx" ON "ProductionExpense"("productPackagingId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "FranchiseOrder_orderNumber_key" ON "FranchiseOrder"("orderNumber");
@@ -2259,6 +2490,9 @@ CREATE INDEX "Order_customerId_paymentStatus_idx" ON "Order"("customerId", "paym
 
 -- CreateIndex
 CREATE INDEX "Order_franchiseId_paymentStatus_idx" ON "Order"("franchiseId", "paymentStatus");
+
+-- CreateIndex
+CREATE INDEX "OrderItem_inventoryBatchId_idx" ON "OrderItem"("inventoryBatchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Payment_paymentNumber_key" ON "Payment"("paymentNumber");
@@ -2315,6 +2549,9 @@ CREATE UNIQUE INDEX "LeaveBalance_employeeId_leaveTypeId_year_key" ON "LeaveBala
 CREATE UNIQUE INDEX "Quotation_quotationNumber_key" ON "Quotation"("quotationNumber");
 
 -- CreateIndex
+CREATE INDEX "QuotationItem_inventoryBatchId_idx" ON "QuotationItem"("inventoryBatchId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "SalesOrder_orderNumber_key" ON "SalesOrder"("orderNumber");
 
 -- CreateIndex
@@ -2327,6 +2564,9 @@ CREATE UNIQUE INDEX "SalesOrder_proformaInvoiceId_key" ON "SalesOrder"("proforma
 CREATE UNIQUE INDEX "SalesOrder_idempotencyKey_key" ON "SalesOrder"("idempotencyKey");
 
 -- CreateIndex
+CREATE INDEX "SalesOrderItem_inventoryBatchId_idx" ON "SalesOrderItem"("inventoryBatchId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "ProformaInvoice_proformaNumber_key" ON "ProformaInvoice"("proformaNumber");
 
 -- CreateIndex
@@ -2334,6 +2574,9 @@ CREATE UNIQUE INDEX "ProformaInvoice_sourceSalesOrderId_key" ON "ProformaInvoice
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ProformaInvoice_convertedInvoiceId_key" ON "ProformaInvoice"("convertedInvoiceId");
+
+-- CreateIndex
+CREATE INDEX "ProformaInvoiceItem_inventoryBatchId_idx" ON "ProformaInvoiceItem"("inventoryBatchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ReturnOrder_returnNumber_key" ON "ReturnOrder"("returnNumber");
@@ -2357,6 +2600,9 @@ CREATE UNIQUE INDEX "DeliveryChallan_challanNumber_key" ON "DeliveryChallan"("ch
 CREATE UNIQUE INDEX "DeliveryChallan_idempotencyKey_key" ON "DeliveryChallan"("idempotencyKey");
 
 -- CreateIndex
+CREATE INDEX "DeliveryChallanItem_inventoryBatchId_idx" ON "DeliveryChallanItem"("inventoryBatchId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "DeliveryChallanReturn_returnNumber_key" ON "DeliveryChallanReturn"("returnNumber");
 
 -- CreateIndex
@@ -2369,6 +2615,9 @@ CREATE INDEX "DeliveryChallanReturnItem_recallId_idx" ON "DeliveryChallanReturnI
 CREATE UNIQUE INDEX "PurchaseReturn_returnNumber_key" ON "PurchaseReturn"("returnNumber");
 
 -- CreateIndex
+CREATE INDEX "PurchaseReturnItem_inventoryBatchId_idx" ON "PurchaseReturnItem"("inventoryBatchId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "PurchaseRequest_prNumber_key" ON "PurchaseRequest"("prNumber");
 
 -- CreateIndex
@@ -2378,10 +2627,25 @@ CREATE UNIQUE INDEX "RequestForQuotation_rfqNumber_key" ON "RequestForQuotation"
 CREATE UNIQUE INDEX "Warehouse_nameKey_key" ON "Warehouse"("nameKey");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "InventoryBatch_goodsReceiptItemId_key" ON "InventoryBatch"("goodsReceiptItemId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "InventoryBatch_productPackagingId_key" ON "InventoryBatch"("productPackagingId");
+
+-- CreateIndex
 CREATE INDEX "InventoryBatch_productBatchId_idx" ON "InventoryBatch"("productBatchId");
 
 -- CreateIndex
 CREATE INDEX "InventoryBatch_inventoryItemId_status_idx" ON "InventoryBatch"("inventoryItemId", "status");
+
+-- CreateIndex
+CREATE INDEX "InventoryBatch_vendorId_idx" ON "InventoryBatch"("vendorId");
+
+-- CreateIndex
+CREATE INDEX "InventoryBatch_procurementOrderId_idx" ON "InventoryBatch"("procurementOrderId");
+
+-- CreateIndex
+CREATE INDEX "FinishedGoodsLotPriceHistory_inventoryBatchId_effectiveAt_idx" ON "FinishedGoodsLotPriceHistory"("inventoryBatchId", "effectiveAt");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "InspectionRecord_grnItemId_key" ON "InspectionRecord"("grnItemId");
@@ -2442,6 +2706,24 @@ CREATE INDEX "EWayBillVehicleUpdate_ewayBillId_idx" ON "EWayBillVehicleUpdate"("
 
 -- CreateIndex
 CREATE INDEX "Attachment_entityType_entityId_idx" ON "Attachment"("entityType", "entityId");
+
+-- CreateIndex
+CREATE INDEX "ChatConversation_lastMessageAt_idx" ON "ChatConversation"("lastMessageAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ChatConversation_franchiseId_type_key" ON "ChatConversation"("franchiseId", "type");
+
+-- CreateIndex
+CREATE INDEX "ChatMessage_conversationId_createdAt_idx" ON "ChatMessage"("conversationId", "createdAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ChatMessage_senderUserId_clientMessageId_key" ON "ChatMessage"("senderUserId", "clientMessageId");
+
+-- CreateIndex
+CREATE INDEX "ChatReadState_userId_idx" ON "ChatReadState"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ChatReadState_conversationId_userId_key" ON "ChatReadState"("conversationId", "userId");
 
 -- AddForeignKey
 ALTER TABLE "User" ADD CONSTRAINT "User_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2576,10 +2858,34 @@ ALTER TABLE "VendorInvoice" ADD CONSTRAINT "VendorInvoice_warehouseId_fkey" FORE
 ALTER TABLE "Recipe" ADD CONSTRAINT "Recipe_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "RecipeIngredient" ADD CONSTRAINT "RecipeIngredient_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeIngredient" ADD CONSTRAINT "RecipeIngredient_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeFormulation" ADD CONSTRAINT "RecipeFormulation_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeProduct" ADD CONSTRAINT "RecipeProduct_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeProduct" ADD CONSTRAINT "RecipeProduct_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeFormulationItem" ADD CONSTRAINT "RecipeFormulationItem_formulationId_fkey" FOREIGN KEY ("formulationId") REFERENCES "RecipeFormulation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RecipeFormulationItem" ADD CONSTRAINT "RecipeFormulationItem_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "RecipeItem" ADD CONSTRAINT "RecipeItem_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "RecipeItem" ADD CONSTRAINT "RecipeItem_recipeId_fkey" FOREIGN KEY ("recipeId") REFERENCES "Recipe"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Production" ADD CONSTRAINT "Production_formulationId_fkey" FOREIGN KEY ("formulationId") REFERENCES "RecipeFormulation"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Production" ADD CONSTRAINT "Production_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2622,6 +2928,12 @@ ALTER TABLE "Carton" ADD CONSTRAINT "Carton_franchiseId_fkey" FOREIGN KEY ("fran
 
 -- AddForeignKey
 ALTER TABLE "ProductPackaging" ADD CONSTRAINT "ProductPackaging_batchId_fkey" FOREIGN KEY ("batchId") REFERENCES "ProductBatch"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductionExpense" ADD CONSTRAINT "ProductionExpense_productBatchId_fkey" FOREIGN KEY ("productBatchId") REFERENCES "ProductBatch"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductionExpense" ADD CONSTRAINT "ProductionExpense_productPackagingId_fkey" FOREIGN KEY ("productPackagingId") REFERENCES "ProductPackaging"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "FranchiseOrder" ADD CONSTRAINT "FranchiseOrder_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -2828,6 +3140,9 @@ ALTER TABLE "PurchaseReturn" ADD CONSTRAINT "PurchaseReturn_vendorId_fkey" FOREI
 ALTER TABLE "PurchaseReturnItem" ADD CONSTRAINT "PurchaseReturnItem_returnId_fkey" FOREIGN KEY ("returnId") REFERENCES "PurchaseReturn"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "PurchaseReturnItem" ADD CONSTRAINT "PurchaseReturnItem_inventoryBatchId_fkey" FOREIGN KEY ("inventoryBatchId") REFERENCES "InventoryBatch"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "ActivityLog" ADD CONSTRAINT "ActivityLog_targetFranchiseId_fkey" FOREIGN KEY ("targetFranchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -2870,6 +3185,21 @@ ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_productBatchId_fkey"
 ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "Warehouse"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_goodsReceiptItemId_fkey" FOREIGN KEY ("goodsReceiptItemId") REFERENCES "GoodsReceiptItem"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_procurementOrderId_fkey" FOREIGN KEY ("procurementOrderId") REFERENCES "ProcurementOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_vendorId_fkey" FOREIGN KEY ("vendorId") REFERENCES "Vendor"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "InventoryBatch" ADD CONSTRAINT "InventoryBatch_productPackagingId_fkey" FOREIGN KEY ("productPackagingId") REFERENCES "ProductPackaging"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "FinishedGoodsLotPriceHistory" ADD CONSTRAINT "FinishedGoodsLotPriceHistory_inventoryBatchId_fkey" FOREIGN KEY ("inventoryBatchId") REFERENCES "InventoryBatch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "InspectionRecord" ADD CONSTRAINT "InspectionRecord_grnItemId_fkey" FOREIGN KEY ("grnItemId") REFERENCES "GoodsReceiptItem"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -2904,3 +3234,18 @@ ALTER TABLE "EWayBillItem" ADD CONSTRAINT "EWayBillItem_ewayBillId_fkey" FOREIGN
 
 -- AddForeignKey
 ALTER TABLE "EWayBillVehicleUpdate" ADD CONSTRAINT "EWayBillVehicleUpdate_ewayBillId_fkey" FOREIGN KEY ("ewayBillId") REFERENCES "EWayBill"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ChatConversation" ADD CONSTRAINT "ChatConversation_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ChatMessage" ADD CONSTRAINT "ChatMessage_conversationId_fkey" FOREIGN KEY ("conversationId") REFERENCES "ChatConversation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ChatMessage" ADD CONSTRAINT "ChatMessage_senderUserId_fkey" FOREIGN KEY ("senderUserId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ChatReadState" ADD CONSTRAINT "ChatReadState_conversationId_fkey" FOREIGN KEY ("conversationId") REFERENCES "ChatConversation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ChatReadState" ADD CONSTRAINT "ChatReadState_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;

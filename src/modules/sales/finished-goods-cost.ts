@@ -1,5 +1,6 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { expiryCutoff } from '../inventory/lot-eligibility';
 
 /**
  * Estimated cost of issuing finished goods, under the EXISTING issue policy
@@ -49,7 +50,7 @@ export async function estimateIssueCost(
         inventoryItemId: item.id,
         currentQty: { gt: 0 },
         status: 'APPROVED',
-        OR: [{ expDate: null }, { expDate: { gte: new Date() } }],
+        OR: [{ expDate: null }, { expDate: { gte: expiryCutoff() } }],
         ...(params.warehouseId ? { AND: [{ OR: [{ warehouseId: params.warehouseId }, { warehouseId: null }] }] } : {}),
       },
       orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }],

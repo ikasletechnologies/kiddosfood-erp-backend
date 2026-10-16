@@ -901,6 +901,8 @@ model ProductPackaging {
   batch           ProductBatch       @relation(fields: [batchId], references: [id], onDelete: Cascade)
   wasteEntries    WasteEntry[]
   expenses        ProductionExpense[]
+  // The finished-goods stock lot this confirmed run created (Set Price).
+  finishedGoodsLot InventoryBatch?
 }
 
 // Additional production expenses charged to finished goods at packaging.
@@ -1089,8 +1091,14 @@ model OrderItem {
   batchNumber String?
   unitCost    Float?
   totalCost   Float?
+  // Finished-goods lot this line was sold from (Set Price lot); batchNumber
+  // above keeps the lot's batch code. Null = standard FIFO / master price.
+  inventoryBatchId String?
+  lotNumber        String?
   order       Order   @relation(fields: [orderId], references: [id])
   product     Product @relation(fields: [productId], references: [id])
+
+  @@index([inventoryBatchId])
 }
 
 model Payment {
@@ -1510,6 +1518,14 @@ model QuotationItem {
   taxAmount       Float     @default(0)
   totalAmount     Float
   quotation       Quotation @relation(fields: [quotationId], references: [id])
+  // Finished-goods lot this line sells from (Set Price lot), with the lot
+  // number and production cost per line unit snapshotted when the line was
+  // priced. Null on lines that use the standard FIFO / master-price flow.
+  inventoryBatchId String?
+  lotNumber        String?
+  lotUnitCost      Float?
+
+  @@index([inventoryBatchId])
 }
 
 model SalesOrder {
@@ -1571,6 +1587,14 @@ model SalesOrderItem {
   estimatedCostOfGoods Float?
   estimatedProfit      Float?
   salesOrder      SalesOrder @relation(fields: [salesOrderId], references: [id])
+  // Finished-goods lot this line sells from (Set Price lot), with the lot
+  // number and production cost per line unit snapshotted when the line was
+  // priced. Null on lines that use the standard FIFO / master-price flow.
+  inventoryBatchId String?
+  lotNumber        String?
+  lotUnitCost      Float?
+
+  @@index([inventoryBatchId])
 }
 
 model ProformaInvoice {
@@ -1612,6 +1636,14 @@ model ProformaInvoiceItem {
   taxAmount         Float           @default(0)
   totalAmount       Float
   proformaInvoice   ProformaInvoice @relation(fields: [proformaInvoiceId], references: [id])
+  // Finished-goods lot this line sells from (Set Price lot), with the lot
+  // number and production cost per line unit snapshotted when the line was
+  // priced. Null on lines that use the standard FIFO / master-price flow.
+  inventoryBatchId String?
+  lotNumber        String?
+  lotUnitCost      Float?
+
+  @@index([inventoryBatchId])
 }
 
 model ReturnOrder {
@@ -1769,6 +1801,14 @@ model DeliveryChallanItem {
   totalAmount Float                       @default(0)
   challan     DeliveryChallan             @relation(fields: [challanId], references: [id])
   returns     DeliveryChallanReturnItem[]
+  // Finished-goods lot this line sells from (Set Price lot), with the lot
+  // number and production cost per line unit snapshotted when the line was
+  // priced. Null on lines that use the standard FIFO / master-price flow.
+  inventoryBatchId String?
+  lotNumber        String?
+  lotUnitCost      Float?
+
+  @@index([inventoryBatchId])
 }
 
 model DeliveryChallanReturn {
@@ -2048,6 +2088,21 @@ model InventoryBatch {
   stockMovements                  StockMovement[]
   inventoryReservationAllocations InventoryReservationAllocation[]
   purchaseReturnItems             PurchaseReturnItem[]
+  // Finished-goods lot pricing (Sale > Set Price). Only finished-goods lots
+  // carry these; raw-material / bulk lots leave them null. One packaging run
+  // (ProductPackaging) creates at most one lot — the unique key is the
+  // DB-level guard against a run being stocked twice. sellingPrice is the
+  // lot's own selling price per stock unit (packet); unitCost above stays the
+  // production cost and is never changed by pricing. pricingStatus:
+  // "PRICING_PENDING" until a price is set, then "PRICED".
+  productPackagingId              String?                          @unique
+  sellingPrice                    Float?
+  priceTaxInclusive               Boolean                          @default(false)
+  pricingStatus                   String?
+  pricedAt                        DateTime?
+  pricedBy                        String?
+  productPackaging                ProductPackaging?                @relation(fields: [productPackagingId], references: [id])
+  priceHistory                    FinishedGoodsLotPriceHistory[]
 
   // Every recall query (getBatchQuantities, locateDistribution,
   // findCrossBatchAffectedIds' block/unblock updates) filters by
@@ -2058,6 +2113,27 @@ model InventoryBatch {
   @@index([inventoryItemId, status])
   @@index([vendorId])
   @@index([procurementOrderId])
+}
+
+// Audit trail of every Set Price change on a finished-goods lot. Rows are
+// only ever inserted. Finalized invoices keep their own price snapshot, so a
+// later change here never alters them.
+model FinishedGoodsLotPriceHistory {
+  id                   String         @id @default(uuid())
+  inventoryBatchId     String
+  previousPrice        Float?
+  previousTaxInclusive Boolean?
+  newPrice             Float
+  taxInclusive         Boolean        @default(false)
+  // Production cost per packet when the price was set (read-only snapshot).
+  unitCostAtChange     Float?
+  belowCost            Boolean        @default(false)
+  reason               String?
+  changedBy            String?
+  effectiveAt          DateTime       @default(now())
+  inventoryBatch       InventoryBatch @relation(fields: [inventoryBatchId], references: [id])
+
+  @@index([inventoryBatchId, effectiveAt])
 }
 
 model NumberSequence {

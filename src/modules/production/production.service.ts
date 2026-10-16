@@ -9,6 +9,7 @@ import { ProductionFlags, QC_NOT_REQUIRED, PACKAGEABLE_QC_STATUSES } from './pro
 import { ProductionCostingService, LotAllocationInput } from './production-costing.service';
 import { PRICED, PRICING_PENDING } from '../../utils/selling-price.util';
 import { roundRequirement } from './requirement-rounding';
+import { LOT_PRICING_PENDING } from '../sales/lot-pricing';
 import {
   computePackagingCosts, normalizeExpenseLines, ExpenseLineInput, r4,
   buildExpenseSnapshot, computeManufacturingExpenses, packagingPerBatchTotals, snapshotExpenses, snapshotPackagingLines, weightForPerKg,
@@ -1496,6 +1497,9 @@ export class ProductionService {
     // Only the GOOD quantity ever becomes sellable Finished Goods.
     // Credited at effectiveRetailUnitCost so good packets absorb packaging rejection.
     if (good > 0) {
+      // Each confirmed run is its own finished-goods lot (Set Price prices it
+      // independently): <batch code>-L<n>, n counting this batch's runs.
+      const priorRunLots = await tx.inventoryBatch.count({ where: { productBatchId: batch.id, productPackagingId: { not: null } } });
       await InventoryService.recordMovement(tx, {
         itemId: retailItem.id,
         type: 'PRODUCTION_IN',
@@ -1508,9 +1512,12 @@ export class ProductionService {
         receiveAtCost: {
           unitCost: effectiveRetailUnitCost,
           batchNumber: batch.batchCode || undefined,
+          lotNumber: `${batch.batchCode || 'FG'}-L${priorRunLots + 1}`,
           mfgDate: batch.mfgDate,
           expDate: batch.expiryDate,
           productBatchId: batch.id,
+          productPackagingId: packaging.id,
+          pricingStatus: LOT_PRICING_PENDING,
         },
       });
     }

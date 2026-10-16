@@ -2,6 +2,7 @@ import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
 import { FranchiseService } from '../franchise/franchise.service';
 import { PRICED, resolveSellingPrices } from '../../utils/selling-price.util';
+import { LotPricingService } from '../sales/lot-pricing.service';
 
 // Thrown when a Product.sku collides with an existing row — distinguished
 // from other failures so callers (single create + bulk import) can report a
@@ -169,6 +170,8 @@ export class ProductService {
         include: { baseUnit: true, conversions: { include: { unit: true } } }
       });
       console.log(`📦 [ProductAPI] Found ${inventory.length} matching inventory items for stock display`);
+      // Set Price lot prices for each stock item (shown where the master price is empty).
+      const lotPricing = await LotPricingService.lotPriceSummaries(inventory.map(i => i.id));
       
       return products.map(p => {
         const pName = p.name.trim().toLowerCase();
@@ -251,7 +254,10 @@ export class ProductService {
           // to — what Stock Hub displays. Lets POS show the real SKU for a
           // legacy product whose own Product.sku is empty (matched by name).
           // Product.sku itself is left untouched (edit forms save it back).
-          inventorySku: inv.sku || null
+          inventorySku: inv.sku || null,
+          // Sellable Set Price lots of this item: count, price range (excl.
+          // GST, per unit) and lots awaiting a price. Null = no lot stock.
+          lotPricing: lotPricing.get(inv.id) || null
         };
       }).filter(Boolean) as any[];
     }
@@ -269,9 +275,10 @@ export class ProductService {
     const inventory = inventoryWhere.length > 0
       ? await prisma.inventoryItem.findMany({
           where: { OR: inventoryWhere },
-          select: { sku: true, name: true, costPrice: true, basePrice: true, customerPrice: true, unit: true, franchiseId: true }
+          select: { id: true, sku: true, name: true, costPrice: true, basePrice: true, customerPrice: true, unit: true, franchiseId: true }
         })
       : [];
+    const lotPricingAll = await LotPricingService.lotPriceSummaries(inventory.map(i => i.id));
 
     return products.map(p => {
       const pName = p.name.trim().toLowerCase();
@@ -292,7 +299,15 @@ export class ProductService {
         purchaseRate: inv?.costPrice ?? 0,
         saleRate: p.basePrice,
         gstRate: p.taxPercent,
-        packSize
+        packSize,
+        // Set Price lots of the HQ stock item (Sales documents sell HQ stock).
+        lotPricing: (() => {
+          const hqInv = p.sku
+            ? inventory.find(i => i.franchiseId === null && i.sku && i.sku.trim().toUpperCase() === p.sku!.trim().toUpperCase())
+            : undefined;
+          const lotInv = hqInv || inv;
+          return lotInv ? lotPricingAll.get(lotInv.id) || null : null;
+        })()
       };
     });
   }

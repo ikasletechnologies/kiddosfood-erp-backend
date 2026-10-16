@@ -5,6 +5,7 @@ import { FranchiseService } from '../franchise/franchise.service';
 import { businessDayRangeFilter, resolveDatePreset } from '../../utils/business-date.util';
 import { SalesProfitabilityService } from './sales-profitability.service';
 import { assertBillablePrice } from '../../utils/selling-price.util';
+import { LotPricingService } from './lot-pricing.service';
 
 // Atomic, collision-safe document numbering. A raw `.count()`-based scheme
 // (the old approach here) lets two concurrent requests read the same N
@@ -230,15 +231,31 @@ export async function applyAuthoritativePricing<T extends {
   // Customer Retail Discount must not be invented there. Every other
   // document (Estimate, Proforma, Sales Order) supports discounts and
   // defaults to applying it.
-  applyDiscount: boolean = true
-): Promise<T[]> {
-  return Promise.all(items.map(async (item) => {
+  applyDiscount: boolean = true,
+  // Lines naming a finished-goods lot (inventoryBatchId) are priced from
+  // that lot's Set Price instead of the master price. checkStock: the
+  // document commits stock (Sales Order), so each lot must cover its lines.
+  // referenceOnly: the lot is kept for traceability but does not price the
+  // line (Delivery Challan — a goods movement document).
+  lotOptions: { checkStock?: boolean; referenceOnly?: boolean } = {}
+): Promise<Array<T & LotLineFields>> {
+  const lotPriced = await LotPricingService.applyLotPricing(tx, items as Array<T & LotLineFields>, {
+    franchiseId: scopeFranchiseId,
+    checkStock: lotOptions.checkStock,
+    referenceOnly: lotOptions.referenceOnly,
+  });
+  return Promise.all(lotPriced.map(async (item) => {
     const resolved = await resolveItemChannelPricing(tx, item.productId, item.productName, scopeFranchiseId, partyType);
     if (!resolved) return item;
+    // A lot line keeps the lot's price (set in Set Price); the master price
+    // and its Pricing Pending guard apply to every other line.
+    const isLotLine = !!item.inventoryBatchId && !lotOptions.referenceOnly;
+    const rate = isLotLine ? item.rate : resolved.rate;
+    const taxPercent = isLotLine ? (item.taxPercent ?? resolved.taxPercent) : resolved.taxPercent;
     // Priced documents never bill a Pricing Pending product at ₹0 (a
     // Delivery Challan — applyDiscount=false — carries no price and is exempt).
-    if (applyDiscount) assertBillablePrice(resolved.product, resolved.rate);
-    if (!applyDiscount) return { ...item, rate: resolved.rate, taxPercent: resolved.taxPercent };
+    if (applyDiscount && !isLotLine) assertBillablePrice(resolved.product, resolved.rate);
+    if (!applyDiscount) return { ...item, rate, taxPercent };
 
     const hasExplicitDiscount =
       (item.discountAmount !== undefined && item.discountAmount > 0) ||
@@ -246,12 +263,12 @@ export async function applyAuthoritativePricing<T extends {
       (item.discountPercent !== undefined && item.discountPercent > 0) ||
       (item.discountPct !== undefined && item.discountPct > 0);
 
-    const updated: T = { ...item, rate: resolved.rate, taxPercent: resolved.taxPercent };
+    const updated = { ...item, rate, taxPercent };
     if (!hasExplicitDiscount && resolved.discountValue > 0) {
       if (resolved.discountType === 'FLAT') {
         // discountValue is a per-unit flat amount (matches POSService's
         // getItemDiscount) — scale by quantity, capped at the line's gross.
-        const gross = resolved.rate * (item.quantity || 0);
+        const gross = rate * (item.quantity || 0);
         (updated as any).discountAmount = Math.min(resolved.discountValue * (item.quantity || 0), gross);
       } else {
         (updated as any).discountPercent = Math.min(100, resolved.discountValue);
@@ -260,6 +277,16 @@ export async function applyAuthoritativePricing<T extends {
     return updated;
   }));
 }
+
+// Finished-goods lot snapshot on a sales line (see LotPricingService).
+type LotLineFields = { inventoryBatchId?: string | null; lotNumber?: string | null; lotUnitCost?: number | null; unit?: string | null };
+
+// Lot columns copied onto a saved document line. Null on non-lot lines.
+const lotColumns = (item: LotLineFields) => ({
+  inventoryBatchId: item.inventoryBatchId || null,
+  lotNumber: item.inventoryBatchId ? (item.lotNumber || null) : null,
+  lotUnitCost: item.inventoryBatchId ? (item.lotUnitCost ?? null) : null,
+});
 
 // Sales Order workflow: the status changes a PATCH may make, using only the
 // existing SalesOrderStatus values. DELIVERED (converted to a sale) and
@@ -398,7 +425,7 @@ export class SalesService {
     customerEmail?: string;
     validUntil?: string;
     stateOfSupply?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; discountPercent?: number; discountPct?: number; discountAmount?: number; discount?: number }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; discountPercent?: number; discountPct?: number; discountAmount?: number; discount?: number; inventoryBatchId?: string | null }>;
     discountAmount?: number;
     totalAmount?: number;
     // Signed nearest-rupee adjustment the UI computed and displayed as the
@@ -468,7 +495,8 @@ export class SalesService {
             discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
-            totalAmount: item.totalAmount
+            totalAmount: item.totalAmount,
+            ...lotColumns(item)
           }))
         }
       },
@@ -536,7 +564,7 @@ export class SalesService {
     return prisma.$transaction(async (tx) => {
       if (data.items) {
         const discountInput = data.discountAmount !== undefined ? data.discountAmount : 0;
-        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discountInput);
+        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(await LotPricingService.applyLotPricing(tx, data.items), discountInput);
         const roundOff = data.roundOffAmount || 0;
         const computedTotal = totalAmount + roundOff;
 
@@ -568,7 +596,8 @@ export class SalesService {
             discountAmount: item.discountAmount || 0,
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
-            totalAmount: item.totalAmount
+            totalAmount: item.totalAmount,
+            ...lotColumns(item)
           }))
         };
       }
@@ -624,6 +653,9 @@ export class SalesService {
         if (quotation.status === 'CONVERTED' || quotation.convertedOrderId || quotation.convertedInvoiceId) {
           throw new Error('This estimate has already been converted.');
         }
+        // Lot lines keep the quoted lot price (snapshot) but the lot must
+        // still be sellable and cover the quantity before it becomes an order.
+        await LotPricingService.revalidateLotLines(tx, quotation.items);
 
         const orderDate = new Date();
         const DEFAULT_DUE_DAYS = 7;
@@ -666,6 +698,7 @@ export class SalesService {
                 taxPercent: item.taxPercent,
                 taxAmount: item.taxAmount,
                 totalAmount: item.totalAmount,
+                ...lotColumns(item),
               })),
             },
           },
@@ -721,6 +754,7 @@ export class SalesService {
         if (quotation.status === 'CONVERTED' || quotation.convertedInvoiceId || quotation.convertedOrderId) {
           throw new Error('This estimate has already been converted.');
         }
+        await LotPricingService.revalidateLotLines(tx, quotation.items);
 
         let franchiseId = payload?.franchiseId;
         if (!franchiseId) {
@@ -739,7 +773,7 @@ export class SalesService {
 
         // Resolve a valid Product.id for each OrderItem (FK constraint on OrderItem.productId)
         const allProducts = await tx.product.findMany();
-        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
+        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number; inventoryBatchId?: string | null; lotNumber?: string | null }> = [];
 
         for (const item of quotation.items) {
           let validProductId = item.productId || '';
@@ -785,6 +819,8 @@ export class SalesService {
             discountPct: item.discountPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
+            inventoryBatchId: item.inventoryBatchId || null,
+            lotNumber: item.lotNumber || null,
           });
         }
 
@@ -804,7 +840,8 @@ export class SalesService {
             paymentStatus: 'UNPAID',
             paymentType: payload?.paymentType || 'CASH',
             stateOfSupply: quotation.stateOfSupply,
-            inventory_deducted: true,
+            // Set by issueInvoiceStock below once the stock is really issued.
+            inventory_deducted: false,
             sourceQuotationId: quotation.id,
             orderItems: {
               create: orderItemsData
@@ -824,6 +861,9 @@ export class SalesService {
             notes: quotation.notes || null,
           }
         });
+
+        // Issue the finished goods now (selected lots exactly; FIFO otherwise).
+        await SalesService.issueInvoiceStock(tx, order.id, franchiseId, createdBy || 'system');
 
         await tx.quotation.update({
           where: { id: quotationId },
@@ -859,6 +899,80 @@ export class SalesService {
     }
   }
 
+  /**
+   * Issues the finished goods of a converted Sale Invoice (Estimate → Sale,
+   * Sales Order → Sale) at invoice creation — the same stage as a directly
+   * created Sale Invoice and a Delivery Challan → Sale. Payment never moves
+   * stock. A line carrying a Set Price lot is issued from exactly that lot
+   * (locked, re-checked, net of reservations); other lines use FIFO. Each
+   * line's actual cost is recorded on the OrderItem (COGS at issue, from the
+   * lots consumed — never the selling price).
+   *
+   * Idempotent: if this order already has SALES_OUT movements nothing is
+   * issued again, so a retry / repair can never deduct twice.
+   */
+  static async issueInvoiceStock(tx: any, orderId: string, sellerFranchiseId: string, userId = 'system') {
+    const already = await tx.stockMovement.count({ where: { referenceType: 'ORDER', referenceId: orderId, movementType: 'SALES_OUT' } });
+    if (already > 0) return { issued: 0, skipped: true };
+
+    const order = await tx.order.findUnique({ where: { id: orderId }, include: { orderItems: { include: { product: true } } } });
+    if (!order) throw new Error('Sale invoice not found.');
+    const scopeId = await FranchiseService.toInventoryScopeId(tx, sellerFranchiseId);
+    const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+    const scope = !scopeId || (hq && hq.id === scopeId)
+      ? { OR: [{ franchiseId: null }, ...(hq ? [{ franchiseId: hq.id }] : [])] }
+      : { franchiseId: scopeId };
+
+    // Validate every line before deducting anything (all-or-nothing).
+    const plan: Array<{ oi: any; inv: any; baseQty: number; unitId?: string }> = [];
+    for (const oi of order.orderItems) {
+      if (!(oi.quantity > 0)) continue;
+      const lot = oi.inventoryBatchId ? await tx.inventoryBatch.findUnique({ where: { id: oi.inventoryBatchId }, select: { inventoryItemId: true } }) : null;
+      const inv = lot
+        ? await tx.inventoryItem.findUnique({ where: { id: lot.inventoryItemId } })
+        : oi.product?.sku ? await tx.inventoryItem.findFirst({ where: { sku: oi.product.sku, ...scope } }) : null;
+      if (!inv) continue; // no stocked item (service / custom line) — nothing to issue, as before
+      const { requiredBaseQty, unitId } = await InventoryService.convertUnitToBase(inv.id, oi.unit || 'NONE', oi.quantity, tx);
+      if (!oi.inventoryBatchId) {
+        const blocked = (await tx.inventoryBatch.aggregate({
+          where: { inventoryItemId: inv.id, currentQty: { gt: 0 }, status: { in: ['BLOCKED', 'RETURNED', 'REJECTED', 'QC_HOLD', 'EXPIRED'] } },
+          _sum: { currentQty: true },
+        }))._sum.currentQty || 0;
+        const available = Math.max(0, inv.currentStock - blocked);
+        if (available + 0.0001 < requiredBaseQty) {
+          throw new Error(`Insufficient stock for "${oi.product?.name || inv.name}". Available: ${available}, Required: ${requiredBaseQty}. Sale conversion blocked.`);
+        }
+      }
+      plan.push({ oi, inv, baseQty: requiredBaseQty, unitId });
+    }
+
+    for (const { oi, inv, baseQty, unitId } of plan) {
+      const precalculatedFifo = oi.inventoryBatchId
+        ? await InventoryService.depleteLot(tx, inv.id, oi.inventoryBatchId, baseQty)
+        : undefined;
+      const { fifo } = await InventoryService.recordMovement(tx, {
+        itemId: inv.id,
+        type: 'SALES_OUT',
+        quantity: -oi.quantity,
+        baseQty: -baseQty,
+        transactionUnit: unitId,
+        referenceType: 'ORDER',
+        referenceId: order.id,
+        note: `Sale auto-deduction for Invoice ${order.invoiceNum} (Product: ${oi.product?.name || inv.name}${oi.lotNumber ? `, Lot: ${oi.lotNumber}` : ''})`,
+        userId,
+        precalculatedFifo,
+      });
+      const untracked = baseQty - (fifo?.consumedFromBatches || 0);
+      const lineCost = (fifo?.totalCost || 0) + Math.max(0, untracked) * (inv.costPrice || 0);
+      await tx.orderItem.update({
+        where: { id: oi.id },
+        data: { unitCost: oi.quantity > 0 ? lineCost / oi.quantity : 0, totalCost: lineCost },
+      });
+    }
+    await tx.order.update({ where: { id: order.id }, data: { inventory_deducted: true } });
+    return { issued: plan.length, skipped: false };
+  }
+
   // Sales Order -> Sale Invoice (Tax Invoice).
   static async convertSalesOrderToSale(
     salesOrderId: string,
@@ -880,6 +994,7 @@ export class SalesService {
         if (!(SALES_ORDER_TRANSITIONS[salesOrder.status] || []).includes('DELIVERED')) {
           throw new Error(`A ${salesOrder.status} Sales Order cannot be converted to a sale${salesOrder.status === 'DRAFT' ? ' — confirm it first' : ''}.`);
         }
+        await LotPricingService.revalidateLotLines(tx, salesOrder.items);
 
         let franchiseId = payload?.franchiseId;
         if (!franchiseId) {
@@ -896,7 +1011,7 @@ export class SalesService {
 
         const invoiceNum = await nextDocumentNumber(tx, 'INV', 'INV');
         const allProducts = await tx.product.findMany();
-        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number }> = [];
+        const orderItemsData: Array<{ productId: string; quantity: number; unit: string; price: number; discountPct: number; taxAmount: number; totalAmount: number; inventoryBatchId?: string | null; lotNumber?: string | null }> = [];
 
         for (const item of salesOrder.items) {
           let validProductId = item.productId || '';
@@ -929,6 +1044,8 @@ export class SalesService {
             discountPct: item.discountPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
+            inventoryBatchId: item.inventoryBatchId || null,
+            lotNumber: item.lotNumber || null,
           });
         }
 
@@ -948,7 +1065,12 @@ export class SalesService {
             paymentStatus: 'UNPAID',
             paymentType: payload?.paymentType || 'CASH',
             stateOfSupply: salesOrder.stateOfSupply,
-            inventory_deducted: true,
+            // Set by issueInvoiceStock below once the stock is really issued
+            // (this used to be hard-coded true with no stock movement at all).
+            inventory_deducted: false,
+            // Links the sale to its order; DB-unique, so a repeated / double-
+            // clicked conversion can never create a second invoice.
+            sourceSalesOrderId: salesOrder.id,
             orderItems: {
               create: orderItemsData
             }
@@ -967,9 +1089,12 @@ export class SalesService {
           }
         });
 
+        // Issue the finished goods now (selected lots exactly; FIFO otherwise).
+        await SalesService.issueInvoiceStock(tx, order.id, franchiseId, createdBy || 'system');
+
         await tx.salesOrder.update({
           where: { id: salesOrderId },
-          data: { status: 'DELIVERED' },
+          data: { status: 'DELIVERED', convertedInvoiceId: order.id },
         });
 
         return {
@@ -1031,6 +1156,7 @@ export class SalesService {
               taxPercent: item.taxPercent,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
+              ...lotColumns(item),
             })),
           },
         },
@@ -1109,6 +1235,7 @@ export class SalesService {
       // ever creating, or this collides with that existing Product's
       // @unique sku the moment one already exists (which, for any synced
       // Finished/Semi-Finished item, is effectively always).
+      await LotPricingService.revalidateLotLines(tx, proforma.items);
       const resolvedProductIds = new Map<string, string>(); // item.productId (as sent) -> real Product.id
       for (const item of proforma.items) {
         if (!item.productId) continue;
@@ -1174,6 +1301,8 @@ export class SalesService {
               price: item.rate,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
+              inventoryBatchId: item.inventoryBatchId || null,
+              lotNumber: item.lotNumber || null,
             })),
           },
         },
@@ -1241,6 +1370,7 @@ export class SalesService {
     }
 
     return prisma.$transaction(async (tx) => {
+      await LotPricingService.revalidateLotLines(tx, proforma.items);
       const salesOrder = await tx.salesOrder.create({
         data: {
           orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
@@ -1268,7 +1398,8 @@ export class SalesService {
               discountAmount: it.discountAmount || 0,
               taxPercent: it.taxPercent || 0,
               taxAmount: it.taxAmount || 0,
-              totalAmount: it.totalAmount
+              totalAmount: it.totalAmount,
+              ...lotColumns(it)
             }))
           }
         },
@@ -1292,7 +1423,7 @@ export class SalesService {
     customerPhone?: string;
     customerEmail?: string;
     stateOfSupply?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; inventoryBatchId?: string | null }>;
     discountAmount?: number;
     paymentTerms?: string;
     notes?: string;
@@ -1346,6 +1477,7 @@ export class SalesService {
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
+            ...lotColumns(item),
           })),
         },
       },
@@ -1361,7 +1493,7 @@ export class SalesService {
     customerPhone?: string;
     customerEmail?: string;
     stateOfSupply?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; inventoryBatchId?: string | null }>;
     discountAmount?: number;
     paymentTerms?: string;
     notes?: string;
@@ -1379,7 +1511,7 @@ export class SalesService {
     }
 
     const discount = data.discountAmount || 0;
-    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(data.items, discount);
+    const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(await LotPricingService.applyLotPricing(prisma, data.items), discount);
     const roundOff = resolveDocumentRoundOff(data.roundOffAmount, totalAmount);
     const partyType = data.partyType || existing.partyType || 'CUSTOMER';
     const customerId = partyType === 'CUSTOMER' ? (data.customerId || existing.customerId) : undefined;
@@ -1433,6 +1565,7 @@ export class SalesService {
               taxPercent: item.taxPercent || 0,
               taxAmount: item.taxAmount,
               totalAmount: item.totalAmount,
+              ...lotColumns(item),
             })),
           },
         },
@@ -1681,7 +1814,7 @@ export class SalesService {
     customerName?: string;
     customerPhone?: string;
     stateOfSupply?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate: number; taxPercent?: number; inventoryBatchId?: string | null }>;
     discountAmount?: number;
     deliveryDate?: string;
     deliveryAddress?: string;
@@ -1707,7 +1840,7 @@ export class SalesService {
     // — resolve against the Customer channel only, matching current
     // capability rather than inventing a party mechanism that doesn't
     // exist here.
-    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, 'CUSTOMER');
+    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, 'CUSTOMER', true, { checkStock: true });
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
     // Estimated cost/profit frozen with the order (server-calculated, never
     // from the client; an estimate until stock is issued on fulfilment).
@@ -1745,6 +1878,7 @@ export class SalesService {
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
+            ...lotColumns(item),
             ...estimate.items[i],
           }))
         }
@@ -1858,7 +1992,7 @@ export class SalesService {
 
       if (items) {
         const discount = data.discountAmount || 0;
-        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(items as any[], discount);
+        const { computed, subTotal, taxAmount, totalDiscount, totalAmount } = calculateTotals(await LotPricingService.applyLotPricing(tx, items as any[], { checkStock: true }), discount);
 
         updateData.subTotal = subTotal;
         updateData.taxAmount = taxAmount;
@@ -1887,6 +2021,7 @@ export class SalesService {
             taxPercent: item.taxPercent || 0,
             taxAmount: item.taxAmount,
             totalAmount: item.totalAmount,
+            ...lotColumns(item),
             ...estimate.items[i],
           }))
         };
@@ -3561,6 +3696,9 @@ export class SalesService {
         dispatchedQty: rem?.dispatchedQty ?? 0,
         remainingQty: rem?.remaining ?? oi.quantity,
         batchNumber: oi.batchNumber || null,
+        // The invoice's lot travels with the goods (traceability only).
+        inventoryBatchId: oi.inventoryBatchId || null,
+        lotNumber: oi.lotNumber || null,
       });
     }
 
@@ -3590,7 +3728,7 @@ export class SalesService {
     status?: string;
     notes?: string;
     termsConditions?: string;
-    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number; batchNumber?: string }>;
+    items: Array<{ productId?: string; productName: string; quantity: number; unit?: string; rate?: number; taxPercent?: number; batchNumber?: string; inventoryBatchId?: string | null }>;
     idempotencyKey?: string;
   }, userId: string = 'system') {
     // A retry/double-click/API re-entry with the same key returns the
@@ -3654,7 +3792,8 @@ export class SalesService {
       data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
       dcScopeFranchiseId,
       dcPartyType,
-      false // Delivery Challan has no discount concept — see applyAuthoritativePricing
+      false, // Delivery Challan has no discount concept — see applyAuthoritativePricing
+      { referenceOnly: true } // its lot is traceability only, never a separate price
     );
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedDcItems);
 
@@ -3693,7 +3832,8 @@ export class SalesService {
                 rate: i.rate,
                 taxPercent: i.taxPercent || 0,
                 taxAmount: i.taxAmount,
-                totalAmount: i.totalAmount
+                totalAmount: i.totalAmount,
+                ...lotColumns(i)
               }))
             }
           },
@@ -3762,7 +3902,8 @@ export class SalesService {
         data.items.map((i: any) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
         scope,
         partyType,
-        false
+        false,
+        { referenceOnly: true }
       );
       priced = calculateTotals(pricedItems);
     }
@@ -3844,6 +3985,7 @@ export class SalesService {
                 taxPercent: i.taxPercent || 0,
                 taxAmount: i.taxAmount,
                 totalAmount: i.totalAmount,
+                ...lotColumns(i),
               })),
             },
           } : {}),
@@ -4453,6 +4595,9 @@ export class SalesService {
           discountPct: 0,
           taxAmount: compItem.taxAmount,
           totalAmount: compItem.totalAmount,
+          inventoryBatchId: item.inventoryBatchId || null,
+          lotNumber: item.lotNumber || null,
+          batchNumber: item.batchNumber || null,
         });
       }
 
@@ -4472,6 +4617,8 @@ export class SalesService {
         orderItemQty: number;
         unitId?: string;
         product: any;
+        inventoryBatchId?: string | null;
+        lotNumber?: string | null;
       }> = [];
 
       for (const itemData of orderItemsData) {
@@ -4546,7 +4693,9 @@ export class SalesService {
             requiredBaseQty: conversionResult.requiredBaseQty,
             orderItemQty: itemData.quantity,
             unitId: conversionResult.unitId,
-            product: prod || { name: invItem.name, sku: invItem.sku }
+            product: prod || { name: invItem.name, sku: invItem.sku },
+            inventoryBatchId: itemData.inventoryBatchId || null,
+            lotNumber: itemData.lotNumber || null,
           });
         }
       }
@@ -4587,8 +4736,12 @@ export class SalesService {
         }
       });
 
-      // Deduct inventory once for the completed sale
+      // Deduct inventory once for the completed sale. A line carrying the
+      // challan's lot is deducted from that exact lot (locked + re-checked).
       for (const ded of itemsToDeduct) {
+        const precalculatedFifo = ded.inventoryBatchId
+          ? await InventoryService.depleteLot(tx, ded.inventoryItem.id, ded.inventoryBatchId, ded.requiredBaseQty)
+          : undefined;
         await InventoryService.recordMovement(tx, {
           itemId: ded.inventoryItem.id,
           type: 'SALES_OUT',
@@ -4597,7 +4750,8 @@ export class SalesService {
           transactionUnit: ded.unitId,
           referenceType: 'ORDER',
           referenceId: order.id,
-          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name})`
+          note: `Sale auto-deduction for Invoice ${invoiceNum} (Product: ${ded.product.name}${ded.lotNumber ? `, Lot: ${ded.lotNumber}` : ''})`,
+          precalculatedFifo
         });
       }
 
@@ -4623,6 +4777,12 @@ export class SalesService {
   private static async dispatchChallanStock(challan: any, userId: string, tx: any = prisma) {
     const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
     if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to dispatch from
+    // A challan delivering an invoice whose stock was already issued at
+    // invoice creation must not issue the same goods a second time.
+    if (challan.sourceInvoiceId) {
+      const source = await tx.order.findUnique({ where: { id: challan.sourceInvoiceId }, select: { inventory_deducted: true } });
+      if (source?.inventory_deducted) return;
+    }
     for (const item of challan.items) {
       if (!item.productId) continue;
 
@@ -4638,7 +4798,24 @@ export class SalesService {
         }
       });
 
-      if (sourceItem) {
+      if (sourceItem && item.inventoryBatchId) {
+        // A line naming a lot ships exactly that lot — never a silent FIFO
+        // substitute; depleteLot fails clearly if it can't cover the line.
+        const { requiredBaseQty, unitId } = await InventoryService.convertUnitToBase(sourceItem.id, item.unit || 'NONE', item.quantity, tx);
+        const precalculatedFifo = await InventoryService.depleteLot(tx, sourceItem.id, item.inventoryBatchId, requiredBaseQty);
+        await InventoryService.recordMovement(tx, {
+          itemId: sourceItem.id,
+          type: 'PRODUCTION_OUT', // same movement type stockOut records for a dispatch
+          quantity: -item.quantity,
+          baseQty: -requiredBaseQty,
+          transactionUnit: unitId,
+          referenceType: 'DELIVERY_CHALLAN',
+          referenceId: challan.id,
+          note: `Dispatched DC ${challan.challanNumber} (Lot ${item.lotNumber || item.batchNumber || item.inventoryBatchId})`,
+          userId,
+          precalculatedFifo,
+        });
+      } else if (sourceItem) {
         await InventoryService.stockOut({
           itemId: sourceItem.id,
           quantity: item.quantity,

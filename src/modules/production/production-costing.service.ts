@@ -8,6 +8,7 @@ import prisma from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
 import { InventoryService, FifoConsumption, FifoConsumptionResult } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
+import { isLotExpired, expiryCutoff, productionLotIssue, PRODUCTION_EXPIRED_MESSAGE } from '../inventory/lot-eligibility';
 import {
   DEFAULT_EXPENSE_CATEGORIES, EXPENSE_CATEGORIES_SETTING, ExpenseCategory, ExpenseLineInput,
   SharedExpenseState, computePackagingCosts, normalizeExpenseLines, r4, simulateFifoCost,
@@ -51,39 +52,49 @@ export class ProductionCostingService {
       where: { id: { in: ids } },
       select: { id: true, name: true, sku: true, unit: true, costPrice: true },
     });
+    const now = new Date();
     return Promise.all(items.map(async (item) => {
-      const [lots, otherLotQty, warehouseStock] = await Promise.all([
+      // Every lot with stock (any status but rejected, any warehouse), so a
+      // lot the Stock Hub shows is never silently missing here: eligible
+      // lots are allocatable, the rest are listed with the reason.
+      const [allLots, otherLotQty, warehouseStock] = await Promise.all([
         prisma.inventoryBatch.findMany({
-          where: {
-            inventoryItemId: item.id,
-            currentQty: { gt: 0 },
-            status: 'APPROVED',
-            OR: [{ expDate: null }, { expDate: { gte: new Date() } }],
-            AND: [{ OR: [{ warehouseId }, { warehouseId: null }] }],
-          },
-          include: { vendor: { select: { name: true } } },
+          where: { inventoryItemId: item.id, currentQty: { gt: 0 }, status: { not: 'REJECTED' } },
+          include: { vendor: { select: { name: true } }, warehouse: { select: { name: true } } },
           orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }],
         }),
         this.lotQtyInWarehouse(prisma, item.id, warehouseId),
         InventoryService.computeWarehouseStock(item.id, warehouseId),
       ]);
+      const shape = (lot: (typeof allLots)[number]) => ({
+        id: lot.id,
+        lotNumber: lot.lotNumber || lot.batchNumber,
+        billNumber: lot.billNumber,
+        supplier: lot.vendor?.name || null,
+        receivedAt: lot.receivedAt || lot.createdAt,
+        expDate: lot.expDate,
+        availableQty: r4(lot.currentQty),
+        unitCost: r4(lot.unitCost || 0),
+      });
+      const lots: ReturnType<typeof shape>[] = [];
+      const unavailableLots: Array<ReturnType<typeof shape> & { status: string; warehouse: string | null; reasonCode: string; reason: string }> = [];
+      for (const lot of allLots) {
+        const issue = productionLotIssue(lot, { warehouseId, now });
+        if (!issue) lots.push(shape(lot));
+        else unavailableLots.push({ ...shape(lot), status: lot.status, warehouse: lot.warehouse?.name || null, reasonCode: issue.code, reason: issue.message });
+      }
+      // Ledger stock not held in any lot. A difference below the allocation
+      // tolerance is floating-point residue (e.g. 48.6183 − 48.618), not stock.
+      const untracked = Math.max(0, warehouseStock - otherLotQty);
       return {
         inventoryItemId: item.id,
         name: item.name,
         sku: item.sku,
         unit: item.unit,
         averageCost: r4(item.costPrice || 0),
-        lots: lots.map((lot) => ({
-          id: lot.id,
-          lotNumber: lot.lotNumber || lot.batchNumber,
-          billNumber: lot.billNumber,
-          supplier: lot.vendor?.name || null,
-          receivedAt: lot.receivedAt || lot.createdAt,
-          expDate: lot.expDate,
-          availableQty: r4(lot.currentQty),
-          unitCost: r4(lot.unitCost || 0),
-        })),
-        untrackedQty: r4(Math.max(0, warehouseStock - otherLotQty)),
+        lots,
+        unavailableLots,
+        untrackedQty: untracked < QTY_EPS ? 0 : r4(untracked),
       };
     }));
   }
@@ -166,13 +177,12 @@ export class ProductionCostingService {
     const consumptions: FifoConsumption[] = [];
     let lotTotal = 0;
     let lotCost = 0;
-    const now = Date.now();
     for (const a of lotAllocs) {
       const lot = rows.find((r) => r.id === a.batchId);
       const name = lot ? (lot.lotNumber || lot.batchNumber) : a.batchId;
       if (!lot || lot.inventoryItemId !== item.id) throw new Error(`"${item.name}": lot ${name} was not found for this material.`);
       if (lot.status !== 'APPROVED') throw new Error(`"${item.name}": lot ${name} is ${lot.status.toLowerCase().replace('_', ' ')} and cannot be used.`);
-      if (lot.expDate && new Date(lot.expDate).getTime() < now) throw new Error(`"${item.name}": lot ${name} has expired.`);
+      if (isLotExpired(lot.expDate)) throw new Error(`"${item.name}": lot ${name} has expired — ${PRODUCTION_EXPIRED_MESSAGE}`);
       if (warehouseId && lot.warehouseId && lot.warehouseId !== warehouseId) throw new Error(`"${item.name}": lot ${name} is in a different warehouse.`);
       if (lot.currentQty + QTY_EPS < a.qty) throw new Error(`"${item.name}": lot ${name} only has ${r4(lot.currentQty)} available; ${r4(a.qty)} was allocated.`);
 
@@ -371,7 +381,7 @@ export class ProductionCostingService {
     const bulkUnit = bulkItem?.unit || yieldUnit;
     const lots: Array<{ available: number; unitCost: number }> = bulkItem
       ? (await prisma.inventoryBatch.findMany({
-          where: { inventoryItemId: bulkItem.id, currentQty: { gt: 0 }, status: 'APPROVED', OR: [{ expDate: null }, { expDate: { gte: new Date() } }] },
+          where: { inventoryItemId: bulkItem.id, currentQty: { gt: 0 }, status: 'APPROVED', OR: [{ expDate: null }, { expDate: { gte: expiryCutoff() } }] },
           orderBy: [{ mfgDate: 'asc' }, { createdAt: 'asc' }],
           select: { currentQty: true, unitCost: true },
         })).map((l) => ({ available: l.currentQty, unitCost: l.unitCost || 0 }))

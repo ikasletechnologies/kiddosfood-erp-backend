@@ -7,6 +7,7 @@ import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { isRealUnit } from '../../utils/order-item-unit.util';
 import { assertBillablePrice, resolveSellingPrice } from '../../utils/selling-price.util';
+import { LotPricingService } from '../sales/lot-pricing.service';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 // Atomic, collision-safe document numbering using NumberSequence table
@@ -40,10 +41,17 @@ export async function resolvePosLine(
     ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
     : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
 
+  // A line drawn from a chosen finished-goods lot is charged that lot's Set
+  // Price (excl. GST); the lot must be this branch's, sellable and priced.
+  const lotId = typeof item.inventoryBatchId === 'string' ? item.inventoryBatchId.trim() : '';
+  const lot = lotId
+    ? await LotPricingService.resolveSaleLot(tx, { productId, productName: product.name, inventoryBatchId: lotId, unit: item.unit }, { franchiseId: scopeFranchiseId })
+    : null;
+
   // Same resolver the product catalog uses for what POS search shows,
   // so the price shown is exactly the price charged.
-  const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
-  assertBillablePrice(product, unitPrice);
+  const unitPrice = lot ? lot.rate : (resolveSellingPrice(resolvedPartyType, inv, product) ?? 0);
+  if (!lot) assertBillablePrice(product, unitPrice);
   if (unitPrice <= 0) {
     throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
   }
@@ -66,7 +74,7 @@ export async function resolvePosLine(
   // item.taxPercent from the client (BUG 3 previously desynced this
   // from the order-level GST; trusting the client for it was a second,
   // separate hole).
-  const taxPct = inv?.gstRate ?? product.taxPercent ?? 5;
+  const taxPct = lot ? lot.taxPercent : (inv?.gstRate ?? product.taxPercent ?? 5);
   const quantity = Number(item.quantity) || 0;
   const lineTotal = Number((unitPrice * quantity).toFixed(2));
   const lineTax = Number((lineTotal * (taxPct / 100)).toFixed(2));
@@ -78,7 +86,13 @@ export async function resolvePosLine(
   // saved line records a real UOM instead of the "NONE" placeholder.
   const unit = isRealUnit(item.unit) ? item.unit.trim() : (isRealUnit(inv?.unit) ? inv!.unit.trim() : 'NONE');
 
-  return { productId, quantity, unit, unitPrice, lineTotal, lineTax, lineDiscount };
+  return {
+    productId, quantity, unit, unitPrice, lineTotal, lineTax, lineDiscount,
+    inventoryBatchId: lot?.lotId ?? null,
+    lotNumber: lot?.lotNumber ?? null,
+    batchNumber: lot?.batchNumber ?? null,
+    lotUnitCost: lot?.lotUnitCost ?? null,
+  };
 }
 
 export class POSService {
@@ -470,7 +484,7 @@ export class POSService {
     partyId?: string,
     customerName?: string,
     accountId?: string,
-    items: { productId: string, quantity: number, price: number, taxPercent?: number }[],
+    items: { productId: string, quantity: number, price: number, taxPercent?: number, inventoryBatchId?: string | null }[],
     subTotal: number,
     taxAmount: number,
     discountAmount: number,
@@ -648,7 +662,11 @@ export class POSService {
                 ? Number(((l.lineDiscount / (l.unitPrice * l.quantity)) * 100).toFixed(4))
                 : 0,
               taxAmount: l.lineTax,
-              totalAmount: l.lineTotal
+              totalAmount: l.lineTotal,
+              // Lot the line was sold from (null = standard FIFO line).
+              inventoryBatchId: l.inventoryBatchId,
+              lotNumber: l.lotNumber,
+              batchNumber: l.batchNumber,
             }))
           },
         },
@@ -765,6 +783,12 @@ export class POSService {
               throw new Error(`Out of stock: ${inventoryItem.name}. Required: ${requiredBaseQty} (Base Units), Stock: ${inventoryItem.currentStock}`);
             }
 
+            // A lot line is deducted from exactly that lot (locked and
+            // re-checked, net of reservations); other lines keep FIFO.
+            const lotLine = resolvedLines[i];
+            const precalculatedFifo = lotLine?.inventoryBatchId
+              ? await InventoryService.depleteLot(tx, inventoryItem.id, lotLine.inventoryBatchId, requiredBaseQty)
+              : undefined;
             const { fifo } = await InventoryService.recordMovement(tx, {
               itemId: inventoryItem.id,
               type: 'SALES_OUT',
@@ -773,7 +797,8 @@ export class POSService {
               transactionUnit: unitId,
               referenceType: 'ORDER',
               referenceId: order.id,
-              note: `POS Sale: ${item.quantity}x ${product.name}`
+              note: `POS Sale: ${item.quantity}x ${product.name}${lotLine?.lotNumber ? ` (Lot ${lotLine.lotNumber})` : ''}`,
+              precalculatedFifo
             });
             const untracked = requiredBaseQty - (fifo?.consumedFromBatches || 0);
             lineCost = (fifo?.totalCost || 0) + untracked * (inventoryItem.costPrice || 0);
