@@ -23,6 +23,7 @@ import { SettingsController } from './modules/settings/settings.controller';
 import { AuditController } from './modules/audit/audit.controller';
 import { OrderController } from './modules/pos/order.controller';
 import { RecipeController } from './modules/recipes/recipe.controller';
+import { RecipeImportController } from './modules/recipes/recipe-import.controller';
 import { LogisticsController } from './modules/logistics/logistics.controller';
 import { KDSController } from './modules/kds/kds.controller';
 import { CustomerController } from './modules/customers/customer.controller';
@@ -32,6 +33,7 @@ import { CRMController } from './modules/crm/crm.controller';
 import { EmployeeController } from './modules/employee/employee.controller';
 import { PayrollController } from './modules/payroll/payroll.controller';
 import { SalesController } from './modules/sales/sales.controller';
+import { ProfitabilityController } from './modules/sales/profitability.controller';
 import { PurchaseController } from './modules/purchase/purchase.controller';
 import { RawMaterialsController } from './modules/inventory/raw-materials.controller';
 import { UserController } from './modules/users/user.controller';
@@ -66,6 +68,8 @@ app.use(cors());
 // JSON), above the 100 kb default. Parsed here first with a larger limit;
 // the global parser below then sees an already-parsed body and skips it.
 app.use('/api/attachments', express.json({ limit: '8mb' }));
+// Word recipe import: a .docx of up to 10 MB, base64-encoded.
+app.use('/api/recipe-imports', express.json({ limit: '15mb' }));
 app.use(express.json());
 
 // Advanced API Flow Logger
@@ -252,6 +256,12 @@ app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_A
 app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.calculateCost);
 app.get('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getFormulations);
 app.post('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.saveFormulation);
+// Word recipe import (review before anything is saved).
+app.get('/api/recipe-imports', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.list);
+app.post('/api/recipe-imports', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.upload);
+app.get('/api/recipe-imports/:id', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.review);
+app.post('/api/recipe-imports/:id/recipes/:key/confirm', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.confirm);
+app.post('/api/recipe-imports/:id/recipes/:key/skip', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.skip);
 
 // Production Workflow
 app.get('/api/production/history', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getHistory);
@@ -268,6 +278,7 @@ app.get('/api/production/lot-options', authenticate, authorizeRole(['SUPER_ADMIN
 app.get('/api/production/costing-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCostingSettings);
 app.get('/api/production/batches/:id/cost-summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getBatchCostSummary);
 app.post('/api/production/batches/:id/packaging-cost-preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPackagingCost);
+app.get('/api/production/packaging/sku-check', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.checkPackagingSku);
 app.post('/api/production/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.approveBatch);
 app.get('/api/production/batches', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {
@@ -556,6 +567,8 @@ app.get('/api/audit/logs', authenticate, authorizeRole(['SUPER_ADMIN']), AuditCo
 
 // POS (frontend-facing aliases with recipeId→productId resolution + auto loyalty)
 app.post('/api/pos/checkout', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.checkout);
+// Estimated bill profit/loss (read-only; cost visible only to allowed roles).
+app.post('/api/pos/profitability', authenticate, authorizeRole(['FRANCHISE_ADMIN']), ProfitabilityController.estimatePos);
 app.get('/api/pos/orders', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getOrders);
 app.get('/api/pos/settlement/today', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getTodaySettlement);
 app.get('/api/pos/settlement/latest', authenticate, authorizeRole(['FRANCHISE_ADMIN']), POSController.getLatestSettlement);
@@ -692,6 +705,8 @@ app.post('/api/estimates/:id/convert-to-sale', authenticate, authorizeRole(['SUP
 app.post('/api/estimates/:id/convert-to-sales-order', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.convertQuotationToSalesOrder);
 
 app.get('/api/sales/orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getSalesOrders);
+// Estimated order profit/loss (read-only; cost visible only to allowed roles).
+app.post('/api/sales/orders/profitability', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProfitabilityController.estimateSalesOrder);
 app.post('/api/sales/orders', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.createSalesOrder);
 app.get('/api/sales/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.getSalesOrder);
 app.patch('/api/sales/orders/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SalesController.updateSalesOrder);

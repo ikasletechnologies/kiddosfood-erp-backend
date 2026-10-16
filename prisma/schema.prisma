@@ -564,6 +564,10 @@ model Product {
   sku             String?              @unique
   description     String?
   basePrice       Float
+  // "PRICED" (default) or "PENDING": created in Packaging without a selling
+  // price; basePrice then holds 0 as storage only and it can't be billed
+  // until a price is set in Product Master (see selling-price.util.ts).
+  pricingStatus   String               @default("PRICED")
   category        String?
   taxPercent      Float                @default(5)
   isActive        Boolean              @default(true)
@@ -582,6 +586,7 @@ model Product {
   orderItems      OrderItem[]
   batches         ProductBatch[]
   recipe          Recipe?
+  recipeLink      RecipeProduct?
 }
 
 model Recipe {
@@ -594,6 +599,12 @@ model Recipe {
   yieldUnit                String       @default("KG")
   instructions             String?
   estimatedDurationMinutes Int?
+  // Additional Expenses (Manpower, Electricity, Other, Packaging Materials):
+  // [{ category, enabled, basis, rate, sizeRates }], see production-costing.ts.
+  // Null = never configured (all zero). Each change bumps the version; runs
+  // keep their own copy in Production.expenseSnapshot.
+  expenseConfig            Json?
+  expenseConfigVersion     Int          @default(0)
   createdAt                DateTime     @default(now())
   updatedAt                DateTime     @updatedAt
   productions              Production[]
@@ -601,6 +612,7 @@ model Recipe {
   recipeItems              RecipeItem[]
   ingredients              RecipeIngredient[]
   formulations             RecipeFormulation[]
+  productLinks             RecipeProduct[]
 }
 
 // Recipe Master ingredient selection: WHICH raw materials a recipe uses, with
@@ -630,17 +642,57 @@ model RecipeFormulation {
   yieldUnit   String
   notes       String?
   // PLANNING (saved in Production Planning), RECIPE_FORM (legacy recipe form
-  // with quantities), LEGACY (backfilled from the pre-existing recipe BOM).
+  // with quantities), LEGACY (backfilled from the pre-existing recipe BOM),
+  // IMPORT (Word recipe import, reviewed and confirmed).
   source      String                  @default("PLANNING")
   isActive    Boolean                 @default(true)
   createdBy   String?
   createdAt   DateTime                @default(now())
+  // Imported formulations: the output stage the reference yield refers to
+  // (e.g. "After Fermentation"), every stage the source listed
+  // [{ stage, qty, unit, text }], where it came from { document, title,
+  // section, fileHash, importSessionId }, and lines with no usable quantity
+  // ("As Required", skipped) [{ sourceName, sourceText, reason }] — kept for
+  // review, never deducted. Null on non-imported formulations.
+  outputStage     String?
+  outputStages    Json?
+  sourceReference Json?
+  unresolvedItems Json?
   recipe      Recipe                  @relation(fields: [recipeId], references: [id], onDelete: Cascade)
   items       RecipeFormulationItem[]
   productions Production[]
 
   @@unique([recipeId, version])
   @@index([recipeId, isActive])
+}
+
+// Finished-goods variants (e.g. Appam 450g / 900g) made from a recipe. A
+// product belongs to at most one recipe. Recipe.productId (the POS
+// made-to-order link) is separate and unchanged.
+model RecipeProduct {
+  id        String   @id @default(uuid())
+  recipeId  String
+  productId String   @unique
+  createdBy String?
+  createdAt DateTime @default(now())
+  recipe    Recipe   @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([recipeId])
+}
+
+// A Word recipe import under review: the parsed document and each recipe's
+// review state (PENDING / IMPORTED / UNCHANGED / SKIPPED). Re-uploading the
+// same file (same hash) resumes the same session.
+model RecipeImportSession {
+  id        String   @id @default(uuid())
+  fileName  String
+  fileHash  String   @unique
+  parsed    Json
+  status    Json
+  createdBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model RecipeFormulationItem {
@@ -650,6 +702,10 @@ model RecipeFormulationItem {
   quantity        Float
   unit            String
   sortOrder       Int               @default(0)
+  // Imported lines: the ingredient as written in the source document
+  // ("Asfatedita", "Grount Nut") and the original line text.
+  sourceName      String?
+  sourceText      String?
   formulation     RecipeFormulation @relation(fields: [formulationId], references: [id], onDelete: Cascade)
   inventoryItem   InventoryItem     @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
 
@@ -706,6 +762,9 @@ model Production {
   plannedYieldQty     Float?
   plannedYieldUnit    String?
   formulationSnapshot Json?
+  // Recipe Additional Expenses frozen at start. Null on runs started before
+  // expenses moved to Recipe Master: those keep packaging-entered expenses.
+  expenseSnapshot     Json?
   formulation         RecipeFormulation?   @relation(fields: [formulationId], references: [id])
   batches             ProductBatch?
   customer            Customer?            @relation(fields: [customerId], references: [id])
@@ -857,6 +916,9 @@ model ProductionExpense {
   productPackagingId String?
   category           String
   basis              String
+  // MANUFACTURING: charged into the batch cost at completion (never shared
+  // out again by packaging). PACKAGING: entered/charged at packaging.
+  stage              String            @default("PACKAGING")
   rate               Float
   baseQty            Float             @default(0)
   amount             Float
@@ -1479,6 +1541,13 @@ model SalesOrder {
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
   paymentStatus     String           @default("UNPAID")
+  // Estimated when saved (excl. GST, existing finished-goods cost policy);
+  // realized cost is recorded when stock is issued. Null = not estimated.
+  estimatedCostOfGoods Float?
+  estimatedGrossProfit Float?
+  estimatedMarginPct   Float?
+  costUnavailableLines Int?
+  costEstimatedAt      DateTime?
   returns           ReturnOrder[]
   customer          Customer?        @relation(fields: [customerId], references: [id])
   items             SalesOrderItem[]
@@ -1497,6 +1566,10 @@ model SalesOrderItem {
   taxPercent      Float      @default(0)
   taxAmount       Float      @default(0)
   totalAmount     Float
+  // Estimate at save time; null when the cost isn't known (never an invented 0).
+  estimatedUnitCost    Float?
+  estimatedCostOfGoods Float?
+  estimatedProfit      Float?
   salesOrder      SalesOrder @relation(fields: [salesOrderId], references: [id])
 }
 

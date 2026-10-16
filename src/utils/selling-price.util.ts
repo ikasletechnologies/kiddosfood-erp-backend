@@ -46,3 +46,24 @@ export function resolveSellingPrices(
     FRANCHISE: resolveSellingPrice('FRANCHISE', inventoryItem, product),
   };
 }
+
+/**
+ * Product.pricingStatus: "PRICED" (default, every existing product) or
+ * "PENDING" — a finished-goods variant created in Packaging, which records
+ * production cost only. A pending product's basePrice column holds 0 purely
+ * as storage (the column is required); 0 means "not configured", never free.
+ * Saving a real price in Product Master marks it PRICED.
+ */
+export const PRICING_PENDING = 'PENDING';
+export const PRICED = 'PRICED';
+
+/**
+ * Billing guard: a Pricing Pending product can only be billed once a real
+ * selling price (> 0) resolves for the channel. Never bills it at ₹0.
+ * Products that aren't pending are unaffected.
+ */
+export function assertBillablePrice(product: { name?: string; pricingStatus?: string | null } | null | undefined, rate: number | null | undefined) {
+  if (product?.pricingStatus === PRICING_PENDING && !(Number(rate) > 0)) {
+    throw new Error(`"${product.name || 'This product'}" is Pricing Pending — set its selling price in Product Master before billing it.`);
+  }
+}

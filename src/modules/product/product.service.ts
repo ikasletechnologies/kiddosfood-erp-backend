@@ -1,7 +1,7 @@
 import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
 import { FranchiseService } from '../franchise/franchise.service';
-import { resolveSellingPrices } from '../../utils/selling-price.util';
+import { PRICED, resolveSellingPrices } from '../../utils/selling-price.util';
 
 // Thrown when a Product.sku collides with an existing row — distinguished
 // from other failures so callers (single create + bulk import) can report a
@@ -326,6 +326,8 @@ export class ProductService {
         sku: data.sku,
         description: data.description,
         basePrice: data.basePrice,
+        // Only Packaging creates a Pricing Pending variant; everything else defaults to PRICED.
+        ...(data.pricingStatus && { pricingStatus: data.pricingStatus }),
         category: data.category,
         taxPercent: data.taxPercent || 5,
         isActive: true,
@@ -441,6 +443,8 @@ export class ProductService {
           ...(data.sku !== undefined && { sku: data.sku }),
           ...(data.description !== undefined && { description: data.description }),
           ...(data.basePrice !== undefined && { basePrice: data.basePrice }),
+          // Setting a real selling price ends Pricing Pending.
+          ...(Number(data.basePrice) > 0 && { pricingStatus: PRICED }),
           ...(data.category !== undefined && { category: data.category }),
           ...(data.taxPercent !== undefined && { taxPercent: data.taxPercent }),
           ...(data.isActive !== undefined && { isActive: data.isActive }),

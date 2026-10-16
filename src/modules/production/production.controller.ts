@@ -203,6 +203,15 @@ export class ProductionController {
   }
 
   /** Read-only cost of a packaging request (same calculation as Confirm). */
+  /** Packaging Create New Variant: is this SKU free? Read-only. */
+  static async checkPackagingSku(req: Request, res: Response) {
+    try {
+      res.json(await ProductionService.checkSkuAvailability(String(req.query.sku || '')));
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  }
+
   static async previewPackagingCost(req: Request, res: Response) {
     try {
       const rows = Array.isArray(req.body.rows) ? req.body.rows : [];

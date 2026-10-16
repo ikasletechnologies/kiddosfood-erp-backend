@@ -6,7 +6,7 @@ import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { isRealUnit } from '../../utils/order-item-unit.util';
-import { resolveSellingPrice } from '../../utils/selling-price.util';
+import { assertBillablePrice, resolveSellingPrice } from '../../utils/selling-price.util';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 
 // Atomic, collision-safe document numbering using NumberSequence table
@@ -18,6 +18,67 @@ async function nextDocumentNumber(tx: any, key: string, prefix: string, pad = 5)
     update: { value: { increment: 1 } },
   });
   return `${prefix}-${year}-${String(seq.value).padStart(pad, '0')}`;
+}
+
+/**
+ * One POS line as checkout charges it: server-side selling price (the same
+ * resolver POS search shows), GST rate, the master "Customer Retail
+ * Discount" or the cashier's per-unit override, and the unit sold. Used by
+ * checkout and by the profitability estimate, so both price a line the same.
+ */
+export async function resolvePosLine(
+  tx: any,
+  item: any,
+  resolvedPartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE',
+  scopeFranchiseId: string | null,
+) {
+  const productId = item.productId || item.id;
+  const product = await tx.product.findUnique({ where: { id: productId } });
+  if (!product) throw new Error(`Product ${productId} not found`);
+
+  const inv = product.sku
+    ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
+    : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
+
+  // Same resolver the product catalog uses for what POS search shows,
+  // so the price shown is exactly the price charged.
+  const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
+  assertBillablePrice(product, unitPrice);
+  if (unitPrice <= 0) {
+    throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
+  }
+
+  const discountValue = resolvedPartyType === 'CUSTOMER' ? (inv?.discountValue ?? product.discountValue ?? 0) : 0;
+  const discountType = inv?.discountType || product.discountType || 'PERCENT';
+  const masterDiscountPerUnit = discountValue > 0
+    ? (discountType === 'PERCENT' ? unitPrice * (discountValue / 100) : discountValue)
+    : 0;
+  // Cashier-edited line discount (₹ per unit) replaces the master
+  // discount for that line. Same trust level as manualDiscount: no
+  // item-master value to check it against, so it's only bounded to
+  // the line's own price.
+  const override = item.discountPerUnit;
+  const itemDiscountPerUnit = override !== undefined && override !== null && Number.isFinite(Number(override))
+    ? Math.min(Math.max(0, Number(override)), unitPrice)
+    : masterDiscountPerUnit;
+
+  // Real per-product tax rate, sourced server-side rather than trusting
+  // item.taxPercent from the client (BUG 3 previously desynced this
+  // from the order-level GST; trusting the client for it was a second,
+  // separate hole).
+  const taxPct = inv?.gstRate ?? product.taxPercent ?? 5;
+  const quantity = Number(item.quantity) || 0;
+  const lineTotal = Number((unitPrice * quantity).toFixed(2));
+  const lineTax = Number((lineTotal * (taxPct / 100)).toFixed(2));
+  const lineDiscount = Number((itemDiscountPerUnit * quantity).toFixed(2));
+
+  // Unit the line is sold (and its stock deducted) in: the unit the
+  // client sent, or — when none was sent ("NONE" = the inventory item's
+  // own unit in convertUnitToBase) — that inventory item's unit, so the
+  // saved line records a real UOM instead of the "NONE" placeholder.
+  const unit = isRealUnit(item.unit) ? item.unit.trim() : (isRealUnit(inv?.unit) ? inv!.unit.trim() : 'NONE');
+
+  return { productId, quantity, unit, unitPrice, lineTotal, lineTax, lineDiscount };
 }
 
 export class POSService {
@@ -513,54 +574,7 @@ export class POSService {
       // Customer discount smuggled into a Dealer/Franchise sale — can never
       // reach the invoice.
       const scopeFranchiseId = await FranchiseService.toInventoryScopeId(tx, fid);
-      const resolvedLines = await Promise.all(data.items.map(async (item: any) => {
-        const productId = item.productId || item.id;
-        const product = await tx.product.findUnique({ where: { id: productId } });
-        if (!product) throw new Error(`Product ${productId} not found`);
-
-        const inv = product.sku
-          ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
-          : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
-
-        // Same resolver the product catalog uses for what POS search shows,
-        // so the price shown is exactly the price charged.
-        const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
-        if (unitPrice <= 0) {
-          throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
-        }
-
-        const discountValue = resolvedPartyType === 'CUSTOMER' ? (inv?.discountValue ?? product.discountValue ?? 0) : 0;
-        const discountType = inv?.discountType || product.discountType || 'PERCENT';
-        const masterDiscountPerUnit = discountValue > 0
-          ? (discountType === 'PERCENT' ? unitPrice * (discountValue / 100) : discountValue)
-          : 0;
-        // Cashier-edited line discount (₹ per unit) replaces the master
-        // discount for that line. Same trust level as manualDiscount: no
-        // item-master value to check it against, so it's only bounded to
-        // the line's own price.
-        const override = item.discountPerUnit;
-        const itemDiscountPerUnit = override !== undefined && override !== null && Number.isFinite(Number(override))
-          ? Math.min(Math.max(0, Number(override)), unitPrice)
-          : masterDiscountPerUnit;
-
-        // Real per-product tax rate, sourced server-side rather than trusting
-        // item.taxPercent from the client (BUG 3 previously desynced this
-        // from the order-level GST; trusting the client for it was a second,
-        // separate hole).
-        const taxPct = inv?.gstRate ?? product.taxPercent ?? 5;
-        const quantity = Number(item.quantity) || 0;
-        const lineTotal = Number((unitPrice * quantity).toFixed(2));
-        const lineTax = Number((lineTotal * (taxPct / 100)).toFixed(2));
-        const lineDiscount = Number((itemDiscountPerUnit * quantity).toFixed(2));
-
-        // Unit the line is sold (and its stock deducted) in: the unit the
-        // client sent, or — when none was sent ("NONE" = the inventory item's
-        // own unit in convertUnitToBase) — that inventory item's unit, so the
-        // saved line records a real UOM instead of the "NONE" placeholder.
-        const unit = isRealUnit(item.unit) ? item.unit.trim() : (isRealUnit(inv?.unit) ? inv!.unit.trim() : 'NONE');
-
-        return { productId, quantity, unit, unitPrice, lineTotal, lineTax, lineDiscount };
-      }));
+      const resolvedLines = await Promise.all(data.items.map((item: any) => resolvePosLine(tx, item, resolvedPartyType, scopeFranchiseId)));
 
       const serverSubtotal = Number(resolvedLines.reduce((s, l) => s + l.lineTotal, 0).toFixed(2));
       const serverTax = Number(resolvedLines.reduce((s, l) => s + l.lineTax, 0).toFixed(2));

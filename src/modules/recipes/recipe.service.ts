@@ -1,6 +1,8 @@
 import prisma from '../../lib/prisma';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
 import { FormulationService } from './formulation.service';
+import { ProductionCostingService } from '../production/production-costing.service';
+import { normalizeRecipeExpenses, readRecipeExpenses, sameRecipeExpenses, RecipeExpenseItem, ExpenseCategory } from '../production/production-costing';
 
 interface RecipeItemWithInventory {
   quantityRequired: number;
@@ -141,7 +143,9 @@ export class RecipeService {
     productId?: string | null;
     recipeCode?: string;
     estimatedDurationMinutes?: number | null;
-  }) {
+    // Additional Expenses. Omitted = leave the saved configuration as it is.
+    additionalExpenses?: unknown;
+  }, userId?: string) {
     const name = (data.name || '').trim();
     const category = (data.category || '').trim();
     if (!name) throw new Error('Recipe name is required.');
@@ -149,6 +153,8 @@ export class RecipeService {
     const ids = (data.ingredientIds || []).filter(Boolean);
     if (ids.length === 0) throw new Error('Select at least one ingredient.');
     if (new Set(ids).size !== ids.length) throw new Error('Each ingredient can only be selected once.');
+    const categories = await ProductionCostingService.getExpenseCategories();
+    const expenses = data.additionalExpenses === undefined ? undefined : normalizeRecipeExpenses(data.additionalExpenses, categories);
 
     return prisma.$transaction(async (tx) => {
       const found = await tx.inventoryItem.findMany({ where: { id: { in: ids } }, select: { id: true } });
@@ -186,10 +192,36 @@ export class RecipeService {
       }
 
       await RecipeService.syncIngredients(tx, recipeId!, ids);
-      return tx.recipe.findUnique({
+      if (expenses) await RecipeService.saveExpenseConfig(tx, recipeId!, expenses, categories, userId);
+      const saved = await tx.recipe.findUnique({
         where: { id: recipeId },
         include: RecipeService.recipeInclude,
       });
+      return saved ? { ...saved, additionalExpenses: readRecipeExpenses(saved.expenseConfig, categories) } : saved;
+    });
+  }
+
+  /**
+   * Stores a changed Additional Expenses configuration: bumps its version
+   * and records old/new in the audit log. Runs already started keep their
+   * own snapshot (Production.expenseSnapshot), so their cost never changes.
+   */
+  static async saveExpenseConfig(tx: any, recipeId: string, next: RecipeExpenseItem[], categories: ExpenseCategory[], userId?: string) {
+    await tx.$queryRaw`SELECT id FROM "Recipe" WHERE id = ${recipeId} FOR UPDATE`;
+    const current = await tx.recipe.findUnique({ where: { id: recipeId }, select: { expenseConfig: true, expenseConfigVersion: true } });
+    const previous = readRecipeExpenses(current?.expenseConfig ?? null, categories);
+    if (sameRecipeExpenses(previous, next)) return;
+    const version = (current?.expenseConfigVersion ?? 0) + 1;
+    await tx.recipe.update({ where: { id: recipeId }, data: { expenseConfig: next as any, expenseConfigVersion: version } });
+    await tx.auditLog.create({
+      data: {
+        module: 'RECIPE',
+        action: 'EXPENSE_CONFIG_UPDATE',
+        recordId: recipeId,
+        oldValue: { version: current?.expenseConfigVersion ?? 0, expenses: current?.expenseConfig ?? null } as any,
+        newValue: { version, expenses: next } as any,
+        performedBy: userId || 'SYSTEM',
+      },
     });
   }
 
@@ -214,7 +246,11 @@ export class RecipeService {
       include: { items: { include: { inventoryItem: true }, orderBy: { sortOrder: 'asc' as const } } },
       take: 1,
     },
-    _count: { select: { productions: true } },
+    // Finished-goods variants made from this recipe (read-only here).
+    productLinks: { include: { product: { select: { id: true, name: true, sku: true, basePrice: true, isActive: true } } } },
+    // formulations: Word-imported versions (any, active or not), so Recipe
+    // Master can tell an imported recipe from a manually created one.
+    _count: { select: { productions: true, formulations: { where: { source: 'IMPORT' } } } },
   };
 
   /** Adds `activeFormulation` (or null) and drops the raw relation list. */
@@ -228,6 +264,7 @@ export class RecipeService {
       orderBy: { createdAt: 'desc' },
       include: RecipeService.recipeInclude,
     });
+    const categories = await ProductionCostingService.getExpenseCategories();
     return recipes.map((recipe) => {
       const { totalCost, breakdown } = RecipeService.computeCostBreakdown(recipe.recipeItems);
       const productionCount = recipe._count?.productions || 0;
@@ -238,6 +275,8 @@ export class RecipeService {
         costBreakdown: breakdown,
         productionCount,
         isUsedInProduction: productionCount > 0,
+        isImported: (recipe._count?.formulations || 0) > 0,
+        additionalExpenses: readRecipeExpenses(recipe.expenseConfig, categories),
       };
     });
   }
@@ -253,6 +292,7 @@ export class RecipeService {
       ...RecipeService.withActiveFormulation(recipe),
       productionCount,
       isUsedInProduction: productionCount > 0,
+      additionalExpenses: readRecipeExpenses(recipe.expenseConfig, await ProductionCostingService.getExpenseCategories()),
     };
   }
 
