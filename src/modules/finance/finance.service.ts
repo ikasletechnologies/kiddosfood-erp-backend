@@ -2521,13 +2521,10 @@ export class FinanceService {
                 inv?.customerPrice;
           rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
           gst = inv?.gstRate ?? product?.taxPercent ?? 0;
-          if (lotLine) {
-            // The lot's own Set Price (excl. GST) replaces the master price.
-            rate = lotLine.rate;
-            gst = lotLine.taxPercent;
-          } else {
-            assertBillablePrice(product, rate);
-          }
+          // A chosen lot only fixes which stock (and cost) the line draws
+          // from; the price is the product's channel price either way.
+          if (lotLine) gst = lotLine.taxPercent;
+          assertBillablePrice(product, rate);
           if (resolvedInvoicePartyType === 'CUSTOMER') {
             autoDiscountType = inv?.discountType || product?.discountType || 'PERCENT';
             autoDiscountValue = Number(inv?.discountValue ?? product?.discountValue ?? 0);

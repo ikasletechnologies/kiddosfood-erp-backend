@@ -10,6 +10,7 @@
  */
 import { existsSync, readFileSync } from 'fs';
 import prisma from '../../lib/prisma';
+import { cleanupTestRun } from '../fixture-cleanup';
 import { FormulationService } from '../../modules/recipes/formulation.service';
 import { RecipeImportService, RecipeDecision, LEARNED_ALIASES_SETTING } from '../../modules/recipes/recipe-import.service';
 import { ProductionService } from '../../modules/production/production.service';
@@ -268,4 +269,4 @@ async function run() {
 
 run()
   .catch((e) => { console.error(e); process.exitCode = 1; })
-  .finally(() => prisma.$disconnect());
+  .finally(async () => { await cleanupTestRun(ts); await prisma.$disconnect(); });

@@ -5,6 +5,7 @@
  *   DATABASE_URL=<test db> npx tsx src/tests/production/lot-wise-production-costing.test.ts
  */
 import prisma from '../../lib/prisma';
+import { cleanupTestRun } from '../fixture-cleanup';
 import { Prisma } from '@prisma/client';
 import { RecipeService } from '../../modules/recipes/recipe.service';
 import { FormulationService } from '../../modules/recipes/formulation.service';
@@ -245,4 +246,4 @@ async function run() {
 
 run()
   .catch((e) => { console.error(e); process.exitCode = 1; })
-  .finally(() => prisma.$disconnect());
+  .finally(async () => { await cleanupTestRun(ts); await prisma.$disconnect(); });

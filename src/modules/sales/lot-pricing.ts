@@ -1,20 +1,14 @@
 /**
- * Finished-goods lot pricing (Production > Set Price) — shared, pure calculations.
+ * Selling-price calculations shared by Set Price and sales lots — pure.
  *
- * A finished-goods lot is the InventoryBatch a confirmed packaging run
- * creates. It keeps two independent figures per packet:
- *   - unitCost:     production cost (from the packaging cost snapshot; never
- *                   changed by pricing), and
- *   - sellingPrice: the price set for that lot in Set Price (GST-inclusive or
- *                   exclusive, per priceTaxInclusive).
- * Profit is always measured on the selling price EXCLUDING GST. Money is
- * carried in whole paise so lot lines and totals reconcile exactly.
+ * Selling prices are per product (Customer / Dealer / Franchise, see
+ * product-pricing.service); a finished-goods lot keeps only its own
+ * production cost (unitCost, from the packaging cost snapshot). Profit is
+ * always measured on the selling price EXCLUDING GST. Money is carried in
+ * whole paise so lot lines and totals reconcile exactly.
  */
 
-export const LOT_PRICING_PENDING = 'PRICING_PENDING';
-export const LOT_PRICED = 'PRICED';
-
-/** Roles that may set or change a lot's selling price (same as Product Master pricing). */
+/** Roles that may set or change selling prices (same as Product Master pricing). */
 export const LOT_PRICE_EDIT_ROLES = ['SUPER_ADMIN'] as const;
 export function canEditLotPrice(user: { role?: string } | null | undefined): boolean {
   return !!user?.role && (LOT_PRICE_EDIT_ROLES as readonly string[]).includes(user.role);
@@ -25,9 +19,6 @@ const rupees = (p: number) => p / 100;
 
 export const lotLabel = (lot: { lotNumber?: string | null; batchNumber?: string | null; id?: string }) =>
   lot.lotNumber || lot.batchNumber || lot.id || 'lot';
-
-export const lotPricingStatus = (lot: { sellingPrice?: number | null }) =>
-  lot.sellingPrice != null && lot.sellingPrice > 0 ? LOT_PRICED : LOT_PRICING_PENDING;
 
 /** Selling price per packet excluding GST: a GST-inclusive ₹105 at 5% → ₹100. */
 export function priceExcludingTax(price: number, taxInclusive: boolean, taxPercent: number): number {

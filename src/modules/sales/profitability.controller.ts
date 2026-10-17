@@ -12,7 +12,7 @@ export class ProfitabilityController {
   static async estimateSalesOrder(req: Request, res: Response) {
     if (!canViewCost((req as any).user)) return res.status(403).json({ error: 'Not authorized to view cost and profit.' });
     try {
-      res.json(await SalesProfitabilityService.estimateSalesOrder({ items: req.body?.items, discountAmount: req.body?.discountAmount }));
+      res.json(await SalesProfitabilityService.estimateSalesOrder({ items: req.body?.items, discountAmount: req.body?.discountAmount, partyType: req.body?.partyType }));
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }

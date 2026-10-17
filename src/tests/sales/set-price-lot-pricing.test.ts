@@ -1,6 +1,10 @@
-// End-to-end check of Production > Set Price (batch-wise finished-goods pricing)
-// and lot selection across Sales Order, Estimate, Sale Invoice, POS,
-// Delivery Challan and returns. Follows the Phase 15 test plan.
+// End-to-end check of Production > Set Price (product-level Customer / Dealer /
+// Franchise prices) with finished-goods lots across Sales Order, Estimate,
+// Sale Invoice, POS, Delivery Challan and returns.
+//
+// One product (APPAM 500g), three production runs at different costs
+// (₹20, ₹45, ₹100 per packet): prices are set once and reused for every
+// lot; each lot keeps its own cost; the party type picks the price.
 // Run: npx tsx src/tests/sales/set-price-lot-pricing.test.ts
 import prisma from '../../lib/prisma';
 import { ProductionService } from '../../modules/production/production.service';
@@ -10,9 +14,9 @@ import { SalesService } from '../../modules/sales/sales.service';
 import { FinanceService } from '../../modules/finance/finance.service';
 import { POSService } from '../../modules/pos/pos.service';
 import { LotPricingService } from '../../modules/sales/lot-pricing.service';
+import { ProductPricingService, PRODUCT_FULLY_PRICED, PRODUCT_PRICING_PENDING } from '../../modules/sales/product-pricing.service';
 import { SalesProfitabilityService } from '../../modules/sales/sales-profitability.service';
-import { canEditLotPrice, checkLotPrice, summarizeLotAllocations, LOT_PRICED, LOT_PRICING_PENDING } from '../../modules/sales/lot-pricing';
-import { ProductService } from '../../modules/product/product.service';
+import { canEditLotPrice } from '../../modules/sales/lot-pricing';
 
 process.env.PRODUCTION_QC_ENABLED = 'false';
 process.env.PRODUCTION_LABELS_ENABLED = 'false';
@@ -37,7 +41,7 @@ const near = (a: number | null | undefined, b: number, eps = 0.011) => a != null
 const ADMIN = { userId: undefined as string | undefined, role: 'SUPER_ADMIN', franchiseId: null };
 
 async function runTest() {
-  console.log('🧪 Set Price — finished-goods lot pricing E2E\n');
+  console.log('🧪 Set Price — product-level prices with finished-goods lots E2E\n');
   const testId = `SP${Date.now().toString().slice(-6)}`;
 
   const hq = await FranchiseService.getHqFranchiseOrNull();
@@ -56,82 +60,94 @@ async function runTest() {
       recipeItems: { create: [{ inventoryItemId: rawItem.id, quantityRequired: 10, unit: 'KG' }] },
     },
   });
-  // Master price ₹150: lot lines must ignore it, non-lot lines keep it.
+  // As Packaging creates a new finished product: no selling price yet.
   const product = await prisma.product.create({
-    data: { name: `APPAM ${testId} 500g`, sku: `FG-APM${testId}-500G`, category: 'FINISHED_GOOD', productType: 'FINISHED_GOOD', basePrice: 150, taxPercent: 5, isActive: true },
+    data: { name: `APPAM ${testId} 500g`, sku: `FG-APM${testId}-500G`, category: 'FINISHED_GOOD', productType: 'FINISHED_GOOD', basePrice: 0, pricingStatus: 'PENDING', taxPercent: 5, isActive: true },
   });
 
-  // Counter sales need an active HQ cash account; use the existing one (balance
-  // restored afterwards) or a temporary one removed in cleanup.
   const existingCash = await prisma.account.findFirst({ where: { type: 'CASH', status: 'ACTIVE', franchiseId: hq.id } });
   const cashAccount = existingCash || await prisma.account.create({ data: { name: `Test Cash ${testId}`, type: 'CASH', balance: 0, franchiseId: hq.id } });
   const cashBalanceBefore = cashAccount?.balance ?? null;
 
+  const produce = async (kg: number, rawCost: number, packets: number, tag: string) => {
+    await InventoryService.recordMovement(prisma, {
+      itemId: rawItem.id, type: 'PURCHASE_IN', quantity: kg, warehouseId: warehouse.id,
+      note: `Test stock ${testId}`, receiveAtCost: { unitCost: rawCost, batchNumber: `${tag}-${testId}` },
+    });
+    const prod = await ProductionService.startProduction({ recipeId: recipe.id, quantity: kg / 10, franchiseId: hq.id, warehouseId: warehouse.id, productionType: 'FINISHED_GOOD' });
+    const done = await ProductionService.approveProduction(prod.id, undefined, kg);
+    const pk = await ProductionService.packageAndConfirm({ batchId: done.batch.id, packetSize: '500g', packedQty: packets, damagedQty: 0, productId: product.id, expectedPackagedQty: 0 });
+    const lot = await prisma.inventoryBatch.findFirstOrThrow({ where: { productPackagingId: pk.packaging.id } });
+    return { pk, lot, batch: done.batch };
+  };
+  const row = async () => (await ProductPricingService.listProducts({ search: testId, location: 'HQ' }, ADMIN)).products.find((p) => p.sku === product.sku)!;
+
   try {
-    // ── 1–4. Produce Lot A, confirm packaging, lot exists unpriced ──
-    console.log('1️⃣–4️⃣ Produce APPAM 500g Lot A (10 KG raw @ ₹40) → 20 packets');
-    await InventoryService.recordMovement(prisma, {
-      itemId: rawItem.id, type: 'PURCHASE_IN', quantity: 10, warehouseId: warehouse.id,
-      note: `Test stock ${testId}`, receiveAtCost: { unitCost: 40, batchNumber: `RAW1-${testId}` },
-    });
-    const prodA = await ProductionService.startProduction({ recipeId: recipe.id, quantity: 1, franchiseId: hq.id, warehouseId: warehouse.id, productionType: 'FINISHED_GOOD' });
-    const doneA = await ProductionService.approveProduction(prodA.id, undefined, 10);
-    const pkA = await ProductionService.packageAndConfirm({ batchId: doneA.batch.id, packetSize: '500g', packedQty: 20, damagedQty: 0, productId: product.id, expectedPackagedQty: 0 });
+    // ── First production: product awaits its prices ──
+    console.log('1️⃣ First production: Lot A (10 KG @ ₹40 → 20 packets, ₹20/packet)');
+    const { pk: pkA, lot: lotA, batch: batchA } = await produce(10, 40, 20, 'RAW1');
     const fgItemId = pkA.retailItem.id;
-    const lotA = await prisma.inventoryBatch.findFirstOrThrow({ where: { productPackagingId: pkA.packaging.id } });
     const costA = lotA.unitCost!;
-    check('Packaging created one finished-goods lot linked to the packaging run', lotA.inventoryItemId === fgItemId && lotA.productBatchId === doneA.batch.id);
-    check('Lot production cost = packaging cost snapshot (₹20/packet)', near(costA, 20) && near((pkA.packaging.costBreakdown as any)?.stockUnitCost, costA), `lot ${costA}, snapshot ${(pkA.packaging.costBreakdown as any)?.stockUnitCost}`);
-    check('New lot is PRICING_PENDING with no selling price', lotA.pricingStatus === LOT_PRICING_PENDING && lotA.sellingPrice == null);
-    check('Lot number = <batch code>-L1', lotA.lotNumber === `${doneA.batch.batchCode}-L1`, `${lotA.lotNumber}`);
-    check('No duplicate Product Master SKU created', (await prisma.product.count({ where: { sku: product.sku } })) === 1);
+    check('Packaging created one finished-goods lot with its own cost (₹20)', lotA.inventoryItemId === fgItemId && near(costA, 20), `${costA}`);
+    check('Lot number = <batch code>-L1', lotA.lotNumber === `${batchA.batchCode}-L1`, `${lotA.lotNumber}`);
+    check('Lot carries no selling price', lotA.sellingPrice == null && lotA.pricingStatus == null);
+    const r1 = await row();
+    check('Set Price lists the product as PRICING_PENDING, all three prices missing', r1?.pricingStatus === PRODUCT_PRICING_PENDING && r1.missingTiers.length === 3);
+    check('Latest production cost shown (₹20), 20 packets available', near(r1.latestCost, 20) && near(r1.availableQty, 20));
+    await expectReject('A product without prices cannot be sold', () =>
+      SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 100 }] }), /Pricing Pending/i);
 
-    await expectReject('An unpriced lot cannot be sold', () =>
-      SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 100, inventoryBatchId: lotA.id }] }), /no selling price/i);
-
-    // ── 5–6. Set Price on Lot A ──
-    console.log('\n5️⃣–6️⃣ Set Price: Lot A');
-    const list1 = await LotPricingService.listLots({ sku: product.sku!, location: 'HQ' }, ADMIN);
-    check('Set Price lists Lot A as awaiting pricing', list1.lots.length === 1 && list1.lots[0].pricingStatus === LOT_PRICING_PENDING && list1.summary.awaitingPricing === 1);
+    // ── Set Price ──
+    console.log('\n2️⃣ Set Price: validation, partial prices, then all three');
     check('Only SUPER_ADMIN may edit prices', canEditLotPrice({ role: 'SUPER_ADMIN' }) && !canEditLotPrice({ role: 'FRANCHISE_ADMIN' }));
-    await expectReject('Price ≤ 0 is refused', () => LotPricingService.setPrice(lotA.id, { sellingPrice: 0 }, ADMIN), /greater than/);
-    await expectReject('Below-cost price needs explicit acknowledgement', () => LotPricingService.setPrice(lotA.id, { sellingPrice: 3 }, ADMIN), /₹17 below production cost per packet\. Estimated loss: ₹17 per packet/);
-    check('Refused below-cost attempt changed nothing', (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } })).sellingPrice == null);
-    const below = checkLotPrice({ price: 100, taxInclusive: false, taxPercent: 5, unitCost: 117 });
-    check('Warning text matches spec (cost ₹117, price ₹100)', below.warning === 'Warning: Selling price is ₹17 below production cost per packet. Estimated loss: ₹17 per packet.', below.warning || '');
-    const setA = await LotPricingService.setPrice(lotA.id, { sellingPrice: 100, taxInclusive: false, expectedPrice: null }, ADMIN);
-    check('Lot A priced at ₹100 (profit ₹80/packet)', setA.changed === true && near((setA as any).unitProfit, 100 - costA));
-    await expectReject('Stale editor (expected price mismatch) is refused', () => LotPricingService.setPrice(lotA.id, { sellingPrice: 105, expectedPrice: null }, ADMIN), /changed by someone else/);
-    const lotAAfter = await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } });
-    check('Production cost untouched by pricing', lotAAfter.unitCost === costA && lotAAfter.pricingStatus === LOT_PRICED);
+    await expectReject('Branch admin cannot set prices', () => ProductPricingService.setPrices(fgItemId, { customerPrice: 100 }, { role: 'FRANCHISE_ADMIN', franchiseId: hq.id }), /Not authorized/);
+    await expectReject('Price ₹0 is refused', () => ProductPricingService.setPrices(fgItemId, { customerPrice: 0 }, ADMIN), /greater than ₹0/);
+    await expectReject('All prices blank is refused', () => ProductPricingService.setPrices(fgItemId, {}, ADMIN), /at least one/);
+    await expectReject('Below-cost price needs confirmation', () => ProductPricingService.setPrices(fgItemId, { customerPrice: 15 }, ADMIN), /below the latest production cost/);
+    check('Refused attempt changed nothing', ((await prisma.inventoryItem.findUniqueOrThrow({ where: { id: fgItemId } })).customerPrice || 0) === 0);
 
-    // ── 7–10. Lot B: separate lot, separate price ──
-    console.log('\n7️⃣–🔟 Produce Lot B (30 KG raw @ ₹90) → 55 packets, price ₹200');
-    await InventoryService.recordMovement(prisma, {
-      itemId: rawItem.id, type: 'PURCHASE_IN', quantity: 30, warehouseId: warehouse.id,
-      note: `Test stock ${testId}`, receiveAtCost: { unitCost: 90, batchNumber: `RAW2-${testId}` },
-    });
-    const prodB = await ProductionService.startProduction({ recipeId: recipe.id, quantity: 3, franchiseId: hq.id, warehouseId: warehouse.id, productionType: 'FINISHED_GOOD' });
-    const doneB = await ProductionService.approveProduction(prodB.id, undefined, 30);
-    const pkB = await ProductionService.packageAndConfirm({ batchId: doneB.batch.id, packetSize: '500g', packedQty: 55, damagedQty: 0, productId: product.id, expectedPackagedQty: 0 });
-    const lotB = await prisma.inventoryBatch.findFirstOrThrow({ where: { productPackagingId: pkB.packaging.id } });
+    await ProductPricingService.setPrices(fgItemId, { customerPrice: 100, expected: { customerPrice: null, dealerPrice: null, franchisePrice: null } }, ADMIN);
+    const r2 = await row();
+    check('Customer price only → still PRICING_PENDING (Dealer, Franchise missing)', r2.pricingStatus === PRODUCT_PRICING_PENDING && r2.customerPrice === 100 && r2.missingTiers.join(',') === 'Dealer,Franchise');
+    check('Missing prices are not filled with ₹0 or another tier', r2.dealerPrice == null && r2.franchisePrice == null);
+    await expectReject('A Dealer sale is refused while the Dealer price is missing', () =>
+      SalesService.createSalesOrder({ partyType: 'DEALER', items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 100 }] }), /Pricing Pending/i);
+
+    await expectReject('Stale editor is refused', () =>
+      ProductPricingService.setPrices(fgItemId, { customerPrice: 100, dealerPrice: 80, franchisePrice: 70, expected: { customerPrice: null, dealerPrice: null, franchisePrice: null } }, ADMIN), /changed by someone else/);
+    // Entered including GST (5%): 105 / 84 / 73.50 → 100 / 80 / 70 excl.
+    const set = await ProductPricingService.setPrices(fgItemId, {
+      customerPrice: 105, dealerPrice: 84, franchisePrice: 73.5, taxInclusive: true,
+      expected: { customerPrice: 100, dealerPrice: null, franchisePrice: null },
+    }, ADMIN) as any;
+    check('GST-inclusive entry stored excl. GST: ₹100 / ₹80 / ₹70', set.customerPrice === 100 && set.dealerPrice === 80 && set.franchisePrice === 70, JSON.stringify(set));
+    const r3 = await row();
+    check('All three set → FULLY_PRICED', r3.pricingStatus === PRODUCT_FULLY_PRICED);
+    check('Product Master marked PRICED', (await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).pricingStatus === 'PRICED');
+    check('Production cost untouched by pricing', (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } })).unitCost === costA);
+
+    // ── Later production at higher costs: prices reused ──
+    console.log('\n3️⃣ More production at higher costs — prices reused');
+    const { lot: lotB } = await produce(30, 90, 55, 'RAW2');
+    const { lot: lotC } = await produce(10, 200, 20, 'RAW3');
     const costB = lotB.unitCost!;
-    check('Lot B is a separate lot of the same SKU', lotB.id !== lotA.id && lotB.inventoryItemId === fgItemId && near(costB, 45), `cost ${costB}`);
-    await LotPricingService.setPrice(lotB.id, { sellingPrice: 200 }, ADMIN);
-    check('Lot A still ₹100 after pricing Lot B', (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } })).sellingPrice === 100);
-
-    // ── 11. Stock Hub / listing shows both lots ──
-    const list2 = await LotPricingService.listLots({ sku: product.sku!, location: 'HQ' }, ADMIN);
-    check('Both lots listed, both priced, 75 packets available', list2.lots.length === 2 && list2.summary.pricedLots === 2 && near(list2.summary.availablePricedQty, 75), JSON.stringify(list2.summary));
-    // Product search (POS / Sales Order / Estimate / Invoice) carries the lot prices.
-    const [listed] = await ProductService.getAll({ id: product.id }, hq.id) as any[];
-    check('Product list shows lot prices ₹100–₹200 (2 priced lots)', listed?.lotPricing?.pricedLots === 2 && listed.lotPricing.minPrice === 100 && listed.lotPricing.maxPrice === 200, JSON.stringify(listed?.lotPricing));
-    check('Product Master price is not overwritten by lot pricing', (await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).basePrice === 150);
+    const costC = lotC.unitCost!;
+    // Lot C draws the ₹90 raw left over first (FIFO), then ₹200 raw: ~₹86/packet.
+    check('Each lot keeps its own, rising cost (₹20 < ₹45 < Lot C)', near(costB, 45) && costC > costB && costC > 80, `${costB} / ${costC}`);
+    check('New lots of the same SKU, no selling price on them', [lotB, lotC].every((l) => l.inventoryItemId === fgItemId && l.sellingPrice == null));
+    const r4 = await row();
+    check('Still FULLY_PRICED, prices unchanged (no reset, no automatic increase)', r4.pricingStatus === PRODUCT_FULLY_PRICED && r4.customerPrice === 100 && r4.dealerPrice === 80 && r4.franchisePrice === 70);
+    check('Latest cost = Lot C cost; 95 packets in 3 lots', near(r4.latestCost, costC) && near(r4.availableQty, 95) && r4.lotCount === 3);
+    check('Inventory value = Σ lot qty × lot cost', near(r4.stockValue, 20 * costA + 55 * costB + 20 * costC), `${r4.stockValue}`);
+    const tier = (k: string) => r4.tiers.find((t) => t.key === k)!;
+    check('Negative-margin warning on Dealer and Franchise vs latest cost, not Customer', tier('dealerPrice').belowCost === true && tier('franchisePrice').belowCost === true && tier('customerPrice').belowCost === false);
+    const lots = await LotPricingService.listLots({ sku: product.sku!, location: 'HQ' }, ADMIN);
+    check('Stock Hub lots: 3 separate lots, total 95, same inventory value', lots.lots.length === 3 && near(lots.summary.availableQty, 95) && near(lots.summary.stockValue, r4.stockValue ?? -1));
     const opts = await LotPricingService.saleLotOptions({ productId: product.id, franchiseId: null }, ADMIN);
-    check('Sale lot options: both selectable, oldest (Lot A) first', opts.eligibleCount === 2 && opts.lots[0].id === lotA.id && opts.lots[1].id === lotB.id);
+    check('All three lots selectable for sale, oldest first', opts.eligibleCount === 3 && opts.lots[0].id === lotA.id);
 
-    // ── 12–19. Sales Order with lot allocations ──
-    console.log('\n1️⃣2️⃣–1️⃣9️⃣ Sales Order: 5 × Lot A + 50 × Lot B');
+    // ── Sales Order: party type picks the price; lots only pick stock ──
+    console.log('\n4️⃣ Sales Order priced by party type');
     const so = await SalesService.createSalesOrder({
       customerName: `Test ${testId}`,
       items: [
@@ -141,89 +157,59 @@ async function runTest() {
       idempotencyKey: `idem-${testId}`,
     } as any) as any;
     const soItems = await prisma.salesOrderItem.findMany({ where: { salesOrderId: so.id } });
-    const soA = soItems.find(i => i.inventoryBatchId === lotA.id);
-    const soB = soItems.find(i => i.inventoryBatchId === lotB.id);
-    check('Two separate lot allocation lines saved', soItems.length === 2 && !!soA && !!soB);
-    check('Server priced each line from its lot (₹100 / ₹200), not the forged rate', soA?.rate === 100 && soB?.rate === 200);
-    check('Total quantity 55', (soA?.quantity || 0) + (soB?.quantity || 0) === 55);
-    check('Selling value ₹10,500 excl. GST', near(so.subTotal, 10500), `${so.subTotal}`);
-    check('GST 5% on top → ₹11,025', near(so.taxAmount, 525) && near(so.totalAmount, 11025), `${so.taxAmount} / ${so.totalAmount}`);
-    check('Lot number and cost snapshotted on the lines', soA?.lotNumber === lotA.lotNumber && near(soA?.lotUnitCost, costA) && near(soB?.lotUnitCost, costB));
-    const expectedProfit = 5 * (100 - costA) + 50 * (200 - costB);
-    check(`Estimated gross profit = Σ lot profit (₹${expectedProfit})`, near(so.estimatedGrossProfit, expectedProfit), `${so.estimatedGrossProfit}`);
-    const avg = summarizeLotAllocations([{ quantity: 5, price: 100, unitCost: costA }, { quantity: 50, price: 200, unitCost: costB }]);
-    check('Weighted average selling price ₹190.91 (display only)', avg.weightedAvgPrice === 190.91 && avg.totalValue === 10500, JSON.stringify(avg));
+    const soA = soItems.find((i) => i.inventoryBatchId === lotA.id);
+    const soB = soItems.find((i) => i.inventoryBatchId === lotB.id);
+    check('Customer order: both lot lines at the Customer price ₹100 (not the forged rate)', soA?.rate === 100 && soB?.rate === 100);
+    check('Subtotal ₹5,500, GST ₹275', near(so.subTotal, 5500) && near(so.taxAmount, 275), `${so.subTotal} / ${so.taxAmount}`);
+    check('Lot cost snapshotted per line', near(soA?.lotUnitCost, costA) && near(soB?.lotUnitCost, costB));
+    check(`Estimated profit from each lot's own cost (₹${5 * (100 - costA) + 50 * (100 - costB)})`, near(so.estimatedGrossProfit, 5 * (100 - costA) + 50 * (100 - costB)), `${so.estimatedGrossProfit}`);
     const dup = await SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 5, rate: 1, inventoryBatchId: lotA.id }], idempotencyKey: `idem-${testId}` } as any) as any;
-    check('Duplicate submission (same idempotency key) returns the same order', dup.id === so.id);
-    const lotsAfterSO = await prisma.inventoryBatch.findMany({ where: { id: { in: [lotA.id, lotB.id] } } });
-    check('Saving the Sales Order deducted no stock', lotsAfterSO.every(l => l.currentQty === l.initialQty));
+    check('Duplicate submission returns the same order', dup.id === so.id);
+    check('Saving the order deducted no stock', (await prisma.inventoryBatch.findMany({ where: { id: { in: [lotA.id, lotB.id] } } })).every((l) => l.currentQty === l.initialQty));
     await expectReject('Overselling a lot is refused (60 > 20 in Lot A)', () =>
       SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 60, rate: 1, inventoryBatchId: lotA.id }] }), /only 20 available/);
 
-    // ── 20–22. Below-cost line warning, not hidden by the profitable average ──
-    console.log('\n2️⃣0️⃣–2️⃣2️⃣ Below-cost warning per lot');
-    const est = await SalesProfitabilityService.estimateSalesOrder({
-      items: [
-        { productId: product.id, productName: product.name, quantity: 5, inventoryBatchId: lotA.id, discountPercent: 90 }, // net ₹10 < cost ₹20
-        { productId: product.id, productName: product.name, quantity: 50, inventoryBatchId: lotB.id },
-      ],
-    });
-    const lossLine = est.lines.find(l => l.inventoryBatchId === lotA.id)!;
-    check('Lot A line is a loss of ₹10/packet, ₹50 for 5', lossLine.status === 'LOSS' && near(lossLine.unitProfit, -10) && near(lossLine.profit, -50), JSON.stringify(lossLine));
-    check('Lot-specific warning text', lossLine.warning === `Lot ${lotA.lotNumber} is being sold ₹10 below production cost per packet. Estimated loss for 5 packets: ₹50.`, lossLine.warning || '');
-    check('Order is still profitable overall, warning not hidden', (est.summary.profit || 0) > 0 && !!lossLine.warning);
-    check('Per-product weighted averages reported', est.products.length === 1 && est.products[0].weightedAvgSellingPrice === 190.91 && est.products[0].lots === 2, JSON.stringify(est.products));
+    const dealer = await prisma.dealer.findFirst({ where: { status: { not: 'INACTIVE' } } });
+    const dealerSo = await SalesService.createSalesOrder({ partyType: 'DEALER', partyId: dealer?.id, customerName: dealer?.name || 'Dealer', items: [{ productId: product.id, productName: product.name, quantity: 2, rate: 1 }] }) as any;
+    check('Dealer order: Dealer price ₹80, party type saved, no customer link', dealerSo.items[0].rate === 80 && dealerSo.partyType === 'DEALER' && dealerSo.customerId == null && (dealer ? dealerSo.partyId === dealer.id : true));
+    const franchise = await prisma.franchise.findFirst({ where: { isHQ: false } });
+    const frSo = await SalesService.createSalesOrder({ partyType: 'FRANCHISE', partyId: franchise?.id, items: [{ productId: product.id, productName: product.name, quantity: 2, rate: 1, inventoryBatchId: lotC.id }] }) as any;
+    check('Franchise order: Franchise price ₹70 on a lot line', frSo.items[0].rate === 70 && frSo.partyType === 'FRANCHISE');
+    const est = await SalesProfitabilityService.estimateSalesOrder({ partyType: 'FRANCHISE', items: [{ productId: product.id, productName: product.name, quantity: 2, inventoryBatchId: lotC.id }] });
+    const loss = est.lines[0];
+    check('Loss warning: Franchise price ₹70 below Lot C cost', loss.status === 'LOSS' && near(loss.unitProfit, 70 - costC) && !!loss.warning, JSON.stringify(loss));
 
-    // ── 23–24. Existing workflow: confirm, convert to Sale Invoice ──
-    console.log('\n2️⃣3️⃣–2️⃣4️⃣ Confirm and convert the Sales Order');
+    // ── Estimate ──
+    console.log('\n5️⃣ Estimate');
+    const qt = await SalesService.createQuotation({ partyType: 'DEALER', items: [{ productId: product.id, productName: product.name, quantity: 25, rate: 1, inventoryBatchId: lotA.id }] } as any) as any;
+    check('Dealer estimate priced at ₹80 on a lot line, no stock touched', qt.items[0].rate === 80 && qt.items[0].inventoryBatchId === lotA.id
+      && (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } })).currentQty === 20);
+    await expectReject('Converting the estimate revalidates lot stock (25 > 20)', () => SalesService.convertQuotationToSalesOrder(qt.id, 'test'), /only 20 available/);
+
+    // ── Convert the customer order → Sale Invoice (stock issued from lots) ──
+    console.log('\n6️⃣ Convert Sales Order → Sale Invoice');
     await SalesService.updateSalesOrder(so.id, { status: 'CONFIRMED' });
     const conv = await SalesService.convertSalesOrderToSale(so.id, 'test', { franchiseId: hq.id }) as any;
     const convItems = await prisma.orderItem.findMany({ where: { orderId: conv.sale.id } });
-    check('Converted sale keeps both lot identities and lot prices', convItems.length === 2 && convItems.some(i => i.inventoryBatchId === lotA.id && i.price === 100) && convItems.some(i => i.inventoryBatchId === lotB.id && i.price === 200));
-    check('Converted totals copied, not rebuilt from the average', near(conv.sale.subTotal, 10500) && near(conv.sale.totalAmount, 11025));
-
-    // Stock is issued when the Sale Invoice is created — from the chosen lots.
+    check('Converted sale keeps lots and the ₹100 price', convItems.length === 2 && convItems.every((i) => i.price === 100) && convItems.some((i) => i.inventoryBatchId === lotA.id));
     const lotQty = async (id: string) => (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id } })).currentQty;
-    check('Conversion issued the chosen lots (A 20→15, B 55→5)', (await lotQty(lotA.id)) === 15 && (await lotQty(lotB.id)) === 5, `${await lotQty(lotA.id)} / ${await lotQty(lotB.id)}`);
+    check('Stock issued from the chosen lots (A 20→15, B 55→5)', (await lotQty(lotA.id)) === 15 && (await lotQty(lotB.id)) === 5);
     const convMoves = await prisma.stockMovement.findMany({ where: { referenceType: 'ORDER', referenceId: conv.sale.id, movementType: 'SALES_OUT' } });
-    check('One SALES_OUT movement per lot, with lot id and cost', convMoves.length === 2 && convMoves.some(m => m.batchId === lotA.id && near(m.unitCost, costA)) && convMoves.some(m => m.batchId === lotB.id && near(m.unitCost, costB)));
-    const convOrder = await prisma.order.findUniqueOrThrow({ where: { id: conv.sale.id }, include: { orderItems: true } });
-    check('Invoice marked deducted, linked to its Sales Order', convOrder.inventory_deducted === true && convOrder.sourceSalesOrderId === so.id);
-    check('Actual cost (COGS) recorded per line from the lot', convOrder.orderItems.some(i => i.inventoryBatchId === lotA.id && near(i.totalCost, 5 * costA)) && convOrder.orderItems.some(i => i.inventoryBatchId === lotB.id && near(i.totalCost, 50 * costB)));
-    await expectReject('Converting the same Sales Order again is refused', () => SalesService.convertSalesOrderToSale(so.id, 'test', { franchiseId: hq.id }), /already been converted/);
-    const rerun = await prisma.$transaction((tx) => SalesService.issueInvoiceStock(tx, conv.sale.id, hq.id));
-    check('Re-running the stock issue is a no-op (no double deduction)', rerun.skipped === true && (await lotQty(lotA.id)) === 15 && (await lotQty(lotB.id)) === 5);
-    const dcFromInv = await SalesService.createDeliveryChallan({
-      sourceInvoiceId: conv.sale.id, status: 'IN_TRANSIT', deductStockOnDispatch: true,
-      items: [{ productId: product.id, productName: product.name, quantity: 5, inventoryBatchId: lotA.id }],
-    } as any) as any;
-    check('Challan for the already-issued invoice deducts nothing again', (await lotQty(lotA.id)) === 15 && dcFromInv.items[0].inventoryBatchId === lotA.id);
+    check('One SALES_OUT per lot at the lot cost', convMoves.length === 2 && convMoves.some((m) => m.batchId === lotA.id && near(m.unitCost, costA)) && convMoves.some((m) => m.batchId === lotB.id && near(m.unitCost, costB)));
+    await expectReject('Converting the same order again is refused', () => SalesService.convertSalesOrderToSale(so.id, 'test', { franchiseId: hq.id }), /already been converted/);
 
-    // ── Estimate: no reservation, revalidated on conversion ──
-    console.log('\n📝 Estimate with lot price');
-    const qt = await SalesService.createQuotation({ items: [{ productId: product.id, productName: product.name, quantity: 25, rate: 1, inventoryBatchId: lotA.id }] }) as any;
-    check('Estimate priced from the lot (₹100), no stock check or deduction', qt.items[0].rate === 100 && qt.items[0].inventoryBatchId === lotA.id
-      && (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotA.id } })).currentQty === 15);
-    await expectReject('Converting the estimate revalidates lot stock (25 > 15)', () => SalesService.convertQuotationToSalesOrder(qt.id, 'test'), /only 15 available/);
-
-    // ── Sale Invoice: exact lot deduction ──
-    console.log('\n🧾 Sale Invoice from lots');
+    // ── Sale Invoice for a dealer ──
+    console.log('\n7️⃣ Sale Invoice (Dealer)');
     const inv = await FinanceService.createInvoice({
-      franchiseId: hq.id, partyType: 'CUSTOMER', receivedAmount: 0, createdBy: 'test',
-      items: [
-        { productId: product.id, productName: product.name, qty: 3, rate: 1, gst: 0, inventoryBatchId: lotA.id },
-        { productId: product.id, productName: product.name, qty: 2, rate: 1, gst: 0, inventoryBatchId: lotB.id },
-      ],
-    }) as any;
-    const invItems = await prisma.orderItem.findMany({ where: { orderId: inv.order.id } });
-    check('Invoice lines priced from lots with lot GST (₹100/₹200 @5%)', invItems.some(i => i.inventoryBatchId === lotA.id && i.price === 100) && invItems.some(i => i.inventoryBatchId === lotB.id && i.price === 200) && near(inv.order.taxAmount, 35));
-    const [aInv, bInv] = await Promise.all([lotA.id, lotB.id].map(id => prisma.inventoryBatch.findUniqueOrThrow({ where: { id } })));
-    check('Deducted from the exact lots (A 15→12, B 5→3)', aInv.currentQty === 12 && bInv.currentQty === 3, `${aInv.currentQty} / ${bInv.currentQty}`);
-    const invMoves = await prisma.stockMovement.findMany({ where: { referenceId: inv.order.id, itemId: fgItemId } });
-    check('Each stock movement carries its lot id and cost', invMoves.length === 2 && invMoves.some(m => m.batchId === lotA.id && near(m.unitCost, costA)) && invMoves.some(m => m.batchId === lotB.id && near(m.unitCost, costB)));
+      franchiseId: hq.id, partyType: 'DEALER', partyId: dealer?.id, receivedAmount: 0, createdBy: 'test',
+      items: [{ productId: product.id, productName: product.name, qty: 3, rate: 1, gst: 0, inventoryBatchId: lotA.id }],
+    } as any) as any;
+    const invItem = await prisma.orderItem.findFirstOrThrow({ where: { orderId: inv.order.id } });
+    check('Invoice line at the Dealer price ₹80 with 5% GST', invItem.price === 80 && invItem.inventoryBatchId === lotA.id && near(inv.order.taxAmount, 12), `${invItem.price} / ${inv.order.taxAmount}`);
+    check('Deducted from Lot A (15 → 12)', (await lotQty(lotA.id)) === 12);
 
-    // ── 25–27. POS with lot allocation + return to the originating lot ──
-    console.log('\n2️⃣5️⃣–2️⃣7️⃣ POS counter sale from Lot B, then a return');
+    // ── POS ──
+    console.log('\n8️⃣ POS counter billing');
     const settled = await prisma.dailySettlement.findFirst({ where: { franchiseId: hq.id, businessDate: { gte: new Date(new Date().setHours(0, 0, 0, 0)) } } });
     if (settled) {
       console.log('   ⏭️  SKIP: HQ business day already closed — POS checkout not possible today');
@@ -233,55 +219,50 @@ async function runTest() {
         subTotal: 0, taxAmount: 0, discountAmount: 0, totalAmount: 0, paymentMode: 'CASH', paidAmount: 1000,
       }) as any;
       const posItem = pos.orderItems[0];
-      check('POS charged the lot price ₹200 (not the sent ₹999 / master ₹150)', posItem.price === 200 && posItem.inventoryBatchId === lotB.id && posItem.lotNumber === lotB.lotNumber);
-      check('POS line cost = Lot B production cost', near(posItem.unitCost, costB));
-      check('Lot B deducted 3 → 1', (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotB.id } })).currentQty === 1);
-
+      check('Customer mode charged ₹100 (not the sent ₹999) from Lot B', posItem.price === 100 && posItem.inventoryBatchId === lotB.id);
+      check('POS line cost = Lot B cost; Lot B 5 → 3', near(posItem.unitCost, costB) && (await lotQty(lotB.id)) === 3);
+      const posStd = await POSService.checkout({
+        franchiseId: hq.id, accountId: cashAccount.id, partyType: 'DEALER', items: [{ productId: product.id, quantity: 1, price: 1 }],
+        subTotal: 0, taxAmount: 0, discountAmount: 0, totalAmount: 0, paymentMode: 'CASH', paidAmount: 1000,
+      } as any) as any;
+      check('Dealer mode charged the Dealer price ₹80', posStd.orderItems[0].price === 80);
       await SalesService.createReturnOrder({
         posOrderId: pos.id, reason: 'Test return', status: 'APPROVED',
-        items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 200, condition: 'GOOD' }],
-      } as any) as any;
-      check('Return restored stock to the originating lot (Lot B 1 → 2)', (await prisma.inventoryBatch.findUniqueOrThrow({ where: { id: lotB.id } })).currentQty === 2);
+        items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 100, condition: 'GOOD' }],
+      } as any);
+      check('Return restored stock to the originating lot (Lot B 3 → 4)', (await lotQty(lotB.id)) === 4);
     }
 
-    // ── 28. Delivery Challan keeps the lot (traceability only) ──
-    console.log('\n2️⃣8️⃣ Delivery Challan');
-    const dc = await SalesService.createDeliveryChallan({
-      customerId: undefined, status: 'DRAFT',
-      items: [{ productId: product.id, productName: product.name, quantity: 2, inventoryBatchId: lotA.id }],
-    }) as any;
-    check('Challan line keeps the lot id and number', dc.items[0].inventoryBatchId === lotA.id && dc.items[0].lotNumber === lotA.lotNumber);
-    check('Challan does not invent a lot selling price (master price kept)', dc.items[0].rate === 150, `${dc.items[0].rate}`);
+    // ── Delivery Challan ──
+    console.log('\n9️⃣ Delivery Challan');
+    const dc = await SalesService.createDeliveryChallan({ status: 'DRAFT', items: [{ productId: product.id, productName: product.name, quantity: 2, inventoryBatchId: lotA.id }] } as any) as any;
+    check('Challan keeps the lot; rate is the Customer price', dc.items[0].inventoryBatchId === lotA.id && dc.items[0].lotNumber === lotA.lotNumber && dc.items[0].rate === 100, `${dc.items[0].rate}`);
 
-    // ── 29. Historical prices unchanged after a price edit ──
-    console.log('\n2️⃣9️⃣ Price change does not touch finalized documents');
-    await LotPricingService.setPrice(lotA.id, { sellingPrice: 120, reason: 'Revised' }, ADMIN);
-    const invAfter = await prisma.orderItem.findFirstOrThrow({ where: { orderId: inv.order.id, inventoryBatchId: lotA.id } });
-    check('Invoice line still ₹100', invAfter.price === 100);
-    const [relisted] = await ProductService.getAll({ id: product.id }, hq.id) as any[];
-    check('Product search shows the new lot price at once (₹120–₹200)', relisted?.lotPricing?.minPrice === 120 && relisted.lotPricing.maxPrice === 200, JSON.stringify(relisted?.lotPricing));
-    const detail = await LotPricingService.getLot(lotA.id, ADMIN);
-    check('Price history: ₹100 then ₹100 → ₹120, with reason', detail.history.length === 2 && detail.history[0].previousPrice === 100 && detail.history[0].newPrice === 120 && detail.history[0].reason === 'Revised');
+    // ── Price change: audited, history untouched ──
+    console.log('\n🔟 Price change');
+    await ProductPricingService.setPrices(fgItemId, { customerPrice: 120, dealerPrice: 80, franchisePrice: 70, reason: 'Revised', acknowledgeBelowCost: true }, ADMIN);
+    check('Existing invoice line still ₹80 / converted sale still ₹100', (await prisma.orderItem.findFirstOrThrow({ where: { orderId: inv.order.id } })).price === 80
+      && (await prisma.orderItem.findMany({ where: { orderId: conv.sale.id } })).every((i) => i.price === 100));
+    const detail = await ProductPricingService.getProduct(fgItemId, ADMIN);
+    check('Price history: 3 changes, newest ₹100 → ₹120 with reason', detail.history.length === 3 && detail.history[0].previous.customerPrice === 100 && detail.history[0].prices.customerPrice === 120 && detail.history[0].reason === 'Revised');
+    check('History records the GST basis entered', detail.history[1].enteredTaxInclusive === true && detail.history[0].enteredTaxInclusive === false);
+    const plain = await SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 1 }] }) as any;
+    check('New orders use the new price ₹120 (no lot needed)', plain.items[0].rate === 120 && plain.items[0].inventoryBatchId === null);
 
-    // ── Expired / unavailable lots are never offered ──
+    // ── Expired lots ──
     console.log('\n⛔ Expired lot');
     await prisma.inventoryBatch.update({ where: { id: lotA.id }, data: { expDate: new Date(Date.now() - 86400000) } });
     const optsExpired = await LotPricingService.saleLotOptions({ productId: product.id, franchiseId: null }, ADMIN);
-    check('Expired Lot A not offered for sale', !optsExpired.lots.some(l => l.id === lotA.id));
+    check('Expired Lot A not offered for sale', !optsExpired.lots.some((l) => l.id === lotA.id));
     await expectReject('Expired lot cannot be invoiced', () => FinanceService.createInvoice({
       franchiseId: hq.id, partyType: 'CUSTOMER', receivedAmount: 0, items: [{ productId: product.id, qty: 1, inventoryBatchId: lotA.id }],
     }), /expired/);
-
-    // ── 30. Standard (non-lot) flow unchanged ──
-    console.log('\n3️⃣0️⃣ Non-lot lines keep the existing master-price flow');
-    const plain = await SalesService.createSalesOrder({ items: [{ productId: product.id, productName: product.name, quantity: 1, rate: 1 }] }) as any;
-    check('Non-lot Sales Order line priced at master ₹150, no lot', plain.items[0].rate === 150 && plain.items[0].inventoryBatchId === null);
   } finally {
     if (existingCash && cashBalanceBefore != null) await prisma.account.update({ where: { id: existingCash.id }, data: { balance: cashBalanceBefore } });
     await cleanup(testId);
   }
 
-  if (failures === 0) console.log('🎉 ALL SET PRICE / LOT PRICING TESTS PASSED');
+  if (failures === 0) console.log('🎉 ALL SET PRICE / PRODUCT PRICING TESTS PASSED');
   else { console.error(`💥 ${failures} CHECK(S) FAILED`); process.exit(1); }
 }
 
@@ -290,7 +271,8 @@ async function runTest() {
 async function cleanup(testId: string) {
   console.log('\n🧹 Cleaning up test records...');
   const productIds = (await prisma.product.findMany({ where: { OR: [{ sku: { contains: testId } }, { name: { contains: testId } }] }, select: { id: true } })).map(p => p.id);
-  const itemIds = (await prisma.inventoryItem.findMany({ where: { OR: [{ sku: { contains: testId } }, { name: { contains: testId } }] }, select: { id: true } })).map(i => i.id);
+  const items = await prisma.inventoryItem.findMany({ where: { OR: [{ sku: { contains: testId } }, { name: { contains: testId } }] }, select: { id: true, sku: true } });
+  const itemIds = items.map(i => i.id);
   const recipeIds = (await prisma.recipe.findMany({ where: { name: { contains: testId } }, select: { id: true } })).map(r => r.id);
 
   const orderIds = [...new Set((await prisma.orderItem.findMany({ where: { productId: { in: productIds } }, select: { orderId: true } })).map(o => o.orderId))];
@@ -315,6 +297,7 @@ async function cleanup(testId: string) {
   await prisma.deliveryChallanItem.deleteMany({ where: { challanId: { in: dcIds } } });
   await prisma.deliveryChallan.deleteMany({ where: { id: { in: dcIds } } });
 
+  await prisma.auditLog.deleteMany({ where: { module: 'SET_PRICE', recordId: { in: items.map(i => i.sku) } } });
   await prisma.finishedGoodsLotPriceHistory.deleteMany({ where: { inventoryBatch: { inventoryItemId: { in: itemIds } } } });
   await prisma.wasteEntry.deleteMany({ where: { inventoryItemId: { in: itemIds } } });
   await prisma.stockMovement.deleteMany({ where: { itemId: { in: itemIds } } });

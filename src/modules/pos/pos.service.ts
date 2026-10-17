@@ -41,8 +41,9 @@ export async function resolvePosLine(
     ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, franchiseId: scopeFranchiseId } })
     : await tx.inventoryItem.findFirst({ where: { name: { equals: product.name, mode: 'insensitive' }, franchiseId: scopeFranchiseId } });
 
-  // A line drawn from a chosen finished-goods lot is charged that lot's Set
-  // Price (excl. GST); the lot must be this branch's, sellable and priced.
+  // A line drawn from a chosen finished-goods lot takes stock (and cost)
+  // from that lot, which must be this branch's and sellable. The price is
+  // the product's channel price either way — a lot never changes it.
   const lotId = typeof item.inventoryBatchId === 'string' ? item.inventoryBatchId.trim() : '';
   const lot = lotId
     ? await LotPricingService.resolveSaleLot(tx, { productId, productName: product.name, inventoryBatchId: lotId, unit: item.unit }, { franchiseId: scopeFranchiseId })
@@ -50,8 +51,8 @@ export async function resolvePosLine(
 
   // Same resolver the product catalog uses for what POS search shows,
   // so the price shown is exactly the price charged.
-  const unitPrice = lot ? lot.rate : (resolveSellingPrice(resolvedPartyType, inv, product) ?? 0);
-  if (!lot) assertBillablePrice(product, unitPrice);
+  const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
+  assertBillablePrice(product, unitPrice);
   if (unitPrice <= 0) {
     throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);
   }

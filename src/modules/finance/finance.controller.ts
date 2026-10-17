@@ -2,6 +2,8 @@ import { Request, Response } from 'express';
 import { FinanceService } from './finance.service';
 import { IsolationUtil } from '../../utils/isolation.util';
 import { LotPricingError } from '../sales/lot-pricing.service';
+import { PartyLedgerService, PARTY_TYPES } from './party-ledger.service';
+import { businessDayRangeFilter } from '../../utils/business-date.util';
 
 export class FinanceController {
   static async getPL(req: Request, res: Response) {
@@ -566,6 +568,33 @@ export class FinanceController {
       res.json(report);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Unified Party Statement: one party, one party type or all parties
+   * (Customer, Dealer, Franchise, Vendor). from/to are business-calendar
+   * dates (YYYY-MM-DD, inclusive). Franchise admins see only their own
+   * customers, dealers and franchise.
+   */
+  static async getPartyLedger(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      const q = req.query as Record<string, string | undefined>;
+      const partyType = (q.partyType || 'ALL').toUpperCase();
+      if (!['ALL', ...PARTY_TYPES].includes(partyType)) return res.status(400).json({ error: 'Invalid party type.' });
+      const range = businessDayRangeFilter({ from: q.from || undefined, to: q.to || undefined });
+      const report = await PartyLedgerService.getStatement({
+        partyType: partyType as any,
+        partyId: q.partyId || undefined,
+        start: range?.gte,
+        end: range?.lt ? new Date(range.lt.getTime() - 1) : undefined,
+        search: q.search || undefined,
+        restrictToFranchiseId: user?.role === 'SUPER_ADMIN' ? null : (user?.franchiseId || '__none__'),
+      });
+      res.json(report);
+    } catch (error: any) {
+      res.status(/not found|not accessible/i.test(error.message) ? 404 : 500).json({ error: error.message });
     }
   }
 

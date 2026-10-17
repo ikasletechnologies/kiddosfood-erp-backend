@@ -27,7 +27,12 @@ async function dryRun<T>(fn: (tx: any) => Promise<T>): Promise<T> {
 async function run() {
   console.log('🧪 Production purchase-lot eligibility\n');
   const id = `PLE${Date.now().toString().slice(-6)}`;
-  const [whA, whB] = await prisma.warehouse.findMany({ take: 2 });
+  // Two warehouses: use existing ones, or a temporary second one removed afterwards.
+  const existing = await prisma.warehouse.findMany({ take: 2 });
+  const tempWh = existing.length < 2
+    ? await prisma.warehouse.create({ data: { name: `Test Store ${id}`, nameKey: `test-store-${id.toLowerCase()}`, status: 'ACTIVE' } })
+    : null;
+  const [whA, whB] = tempWh ? [existing[0] ?? tempWh, existing[0] ? tempWh : null] : existing;
   if (!whA || !whB) throw new Error('Need two warehouses');
   const item = await prisma.inventoryItem.create({
     data: { name: `Thenai Test ${id}`, sku: `RM-${id}`, category: 'RAW_MATERIAL', unit: 'kg', currentStock: 0, franchiseId: null, costPrice: 100 },
@@ -113,6 +118,7 @@ async function run() {
   } finally {
     await prisma.inventoryBatch.deleteMany({ where: { inventoryItemId: item.id } });
     await prisma.inventoryItem.delete({ where: { id: item.id } });
+    if (tempWh) await prisma.warehouse.delete({ where: { id: tempWh.id } });
   }
 
   if (failures) { console.error(`\n💥 ${failures} CHECK(S) FAILED`); process.exit(1); }

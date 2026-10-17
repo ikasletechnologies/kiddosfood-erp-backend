@@ -232,29 +232,26 @@ export async function applyAuthoritativePricing<T extends {
   // document (Estimate, Proforma, Sales Order) supports discounts and
   // defaults to applying it.
   applyDiscount: boolean = true,
-  // Lines naming a finished-goods lot (inventoryBatchId) are priced from
-  // that lot's Set Price instead of the master price. checkStock: the
-  // document commits stock (Sales Order), so each lot must cover its lines.
-  // referenceOnly: the lot is kept for traceability but does not price the
-  // line (Delivery Challan — a goods movement document).
+  // Lines naming a finished-goods lot (inventoryBatchId) draw stock and
+  // cost from that lot; the price is still the product's channel price (a
+  // lot never prices a line). checkStock: the document commits stock (Sales
+  // Order), so each lot must cover its lines. referenceOnly: the lot is kept
+  // for traceability only (Delivery Challan — a goods movement document).
   lotOptions: { checkStock?: boolean; referenceOnly?: boolean } = {}
 ): Promise<Array<T & LotLineFields>> {
-  const lotPriced = await LotPricingService.applyLotPricing(tx, items as Array<T & LotLineFields>, {
+  const lotChecked = await LotPricingService.applyLotPricing(tx, items as Array<T & LotLineFields>, {
     franchiseId: scopeFranchiseId,
     checkStock: lotOptions.checkStock,
     referenceOnly: lotOptions.referenceOnly,
   });
-  return Promise.all(lotPriced.map(async (item) => {
+  return Promise.all(lotChecked.map(async (item) => {
     const resolved = await resolveItemChannelPricing(tx, item.productId, item.productName, scopeFranchiseId, partyType);
     if (!resolved) return item;
-    // A lot line keeps the lot's price (set in Set Price); the master price
-    // and its Pricing Pending guard apply to every other line.
-    const isLotLine = !!item.inventoryBatchId && !lotOptions.referenceOnly;
-    const rate = isLotLine ? item.rate : resolved.rate;
-    const taxPercent = isLotLine ? (item.taxPercent ?? resolved.taxPercent) : resolved.taxPercent;
+    const rate = resolved.rate;
+    const taxPercent = resolved.taxPercent;
     // Priced documents never bill a Pricing Pending product at ₹0 (a
     // Delivery Challan — applyDiscount=false — carries no price and is exempt).
-    if (applyDiscount && !isLotLine) assertBillablePrice(resolved.product, resolved.rate);
+    if (applyDiscount) assertBillablePrice(resolved.product, resolved.rate);
     if (!applyDiscount) return { ...item, rate, taxPercent };
 
     const hasExplicitDiscount =
@@ -1810,6 +1807,8 @@ export class SalesService {
   }
 
   static async createSalesOrder(data: {
+    partyType?: 'CUSTOMER' | 'DEALER' | 'FRANCHISE';
+    partyId?: string;
     customerId?: string;
     customerName?: string;
     customerPhone?: string;
@@ -1835,12 +1834,18 @@ export class SalesService {
     }
 
     const discount = data.discountAmount || 0;
-    // Direct Sales Order creation has no Dealer/Franchise selector in the
-    // UI today (only conversion from Estimate/Proforma carries partyType)
-    // — resolve against the Customer channel only, matching current
-    // capability rather than inventing a party mechanism that doesn't
-    // exist here.
-    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, 'CUSTOMER', true, { checkStock: true });
+    // The party picked on the order (Customer / Dealer / Franchise master)
+    // selects that tier of the product's Set Price for every line.
+    const partyType = data.partyType === 'DEALER' || data.partyType === 'FRANCHISE' ? data.partyType : 'CUSTOMER';
+    const partyId = partyType === 'CUSTOMER' ? undefined : data.partyId || undefined;
+    if (partyType === 'DEALER' && partyId) {
+      const dealer = await prisma.dealer.findUnique({ where: { id: partyId }, select: { status: true } });
+      if (!dealer) throw new Error('Selected dealer not found.');
+      if (dealer.status === 'INACTIVE') throw new Error('Dealer is inactive. This operation is not allowed.');
+    } else if (partyType === 'FRANCHISE' && partyId) {
+      if (!(await prisma.franchise.count({ where: { id: partyId } }))) throw new Error('Selected franchise not found.');
+    }
+    const pricedItems = await applyAuthoritativePricing(prisma, data.items, null, partyType, true, { checkStock: true });
     const { computed, subTotal, taxAmount, totalAmount } = calculateTotals(pricedItems, discount);
     // Estimated cost/profit frozen with the order (server-calculated, never
     // from the client; an estimate until stock is issued on fulfilment).
@@ -1851,7 +1856,9 @@ export class SalesService {
       data: {
         orderNumber: await nextDocumentNumber(tx, 'SO', 'SO'),
         idempotencyKey: data.idempotencyKey || undefined,
-        customerId: data.customerId,
+        partyType: partyType as any,
+        partyId: partyId || null,
+        customerId: partyType === 'CUSTOMER' ? data.customerId : undefined,
         customerName: data.customerName,
         customerPhone: data.customerPhone,
         stateOfSupply: data.stateOfSupply || undefined,

@@ -4,18 +4,19 @@ import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { canViewCost } from './profitability';
 import { expiryCutoff, isLotExpired } from '../inventory/lot-eligibility';
-import {
-  checkLotPrice, lotLabel, lotPricingStatus, priceExcludingTax, priceIncludingTax,
-  LOT_PRICED, LOT_PRICING_PENDING,
-} from './lot-pricing';
+import { lotLabel } from './lot-pricing';
 
 /**
- * Production > Set Price, and lot selection for sales documents / POS.
+ * Finished-goods lots: listing (Stock Hub, Set Price "production lots") and
+ * lot selection for sales documents / POS.
  *
  * The finished-goods lot is the existing InventoryBatch row a confirmed
  * packaging run creates (InventoryItem.category = FINISHED_GOOD) — no second
- * inventory model. Selling price lives on that row; production cost
- * (unitCost) is read-only here.
+ * inventory model. A lot carries stock, its own production cost (unitCost),
+ * expiry and traceability. It does NOT carry a selling price: the product's
+ * Customer / Dealer / Franchise prices (Set Price, see product-pricing.service)
+ * price every lot of it, so choosing a lot never changes what a line costs.
+ * The old per-lot price columns are left untouched as history.
  */
 
 export class LotPricingError extends Error {
@@ -28,7 +29,7 @@ const round2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const MAX_PRICE = 10_000_000;
 
 /** Inventory scope filter: HQ stock (franchiseId null or the HQ row) or one branch. */
-async function scopeWhere(tx: any, franchiseId: string | null | undefined): Promise<Prisma.InventoryItemWhereInput> {
+export async function scopeWhere(tx: any, franchiseId: string | null | undefined): Promise<Prisma.InventoryItemWhereInput> {
   const scopeId = franchiseId ? await FranchiseService.toInventoryScopeId(tx, franchiseId) : null;
   if (scopeId) return { franchiseId: scopeId };
   const hq = await FranchiseService.getHqFranchiseOrNull(tx);
@@ -39,7 +40,7 @@ const sellable = (lot: { status: string; currentQty: number; expDate: Date | nul
   lot.status === 'APPROVED' && lot.currentQty > 0.0001 && !isLotExpired(lot.expDate);
 
 const lotInclude = {
-  inventoryItem: { select: { id: true, name: true, sku: true, unit: true, gstRate: true, franchiseId: true, customerPrice: true, basePrice: true, franchise: { select: { id: true, name: true } } } },
+  inventoryItem: { select: { id: true, name: true, sku: true, unit: true, gstRate: true, franchiseId: true, franchise: { select: { id: true, name: true } } } },
   productBatch: { select: { id: true, batchCode: true, mfgDate: true, production: { select: { id: true, warehouse: { select: { id: true, name: true } } } } } },
   productPackaging: { select: { id: true, packetSize: true, quantityPackets: true, goodQty: true, confirmedAt: true, costBreakdown: true } },
   warehouse: { select: { id: true, name: true } },
@@ -55,15 +56,7 @@ async function productsBySku(tx: any, skus: string[]) {
 }
 
 function shapeLot(lot: LotRow, product: any, reserved: number, opts: { showCost: boolean }) {
-  const taxPercent = lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5;
-  const priced = lot.sellingPrice != null && lot.sellingPrice > 0;
-  const check = priced
-    ? checkLotPrice({ price: lot.sellingPrice!, taxInclusive: lot.priceTaxInclusive, taxPercent, unitCost: lot.unitCost })
-    : null;
   const available = Math.max(0, lot.currentQty - reserved);
-  const masterPrice = (lot.inventoryItem.customerPrice && lot.inventoryItem.customerPrice > 0)
-    ? lot.inventoryItem.customerPrice
-    : (lot.inventoryItem.basePrice || product?.basePrice || null);
   return {
     id: lot.id,
     lotNumber: lotLabel(lot),
@@ -91,43 +84,20 @@ function shapeLot(lot: LotRow, product: any, reserved: number, opts: { showCost:
     warehouse: lot.warehouse ?? lot.productBatch?.production?.warehouse ?? null,
     stockStatus: lot.status,
     sellable: sellable(lot),
-    taxPercent,
-    pricingStatus: lotPricingStatus(lot),
-    sellingPrice: priced ? lot.sellingPrice : null,
-    priceTaxInclusive: lot.priceTaxInclusive,
-    sellingPriceExclTax: check?.priceExclTax ?? null,
-    sellingPriceInclTax: priced ? priceIncludingTax(lot.sellingPrice!, lot.priceTaxInclusive, taxPercent) : null,
-    pricedAt: lot.pricedAt,
-    pricedBy: lot.pricedBy,
-    masterPrice,
-    // Production cost and margins only for roles allowed to see cost.
+    taxPercent: lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5,
+    // Production cost and stock value only for roles allowed to see cost.
     unitCost: opts.showCost ? (lot.unitCost ?? null) : undefined,
-    unitProfit: opts.showCost ? (check?.unitProfit ?? null) : undefined,
-    marginPct: opts.showCost ? (check?.marginPct ?? null) : undefined,
-    belowCost: opts.showCost ? (check?.belowCost ?? false) : undefined,
+    stockValue: opts.showCost ? (lot.unitCost != null ? round2(lot.currentQty * lot.unitCost) : null) : undefined,
   };
 }
 
 export type ShapedLot = ReturnType<typeof shapeLot>;
-
-/** Sellable lots of one product: priced ones (with their price range) and ones awaiting a price. */
-export interface LotPriceSummary {
-  pricedLots: number;
-  pendingLots: number;
-  pricedQty: number;
-  pendingQty: number;
-  /** Lowest / highest lot selling price per stock unit, excl. GST. */
-  minPrice: number | null;
-  maxPrice: number | null;
-}
 
 export interface PricedLotLine {
   lotId: string;
   lotNumber: string;
   batchNumber: string;
   inventoryItemId: string;
-  /** Lot selling price excl. GST per LINE unit (lot price per packet × unit factor). */
-  rate: number;
   taxPercent: number;
   /** Production cost per LINE unit, or null when the lot has no recorded cost. */
   lotUnitCost: number | null;
@@ -137,7 +107,7 @@ export interface PricedLotLine {
 }
 
 export class LotPricingService {
-  // ─── Set Price page ──────────────────────────────────────────────────────
+  // ─── Lot listing (Stock Hub / Set Price production lots) ────────────────
 
   static async listLots(filters: {
     search?: string; category?: string; status?: string; warehouseId?: string;
@@ -151,7 +121,7 @@ export class LotPricingService {
     // Franchise admins only ever see their own branch's lots. Super admin
     // picks a location: HQ (default), one branch, or ALL.
     if (user?.role !== 'SUPER_ADMIN') {
-      if (!user?.franchiseId) return { lots: [], summary: emptySummary(), locations: [] };
+      if (!user?.franchiseId) return { lots: [], summary: { totalLots: 0, sellableLots: 0, availableQty: 0, stockValue: undefined }, categories: [], showCost: false };
       and.push({ inventoryItem: await scopeWhere(prisma, user.franchiseId) });
     } else if (filters.location && filters.location !== 'ALL') {
       and.push({ inventoryItem: await scopeWhere(prisma, filters.location === 'HQ' ? null : filters.location) });
@@ -168,8 +138,6 @@ export class LotPricingService {
       if (filters.to) range.lte = new Date(`${filters.to.slice(0, 10)}T23:59:59.999Z`);
       and.push({ OR: [{ mfgDate: range }, { mfgDate: null, createdAt: range }] });
     }
-    if (filters.status === LOT_PRICED) and.push({ sellingPrice: { gt: 0 } });
-    if (filters.status === LOT_PRICING_PENDING) and.push({ OR: [{ sellingPrice: null }, { sellingPrice: { lte: 0 } }] });
     if (filters.search?.trim()) {
       const s = filters.search.trim();
       and.push({
@@ -196,16 +164,14 @@ export class LotPricingService {
     let lots = rows.map((r) => shapeLot(r, products.get(r.inventoryItem.sku), reserved.get(r.id) || 0, { showCost }));
     if (filters.category) lots = lots.filter((l) => (l.category || '').toUpperCase() === filters.category!.toUpperCase());
 
-    const priced = lots.filter((l) => l.pricingStatus === LOT_PRICED);
     const summary = {
       totalLots: lots.length,
-      awaitingPricing: lots.length - priced.length,
-      pricedLots: priced.length,
-      availablePricedQty: round2(priced.reduce((s, l) => s + (l.sellable ? l.availableQty : 0), 0)),
-      availablePricedValue: round2(priced.reduce((s, l) => s + (l.sellable ? l.availableQty * (l.sellingPriceExclTax || 0) : 0), 0)),
+      sellableLots: lots.filter((l) => l.sellable).length,
+      availableQty: round2(lots.reduce((s, l) => s + (l.sellable ? l.availableQty : 0), 0)),
+      stockValue: showCost ? round2(lots.reduce((s, l) => s + (l.stockValue || 0), 0)) : undefined,
     };
     const categories = [...new Set(lots.map((l) => l.category).filter(Boolean))].sort();
-    return { lots, summary, categories, canEdit: user?.role === 'SUPER_ADMIN', showCost };
+    return { lots, summary, categories, showCost };
   }
 
   static async getLot(id: string, user: User) {
@@ -218,27 +184,9 @@ export class LotPricingService {
     const products = await productsBySku(prisma, [lot.inventoryItem.sku]);
     const reserved = (await InventoryService.reservedQtyByLot(prisma, [lot.id])).get(lot.id) || 0;
     const showCost = canViewCost(user);
-    const history = await prisma.finishedGoodsLotPriceHistory.findMany({ where: { inventoryBatchId: id }, orderBy: { effectiveAt: 'desc' } });
-    const userIds = [...new Set(history.map((h) => h.changedBy).concat(lot.pricedBy ? [lot.pricedBy] : []).filter(Boolean) as string[])];
-    const users = userIds.length ? await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, fullName: true, email: true } }) : [];
-    const nameOf = (uid: string | null) => (uid ? users.find((u) => u.id === uid)?.fullName || users.find((u) => u.id === uid)?.email || uid : null);
-    const shaped = shapeLot(lot, products.get(lot.inventoryItem.sku), reserved, { showCost });
     return {
-      ...shaped,
-      pricedByName: nameOf(lot.pricedBy),
+      ...shapeLot(lot, products.get(lot.inventoryItem.sku), reserved, { showCost }),
       costBreakdown: showCost ? (lot.productPackaging?.costBreakdown ?? null) : undefined,
-      history: history.map((h) => ({
-        id: h.id,
-        previousPrice: h.previousPrice,
-        previousTaxInclusive: h.previousTaxInclusive,
-        newPrice: h.newPrice,
-        taxInclusive: h.taxInclusive,
-        unitCostAtChange: showCost ? h.unitCostAtChange : undefined,
-        belowCost: showCost ? h.belowCost : undefined,
-        reason: h.reason,
-        changedBy: nameOf(h.changedBy),
-        effectiveAt: h.effectiveAt,
-      })),
     };
   }
 
@@ -247,114 +195,11 @@ export class LotPricingService {
     return item?.category === 'FINISHED_GOOD';
   }
 
-  /**
-   * Sets or changes one lot's selling price. Production cost is never
-   * touched. Below-cost prices need an explicit acknowledgement, and
-   * `expectedPrice` (what the editor last saw) rejects a stale overwrite.
-   * Every change appends a history row in the same transaction.
-   */
-  static async setPrice(id: string, input: {
-    sellingPrice: unknown; taxInclusive?: unknown; reason?: unknown;
-    acknowledgeBelowCost?: unknown; expectedPrice?: unknown;
-  }, user: User) {
-    const price = Number(input.sellingPrice);
-    if (!Number.isFinite(price) || price <= 0) throw new LotPricingError('Enter a selling price greater than ₹0.', 'INVALID_PRICE');
-    if (price > MAX_PRICE) throw new LotPricingError('Selling price is too large.', 'INVALID_PRICE');
-    if (Math.abs(round2(price) - price) > 1e-9) throw new LotPricingError('Selling price can have at most 2 decimal places.', 'INVALID_PRICE');
-    const taxInclusive = input.taxInclusive === true || input.taxInclusive === 'true';
-    const reason = typeof input.reason === 'string' ? input.reason.trim().slice(0, 500) || null : null;
-
-    return prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM "InventoryBatch" WHERE id = ${id} FOR UPDATE`;
-      const lot = await tx.inventoryBatch.findUnique({ where: { id }, include: { inventoryItem: { select: { category: true, gstRate: true, sku: true } } } });
-      if (!lot || lot.inventoryItem.category !== 'FINISHED_GOOD') throw new LotPricingError('Finished-goods lot not found.', 'NOT_FOUND', 404);
-
-      const previous = lot.sellingPrice != null && lot.sellingPrice > 0 ? lot.sellingPrice : null;
-      if (input.expectedPrice !== undefined) {
-        const expected = input.expectedPrice === null || input.expectedPrice === '' ? null : Number(input.expectedPrice);
-        if ((expected ?? null) !== (previous ?? null) && !(expected != null && previous != null && Math.abs(expected - previous) < 0.001)) {
-          throw new LotPricingError('This lot\'s price was just changed by someone else. Refresh and try again.', 'STALE_PRICE', 409);
-        }
-      }
-      if (previous != null && Math.abs(previous - price) < 0.001 && lot.priceTaxInclusive === taxInclusive) {
-        return { changed: false, lotId: id };
-      }
-
-      const product = await tx.product.findUnique({ where: { sku: lot.inventoryItem.sku }, select: { taxPercent: true } });
-      const taxPercent = lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5;
-      const check = checkLotPrice({ price, taxInclusive, taxPercent, unitCost: lot.unitCost });
-      if (check.belowCost && !(input.acknowledgeBelowCost === true || input.acknowledgeBelowCost === 'true')) {
-        throw new LotPricingError(check.warning!, 'BELOW_COST_CONFIRMATION_REQUIRED', 409, check);
-      }
-
-      const now = new Date();
-      await tx.finishedGoodsLotPriceHistory.create({
-        data: {
-          inventoryBatchId: id,
-          previousPrice: previous,
-          previousTaxInclusive: previous != null ? lot.priceTaxInclusive : null,
-          newPrice: price,
-          taxInclusive,
-          unitCostAtChange: lot.unitCost ?? null,
-          belowCost: check.belowCost,
-          reason,
-          changedBy: user?.userId || null,
-          effectiveAt: now,
-        },
-      });
-      await tx.inventoryBatch.update({
-        where: { id },
-        data: { sellingPrice: price, priceTaxInclusive: taxInclusive, pricingStatus: LOT_PRICED, pricedAt: now, pricedBy: user?.userId || null },
-      });
-      return { changed: true, lotId: id, previousPrice: previous, sellingPrice: price, taxInclusive, ...check };
-    });
-  }
-
-  // ─── Product catalogue: lot price summary ─────────────────────────────────
-
-  /**
-   * Per finished-goods stock item, what its sellable lots are priced at —
-   * attached to the product list (POS search, Sales Order / Estimate /
-   * Proforma / Invoice item search) so a product whose price lives on its
-   * Set Price lots never shows ₹0 / "No price". Sellable = approved, not
-   * expired, stock left after reservations. Prices are per stock unit,
-   * excluding GST. Read fresh on every request (no cache to go stale).
-   */
-  static async lotPriceSummaries(inventoryItemIds: string[]): Promise<Map<string, LotPriceSummary>> {
-    const out = new Map<string, LotPriceSummary>();
-    const ids = [...new Set(inventoryItemIds.filter(Boolean))];
-    if (!ids.length) return out;
-    const lots = await prisma.inventoryBatch.findMany({
-      where: { inventoryItemId: { in: ids }, currentQty: { gt: 0.0001 }, status: 'APPROVED', inventoryItem: { category: 'FINISHED_GOOD' } },
-      select: { id: true, inventoryItemId: true, currentQty: true, expDate: true, sellingPrice: true, priceTaxInclusive: true, inventoryItem: { select: { gstRate: true } } },
-    });
-    const reserved = await InventoryService.reservedQtyByLot(prisma, lots.map((l) => l.id));
-    for (const lot of lots) {
-      if (isLotExpired(lot.expDate)) continue;
-      const available = Math.max(0, lot.currentQty - (reserved.get(lot.id) || 0));
-      if (available <= 0.0001) continue;
-      const s = out.get(lot.inventoryItemId) || { pricedLots: 0, pendingLots: 0, pricedQty: 0, pendingQty: 0, minPrice: null, maxPrice: null };
-      if (lot.sellingPrice != null && lot.sellingPrice > 0) {
-        const p = priceExcludingTax(lot.sellingPrice, lot.priceTaxInclusive, lot.inventoryItem.gstRate ?? 5);
-        s.pricedLots += 1;
-        s.pricedQty = round2(s.pricedQty + available);
-        s.minPrice = s.minPrice == null ? p : Math.min(s.minPrice, p);
-        s.maxPrice = s.maxPrice == null ? p : Math.max(s.maxPrice, p);
-      } else {
-        s.pendingLots += 1;
-        s.pendingQty = round2(s.pendingQty + available);
-      }
-      out.set(lot.inventoryItemId, s);
-    }
-    return out;
-  }
-
   // ─── Lot selection for sales documents / POS ─────────────────────────────
 
   /**
    * Lots of one product a sale can draw from, oldest first: approved,
-   * unexpired, with stock net of reservations. Unpriced lots are listed as
-   * not selectable so the operator knows why. `franchiseId` = seller branch
+   * unexpired, with stock net of reservations. `franchiseId` = seller branch
    * (POS / branch invoice); omitted = HQ stock (Estimate, Sales Order, …).
    */
   static async saleLotOptions(params: { productId: string; franchiseId?: string | null }, user: User) {
@@ -379,13 +224,13 @@ export class LotPricingService {
     const lots = rows
       .map((r) => shapeLot(r, products.get(invItem!.sku) || product, reserved.get(r.id) || 0, { showCost }))
       .filter((l) => l.availableQty > 0.0001)
-      .map((l) => ({ ...l, selectable: l.pricingStatus === LOT_PRICED }));
+      .map((l) => ({ ...l, selectable: true }));
     return {
       lotTracked: rows.length > 0,
       unit: invItem.unit,
       lots,
-      eligibleCount: lots.filter((l) => l.selectable).length,
-      pendingCount: lots.filter((l) => !l.selectable).length,
+      eligibleCount: lots.length,
+      pendingCount: 0,
       showCost,
     };
   }
@@ -393,8 +238,9 @@ export class LotPricingService {
   /**
    * Resolves one sales line that names a lot: the lot must belong to the
    * line's product (Product id or InventoryItem id, matched by SKU), sit in
-   * one of the allowed inventory scopes, be sellable and priced. Returns the
-   * lot's price and cost converted to the line's unit.
+   * one of the allowed inventory scopes and be sellable. Returns the lot's
+   * cost converted to the line's unit — the line's price is the product's
+   * channel price (a lot never prices a line).
    */
   static async resolveSaleLot(tx: any, line: { productId?: string | null; productName?: string | null; inventoryBatchId: string; unit?: string | null }, opts: { franchiseId?: string | null; anyScope?: boolean; referenceOnly?: boolean } = {}): Promise<PricedLotLine> {
     const lot = await tx.inventoryBatch.findUnique({
@@ -421,7 +267,7 @@ export class LotPricingService {
       const factor = (await InventoryService.convertUnitToBase(lot.inventoryItemId, line.unit || 'NONE', 1, tx)).requiredBaseQty || 1;
       return {
         lotId: lot.id, lotNumber: label, batchNumber: lot.batchNumber, inventoryItemId: lot.inventoryItemId,
-        rate: 0, taxPercent: lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5,
+        taxPercent: lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5,
         lotUnitCost: lot.unitCost != null && lot.unitCost > 0 ? Math.round(lot.unitCost * factor * 10000) / 10000 : null,
         factor,
         product: product ? { id: product.id, name: product.name, sku: product.sku } : null,
@@ -438,19 +284,14 @@ export class LotPricingService {
         : isLotExpired(lot.expDate) ? 'has expired' : 'has no stock left';
       throw new LotPricingError(`Lot ${label} of "${name}" ${why} and cannot be sold.`, 'LOT_NOT_SELLABLE');
     }
-    if (!(lot.sellingPrice > 0)) {
-      throw new LotPricingError(`Lot ${label} of "${name}" has no selling price. Set its price in Production > Set Price first.`, 'LOT_UNPRICED');
-    }
 
     const factor = (await InventoryService.convertUnitToBase(lot.inventoryItemId, line.unit || 'NONE', 1, tx)).requiredBaseQty || 1;
     const taxPercent = lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5;
-    const perPacket = priceExcludingTax(lot.sellingPrice, lot.priceTaxInclusive, taxPercent);
     return {
       lotId: lot.id,
       lotNumber: label,
       batchNumber: lot.batchNumber,
       inventoryItemId: lot.inventoryItemId,
-      rate: round2(perPacket * factor),
       taxPercent,
       lotUnitCost: lot.unitCost != null && lot.unitCost > 0 ? Math.round(lot.unitCost * factor * 10000) / 10000 : null,
       factor,
@@ -459,9 +300,9 @@ export class LotPricingService {
   }
 
   /**
-   * Re-prices every line that names a lot from that lot's current Set Price
-   * (excl. GST) and snapshots lot number + cost on the line. Lines without a
-   * lot are returned untouched (the existing pricing flow handles them).
+   * Validates every line that names a lot and snapshots lot number + cost on
+   * the line. Rates are left as they are: the product's channel price (or the
+   * document's own update rules) prices lot and non-lot lines alike.
    * With `checkStock`, the combined quantity drawn from each lot must fit its
    * available stock (net of reservations) — used by documents that commit
    * stock (Sales Order, Invoice, Challan); Estimates/Proformas skip it.
@@ -485,8 +326,6 @@ export class LotPricingService {
       out.push({
         ...item,
         inventoryBatchId: lotId,
-        rate: resolved.rate,
-        taxPercent: resolved.taxPercent,
         lotNumber: resolved.lotNumber,
         lotUnitCost: resolved.lotUnitCost,
         batchNumber: resolved.batchNumber,
@@ -512,7 +351,7 @@ export class LotPricingService {
 
   /**
    * Conversion check (Estimate → Order, Order → Invoice, …): each lot line
-   * keeps its price snapshot, but the lot must still be sellable and cover
+   * keeps its price, but the lot must still be sellable and cover
    * the quantity. Lines without a lot are not checked (unchanged behaviour).
    */
   static async revalidateLotLines(tx: any, lines: Array<{ productId?: string | null; productName?: string | null; inventoryBatchId?: string | null; unit?: string | null; quantity: number }>) {
@@ -529,8 +368,4 @@ export class LotPricingService {
     }
     if (claims.size) await this.assertLotStock(tx, claims);
   }
-}
-
-function emptySummary() {
-  return { totalLots: 0, awaitingPricing: 0, pricedLots: 0, availablePricedQty: 0, availablePricedValue: 0 };
 }

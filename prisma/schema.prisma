@@ -2102,6 +2102,12 @@ model InventoryBatch {
   pricingStatus                   String?
   pricedAt                        DateTime?
   pricedBy                        String?
+  // MANUAL (Set Price) | AUTO_REUSED (inherited at packaging from a manually
+  // priced lot of the same stock item and exact cost); see LotPricingService.
+  priceSource                     String?
+  priceSourceLotId                String?
+  // MULTIPLE_PRICE_MATCHES: several manual prices exist for this item + cost.
+  pricingNote                     String?
   productPackaging                ProductPackaging?                @relation(fields: [productPackagingId], references: [id])
   priceHistory                    FinishedGoodsLotPriceHistory[]
 

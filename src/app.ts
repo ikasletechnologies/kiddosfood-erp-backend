@@ -204,6 +204,13 @@ app.post('/api/workflow-approvals/:id/approve', authenticate, WorkflowApprovalsC
 // Other Business Modules
 // Inventory & Stock Management
 app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getInventory);
+// Expiry Tracking: lot-wise expiry, ?view=FINISHED|RAW (branch-scoped server-side)
+app.get('/api/inventory/expiry-tracking', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try {
+    const { ExpiryTrackingService } = await import('./modules/inventory/expiry-tracking.service');
+    res.json(await ExpiryTrackingService.list(req.query as any, (req as any).user));
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/inventory/raw-materials/summary', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialStockSummary);
 app.get('/api/inventory/raw-materials/consumption', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getRawMaterialConsumption);
 app.get('/api/inventory/raw-materials/ledger', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.getRawMaterialLedger);
@@ -406,6 +413,8 @@ app.get('/api/reports/account-summary', authenticate, authorizeRole(['SUPER_ADMI
 app.get('/api/reports/bill-wise-profit', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getBillWiseProfit);
 app.get('/api/reports/cash-flow', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getCashFlow);
 app.get('/api/reports/party-statement', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getPartyStatement);
+// Unified Party Statement (Customer / Dealer / Franchise / Vendor; one party, a type, or all).
+app.get('/api/reports/party-ledger', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getPartyLedger);
 app.get('/api/reports/party-profit-loss', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getPartyProfitLoss);
 app.get('/api/reports/party-by-item', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getPartyReportByItem);
 app.get('/api/reports/sale-purchase-by-party', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getSalePurchaseByParty);
@@ -729,7 +738,9 @@ app.get('/api/sales/invoices/batch-options', authenticate, authorizeRole(['SUPER
 // Production > Set Price (finished-goods lot pricing) and lot selection for sales / POS.
 app.get('/api/sales/set-price/lots', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.listLots);
 app.get('/api/sales/set-price/lots/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.getLot);
-app.put('/api/sales/set-price/lots/:id/price', authenticate, authorizeRole(['SUPER_ADMIN']), LotPricingController.setPrice);
+app.get('/api/sales/set-price/products', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.listProducts);
+app.get('/api/sales/set-price/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.getProduct);
+app.put('/api/sales/set-price/products/:id/prices', authenticate, authorizeRole(['SUPER_ADMIN']), LotPricingController.setProductPrices);
 app.get('/api/sales/lot-options', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.saleLotOptions);
 app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
 app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);

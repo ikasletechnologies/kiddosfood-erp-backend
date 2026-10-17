@@ -88,19 +88,21 @@ function finish(lines: EstimatedLine[]) {
 
 export class SalesProfitabilityService {
   /**
-   * Sales Order: same pricing as createSalesOrder (Customer channel, HQ
-   * scope). Line revenue is the line's taxable amount — after its own
+   * Sales Order: same pricing as createSalesOrder (the party type's price,
+   * HQ scope). Line revenue is the line's taxable amount — after its own
    * discount, or its share of an order discount when no line has one —
    * excluding GST.
    */
   static async estimateSalesOrder(input: {
     items: Array<{ productId?: string; productName?: string; quantity: number; unit?: string; rate?: number; discountPercent?: number; discountAmount?: number; inventoryBatchId?: string | null }>;
     discountAmount?: number;
+    partyType?: string;
   }) {
+    const partyType = input.partyType === 'DEALER' ? 'DEALER' : input.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
     const items = (Array.isArray(input.items) ? input.items : [])
       .filter((i) => Number(i?.quantity) > 0)
       .map((i) => ({ ...i, quantity: Number(i.quantity), rate: Number(i.rate) || 0, productName: i.productName || '' }));
-    const priced = await applyAuthoritativePricing(prisma, items, null, 'CUSTOMER');
+    const priced = await applyAuthoritativePricing(prisma, items, null, partyType);
     const { computed } = calculateTotals(priced, Number(input.discountAmount) || 0);
     return this.estimateComputedLines(computed);
   }
