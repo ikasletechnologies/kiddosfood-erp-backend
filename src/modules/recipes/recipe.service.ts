@@ -31,6 +31,9 @@ export class RecipeService {
     estimatedDurationMinutes?: number | null,
     items: { inventoryItemId: string, quantityRequired: number, unit: string }[]
   }) {
+    // A new recipe starts with the default Additional Expenses (as in Recipe Master).
+    const expenseCategories = data.id ? null : await ProductionCostingService.getExpenseCategories();
+    const defaultExpenses = expenseCategories ? await ProductionCostingService.getDefaultRecipeExpenses(expenseCategories) : null;
     return prisma.$transaction(async (tx) => {
       // Validate items before saving to prevent DB constraint errors
       if (data.items && data.items.length > 0) {
@@ -79,7 +82,14 @@ export class RecipeService {
       } else {
         // Auto-generate a unique, sequential recipe code (RCP-0001, RCP-0002, ...)
         // when none was typed in, so codes can't collide or be mistyped.
-        const recipeCode = data.recipeCode || `RCP-${((await tx.recipe.count()) + 1).toString().padStart(4, '0')}`;
+        // Next free RCP-nnnn: the count alone can land on a code still in use
+        // once a recipe has been removed (same rule as the Word import).
+        let recipeCode = data.recipeCode;
+        if (!recipeCode) {
+          let n = (await tx.recipe.count()) + 1;
+          recipeCode = `RCP-${String(n).padStart(4, '0')}`;
+          while (await tx.recipe.findUnique({ where: { recipeCode }, select: { id: true } })) recipeCode = `RCP-${String(++n).padStart(4, '0')}`;
+        }
 
         const recipe = await tx.recipe.create({
           data: {
@@ -94,6 +104,7 @@ export class RecipeService {
           }
         });
         recipeId = recipe.id;
+        if (defaultExpenses && expenseCategories) await RecipeService.saveExpenseConfig(tx, recipe.id, defaultExpenses, expenseCategories);
       }
 
       // 2. Clear old recipe items and add new ones
@@ -143,7 +154,8 @@ export class RecipeService {
     productId?: string | null;
     recipeCode?: string;
     estimatedDurationMinutes?: number | null;
-    // Additional Expenses. Omitted = leave the saved configuration as it is.
+    // Additional Expenses. Omitted = leave the saved configuration as it is
+    // (a new recipe then gets the default expenses).
     additionalExpenses?: unknown;
   }, userId?: string) {
     const name = (data.name || '').trim();
@@ -154,7 +166,11 @@ export class RecipeService {
     if (ids.length === 0) throw new Error('Select at least one ingredient.');
     if (new Set(ids).size !== ids.length) throw new Error('Each ingredient can only be selected once.');
     const categories = await ProductionCostingService.getExpenseCategories();
-    const expenses = data.additionalExpenses === undefined ? undefined : normalizeRecipeExpenses(data.additionalExpenses, categories);
+    // A new recipe saved without an expense list starts with the defaults
+    // (₹5/packet), persisted like any other configuration.
+    const expenses = data.additionalExpenses !== undefined
+      ? normalizeRecipeExpenses(data.additionalExpenses, categories)
+      : !data.id ? await ProductionCostingService.getDefaultRecipeExpenses(categories) : undefined;
 
     return prisma.$transaction(async (tx) => {
       const found = await tx.inventoryItem.findMany({ where: { id: { in: ids } }, select: { id: true } });
@@ -183,7 +199,14 @@ export class RecipeService {
         if (!exists) throw new Error('Recipe not found');
         await tx.recipe.update({ where: { id: recipeId }, data: common });
       } else {
-        const recipeCode = data.recipeCode || `RCP-${((await tx.recipe.count()) + 1).toString().padStart(4, '0')}`;
+        // Next free RCP-nnnn: the count alone can land on a code still in use
+        // once a recipe has been removed (same rule as the Word import).
+        let recipeCode = data.recipeCode;
+        if (!recipeCode) {
+          let n = (await tx.recipe.count()) + 1;
+          recipeCode = `RCP-${String(n).padStart(4, '0')}`;
+          while (await tx.recipe.findUnique({ where: { recipeCode }, select: { id: true } })) recipeCode = `RCP-${String(++n).padStart(4, '0')}`;
+        }
         // yieldQty/yieldUnit get their column defaults here; they carry no
         // meaning until a formulation is saved (which overwrites them), and
         // Production refuses a recipe with no BOM.

@@ -190,9 +190,19 @@ export class ProductionController {
   /** Expense categories and bases for packaging cost entry. */
   static async getCostingSettings(_req: Request, res: Response) {
     try {
-      res.json({ categories: await ProductionCostingService.getExpenseCategories(), bases: EXPENSE_BASES });
+      const categories = await ProductionCostingService.getExpenseCategories();
+      res.json({ categories, bases: EXPENSE_BASES, defaultExpenses: await ProductionCostingService.getDefaultRecipeExpenses(categories) });
     } catch (error) {
       res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /** Defaults new recipes start with; never changes recipes already saved. */
+  static async setDefaultRecipeExpenses(req: Request, res: Response) {
+    try {
+      res.json({ defaultExpenses: await ProductionCostingService.setDefaultRecipeExpenses(req.body?.expenses, (req as any).user?.userId) });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
     }
   }
 

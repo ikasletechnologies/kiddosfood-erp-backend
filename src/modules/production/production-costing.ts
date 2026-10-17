@@ -144,6 +144,20 @@ export function normalizeExpenseLines(lines: unknown, categories: ExpenseCategor
 // packaging, when pack sizes and packet counts are known.
 
 export const PACKAGING_MATERIAL = 'PACKAGING_MATERIAL';
+
+/**
+ * Additional Expenses every new recipe (created in Recipe Master or imported
+ * from Word) starts with: ₹5 per packet in all. Stored centrally under
+ * RECIPE_DEFAULT_EXPENSES_SETTING when an admin changes them; this list is
+ * the fallback. Changing the defaults never touches recipes already saved.
+ */
+export const RECIPE_DEFAULT_EXPENSES_SETTING = 'RECIPE_DEFAULT_EXPENSES';
+export const DEFAULT_RECIPE_EXPENSES = [
+  { category: 'MANPOWER', enabled: true, basis: 'PER_PACKET', rate: 1, sizeRates: [] },
+  { category: 'ELECTRICITY', enabled: true, basis: 'PER_PACKET', rate: 1, sizeRates: [] },
+  { category: 'OTHER', enabled: true, basis: 'PER_PACKET', rate: 1, sizeRates: [] },
+  { category: PACKAGING_MATERIAL, enabled: true, basis: 'PER_PACKET', rate: 2, sizeRates: [] },
+] as const;
 export const isPackagingCategory = (code: string) => code === PACKAGING_MATERIAL;
 const MAX_EXPENSE_RATE = 10_000_000;
 

@@ -284,6 +284,7 @@ app.get('/api/production/:id/stage-history', authenticate, authorizeRole(['SUPER
 app.get('/api/production/completion-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCompletionSettings);
 app.get('/api/production/lot-options', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.getLotOptions);
 app.get('/api/production/costing-settings', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getCostingSettings);
+app.put('/api/production/costing-settings/default-expenses', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.setDefaultRecipeExpenses);
 app.get('/api/production/batches/:id/cost-summary', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductionController.getBatchCostSummary);
 app.post('/api/production/batches/:id/packaging-cost-preview', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.previewPackagingCost);
 app.get('/api/production/packaging/sku-check', authenticate, authorizeRole(['SUPER_ADMIN']), ProductionController.checkPackagingSku);

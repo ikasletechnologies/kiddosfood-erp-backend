@@ -13,6 +13,7 @@ import {
   DEFAULT_EXPENSE_CATEGORIES, EXPENSE_CATEGORIES_SETTING, ExpenseCategory, ExpenseLineInput,
   SharedExpenseState, computePackagingCosts, normalizeExpenseLines, r4, simulateFifoCost,
   isPackagingCategory, snapshotExpenses, snapshotPackagingLines,
+  DEFAULT_RECIPE_EXPENSES, RECIPE_DEFAULT_EXPENSES_SETTING, RecipeExpenseItem, normalizeRecipeExpenses, readRecipeExpenses,
 } from './production-costing';
 
 const QTY_EPS = 0.0005;
@@ -37,6 +38,34 @@ export class ProductionCostingService {
     } catch {
       return DEFAULT_EXPENSE_CATEGORIES;
     }
+  }
+
+  /**
+   * Additional Expenses a new recipe starts with: the admin-saved defaults
+   * (SystemSetting RECIPE_DEFAULT_EXPENSES), else ₹1 Manpower + ₹1
+   * Electricity + ₹1 Other + ₹2 Packaging Materials, all per packet.
+   */
+  static async getDefaultRecipeExpenses(categories?: ExpenseCategory[]): Promise<RecipeExpenseItem[]> {
+    const cats = categories ?? await this.getExpenseCategories();
+    const { SettingsService } = require('../settings/settings.service');
+    const raw = await SettingsService.getSettingValue(RECIPE_DEFAULT_EXPENSES_SETTING, '');
+    if (raw) {
+      try { return readRecipeExpenses(normalizeRecipeExpenses(JSON.parse(raw), cats), cats); } catch { /* fall back below */ }
+    }
+    return readRecipeExpenses(DEFAULT_RECIPE_EXPENSES as unknown, cats);
+  }
+
+  /** Saves new defaults for future recipes only — saved recipes keep their own expenses. */
+  static async setDefaultRecipeExpenses(raw: unknown, userId?: string): Promise<RecipeExpenseItem[]> {
+    const cats = await this.getExpenseCategories();
+    const next = normalizeRecipeExpenses(raw, cats);
+    const previous = await this.getDefaultRecipeExpenses(cats);
+    const { SettingsService } = require('../settings/settings.service');
+    await SettingsService.setSetting(RECIPE_DEFAULT_EXPENSES_SETTING, JSON.stringify(next), 'PRODUCTION', 'Additional Expenses new recipes start with (Recipe Master and Word import)');
+    await prisma.auditLog.create({
+      data: { module: 'RECIPE', action: 'DEFAULT_EXPENSES_UPDATE', recordId: RECIPE_DEFAULT_EXPENSES_SETTING, oldValue: previous as any, newValue: next as any, performedBy: userId || null },
+    });
+    return readRecipeExpenses(next, cats);
   }
 
   // ── Production Planning: purchase lots ─────────────────────────────────

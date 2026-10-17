@@ -16,6 +16,7 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FormulationService, FormulationError, convertQty, normalizeUnit } from './formulation.service';
 import { RecipeService } from './recipe.service';
+import { ProductionCostingService } from '../production/production-costing.service';
 import { readDocxParagraphs } from './docx-reader';
 import { parseRecipeDocument, ParsedRecipe, titleCase } from './recipe-import.parser';
 import { matchMaterial, matchRecipe, normalizeName, suggestProducts, MaterialRef } from './recipe-import.matcher';
@@ -51,6 +52,12 @@ export interface RecipeDecision {
   yieldUnit?: string;
   ingredients: IngredientDecision[];
   productIds?: string[];
+  /**
+   * Updating an existing recipe that already has Additional Expenses: true
+   * replaces them with the current defaults. Otherwise they are kept. (New
+   * recipes, and recipes never configured, always get the defaults.)
+   */
+  replaceExpenses?: boolean;
 }
 
 export class ImportError extends Error {
@@ -253,6 +260,9 @@ export class RecipeImportService {
       }
     }
 
+    const expenseCategories = await ProductionCostingService.getExpenseCategories();
+    const defaultExpenses = await ProductionCostingService.getDefaultRecipeExpenses(expenseCategories);
+
     const result = await prisma.$transaction(async (tx) => {
       const locked = await this.lockSession(tx, sessionId);
       const status = locked.status as unknown as Record<string, RecipeStatus>;
@@ -306,6 +316,14 @@ export class RecipeImportService {
         }
         recipeId = recipe.id;
       }
+
+      // Additional Expenses: a new recipe (or one never configured) gets the
+      // default expenses; an existing configuration is kept unless the
+      // reviewer chose to replace it. Versioned and audited like a manual edit.
+      const currentExpenses = await tx.recipe.findUnique({ where: { id: recipeId }, select: { expenseConfig: true } });
+      const applyDefaults = currentExpenses?.expenseConfig == null || decision.replaceExpenses === true;
+      if (applyDefaults) await RecipeService.saveExpenseConfig(tx, recipeId, defaultExpenses, expenseCategories, userId);
+      const expenses: 'DEFAULTS_APPLIED' | 'KEPT' = applyDefaults ? 'DEFAULTS_APPLIED' : 'KEPT';
 
       // Same formulation as the active one → nothing new (repeat import).
       const active = await FormulationService.getActive(tx, recipeId);
@@ -378,11 +396,11 @@ export class RecipeImportService {
           newValue: {
             document: session.fileName, recipeKey: key, title: parsed.title, mode: decision.mode, result: newState.state,
             formulationVersion: formulation!.version, outputStage: plan.output.stage, yield: plan.yield,
-            edits: plan.edits, unresolved, productIds, createdMaterials: created,
+            edits: plan.edits, unresolved, productIds, createdMaterials: created, expenses,
           } as any,
         },
       });
-      return { status: newState, recipeId, formulationId: formulation!.id, version: formulation!.version };
+      return { status: newState, recipeId, formulationId: formulation!.id, version: formulation!.version, expenses };
     }, { timeout: 30000 });
 
     return { ...result, createdMaterials: created };

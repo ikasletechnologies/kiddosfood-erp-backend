@@ -72,13 +72,28 @@ async function run() {
     id: recipe.id, name: recipe.name, category: recipe.category, ingredientIds: [rice.id], additionalExpenses,
   }, userId);
 
-  // 1. Recipe with no additional expenses
-  const { recipe: plain, f: plainF } = await newRecipe('Plain Batter');
+  // 1. Recipe saved with every expense switched off (an explicit empty list)
+  const { recipe: plain, f: plainF } = await newRecipe('Plain Batter', []);
   const plainRead = await RecipeService.getRecipeById(plain.id);
   check('1. No expenses: four categories, all disabled at ₹0, version 0',
     plainRead!.additionalExpenses.length === 4 && plainRead!.additionalExpenses.every((e) => !e.enabled) &&
     plainRead!.additionalExpenses.filter((e) => e.category !== 'PACKAGING_MATERIAL').every((e) => e.rate === 0) &&
     plainRead!.expenseConfigVersion === 0 && plainRead!.expenseConfig === null, plainRead!.additionalExpenses);
+
+  // 1b. A new recipe saved without an expense list starts with the defaults:
+  // Manpower ₹1, Electricity ₹1, Other ₹1, Packaging Materials ₹2 — per packet.
+  const { recipe: dflt } = await newRecipe('Default Batter');
+  const dfltRead = await RecipeService.getRecipeById(dflt.id);
+  const rateOf = (code: string) => dfltRead!.additionalExpenses.find((e) => e.category === code);
+  check('1b. New recipe gets the default expenses (₹5 per packet), saved as version 1',
+    dfltRead!.additionalExpenses.every((e) => e.enabled && e.basis === 'PER_PACKET') &&
+    rateOf('MANPOWER')?.rate === 1 && rateOf('ELECTRICITY')?.rate === 1 && rateOf('OTHER')?.rate === 1 && rateOf('PACKAGING_MATERIAL')?.rate === 2 &&
+    dfltRead!.expenseConfigVersion === 1 && Array.isArray(dfltRead!.expenseConfig), dfltRead!.additionalExpenses);
+  const dfltEdited = await edit(dfltRead, [{ category: 'MANPOWER', enabled: true, basis: 'PER_PACKET', rate: 0 }, { category: 'ELECTRICITY', enabled: false, basis: 'PER_PACKET', rate: 1 }]);
+  check('1c. Edited defaults persist (₹0 kept, disabled kept), version 2',
+    dfltEdited!.additionalExpenses.find((e) => e.category === 'MANPOWER')?.rate === 0 &&
+    dfltEdited!.additionalExpenses.find((e) => e.category === 'ELECTRICITY')?.enabled === false &&
+    (await RecipeService.getRecipeById(dflt.id))!.expenseConfigVersion === 2);
 
   // 2–3. All four expenses, saved and reloaded
   const { recipe: full, f: fullF } = await newRecipe('Rice Batter', allFour);
