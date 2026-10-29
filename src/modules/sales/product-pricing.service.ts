@@ -1,3 +1,5 @@
+import { PRICING_FIELDS, PricingField, readPricing, mergePricing, mrpWarnings } from './sku-price-fields';
+import { resolveSkuPriceMaster, hasCompleteSkuPrices } from '../../utils/sku-pricing';
 import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
@@ -40,7 +42,6 @@ export type PriceTier = typeof PRICE_TIERS[number]['key'];
 type TierPrices = Record<PriceTier, number | null>;
 
 const AUDIT_MODULE = 'SET_PRICE';
-const MAX_PRICE = 10_000_000;
 const round2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const positive = (v: unknown): number | null => {
   const n = Number(v);
@@ -50,12 +51,12 @@ const positive = (v: unknown): number | null => {
 type User = { userId?: string; role?: string; franchiseId?: string | null } | null | undefined;
 
 export function pricingStatusOf(prices: TierPrices): string {
-  return PRICE_TIERS.every((t) => prices[t.key] != null) ? PRODUCT_FULLY_PRICED : PRODUCT_PRICING_PENDING;
+  return hasCompleteSkuPrices(prices) ? PRODUCT_FULLY_PRICED : PRODUCT_PRICING_PENDING;
 }
 
 const itemSelect = {
   id: true, name: true, sku: true, unit: true, gstRate: true, franchiseId: true, isActive: true,
-  customerPrice: true, dealerPrice: true, franchisePrice: true, basePrice: true, updatedAt: true,
+  customerPrice: true, dealerPrice: true, franchisePrice: true, upcountryFranchisePrice: true, mrp: true, whiteLabelCost: true, basePrice: true, updatedAt: true,
   franchise: { select: { id: true, name: true } },
 } satisfies Prisma.InventoryItemSelect;
 type ItemRow = Prisma.InventoryItemGetPayload<{ select: typeof itemSelect }>;
@@ -70,14 +71,10 @@ type LotRow = Prisma.InventoryBatchGetPayload<{ select: typeof lotSelect }>;
 
 /** Prices, stock and latest cost of one finished product (one stock item). */
 function shapeProduct(item: ItemRow, product: any, lots: LotRow[], reserved: Map<string, number>, showCost: boolean) {
-  const prices: TierPrices = {
-    customerPrice: positive(item.customerPrice),
-    dealerPrice: positive(item.dealerPrice),
-    franchisePrice: positive(item.franchisePrice),
-  };
+  const prices = readPricing(item);
   const taxPercent = item.gstRate ?? product?.taxPercent ?? 5;
   const newestFirst = [...lots].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-  const latestCost = newestFirst.find((l) => l.unitCost != null && l.unitCost > 0)?.unitCost ?? null;
+  const latestCost = newestFirst.find((l) => l.unitCost != null && Number.isFinite(l.unitCost))?.unitCost ?? null;
   const sellable = lots.filter((l) => l.status === 'APPROVED' && l.currentQty > 0.0001 && !isLotExpired(l.expDate));
   const availableQty = round2(sellable.reduce((s, l) => s + Math.max(0, l.currentQty - (reserved.get(l.id) || 0)), 0));
   const totalQty = round2(lots.reduce((s, l) => s + Math.max(0, l.currentQty), 0));
@@ -113,6 +110,7 @@ function shapeProduct(item: ItemRow, product: any, lots: LotRow[], reserved: Map
     taxPercent,
     ...prices,
     tiers,
+    mrpWarnings: mrpWarnings(prices, taxPercent),
     pricingStatus: pricingStatusOf(prices),
     missingTiers: PRICE_TIERS.filter((t) => prices[t.key] == null).map((t) => t.label),
     lotCount: lots.length,
@@ -152,7 +150,13 @@ export class ProductPricingService {
     const lotsByItem = new Map<string, LotRow[]>();
     for (const l of lots) lotsByItem.set(l.inventoryItemId, [...(lotsByItem.get(l.inventoryItemId) || []), l]);
     const productBySku = new Map(products.map((p) => [p.sku, p]));
-    return items.map((i) => shapeProduct(i, productBySku.get(i.sku), lotsByItem.get(i.id) || [], reserved, showCost));
+    const groups = new Map<string, ItemRow[]>();
+    for (const item of items) groups.set(item.sku, [...(groups.get(item.sku) || []), item]);
+    return Promise.all([...groups.values()].map(async (copies) => {
+      const item = copies.find(i => i.franchiseId == null) || copies[0];
+      const master = await resolveSkuPriceMaster(prisma, item.sku);
+      return shapeProduct({ ...item, ...(master ? { customerPrice: master.customerPrice, dealerPrice: master.dealerPrice, franchisePrice: master.franchisePrice, upcountryFranchisePrice: master.upcountryFranchisePrice, mrp: master.mrp, whiteLabelCost: master.whiteLabelCost } : {}) }, productBySku.get(item.sku), copies.flatMap(i => lotsByItem.get(i.id) || []), reserved, showCost);
+    }));
   }
 
   static async listProducts(filters: {
@@ -163,9 +167,8 @@ export class ProductPricingService {
     const empty = { products: [], summary: { total: 0, fullyPriced: 0, pending: 0, availableQty: 0, stockValue: showCost ? 0 : undefined }, categories: [], warehouses: [], canEdit: false, showCost };
     if (!scope) return empty;
 
-    // Finished products that exist as stock items: produced (have lots) or already priced.
-    let rows = (await this.load({ ...scope, isActive: true }, showCost))
-      .filter((p) => p.lotCount > 0 || p.pricingStatus === PRODUCT_FULLY_PRICED || p.missingTiers.length < PRICE_TIERS.length);
+    // Include first-time unpriced SKUs even before their first receipt.
+    let rows = await this.load({ ...scope, isActive: true }, showCost);
     const warehouses = [...new Map(rows.flatMap((p) => p.warehouses).map((w) => [w.id, w])).values()].sort((a, b) => a.name.localeCompare(b.name));
     const categories = [...new Set(rows.map((p) => p.category).filter(Boolean) as string[])].sort();
 
@@ -210,8 +213,8 @@ export class ProductPricingService {
           id: l.id,
           at: l.timestamp,
           by: nameOf(l.performedBy),
-          previous: { customerPrice: oldV.customerPrice ?? null, dealerPrice: oldV.dealerPrice ?? null, franchisePrice: oldV.franchisePrice ?? null },
-          prices: { customerPrice: newV.customerPrice ?? null, dealerPrice: newV.dealerPrice ?? null, franchisePrice: newV.franchisePrice ?? null },
+          previous: readPricing(oldV),
+          prices: readPricing(newV),
           enteredTaxInclusive: !!newV.enteredTaxInclusive,
           reason: newV.reason ?? null,
           latestCost: showCost ? (newV.latestCost ?? null) : undefined,
@@ -223,7 +226,7 @@ export class ProductPricingService {
 
   /**
    * Sets the product's Customer / Dealer / Franchise prices. A blank tier is
-   * left "not configured" (stored as the schema's 0 = not configured — never
+   * left "not configured" (stored as null = not configured — never
    * billed). Applied to every stock item of the SKU (HQ and branches) so a
    * product has one price set wherever it's sold. Below-cost prices (vs the
    * latest production cost) need acknowledgement; `expected` (what the
@@ -231,24 +234,17 @@ export class ProductPricingService {
    */
   static async setPrices(id: string, input: {
     customerPrice?: unknown; dealerPrice?: unknown; franchisePrice?: unknown;
+    upcountryFranchisePrice?: unknown; mrp?: unknown; whiteLabelCost?: unknown; taxPercent?: unknown;
     taxInclusive?: unknown; reason?: unknown; acknowledgeBelowCost?: unknown;
-    expected?: Partial<Record<PriceTier, unknown>> | null;
+    expected?: Partial<Record<PricingField, unknown>> | null;
   }, user: User) {
     if (!canEditLotPrice(user)) throw new LotPricingError('Not authorized to change selling prices.', 'FORBIDDEN', 403);
     const taxInclusive = input.taxInclusive === true || input.taxInclusive === 'true';
     const reason = typeof input.reason === 'string' ? input.reason.trim().slice(0, 500) || null : null;
 
-    const entered: TierPrices = { customerPrice: null, dealerPrice: null, franchisePrice: null };
-    for (const t of PRICE_TIERS) {
-      const raw = input[t.key];
-      if (raw === undefined || raw === null || String(raw).trim() === '') continue;
-      const n = Number(raw);
-      if (!Number.isFinite(n) || n <= 0) throw new LotPricingError(`${t.label} price must be greater than ₹0 (leave it blank if not decided yet).`, 'INVALID_PRICE');
-      if (n > MAX_PRICE) throw new LotPricingError(`${t.label} price is too large.`, 'INVALID_PRICE');
-      if (Math.abs(round2(n) - n) > 1e-9) throw new LotPricingError(`${t.label} price can have at most 2 decimal places.`, 'INVALID_PRICE');
-      entered[t.key] = n;
-    }
-    if (PRICE_TIERS.every((t) => entered[t.key] == null)) throw new LotPricingError('Enter at least one price.', 'INVALID_PRICE');
+    const entered = Object.fromEntries(PRICING_FIELDS.filter(t => input[t.key] !== undefined).map(t => [t.key, input[t.key]]));
+    if (!PRICING_FIELDS.some(t => input[t.key] !== undefined) && input.taxPercent === undefined) throw new LotPricingError('No pricing changes supplied.', 'INVALID_PRICE');
+    if (input.taxPercent !== undefined && ![5, 12, 18, 28].includes(Number(input.taxPercent))) throw new LotPricingError('Choose a valid GST rate.', 'INVALID_TAX');
 
     return prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${id} FOR UPDATE`;
@@ -257,15 +253,14 @@ export class ProductPricingService {
         throw new LotPricingError('Finished product not found.', 'NOT_FOUND', 404);
       }
       const product = await tx.product.findUnique({ where: { sku: item.sku }, select: { id: true, taxPercent: true } });
-      const taxPercent = item.gstRate ?? product?.taxPercent ?? 5;
-      const previous: TierPrices = {
-        customerPrice: positive(item.customerPrice),
-        dealerPrice: positive(item.dealerPrice),
-        franchisePrice: positive(item.franchisePrice),
-      };
+      const taxPercent = input.taxPercent === undefined ? item.gstRate ?? product?.taxPercent ?? 5 : Number(input.taxPercent);
+      const master = await resolveSkuPriceMaster(tx, item.sku);
+      if (master && master.id !== item.id) await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${master.id} FOR UPDATE`;
+      const previous = readPricing(master || item);
 
       if (input.expected) {
-        for (const t of PRICE_TIERS) {
+        for (const t of PRICING_FIELDS) {
+          if (input.expected[t.key] === undefined) continue;
           const seen = positive(input.expected[t.key]);
           const now = previous[t.key];
           if ((seen == null) !== (now == null) || (seen != null && now != null && Math.abs(seen - now) > 0.001)) {
@@ -274,22 +269,19 @@ export class ProductPricingService {
         }
       }
 
-      const next: TierPrices = { customerPrice: null, dealerPrice: null, franchisePrice: null };
-      for (const t of PRICE_TIERS) {
-        const v = entered[t.key];
-        next[t.key] = v == null ? null : priceExcludingTax(v, taxInclusive, taxPercent);
-        if (next[t.key] != null && !(next[t.key]! > 0)) throw new LotPricingError(`${t.label} price is too small.`, 'INVALID_PRICE');
-      }
-      if (PRICE_TIERS.every((t) => (next[t.key] ?? null) === (previous[t.key] ?? null))) {
-        return { changed: false, id, ...next, pricingStatus: pricingStatusOf(next) };
+      const next = mergePricing(previous, input, taxInclusive, taxPercent);
+      const warnings = mrpWarnings(next, taxPercent);
+      const gstChanged = input.taxPercent !== undefined && taxPercent !== item.gstRate;
+      if (!gstChanged && PRICING_FIELDS.every(t => next[t.key] === previous[t.key])) {
+        return { changed: false, id, ...next, taxPercent, mrpWarnings: warnings, pricingStatus: pricingStatusOf(next) };
       }
 
       // Margin check against the most recent production cost.
       const latest = await tx.inventoryBatch.findFirst({
-        where: { inventoryItemId: id, unitCost: { gt: 0 } }, orderBy: { createdAt: 'desc' }, select: { unitCost: true },
+        where: { inventoryItemId: id, unitCost: { gte: 0 } }, orderBy: { createdAt: 'desc' }, select: { unitCost: true },
       });
       const latestCost = latest?.unitCost ?? null;
-      const below = PRICE_TIERS
+      const below = PRICING_FIELDS.filter(t => t.selling)
         .filter((t) => next[t.key] != null && latestCost != null)
         .map((t) => ({ tier: t.label, ...checkLotPrice({ price: next[t.key]!, taxInclusive: false, taxPercent, unitCost: latestCost }) }))
         .filter((c) => c.belowCost);
@@ -303,9 +295,8 @@ export class ProductPricingService {
 
       // Every stock copy of this SKU (HQ and branches) gets the same prices.
       const data = {
-        customerPrice: next.customerPrice ?? 0,
-        dealerPrice: next.dealerPrice ?? 0,
-        franchisePrice: next.franchisePrice ?? 0,
+        ...next,
+        ...(gstChanged ? { gstRate: taxPercent } : {}),
       };
       await tx.inventoryItem.updateMany({ where: { sku: item.sku, category: 'FINISHED_GOOD' }, data });
       // HQ convention (InventoryService.updateItem): basePrice mirrors the
@@ -321,6 +312,7 @@ export class ProductPricingService {
           data: {
             pricingStatus: status === PRODUCT_FULLY_PRICED ? PRICED : PRICING_PENDING,
             ...(next.franchisePrice != null ? { basePrice: next.franchisePrice } : {}),
+            ...(gstChanged ? { taxPercent } : {}),
           },
         });
       }
@@ -342,7 +334,7 @@ export class ProductPricingService {
           performedBy: user?.userId || null,
         },
       });
-      return { changed: true, id, previous, ...next, pricingStatus: status, belowCostTiers: below.map((b) => b.tier) };
+      return { changed: true, id, previous, ...next, taxPercent, mrpWarnings: warnings, pricingStatus: status, belowCostTiers: below.map((b) => b.tier) };
     });
   }
 }

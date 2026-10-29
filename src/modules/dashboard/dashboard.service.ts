@@ -200,6 +200,9 @@ export class DashboardService {
         revenueToday: ana.revenueToday,               // Today's Sales / Billing
         pendingCollections: col.pendingCollections,   // Unpaid dealer invoices
         outstandingAmount: col.totalDealerOutstanding, // Total Credit / Receivables
+        finishedGoodsLowStockThreshold: inv.finishedGoodsLowStockThreshold,
+        finishedGoodsLowStockCount: inv.finishedGoodsLowStockCount,
+        finishedGoodsOutOfStockCount: inv.finishedGoodsOutOfStockCount,
         lowStockCount: inv.lowStockCount,             // Products below threshold
         pendingDeliveries: disp.pendingDeliveries,     // Orders not delivered
         dealerCount: dealerCount,                     // Total network size

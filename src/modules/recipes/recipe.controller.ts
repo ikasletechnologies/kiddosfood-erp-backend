@@ -95,6 +95,15 @@ export class RecipeController {
     }
   }
 
+  static async linkProducts(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      res.json(await RecipeService.linkProducts(req.params.id, req.body?.productIds, user?.userId));
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   static async getCategories(req: Request, res: Response) {
     try {
       const categories = await RecipeService.getCategories();
@@ -107,11 +116,10 @@ export class RecipeController {
   static async createCategory(req: Request, res: Response) {
     try {
       const { name } = req.body;
-      if (!name) return res.status(400).json({ error: 'Name is required' });
       const category = await RecipeService.createCategory(name);
       res.status(201).json(category);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   }
 }

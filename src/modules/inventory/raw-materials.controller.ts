@@ -50,13 +50,14 @@ export class RawMaterialsController {
       // own listing omits it to keep showing every category for reconciliation.
       const excludeCategory = req.query.excludeCategory as string | undefined;
       const excludeCategories = excludeCategory ? excludeCategory.split(',') as any[] : undefined;
+      const category = req.query.category as any;
       // Item Master must show the same stock figure the ledger would compute
       // (InventoryItem.currentStock is only a cache and can drift if some
       // code path ever updates it without a StockMovement) — so this reuses
       // InventoryService.getInventory(), which recomputes currentStock from
       // StockMovement on every read, instead of trusting the cached column
       // directly the way a plain findMany() here previously did.
-      const items = await InventoryService.getInventory(franchiseId as any, includeInactive, excludeCategories);
+      const items = await InventoryService.getInventory(franchiseId as any, includeInactive, excludeCategories, category);
       // Additive: lot-based valuation for Stock Hub (existing fields untouched).
       const lotSummaries = await PurchaseLotsService.getLotSummaries(items.map((i: any) => i.id));
       res.json(items.map((i: any) => ({

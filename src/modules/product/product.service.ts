@@ -1,3 +1,4 @@
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import prisma from '../../lib/prisma';
 import { ItemCategory, ProductType } from '@prisma/client';
 import { FranchiseService } from '../franchise/franchise.service';
@@ -93,7 +94,7 @@ async function syncInventoryItemForProduct(tx: any, product: { id: string; name:
       data: {
         name: product.name,
         basePrice: product.basePrice || 0,
-        customerPrice: product.basePrice || 0,
+        // Preserve the explicit Customer / Dealer / Franchise price configuration.
         gstRate: product.taxPercent,
         franchiseId: existing.franchiseId ?? hqFranchiseId,
       },
@@ -170,6 +171,7 @@ export class ProductService {
       });
       console.log(`📦 [ProductAPI] Found ${inventory.length} matching inventory items for stock display`);
       
+      const priceMasters = new Map(await Promise.all(products.map(async p => [p.id, p.sku ? await resolveSkuPriceMaster(prisma, p.sku) : null] as const)));
       return products.map(p => {
         const pName = p.name.trim().toLowerCase();
         // Match by SKU strictly when product has a SKU — NEVER fall back to name,
@@ -197,6 +199,7 @@ export class ProductService {
         // configured unit at all.
         const resolvedUnit = inv?.unit || (inv?.baseUnit as any)?.shortName || (inv?.baseUnit as any)?.code || p.recipe?.yieldUnit || packSize?.unit || 'PC';
 
+        const priceMaster = priceMasters.get(p.id);
         if (!inv) {
           // If resolving for a branch franchise (non-HQ), exclude products
           // that have not yet been transferred/inwarded into this franchise's inventory.
@@ -205,7 +208,7 @@ export class ProductService {
           }
           return {
             ...p,
-            unit: resolvedUnit,
+            unit: priceMaster?.unit || resolvedUnit,
             currentStock: 0,
             inventoryFranchiseId: franchiseId || null,
             inventoryBasePrice: p.basePrice,
@@ -220,10 +223,12 @@ export class ProductService {
             packSize,
             // Applicable selling price per channel (null = cannot be billed),
             // from the same resolver POS checkout charges with.
-            sellingPrices: resolveSellingPrices(null, p)
+            customerPrice: priceMaster?.customerPrice ?? null, dealerPrice: priceMaster?.dealerPrice ?? null, franchisePrice: priceMaster?.franchisePrice ?? null,
+            sellingPrices: resolveSellingPrices(priceMaster, p)
           };
         }
 
+        const prices = priceMaster || inv;
         return {
           ...p,
           unit: resolvedUnit,
@@ -240,13 +245,13 @@ export class ProductService {
           // Product — without this, POS's getPrice(p, partyType) always
           // fell through to the generic base/franchise price for every
           // channel (the ₹135-shown-for-Dealer bug).
-          franchisePrice: inv.franchisePrice,
-          dealerPrice: inv.dealerPrice,
-          customerPrice: inv.customerPrice,
+          franchisePrice: prices.franchisePrice,
+          dealerPrice: prices.dealerPrice,
+          customerPrice: prices.customerPrice,
           baseUnit: inv.baseUnit,
           conversions: inv.conversions,
           packSize,
-          sellingPrices: resolveSellingPrices(inv, p),
+          sellingPrices: resolveSellingPrices(prices, p),
           // SKU of the Stock Hub (Item Master) record this product resolved
           // to — what Stock Hub displays. Lets POS show the real SKU for a
           // legacy product whose own Product.sku is empty (matched by name).
@@ -505,5 +510,90 @@ export class ProductService {
 
       return { success: true, item, product };
     });
+  }
+
+  static async getBulkProducts() {
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      select: { id: true, name: true, sku: true, category: true, basePrice: true, taxPercent: true }
+    });
+
+    const families = new Map<string, {
+      canonicalProduct: any;
+      baseName: string;
+      category: string;
+      variants: any[];
+    }>();
+
+    for (const p of products) {
+      const raw = p.name;
+      const baseName = raw.replace(/\s*\(?\s*\d+(\.\d+)?\s*(kg|g|l|ml|pcs|pc)\.?\s*\)?\s*$/i, '').trim() || raw;
+      const key = baseName.toUpperCase();
+      if (!families.has(key)) {
+        families.set(key, {
+          canonicalProduct: p,
+          baseName,
+          category: p.category || 'FINISHED_GOOD',
+          variants: []
+        });
+      }
+      families.get(key)!.variants.push(p);
+    }
+
+    const hq = await FranchiseService.getHqFranchiseOrNull();
+    const franchiseId = hq?.id || null;
+
+    const result: any[] = [];
+    for (const [, family] of families.entries()) {
+      const p = family.canonicalProduct;
+      const baseCode = (p.sku || p.name)
+        .replace(/-(\d+(?:\.\d+)?)(KG|G|ML|L|PCS|PC)$/i, '')
+        .replace(/[^A-Za-z0-9]/g, '')
+        .slice(0, 8)
+        .toUpperCase() || 'PROD';
+      const bulkSku = `${baseCode}-BULK`;
+      const bulkName = `${family.baseName} - Bulk`;
+
+      let bulkItem = await prisma.inventoryItem.findFirst({
+        where: {
+          OR: [
+            { sku: bulkSku },
+            { name: bulkName }
+          ]
+        }
+      });
+
+      if (!bulkItem) {
+        bulkItem = await prisma.inventoryItem.create({
+          data: {
+            name: bulkName,
+            sku: bulkSku,
+            category: 'SEMI_FINISHED',
+            currentStock: 0,
+            unit: 'KG',
+            minimumStock: 5,
+            franchiseId,
+            gstRate: p.taxPercent || 5,
+          }
+        });
+      }
+
+      result.push({
+        id: family.canonicalProduct.id,
+        productId: family.canonicalProduct.id,
+        name: family.baseName,
+        category: family.category,
+        inventoryItemId: bulkItem.id,
+        sku: bulkItem.sku,
+        unit: bulkItem.unit,
+        currentStock: bulkItem.currentStock,
+        price: bulkItem.costPrice || 0,
+        gstRate: bulkItem.gstRate || p.taxPercent || 5,
+        compatibleUnits: ['KG', 'G', 'L', 'ML', 'PCS'],
+        variants: family.variants
+      });
+    }
+
+    return result.sort((a, b) => a.name.localeCompare(b.name));
   }
 }

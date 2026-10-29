@@ -17,7 +17,7 @@ export class SettingsController {
       const setting = await SettingsService.setSetting(key, value, group, description);
       res.status(200).json(setting);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      res.status((error as any).statusCode || 500).json({ error: (error as Error).message });
     }
   }
 

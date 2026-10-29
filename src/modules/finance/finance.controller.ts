@@ -331,12 +331,13 @@ export class FinanceController {
 
       const invoice = await FinanceService.createInvoice({
         ...req.body,
+        deferFulfillment: req.originalUrl.startsWith('/api/sales/invoices') && !req.body.sourceDeliveryChallanId && !req.body.sourceFranchiseOrderId,
         franchiseId,
         createdBy: user?.fullName || user?.email || 'System'
       });
       res.status(201).json(invoice);
     } catch (error: any) {
-      const isBusinessError = error instanceof LotPricingError || /Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to|Invalid batch|^Batch "|^Lot /i.test(error.message);
+      const isBusinessError = error instanceof LotPricingError || /Confirm unallocated|Selected lot|Lot quantities|Select a SKU|Invalid lot|Invoice items require|Insufficient stock|Cannot price|Selected customer|branch\/franchise must be selected|already been converted|does not belong to|Invalid batch|^Batch "|^Lot /i.test(error.message);
       res.status(isBusinessError ? 400 : 500).json({ error: error.message });
     }
   }

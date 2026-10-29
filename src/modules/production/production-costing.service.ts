@@ -298,15 +298,16 @@ export class ProductionCostingService {
       include: {
         production: { include: { recipe: true, items: { include: { inventoryItem: { select: { name: true, unit: true } } } } } },
         packagings: { where: { status: 'CONFIRMED' }, orderBy: { confirmedAt: 'asc' } },
+        goodsReceiptItem: { select: { unit: true } },
       },
     });
     if (!batch) throw new Error('Product batch not found');
     const p = batch.production;
-    const unit = p?.plannedYieldUnit || p?.recipe?.yieldUnit || 'KG';
-    const plannedYield = p ? (p.plannedYieldQty ?? (p.quantity * (p.recipe?.yieldQty || 0))) : null;
+    const unit = p?.plannedYieldUnit || p?.recipe?.yieldUnit || batch.goodsReceiptItem?.unit || 'KG';
+    const plannedYield = p ? (p.plannedYieldQty ?? (p.quantity * (p.recipe?.yieldQty || 0))) : (batch.quantity ?? null);
     const actualYield = p?.actualYield ?? batch.quantity ?? null;
     const items = p?.items || [];
-    const materialCost = r4(p?.materialCost ?? items.reduce((s, i) => s + (i.totalCost || 0), 0));
+    const materialCost = r4(p?.materialCost ?? (batch.totalCost || (batch.unitCost ? batch.unitCost * batch.quantity : items.reduce((s, i) => s + (i.totalCost || 0), 0))));
     const additionalMaterialCost = r4(items.filter((i) => i.isAdditional).reduce((s, i) => s + (i.totalCost || 0), 0));
     const shared = await this.loadSharedExpenses(prisma, batchId);
     const categories = await this.getExpenseCategories();

@@ -693,7 +693,7 @@ export class ProcurementService {
     discountAmount?: number;
     freightCost?: number;
     paymentTerms?: string;
-    items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string }>;
+    items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string; isBulk?: boolean; productId?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     const [vendor, sellerState] = await Promise.all([
@@ -708,46 +708,105 @@ export class ProcurementService {
       throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
     }
 
-    const poItemsData = await Promise.all(data.items.map(async (item) => {
-      const inventoryItem = await prisma.inventoryItem.findUnique({
-        where: { id: item.inventoryItemId }
-      });
-      // A Finished Good is only ever created by Production/QC (see
-      // ProductionService.inspectBatch) — receiving one on a vendor PO would
-      // credit its stock outside that workflow, bypassing the batch/QC trail
-      // and silently inflating Finished Goods that were never manufactured.
-      if (inventoryItem?.category === 'FINISHED_GOOD') {
-        throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
+    const purchaseType = (data.purchaseType as string) || 'RAW_MATERIAL';
+    const isFinishedGoodsPO = purchaseType === 'FINISHED_GOOD' || purchaseType === 'FINISHED_GOODS';
+    const isRawMaterialPO = purchaseType === 'RAW_MATERIAL';
+
+    const poItemsData = await Promise.all(data.items.map(async (rawItem) => {
+      let item = { ...rawItem };
+      let inventoryItem = item.inventoryItemId
+        ? await prisma.inventoryItem.findUnique({ where: { id: item.inventoryItemId } })
+        : null;
+
+      // If item was selected by Product ID (e.g. bulk catalog product or uncatalogued FG variant)
+      if (!inventoryItem && item.productId) {
+        const prod = await prisma.product.findUnique({ where: { id: item.productId } });
+        if (prod) {
+          if (item.isBulk) {
+            const baseCode = prod.sku || prod.name;
+            const bulkSku = baseCode.toUpperCase().endsWith('-BULK') ? baseCode.toUpperCase() : `${baseCode.toUpperCase()}-BULK`;
+            const bulkName = prod.name.endsWith(' - Bulk') ? prod.name : `${prod.name} - Bulk`;
+            inventoryItem = await prisma.inventoryItem.findFirst({
+              where: { OR: [{ sku: bulkSku }, { name: bulkName }] }
+            });
+            if (!inventoryItem) {
+              inventoryItem = await prisma.inventoryItem.create({
+                data: {
+                  name: bulkName,
+                  sku: bulkSku,
+                  category: 'SEMI_FINISHED',
+                  currentStock: 0,
+                  unit: item.unit || 'KG',
+                  minimumStock: 5,
+                }
+              });
+            }
+          } else {
+            inventoryItem = await prisma.inventoryItem.findFirst({
+              where: { OR: [{ sku: prod.sku || undefined }, { name: prod.name }] }
+            });
+            if (!inventoryItem) {
+              inventoryItem = await prisma.inventoryItem.create({
+                data: {
+                  name: prod.name,
+                  sku: prod.sku || `FG-${prod.name.substring(0, 4).toUpperCase()}`,
+                  category: 'FINISHED_GOOD',
+                  currentStock: 0,
+                  unit: item.unit || 'PC',
+                  minimumStock: 10,
+                }
+              });
+            }
+          }
+          item.inventoryItemId = inventoryItem.id;
+        }
+      }
+
+      // Check category compatibility with PO purchaseType:
+      if (isRawMaterialPO && inventoryItem?.category === 'FINISHED_GOOD') {
+        throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a Raw Material PO — select Finished Goods purchase type.`);
+      }
+      if (isFinishedGoodsPO && inventoryItem?.category === 'RAW_MATERIAL') {
+        throw new Error(`"${inventoryItem.name}" is a Raw Material and cannot be purchased on a Finished Goods PO — select Raw Material purchase type.`);
       }
 
       // Unit Validation: Ensure the transaction unit is compatible with the item's base unit.
-      // E.g. Reject KG -> ML. We don't save the unit or convert the quantity for PO financials,
-      // we only use the engine to enforce dimension safety.
       if (item.unit && inventoryItem?.unit) {
-         try {
-            const { convertMeasurement } = require('@businessgroupikasle/erp-units');
-            // This will throw if dimensions don't match (e.g. WEIGHT vs VOLUME)
-            convertMeasurement(item.quantity, item.unit.toUpperCase(), inventoryItem.unit.toUpperCase());
-         } catch (e: any) {
-            throw new Error(`Unit mismatch for "${inventoryItem.name}": ${e.message}`);
-         }
+        const u1 = item.unit.toUpperCase();
+        const u2 = inventoryItem.unit.toUpperCase();
+        const countUnits = ['PC', 'PCS', 'UNIT', 'PACKET', 'BOX', 'NOS'];
+        const isCount1 = countUnits.includes(u1);
+        const isCount2 = countUnits.includes(u2);
+        if (u1 !== u2) {
+          if (isCount1 && isCount2) {
+            // Both are discrete count units
+          } else if (isCount1 || isCount2) {
+            throw new Error(`Unit mismatch for "${inventoryItem.name}": Cannot convert count unit ${u1} to measurement unit ${u2}`);
+          } else {
+            try {
+              const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+              convertMeasurement(item.quantity, u1, u2);
+            } catch (e: any) {
+              throw new Error(`Unit mismatch for "${inventoryItem.name}": ${e.message}`);
+            }
+          }
+        }
       }
 
-      // Prefer whatever GST% the line item actually shows on the PO (the
-      // user can override it there); fall back to the item master's own
-      // rate, then 5% as a last resort. `??` matters here — `|| 5` would
-      // silently turn a genuine 0%-GST item into 5%, since 0 is falsy.
       const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
       const subtotal = item.quantity * item.price;
       const split = computeGstFromRate(subtotal, gstRate, vendor?.state, sellerState);
 
       return {
         ...item,
+        isBulk: Boolean(item.isBulk),
+        productId: item.productId || null,
+        inventoryItemId: inventoryItem?.id || item.inventoryItemId,
         itemName: inventoryItem?.name || "Unknown Material",
         gstRate,
         quantity: item.quantity,
         price: item.price,
-        unit: item.unit || 'UNIT',
+        unit: item.unit || inventoryItem?.unit || 'UNIT',
         subtotal,
         cgst: split.cgst,
         sgst: split.sgst,
@@ -829,6 +888,8 @@ export class ProcurementService {
           poItems: {
             create: poItemsData.map((item) => ({
               inventoryItemId: item.inventoryItemId,
+              productId: item.productId,
+              isBulk: item.isBulk,
               itemName: item.itemName,
               gstRate: item.gstRate,
               quantity: item.quantity,
@@ -927,7 +988,7 @@ export class ProcurementService {
     discountAmount?: number;
     freightCost?: number;
     paymentTerms?: string;
-    items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string }>;
+    items?: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string; isBulk?: boolean; productId?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
     return prisma.$transaction(async (tx) => {
@@ -972,12 +1033,64 @@ export class ProcurementService {
           resolveSellerState(data.franchiseId !== undefined ? data.franchiseId : po.franchiseId)
         ]);
 
-        const poItemsData = await Promise.all(data.items.map(async (item) => {
-          const inventoryItem = await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } });
-          // Same guard as createPurchaseOrder — a Finished Good must never
-          // be added to a vendor PO, on creation or on a later edit.
-          if (inventoryItem?.category === 'FINISHED_GOOD') {
-            throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a vendor PO — Finished Goods stock is only credited via Production QC acceptance.`);
+        const purchaseType = (data.purchaseType as string) || (po.purchaseType as string) || 'RAW_MATERIAL';
+        const isFinishedGoodsPO = purchaseType === 'FINISHED_GOOD' || purchaseType === 'FINISHED_GOODS';
+        const isRawMaterialPO = purchaseType === 'RAW_MATERIAL';
+
+        const poItemsData = await Promise.all(data.items.map(async (rawItem) => {
+          let item = { ...rawItem };
+          let inventoryItem = item.inventoryItemId
+            ? await tx.inventoryItem.findUnique({ where: { id: item.inventoryItemId } })
+            : null;
+
+          if (!inventoryItem && item.productId) {
+            const prod = await tx.product.findUnique({ where: { id: item.productId } });
+            if (prod) {
+              if (item.isBulk) {
+                const baseCode = prod.sku || prod.name;
+                const bulkSku = baseCode.toUpperCase().endsWith('-BULK') ? baseCode.toUpperCase() : `${baseCode.toUpperCase()}-BULK`;
+                const bulkName = prod.name.endsWith(' - Bulk') ? prod.name : `${prod.name} - Bulk`;
+                inventoryItem = await tx.inventoryItem.findFirst({
+                  where: { OR: [{ sku: bulkSku }, { name: bulkName }] }
+                });
+                if (!inventoryItem) {
+                  inventoryItem = await tx.inventoryItem.create({
+                    data: {
+                      name: bulkName,
+                      sku: bulkSku,
+                      category: 'SEMI_FINISHED',
+                      currentStock: 0,
+                      unit: item.unit || 'KG',
+                      minimumStock: 5,
+                    }
+                  });
+                }
+              } else {
+                inventoryItem = await tx.inventoryItem.findFirst({
+                  where: { OR: [{ sku: prod.sku || undefined }, { name: prod.name }] }
+                });
+                if (!inventoryItem) {
+                  inventoryItem = await tx.inventoryItem.create({
+                    data: {
+                      name: prod.name,
+                      sku: prod.sku || `FG-${prod.name.substring(0, 4).toUpperCase()}`,
+                      category: 'FINISHED_GOOD',
+                      currentStock: 0,
+                      unit: item.unit || 'PC',
+                      minimumStock: 10,
+                    }
+                  });
+                }
+              }
+              item.inventoryItemId = inventoryItem.id;
+            }
+          }
+
+          if (isRawMaterialPO && inventoryItem?.category === 'FINISHED_GOOD') {
+            throw new Error(`"${inventoryItem.name}" is a Finished Good and cannot be purchased on a Raw Material PO — select Finished Goods purchase type.`);
+          }
+          if (isFinishedGoodsPO && inventoryItem?.category === 'RAW_MATERIAL') {
+            throw new Error(`"${inventoryItem.name}" is a Raw Material and cannot be purchased on a Finished Goods PO — select Raw Material purchase type.`);
           }
 
           if (item.unit && inventoryItem?.unit) {
@@ -989,18 +1102,18 @@ export class ProcurementService {
              }
           }
 
-          // Same `??` fix as createPurchaseOrder — a real 0%-GST item must
-          // not get silently bumped to 5% by a falsy-zero fallback.
           const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
           const subtotal = item.quantity * item.price;
           const split = computeGstFromRate(subtotal, gstRate, vendorForTax?.state, sellerState);
           return {
-            inventoryItemId: item.inventoryItemId,
+            inventoryItemId: inventoryItem?.id || item.inventoryItemId,
+            productId: item.productId || null,
+            isBulk: Boolean(item.isBulk),
             itemName: inventoryItem?.name || 'Unknown Material',
             gstRate,
             quantity: item.quantity,
             price: item.price,
-            unit: item.unit || 'UNIT',
+            unit: item.unit || inventoryItem?.unit || 'UNIT',
             subtotal,
             cgst: split.cgst,
             sgst: split.sgst,

@@ -66,3 +66,4 @@ verify_users.js
 /lint_output.txt
 /lint_report.json
 /migration_log.txt
+/powershell.cmd

@@ -2,10 +2,7 @@ import axios from 'axios';
 import prisma from '../../lib/prisma';
 
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
-const GSTVERIFY_BASE_URL = process.env.GSTVERIFY_BASE_URL || 'https://gstverify.co.in/api/v1/verify';
-const SANDBOX_PRODUCTION_URL = 'https://api.sandbox.co.in';
-const SANDBOX_TEST_URL = 'https://test-api.sandbox.co.in';
-const SANDBOX_BASE_URL = process.env.SANDBOX_BASE_URL || 'https://api.sandbox.co.in';
+const GSTIN_API_BASE_URL = (process.env.GSTIN_API_BASE_URL || 'https://www.gstinapi.in').replace(/\/$/, '');
 
 const GST_STATE_MAP: Record<string, string> = {
   '01': 'Jammu and Kashmir',
@@ -83,56 +80,7 @@ type CachedRow = {
   natureOfBusiness: unknown;
 };
 
-// In-memory token cache for Sandbox.co.in API (valid for 24h)
-class SandboxAuth {
-  private static cachedToken: string | null = null;
-  private static tokenExpiresAt = 0;
-
-  static async getAccessToken(apiKey: string, apiSecret: string): Promise<string> {
-    const now = Date.now();
-    if (this.cachedToken && this.tokenExpiresAt > now + 60_000) {
-      return this.cachedToken;
-    }
-
-    try {
-      const response = await axios.post(
-        `${SANDBOX_BASE_URL}/authenticate`,
-        {},
-        {
-          headers: {
-            'x-api-key': apiKey,
-            'x-api-secret': apiSecret,
-            'x-api-version': '1.0.0',
-            'Content-Type': 'application/json',
-          },
-          validateStatus: () => true,
-        }
-      );
-
-      if (response.status !== 200 || !response.data?.data?.access_token) {
-        const errorMsg =
-          response.data?.message ||
-          response.data?.error ||
-          `Sandbox authentication failed (HTTP ${response.status})`;
-        throw new GstVerifyError(errorMsg, response.status === 401 ? 401 : 502);
-      }
-
-      this.cachedToken = response.data.data.access_token as string;
-      this.tokenExpiresAt = now + 23 * 60 * 60 * 1000; // cache for 23 hours
-      return this.cachedToken;
-    } catch (err: any) {
-      if (err instanceof GstVerifyError) throw err;
-      throw new GstVerifyError(
-        `Failed to authenticate with Sandbox API: ${err.message}`,
-        502
-      );
-    }
-  }
-}
-
 export class GstService {
-  private static sandboxToken: { value: string; expiresAt: number } | null = null;
-
   static isValidGstin(gstin: string): boolean {
     return GSTIN_REGEX.test(gstin);
   }
@@ -156,18 +104,19 @@ export class GstService {
       }
     }
 
-    const apiKey = process.env.GSTVERIFY_API_KEY;
+    const apiKey = process.env.GSTIN_API_KEY;
     if (!apiKey) {
-      throw new GstVerifyError('GSTVERIFY_API_KEY is not configured on the server.', 500);
+      throw new GstVerifyError('GSTIN_API_KEY is not configured on the server.', 500);
     }
 
-    const response = await axios.get(`${GSTVERIFY_BASE_URL}/${gstin}`, {
-      headers: { 'X-API-Key': apiKey },
+    const response = await axios.get(`${GSTIN_API_BASE_URL}/v1/gstin/${encodeURIComponent(gstin)}`, {
+      headers: { 'x-api-key': apiKey },
+      params: { include: 'profile' },
       validateStatus: () => true,
     });
 
     if (response.status !== 200 || !response.data?.success) {
-      const message = response.data?.error || `GSTVerify lookup failed (${response.status})`;
+      const message = response.data?.error || `GSTIN lookup failed (${response.status})`;
       // 429 (rate limit) is worth surfacing as-is; everything else (bad/expired
       // key, no credits, upstream GST outage) is a server-side problem, not
       // the caller's, so it comes back as a generic upstream failure.
@@ -176,19 +125,21 @@ export class GstService {
 
     const raw = response.data.data || {};
     const address = raw.address || '';
-    const state = raw.state || '';
+    const state = raw.address_details?.state || GST_STATE_MAP[String(raw.state_code || gstin.slice(0, 2))] || '';
+    const derived = this.deriveLocation(address, state);
     const details: GstinDetails = {
       gstin: raw.gstin || gstin,
       legalName: raw.legal_name || raw.trade_name || 'Unknown Business',
       tradeName: raw.trade_name || raw.legal_name || '',
       status: raw.status || 'UNKNOWN',
-      constitution: raw.constitution || '',
+      constitution: raw.business_constitution || '',
       taxpayerType: raw.taxpayer_type || 'Regular',
       registrationDate: raw.registration_date || '',
       pan: raw.pan || '',
       address,
       state,
-      ...this.deriveLocation(address, state),
+      city: raw.address_details?.city || raw.city || derived.city,
+      pinCode: raw.address_details?.pincode || raw.pincode || derived.pinCode,
       natureOfBusiness: Array.isArray(raw.nature_of_business) ? raw.nature_of_business : [],
     };
 

@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import {FINISHED_GOODS_LOW_STOCK_KEY,validateFinishedGoodsThreshold} from './finished-goods-low-stock';
 import { FranchiseService } from '../franchise/franchise.service';
 
 export class SettingsService {
@@ -10,6 +11,10 @@ export class SettingsService {
   }
 
   static async setSetting(key: string, value: string, group: string = 'GENERAL', description?: string) {
+    if(key===FINISHED_GOODS_LOW_STOCK_KEY){
+      if(typeof value!=='string'||!/^\d+$/.test(value))validateFinishedGoodsThreshold(value);
+      value=String(validateFinishedGoodsThreshold(Number(value)));
+    }
     return prisma.systemSetting.upsert({
       where: { key },
       update: { value, group, description },

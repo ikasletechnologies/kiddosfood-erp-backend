@@ -24,8 +24,12 @@ export class FranchiseOrderController {
           ? user.franchiseId
           : (req.query.franchiseId as string | undefined);
 
+      if (user.role === 'FRANCHISE_ADMIN' && !user.franchiseId) {
+        return res.status(403).json({ error: 'No franchise assigned' });
+      }
       const status = req.query.status as FranchiseOrderStatus | undefined;
-      const orders = await FranchiseOrderService.getOrders({ franchiseId, status });
+      const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+      const orders = await FranchiseOrderService.getOrders({ franchiseId, status, search });
       res.json(orders);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -36,6 +40,10 @@ export class FranchiseOrderController {
     try {
       const order = await FranchiseOrderService.getOrderById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+      const user = (req as any).user;
+      if (user.role === 'FRANCHISE_ADMIN' && (!user.franchiseId || order.franchiseId !== user.franchiseId)) {
+        return res.status(403).json({ error: 'Forbidden: You can only view your own franchise orders' });
+      }
       res.json(order);
     } catch (e: any) {
       res.status(500).json({ error: e.message });

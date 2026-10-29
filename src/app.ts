@@ -20,6 +20,7 @@ import { FranchiseController } from './modules/franchise/franchise.controller';
 import { FranchiseService } from './modules/franchise/franchise.service';
 import { NavController } from './modules/users/nav.controller';
 import { SettingsController } from './modules/settings/settings.controller';
+import { FinishedGoodsLowStockController } from './modules/settings/finished-goods-low-stock.controller';
 import { AuditController } from './modules/audit/audit.controller';
 import { OrderController } from './modules/pos/order.controller';
 import { RecipeController } from './modules/recipes/recipe.controller';
@@ -57,6 +58,8 @@ import AlertRoutes from './modules/alerts/alert.routes';
 import EWayBillRoutes from './modules/eway-bill/ewaybill.routes';
 import AttachmentRoutes from './modules/attachments/attachment.routes';
 import ChatRoutes from './modules/chat/chat.routes';
+import FranchiseDocumentRoutes from './modules/franchise/franchise-document.routes';
+import {documentJsonLimit} from './modules/franchise/franchise-document.validation';
 import bcrypt from 'bcryptjs';
 import prisma from './lib/prisma';
 
@@ -69,12 +72,13 @@ app.use(cors());
 // JSON), above the 100 kb default. Parsed here first with a larger limit;
 // the global parser below then sees an already-parsed body and skips it.
 app.use('/api/attachments', express.json({ limit: '8mb' }));
+app.use('/api/franchise', express.json({limit:Math.max(8*1024*1024,documentJsonLimit)}));
 // Word recipe import: a .docx of up to 10 MB, base64-encoded.
 app.use('/api/recipe-imports', express.json({ limit: '15mb' }));
 app.use(express.json());
 
 // Advanced API Flow Logger
-const REDACTED_KEYS = ['password', 'dashboardPassword', 'accessToken', 'refreshToken', 'token', 'aadhaarNumber'];
+const REDACTED_KEYS = ['password', 'dashboardPassword', 'accessToken', 'refreshToken', 'token', 'aadhaarNumber', 'dataBase64'];
 // Recursive so nested secrets (e.g. adminUser.password on franchise create)
 // are masked too. Only plain objects/arrays are walked, so Dates, Decimals
 // etc. still serialise normally.
@@ -121,7 +125,7 @@ app.use((req, res, next) => {
   console.log(`\n🚀 [${icon} ${req.method}] ${req.url} (ID: ${requestId})`);
   if (req.query && Object.keys(req.query).length > 0) console.log(`   🔸 Query:`, req.query);
   // Chat message text and history are never written to the server log.
-  const isChat = req.url.startsWith('/api/chat');
+  const isChat = req.url.startsWith('/api/chat') || /^\/api\/franchise\/[^/]+\/documents(?:[/?]|$)/.test(req.url);
   if (!isChat && req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
     console.log(`   🔸 Body:`, redact(req.body));
   }
@@ -204,6 +208,15 @@ app.post('/api/workflow-approvals/:id/approve', authenticate, WorkflowApprovalsC
 // Other Business Modules
 // Inventory & Stock Management
 app.get('/api/inventory', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), InventoryController.getInventory);
+// Semi-Finished Goods is a read projection of the same lots Packaging consumes.
+app.get('/api/inventory/semi-finished', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try { const { SemiFinishedService } = await import('./modules/inventory/semi-finished.service'); res.json(await SemiFinishedService.list(req.query as any, (req as any).user)); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/inventory/semi-finished/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try { const { SemiFinishedService } = await import('./modules/inventory/semi-finished.service'); const result = await SemiFinishedService.list({ lotId: req.params.id }, (req as any).user); if (!result.rows.length) return res.status(404).json({ error: 'Bulk lot not found' }); res.json(result.rows[0]); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 // Expiry Tracking: lot-wise expiry, ?view=FINISHED|RAW (branch-scoped server-side)
 app.get('/api/inventory/expiry-tracking', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
   try {
@@ -250,6 +263,7 @@ app.get('/api/products', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_
 app.post('/api/products', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.create);
 app.post('/api/products/bulk-import', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.bulkImport);
 app.post('/api/products/link', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.linkExistingProduct);
+app.get('/api/products/bulk-names', authenticate, ProductController.getBulkProducts);
 app.get('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), ProductController.getOne);
 app.patch('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.update);
 app.delete('/api/products/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProductController.delete);
@@ -264,6 +278,7 @@ app.get('/api/recipes/product/:productId', authenticate, authorizeRole(['SUPER_A
 app.post('/api/recipes/:id/cost', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.calculateCost);
 app.get('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.getFormulations);
 app.post('/api/recipes/:id/formulations', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.saveFormulation);
+app.post('/api/recipes/:id/products', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeController.linkProducts);
 // Word recipe import (review before anything is saved).
 app.get('/api/recipe-imports', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.list);
 app.post('/api/recipe-imports', authenticate, authorizeRole(['SUPER_ADMIN']), RecipeImportController.upload);
@@ -554,6 +569,8 @@ app.post('/api/franchise/requests', authenticate, authorizeRole(['SUPER_ADMIN', 
 app.post('/api/franchise/fulfill', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseController.fulfillRequest);
 app.get('/api/franchise/transfers', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getAllTransfers);
 app.patch('/api/franchise/transfers/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.updateTransferStatus);
+app.use('/api/franchise/:id/documents', FranchiseDocumentRoutes);
+app.get('/api/franchise/:id/photo', authenticate, authorizeRole(['SUPER_ADMIN','FRANCHISE_ADMIN']), FranchiseController.getPhoto);
 app.get('/api/franchise/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.getOne);
 app.post('/api/franchise/:id/verify-password', authenticate, authorizeRole(['SUPER_ADMIN']), FranchiseController.verifyDashboardPassword);
 app.patch('/api/franchise/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FranchiseController.update);
@@ -570,6 +587,8 @@ app.get('/api/franchise/:id/users', authenticate, authorizeRole(['SUPER_ADMIN', 
 app.patch('/api/users/:id/reset-password', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), UserController.resetPassword);
 
 // Governance & Settings
+app.get('/api/settings/finished-goods-low-stock', authenticate, authorizeRole(['SUPER_ADMIN','FRANCHISE_ADMIN']), FinishedGoodsLowStockController.get);
+app.put('/api/settings/finished-goods-low-stock', authenticate, authorizeRole(['SUPER_ADMIN']), FinishedGoodsLowStockController.update);
 app.get('/api/settings', authenticate, authorizeRole(['SUPER_ADMIN']), SettingsController.getAll);
 app.post('/api/settings', authenticate, authorizeRole(['SUPER_ADMIN']), SettingsController.setSetting);
 app.get('/api/settings/company', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), SettingsController.getCompanyProfile);
@@ -743,6 +762,23 @@ app.get('/api/sales/set-price/products', authenticate, authorizeRole(['SUPER_ADM
 app.get('/api/sales/set-price/products/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.getProduct);
 app.put('/api/sales/set-price/products/:id/prices', authenticate, authorizeRole(['SUPER_ADMIN']), LotPricingController.setProductPrices);
 app.get('/api/sales/lot-options', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), LotPricingController.saleLotOptions);
+app.get('/api/sales/invoices/lot-suggestions', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try {
+    const { InvoiceFulfilmentService } = await import('./modules/sales/invoice-fulfilment.service');
+    const user = (req as any).user;
+    const franchiseId = user.role === 'SUPER_ADMIN' ? (req.query.partyType === 'FRANCHISE' ? undefined : req.query.franchiseId as string | undefined) : user.franchiseId;
+    const { canViewCost } = await import('./modules/sales/profitability');
+    res.json(await InvoiceFulfilmentService.options(prisma, { productId: String(req.query.productId || ''), quantity: Number(req.query.quantity || 0), unit: req.query.unit as string | undefined, franchiseId, warehouseId: req.query.warehouseId as string | undefined }, canViewCost(user)));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.get('/api/sales/invoices/:id/fulfilment', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try {
+    const { InvoiceFulfilmentService } = await import('./modules/sales/invoice-fulfilment.service');
+    const invoice = await prisma.invoice.findFirst({ where: { OR: [{ id: req.params.id }, { orderId: req.params.id }] }, include: { order: true } });
+    if (!invoice || ((req as any).user.role !== 'SUPER_ADMIN' && invoice.order.franchiseId !== (req as any).user.franchiseId)) return res.status(404).json({ error: 'Invoice not found' });
+    res.json(await InvoiceFulfilmentService.state(prisma, invoice.orderId));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
 app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
 app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.cancelInvoice);

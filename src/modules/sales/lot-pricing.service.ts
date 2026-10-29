@@ -1,4 +1,5 @@
 import { Prisma } from '@prisma/client';
+import { hasCompleteSkuPrices, resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from '../franchise/franchise.service';
@@ -40,7 +41,7 @@ const sellable = (lot: { status: string; currentQty: number; expDate: Date | nul
   lot.status === 'APPROVED' && lot.currentQty > 0.0001 && !isLotExpired(lot.expDate);
 
 const lotInclude = {
-  inventoryItem: { select: { id: true, name: true, sku: true, unit: true, gstRate: true, franchiseId: true, franchise: { select: { id: true, name: true } } } },
+  inventoryItem: { select: { id: true, name: true, sku: true, unit: true, gstRate: true, customerPrice: true, dealerPrice: true, franchisePrice: true, franchiseId: true, franchise: { select: { id: true, name: true } } } },
   productBatch: { select: { id: true, batchCode: true, mfgDate: true, production: { select: { id: true, warehouse: { select: { id: true, name: true } } } } } },
   productPackaging: { select: { id: true, packetSize: true, quantityPackets: true, goodQty: true, confirmedAt: true, costBreakdown: true } },
   warehouse: { select: { id: true, name: true } },
@@ -52,7 +53,10 @@ async function productsBySku(tx: any, skus: string[]) {
   const products = skus.length
     ? await tx.product.findMany({ where: { sku: { in: skus } }, select: { id: true, name: true, sku: true, category: true, taxPercent: true, basePrice: true, pricingStatus: true } })
     : [];
-  return new Map<string, any>(products.map((p: any) => [p.sku, p]));
+  return new Map<string, any>(await Promise.all(products.map(async (p: any) => {
+    const master = await resolveSkuPriceMaster(tx, p.sku);
+    return [p.sku, { ...p, pricingStatus: hasCompleteSkuPrices(master || {}) ? 'PRICED' : 'PENDING' }];
+  })));
 }
 
 function shapeLot(lot: LotRow, product: any, reserved: number, opts: { showCost: boolean }) {
@@ -83,6 +87,7 @@ function shapeLot(lot: LotRow, product: any, reserved: number, opts: { showCost:
     expiryDate: lot.expDate,
     warehouse: lot.warehouse ?? lot.productBatch?.production?.warehouse ?? null,
     stockStatus: lot.status,
+    pricingStatus: (product ? product.pricingStatus === 'PRICED' : hasCompleteSkuPrices(lot.inventoryItem)) ? 'PRICED' : 'PENDING',
     sellable: sellable(lot),
     taxPercent: lot.inventoryItem.gstRate ?? product?.taxPercent ?? 5,
     // Production cost and stock value only for roles allowed to see cost.
@@ -279,7 +284,7 @@ export class LotPricingService {
       const inScope = await tx.inventoryItem.count({ where: { id: lot.inventoryItemId, ...scope } });
       if (!inScope) throw new LotPricingError(`Lot ${label} is not held at the selling location.`, 'LOT_SCOPE');
     }
-    if (!sellable(lot)) {
+    if (!opts.referenceOnly && !sellable(lot)) {
       const why = lot.status !== 'APPROVED' ? `is ${String(lot.status).replace(/_/g, ' ')}`
         : isLotExpired(lot.expDate) ? 'has expired' : 'has no stock left';
       throw new LotPricingError(`Lot ${label} of "${name}" ${why} and cannot be sold.`, 'LOT_NOT_SELLABLE');

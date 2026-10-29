@@ -1931,6 +1931,7 @@ CREATE TABLE "WarehouseBin" (
     "warehouseId" TEXT NOT NULL,
     "code" TEXT NOT NULL,
     "description" TEXT,
+    "capacity" DOUBLE PRECISION,
 
     CONSTRAINT "WarehouseBin_pkey" PRIMARY KEY ("id")
 );
@@ -1965,6 +1966,9 @@ CREATE TABLE "InventoryBatch" (
     "pricingStatus" TEXT,
     "pricedAt" TIMESTAMP(3),
     "pricedBy" TEXT,
+    "priceSource" TEXT,
+    "priceSourceLotId" TEXT,
+    "pricingNote" TEXT,
 
     CONSTRAINT "InventoryBatch_pkey" PRIMARY KEY ("id")
 );

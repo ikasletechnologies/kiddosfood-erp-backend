@@ -1,8 +1,8 @@
+import { InvoiceEwbSource } from './invoice-source';
 import prisma from '../../lib/prisma';
 import { AppError } from '../../middleware/error.middleware';
 import { TokenPayload } from '../../lib/jwt.util';
 import { FranchiseService } from '../franchise/franchise.service';
-import { SettingsService } from '../settings/settings.service';
 import { INDIAN_GST_STATE_MAP, normalizeState } from '../../utils/gst-tax.util';
 import {
   SUPPLY_DOC_MATRIX,
@@ -136,8 +136,18 @@ export class EWayBillService {
   }
 
   // ── Reads ───────────────────────────────────────────────────────────────
-  static async list(user: TokenPayload, q: { status?: string; search?: string; fromDate?: string; toDate?: string; franchiseId?: string }) {
+  static async list(user: TokenPayload, q: { status?: string; search?: string; fromDate?: string; toDate?: string; franchiseId?: string; sourceType?: string; sourceId?: string }) {
     const where: any = { ...this.scopeWhere(user, q.franchiseId) };
+    if (q.sourceType && q.sourceId) {
+      if(q.sourceType === 'SALE_INVOICE') {
+        const invoice=await InvoiceEwbSource.resolve(user,q.sourceId,prisma,false);
+        const challans=await prisma.deliveryChallan.findMany({where:{sourceInvoiceId:invoice.orderId},select:{id:true}});
+        where.AND=[{OR:[{sourceType:'SALE_INVOICE',sourceId:{in:[invoice.id,invoice.orderId]}},...(challans.length?[{sourceType:'DELIVERY_CHALLAN',sourceId:{in:challans.map(c=>c.id)}}]:[])]}];
+      } else {
+        const context = await this.sourceContext(user,q.sourceType,q.sourceId);
+        where.AND = [{ OR: context.aliases }];
+      }
+    }
     const now = new Date();
     if (q.status === 'EXPIRED') {
       where.status = 'GENERATED';
@@ -166,7 +176,7 @@ export class EWayBillService {
         { toTradeName: { contains: s, mode: 'insensitive' } },
         { vehicleNo: { contains: s.replace(/[\s-]/g, '').toUpperCase() } },
       ];
-      where.AND = [{ OR: searchOr }];
+      where.AND = [...(where.AND || []), { OR: searchOr }];
     }
     const rows = await prisma.eWayBill.findMany({
       where,
@@ -198,7 +208,8 @@ export class EWayBillService {
 
   // Consignor defaults — the company profile (Settings → Company).
   static async consignorDefaults() {
-    const p = await SettingsService.getCompanyProfile();
+    const saved = await prisma.systemSetting.findUnique({where:{key:'COMPANY_PROFILE'}});
+    let p:any={}; try {p=JSON.parse(saved?.value || '{}');} catch {}
     const gstin = String(p.gstNumber || p.gstin || '').toUpperCase();
     const stateCode = stateCodeFromGstin(gstin) ?? stateCodeFromName(p.state);
     return {
@@ -217,14 +228,10 @@ export class EWayBillService {
   static async listSources(user: TokenPayload, sourceType: string, search?: string) {
     const franchiseId = await this.ownFranchiseId(user);
     const s = search?.trim();
-    let docs: { id: string; docNo: string; date: Date; partyName: string; amount: number }[] = [];
+    let docs: any[] = [];
 
     if (sourceType === 'SALE_INVOICE') {
-      const where: any = { invoice: { isNot: null }, status: { not: 'CANCELLED' } };
-      if (user.role !== 'SUPER_ADMIN') where.franchiseId = franchiseId || '__UNASSIGNED__';
-      if (s) where.OR = [{ invoiceNum: { contains: s, mode: 'insensitive' } }, { customerName: { contains: s, mode: 'insensitive' } }];
-      const orders = await prisma.order.findMany({ where, orderBy: { createdAt: 'desc' }, take: 50 });
-      docs = orders.map(o => ({ id: o.id, docNo: o.invoiceNum, date: o.createdAt, partyName: o.customerName || '—', amount: o.totalAmount }));
+      docs = await InvoiceEwbSource.list(user,s || '');
     } else if (sourceType === 'DELIVERY_CHALLAN') {
       const where: any = { status: { not: 'CANCELLED' } };
       if (user.role !== 'SUPER_ADMIN') where.OR = [{ sourceFranchiseId: franchiseId }, { franchiseId }];
@@ -251,16 +258,22 @@ export class EWayBillService {
     }
 
     const existing = await prisma.eWayBill.findMany({
-      where: { sourceType, sourceId: { in: docs.map(d => d.id) }, status: { not: 'CANCELLED' } },
-      select: { sourceId: true, refNumber: true, ewbNumber: true, status: true },
+      where: { sourceType, sourceId: { in: docs.flatMap(d => [d.id,d.legacySourceId].filter(Boolean)) }, status: { not: 'CANCELLED' } },
+      select: { id:true, sourceId: true, refNumber: true, ewbNumber: true, status: true },
     });
     const bySource = new Map(existing.map(e => [e.sourceId, e]));
-    return docs.map(d => ({ ...d, existingEwb: bySource.get(d.id) || null }));
+    if(sourceType === 'SALE_INVOICE') {
+      const challans=await prisma.deliveryChallan.findMany({where:{sourceInvoiceId:{in:docs.map(d=>d.legacySourceId)},status:{not:'CANCELLED'}},select:{id:true,sourceInvoiceId:true}});
+      const linked=await prisma.eWayBill.findMany({where:{sourceType:'DELIVERY_CHALLAN',sourceId:{in:challans.map(c=>c.id)},status:{not:'CANCELLED'}},select:{id:true,sourceId:true,refNumber:true,ewbNumber:true,status:true}});
+      for(const ewb of linked){const orderId=challans.find(c=>c.id===ewb.sourceId)?.sourceInvoiceId;if(orderId && !bySource.has(orderId)) bySource.set(orderId,ewb);}
+    }
+    return docs.map(d => ({ ...d, existingEwb: bySource.get(d.id) || bySource.get(d.legacySourceId) || null }));
   }
 
   // Builds an unsaved EWB payload from a source document. The UI loads this
   // into the form; nothing is persisted until the user saves.
   static async prefill(user: TokenPayload, sourceType: string, sourceId: string) {
+    if (sourceType === 'SALE_INVOICE') return (await InvoiceEwbSource.mapping(user,sourceId)).payload;
     const from = await this.consignorDefaults();
     const base: any = {
       sourceType, sourceId,
@@ -282,37 +295,11 @@ export class EWayBillService {
       base.actToStateCode = stateCodeFromName(p.state) ?? base.toStateCode;
     };
 
-    if (sourceType === 'SALE_INVOICE') {
-      const order = await prisma.order.findUnique({ where: { id: sourceId }, include: { orderItems: { include: { product: true } }, customer: true } });
-      if (!order) throw new AppError('Sale invoice not found', 404);
-      if (user.role !== 'SUPER_ADMIN' && order.franchiseId !== user.franchiseId) throw new AppError('Forbidden', 403);
-      base.docNo = order.invoiceNum;
-      base.docDate = order.createdAt;
-      if (order.partyType === 'DEALER' && order.partyId) fillParty(await prisma.dealer.findUnique({ where: { id: order.partyId } }));
-      else if (order.partyType === 'FRANCHISE' && order.partyId) {
-        const f = await prisma.franchise.findUnique({ where: { id: order.partyId } });
-        base.toGstin = from.fromGstin || 'URP';
-        base.toTradeName = f?.name || '';
-        base.toAddr1 = f?.location || '';
-        base.toStateCode = from.fromStateCode;
-        base.actToStateCode = from.fromStateCode;
-      } else fillParty(order.customer || (order.partyId ? await prisma.customer.findUnique({ where: { id: order.partyId } }) : null));
-      if (!base.toTradeName) base.toTradeName = order.customerName || '';
-      base.items = order.orderItems.map(i => {
-        const taxable = i.totalAmount != null && i.taxAmount != null
-          ? i.totalAmount - i.taxAmount
-          : i.quantity * i.price * (1 - (i.discountPct || 0) / 100);
-        const rate = i.taxAmount != null && taxable > 0 ? Math.round((i.taxAmount / taxable) * 100 * 4) / 4 : i.product?.taxPercent || 0;
-        return {
-          productName: i.product?.name || 'Item', hsnCode: i.product?.hsnCode || '', quantity: i.quantity,
-          qtyUnit: toUqc(i.unit), taxableAmount: round2(taxable), gstRate: rate,
-        };
-      });
-      const computed = base.items.reduce((s: number, i: any) => s + i.taxableAmount * (1 + i.gstRate / 100), 0);
-      base.otherValue = Math.max(0, round2(order.totalAmount - computed));
-    } else if (sourceType === 'DELIVERY_CHALLAN') {
+    if (sourceType === 'DELIVERY_CHALLAN') {
       const dc = await prisma.deliveryChallan.findUnique({ where: { id: sourceId }, include: { items: true, customer: true, dealer: true } });
       if (!dc) throw new AppError('Delivery challan not found', 404);
+      if (user.role !== 'SUPER_ADMIN' && dc.sourceFranchiseId !== user.franchiseId && dc.franchiseId !== user.franchiseId) throw new AppError('Forbidden',403);
+      if (dc.status === 'CANCELLED') throw new AppError('Delivery challan is cancelled',409);
       base.docType = 'CHL';
       base.subSupplyType = '8';
       base.subSupplyDesc = 'Delivery Challan';
@@ -405,6 +392,7 @@ export class EWayBillService {
       if (!INDIAN_GST_STATE_MAP[String(stateCode).padStart(2, '0')]) errors.push(`${label} state is required`);
       else if (gstin !== 'URP' && stateCodeFromGstin(gstin) !== stateCode) errors.push(`${label} state must match GSTIN state code (${gstin.slice(0, 2)})`);
       const actKey = prefix === 'from' ? 'actFromStateCode' : 'actToStateCode';
+      if(data.sourceType === 'SALE_INVOICE' && !data[actKey]) errors.push(label+' actual shipment state must be confirmed');
       const act = Number(data[actKey]) || stateCode;
       if (!INDIAN_GST_STATE_MAP[String(act).padStart(2, '0')]) errors.push(`${label} actual ${prefix === 'from' ? 'dispatch' : 'ship-to'} state is invalid`);
       return {
@@ -426,8 +414,9 @@ export class EWayBillService {
       if (!String(it.productName || '').trim()) errors.push(`Item ${n}: product name is required`);
       if (!HSN_RE.test(hsnCode)) errors.push(`Item ${n}: HSN code must be 4–8 digits`);
       const quantity = Number(it.quantity);
+      if(!Number.isFinite(quantity) || !Number.isFinite(Number(it.taxableAmount))) errors.push('Item '+n+': quantity and taxable amount must be finite numbers');
       if (!(quantity > 0)) errors.push(`Item ${n}: quantity must be greater than 0`);
-      const qtyUnit = up(it.qtyUnit) || 'NOS';
+      const qtyUnit = up(it.qtyUnit) || (data.sourceType === 'SALE_INVOICE' ? '' : 'NOS');
       if (!isValidUqc(qtyUnit)) errors.push(`Item ${n}: unit "${qtyUnit}" is not a valid GST UQC`);
       const taxableAmount = round2(it.taxableAmount);
       if (!(taxableAmount >= 0)) errors.push(`Item ${n}: taxable value cannot be negative`);
@@ -440,7 +429,7 @@ export class EWayBillService {
       };
     });
 
-    const inter = fromParty.actFromStateCode !== toParty.actToStateCode;
+    const inter = data.sourceType === 'SALE_INVOICE' && typeof data.gstInterState === 'boolean' ? data.gstInterState : fromParty.actFromStateCode !== toParty.actToStateCode;
     items.forEach(i => {
       if (inter && (i.cgstRate || i.sgstRate)) errors.push(`Item ${i.itemNo}: inter-state movement must use IGST, not CGST/SGST`);
       if (!inter && i.igstRate) errors.push(`Item ${i.itemNo}: intra-state movement must use CGST/SGST, not IGST`);
@@ -495,27 +484,93 @@ export class EWayBillService {
     if (errors.length) throw new AppError(errors.join('\n'), 422);
   }
 
-  private static async assertNoDuplicate(h: { sourceType?: string; sourceId?: string | null; docNo: string; docType: string; fromGstin: string }, excludeId?: string) {
-    const notSelf = excludeId ? { id: { not: excludeId } } : {};
-    if (h.sourceId && h.sourceType !== 'MANUAL') {
-      const dup = await prisma.eWayBill.findFirst({ where: { ...notSelf, sourceType: h.sourceType, sourceId: h.sourceId, status: { not: 'CANCELLED' } } });
-      if (dup) throw new AppError(`This document already has an active E-Way Bill (${dup.ewbNumber || dup.refNumber})`, 409);
+  private static async sourceContext(user: TokenPayload, sourceType: string, sourceId: string | null, db: any = prisma): Promise<any> {
+    if (sourceType === 'MANUAL') return {sourceId:null,franchiseId:await this.ownFranchiseId(user),aliases:[]};
+    if (!sourceId) throw new AppError('Select a source document',422);
+    if (sourceType === 'SALE_INVOICE') {
+      const mapping = await InvoiceEwbSource.mapping(user,sourceId,db);
+      return {sourceId:mapping.invoice.id,franchiseId:mapping.invoice.order.franchiseId,mapping,aliases:[{sourceType:'SALE_INVOICE',sourceId:{in:[mapping.invoice.id,mapping.invoice.orderId]}},...(mapping.relatedIds.length?[{sourceType:'DELIVERY_CHALLAN',sourceId:{in:mapping.relatedIds}}]:[])]};
     }
-    const dupDoc = await prisma.eWayBill.findFirst({
-      where: { ...notSelf, docNo: h.docNo, docType: h.docType, fromGstin: h.fromGstin, status: 'GENERATED' },
-    });
-    if (dupDoc) throw new AppError(`An E-Way Bill (${dupDoc.ewbNumber}) is already generated for ${h.docType} ${h.docNo}`, 409);
+    if (sourceType === 'DELIVERY_CHALLAN') {
+      const dc = await db.deliveryChallan.findUnique({where:{id:sourceId}});
+      if (!dc || dc.status === 'CANCELLED') throw new AppError('Eligible delivery challan not found',404);
+      if (user.role !== 'SUPER_ADMIN' && dc.sourceFranchiseId !== user.franchiseId && dc.franchiseId !== user.franchiseId) throw new AppError('Forbidden',403);
+      const aliases:any[]=[{sourceType,sourceId}];
+      if (dc.sourceInvoiceId) {
+        // DC access is already checked above. Read only linked document identity
+        // and quantities here, not another branch's full invoice/party details.
+        const invoice=await db.invoice.findUnique({where:{orderId:dc.sourceInvoiceId},select:{id:true,orderId:true,order:{select:{orderItems:{select:{productId:true,quantity:true,unit:true}}}}}});
+        if(invoice) {
+          const siblings=await db.deliveryChallan.count({where:{sourceInvoiceId:dc.sourceInvoiceId,status:{not:'CANCELLED'}}});
+          const lines=await db.deliveryChallanItem.findMany({where:{challanId:dc.id},select:{productId:true,quantity:true,unit:true}});
+          const quantities=(rows:any[])=>{const result=new Map<string,number>();for(const row of rows){const key=row.productId+'|'+row.unit;result.set(key,(result.get(key)||0)+row.quantity);}return result;};
+          const requested=quantities(invoice.order.orderItems),actual=quantities(lines);
+          const full=siblings===1 && requested.size===actual.size && [...requested].every(([key,value])=>Math.abs(value-(actual.get(key)||0))<0.0001);
+          aliases.push({sourceType:'SALE_INVOICE',sourceId:{in:[invoice.id,invoice.orderId]},...(!full?{status:'GENERATED'}:{})});
+        }
+      }
+      return {sourceId,franchiseId:dc.sourceFranchiseId || dc.franchiseId || await this.ownFranchiseId(user),aliases};
+    }
+    await this.prefill(user,sourceType,sourceId);
+    return {sourceId,franchiseId:await this.ownFranchiseId(user),aliases:[{sourceType,sourceId}]};
+  }
+
+  private static async assertNoDuplicate(h: any, excludeId?: string, db: any = prisma, aliases?: any[]) {
+    const notSelf = excludeId ? {id:{not:excludeId}} : {};
+    if (h.sourceId && h.sourceType !== 'MANUAL') {
+      const duplicate=await db.eWayBill.findFirst({where:{...notSelf,OR:aliases || [{sourceType:h.sourceType,sourceId:h.sourceId}],status:{not:'CANCELLED'}}});
+      if (duplicate) throw new AppError('This movement already has an E-Way Bill ('+(duplicate.ewbNumber || duplicate.refNumber)+'). Open the existing record.',409);
+    }
+    const duplicate=await db.eWayBill.findFirst({where:{...notSelf,docNo:h.docNo,docType:h.docType,fromGstin:h.fromGstin,status:'GENERATED'}});
+    if (duplicate) throw new AppError('An E-Way Bill is already generated for this document',409);
+  }
+
+  static async validateDraft(user: TokenPayload, id: string) {
+    const row=await this.load(user,id);
+    const context=await this.sourceContext(user,row.sourceType,row.sourceId);
+    const errors:string[]=[];
+    const mode=row.sourceType === 'SALE_INVOICE' ? (row.igstValue > 0) : undefined;
+    try {this.normalize({...row,gstInterState:mode});} catch(e:any){errors.push(...e.message.split('\n'));}
+    try {this.assertPartBComplete(row);} catch(e:any){errors.push(...e.message.split('\n'));}
+    await this.assertNoDuplicate(row,id,prisma,context.aliases);
+    if (context.mapping) {
+      const mapping=context.mapping;
+      if(!row.fromAddr1 || !row.toAddr1 || !row.fromPlace || !row.toPlace) errors.push('Confirm actual dispatch-from and ship-to address and place.');
+      if(mapping.splitMovement) errors.push('Partial or multiple dispatches require the actual Delivery Challan source.');
+      const quantities=(items:any[])=>{const values=new Map<string,number>();for(const line of items){const key=line.productDesc || line.productName;values.set(key,(values.get(key)||0)+line.quantity);}return values;};
+      const expected=quantities(mapping.payload.items), actual=quantities(row.items);
+      if([...expected].some(([key,value])=>Math.abs(value-(actual.get(key)||0))>0.0001) || [...actual.keys()].some(key=>!expected.has(key))) errors.push('Item quantities must match the complete source invoice. Use a Delivery Challan for partial movement.');
+      if(fmtDate(row.docDate) !== fmtDate(mapping.invoice.order.createdAt)) errors.push('Document date must match the source invoice.');
+      if(row.docNo !== mapping.invoice.order.invoiceNum) errors.push('Document number must match the source invoice.');
+      if(Math.abs(row.totInvValue-mapping.invoice.finalAmount)>0.02) errors.push('Document total does not reconcile with the saved invoice.');
+      if(Math.abs(row.cgstValue+row.sgstValue+row.igstValue-mapping.invoice.taxAmount)>0.02) errors.push('GST total does not reconcile with the saved invoice.');
+      if(!mapping.payload.actToStateCode && !row.actToStateCode) errors.push('Confirm the actual ship-to state.');
+      if(row.docType==='OTH' && row.subSupplyDesc==='Verify source type') errors.push('Confirm the source transaction classification.');
+    }
+    return {valid:errors.length===0,errors,warnings:context.mapping?.warnings || [],generationAvailable:false,message:'No authorised NIC/GSP API integration is configured. Save and validate the draft; export JSON for the authorised portal. No official E-Way Bill has been generated.'};
+  }
+
+  static async submit(user: TokenPayload,id:string) {
+    const validation=await this.validateDraft(user,id);
+    if(!validation.valid) throw new AppError(validation.errors.join('\n'),422);
+    throw new AppError(validation.message,503);
   }
 
   // ── Writes ──────────────────────────────────────────────────────────────
   static async create(user: TokenPayload, data: any) {
+    if(data.sourceType && !SOURCE_TYPES.includes(data.sourceType)) throw new AppError('Invalid source type',422);
     const sourceType: SourceType = SOURCE_TYPES.includes(data.sourceType) ? data.sourceType : 'MANUAL';
-    const sourceId = sourceType === 'MANUAL' ? null : (data.sourceId || null);
+    const context=await this.sourceContext(user,sourceType,data.sourceId || null);
+    const sourceId=context.sourceId;
     const { header, items } = this.normalize(data);
-    await this.assertNoDuplicate({ ...header, sourceType, sourceId });
-    const franchiseId = await this.ownFranchiseId(user);
+    const franchiseId = context.franchiseId;
 
     const created = await prisma.$transaction(async (tx: any) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('EWB_SOURCE_WRITE'))::text`;
+      const fresh=await this.sourceContext(user,sourceType,sourceId,tx);
+      await this.assertNoDuplicate({...header,sourceType,sourceId},undefined,tx,fresh.aliases);
+      if(fresh.mapping && header.docNo !== fresh.mapping.invoice.order.invoiceNum) throw new AppError('Document number must match the source invoice',422);
+      if(fresh.mapping && fmtDate(header.docDate) !== fmtDate(fresh.mapping.invoice.order.createdAt)) throw new AppError('Document date must match the source invoice',422);
       const seq = await tx.numberSequence.upsert({
         where: { key: 'EWB_REF' }, create: { key: 'EWB_REF', value: 1 }, update: { value: { increment: 1 } },
       });
@@ -533,9 +588,15 @@ export class EWayBillService {
   static async update(user: TokenPayload, id: string, data: any) {
     const row = await this.load(user, id);
     if (row.status !== 'DRAFT') throw new AppError('Only draft E-Way Bills can be edited. Use "Update Vehicle" for Part B changes.', 409);
-    const { header, items } = this.normalize(data);
-    await this.assertNoDuplicate({ ...header, sourceType: row.sourceType, sourceId: row.sourceId }, id);
+    const { header, items } = this.normalize({...data,sourceType:row.sourceType});
     await prisma.$transaction(async (tx: any) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('EWB_SOURCE_WRITE'))::text`;
+      const fresh=await tx.eWayBill.findUnique({where:{id}});
+      if(fresh?.status !== 'DRAFT') throw new AppError('Only draft E-Way Bills can be edited',409);
+      const context=await this.sourceContext(user,row.sourceType,row.sourceId,tx);
+      await this.assertNoDuplicate({...header,sourceType:row.sourceType,sourceId:row.sourceId},id,tx,context.aliases);
+      if(context.mapping && header.docNo !== context.mapping.invoice.order.invoiceNum) throw new AppError('Document number must match the source invoice',422);
+      if(context.mapping && fmtDate(header.docDate) !== fmtDate(context.mapping.invoice.order.createdAt)) throw new AppError('Document date must match the source invoice',422);
       await tx.eWayBillItem.deleteMany({ where: { ewayBillId: id } });
       await tx.eWayBill.update({ where: { id }, data: { ...header, items: { create: items } } });
     });
@@ -553,6 +614,7 @@ export class EWayBillService {
   static async markGenerated(user: TokenPayload, id: string, body: { ewbNumber?: string; ewbDate?: string; validUntil?: string }) {
     const row = await this.load(user, id);
     if (row.status !== 'DRAFT') throw new AppError(`E-Way Bill is already ${row.status.toLowerCase()}`, 409);
+    if(row.sourceType === 'SALE_INVOICE') throw new AppError('No authorised NIC/GSP API integration is configured. Invoice-sourced records remain drafts; a typed number is not a confirmed official response.',503);
     const ewbNumber = String(body.ewbNumber || '').replace(/\s/g, '');
     if (!EWB_NO_RE.test(ewbNumber)) throw new AppError('E-Way Bill number must be exactly 12 digits', 422);
     const taken = await prisma.eWayBill.findUnique({ where: { ewbNumber } });
@@ -672,6 +734,7 @@ export class EWayBillService {
     const notDraft = rows.filter(r => r.status !== 'DRAFT');
     if (notDraft.length) throw new AppError(`Only drafts can be exported for generation (${notDraft.map(r => r.refNumber).join(', ')} already ${notDraft[0].status.toLowerCase()})`, 409);
     rows.forEach(r => this.assertPartBCompleteForExport(r));
+    for(const row of rows) if(row.sourceType === 'SALE_INVOICE') {const check=await this.validateDraft(user,row.id);if(!check.valid) throw new AppError(check.errors.join('\n'),422);}
 
     const mainHsn = (items: any[]) => [...items].sort((a, b) => b.taxableAmount - a.taxableAmount)[0]?.hsnCode;
     return {

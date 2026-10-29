@@ -346,6 +346,7 @@ export class GRNService {
 
         itemsData.push({
           materialId: item.materialId,
+          isBulk: Boolean(poItem?.isBulk),
           quantity: qty,
           receivedQty: received,
           acceptedQty: accepted,
@@ -517,13 +518,20 @@ export class GRNService {
 
         let canonicalQty = item.acceptedQty;
         console.log(`[GRN DBG] item.unit: ${item.unit}, inv.unit: ${invItemBefore.unit}, qty: ${canonicalQty}`);
-        if (item.unit && invItemBefore.unit && item.unit !== 'UNIT') {
-          try {
-            const { convertMeasurement } = require('@businessgroupikasle/erp-units');
-            canonicalQty = convertMeasurement(item.acceptedQty, item.unit.toUpperCase(), invItemBefore.unit.toUpperCase()).toNumber();
-            console.log(`[GRN DBG] canonicalQty after calc: ${canonicalQty}`);
-          } catch (err: any) {
-             throw new Error(`Unit conversion failed for "${invItemBefore.name}": ${err.message}`);
+        if (item.unit && invItemBefore.unit && item.unit.toUpperCase() !== invItemBefore.unit.toUpperCase() && item.unit !== 'UNIT') {
+          const countUnits = ['PC', 'PCS', 'UNIT', 'PACKET', 'BOX', 'NOS'];
+          const u1 = item.unit.toUpperCase();
+          const u2 = invItemBefore.unit.toUpperCase();
+          if (countUnits.includes(u1) && countUnits.includes(u2)) {
+            canonicalQty = item.acceptedQty;
+          } else {
+            try {
+              const { convertMeasurement } = require('@businessgroupikasle/erp-units');
+              canonicalQty = convertMeasurement(item.acceptedQty, u1, u2).toNumber();
+              console.log(`[GRN DBG] canonicalQty after calc: ${canonicalQty}`);
+            } catch (err: any) {
+               throw new Error(`Unit conversion failed for "${invItemBefore.name}": ${err.message}`);
+            }
           }
         }
 
@@ -538,10 +546,69 @@ export class GRNService {
         const lineValue = item.acceptedQty * item.price;
         const unitCostPerStockUnit = canonicalQty > 0 ? lineValue / canonicalQty : item.price;
 
+        const poItem = grn.procurementOrder.poItems.find(p => p.inventoryItemId === item.materialId);
+        const isBulkItem = Boolean(
+          item.isBulk ||
+          poItem?.isBulk ||
+          (invItemBefore.category === 'SEMI_FINISHED' &&
+            (grn.procurementOrder.purchaseType === 'FINISHED_GOOD' || grn.procurementOrder.purchaseType === 'FINISHED_GOODS'))
+        );
+
+        let productBatchId: string | null = null;
+        if (isBulkItem) {
+          const existingProductBatch = await tx.productBatch.findUnique({
+            where: { goodsReceiptItemId: item.id }
+          });
+
+          if (!existingProductBatch) {
+            let resolvedProductId = poItem?.productId || null;
+            if (!resolvedProductId) {
+              const baseName = invItemBefore.name.replace(/\s*-\s*Bulk$/i, '').trim();
+              const prod = await tx.product.findFirst({
+                where: {
+                  OR: [
+                    { name: { equals: baseName, mode: 'insensitive' } },
+                    { name: { contains: baseName, mode: 'insensitive' } }
+                  ]
+                }
+              });
+              if (prod) resolvedProductId = prod.id;
+            }
+
+            const createdBatch = await tx.productBatch.create({
+              data: {
+                sourceType: 'PURCHASE',
+                productId: resolvedProductId,
+                productionId: null,
+                batchCode: batchRef,
+                quantity: canonicalQty,
+                approvedQty: canonicalQty,
+                packagedQty: 0,
+                qcStatus: 'QC_NOT_REQUIRED',
+                packagingStatus: 'PENDING',
+                unitCost: unitCostPerStockUnit,
+                totalCost: lineValue,
+                vendorId: grn.procurementOrder.vendorId,
+                procurementOrderId: grn.poId,
+                goodsReceiptId: grn.id,
+                goodsReceiptItemId: item.id,
+                warehouseId: item.warehouseId || grn.procurementOrder.warehouseId || null,
+                mfgDate: item.mfgDate || grn.receivedAt,
+                expiryDate: item.expDate,
+                franchiseId: grn.procurementOrder.franchiseId,
+              }
+            });
+            productBatchId = createdBatch.id;
+          } else {
+            productBatchId = existingProductBatch.id;
+          }
+        }
+
         // 1. Create Inventory Batch (APPROVED status directly to update stock) using canonicalQty
         const lot = await tx.inventoryBatch.create({
           data: {
             inventoryItemId: item.materialId!,
+            productBatchId: productBatchId || undefined,
             batchNumber: batchRef,
             lotNumber: item.lotNumber,
             // Always the real Purchase Bill reference, independent of

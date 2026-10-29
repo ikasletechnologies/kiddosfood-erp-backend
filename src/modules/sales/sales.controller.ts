@@ -448,7 +448,7 @@ export class SalesController {
   // transitions) are client-fixable — 400, not 500 — so the frontend shows
   // the actual message instead of a generic failure toast.
   private static isDcBusinessError(message: string): boolean {
-    return /can only have one destination|not found|Cannot dispatch|Cannot return|Cannot change status|remains undispatched|Insufficient approved stock|Insufficient stock|Sale conversion blocked|Select at least one item|must be greater than zero|Dispatched .* already returned|hasn't dispatched yet|Only an IN_TRANSIT|Only draft delivery challans|cannot be deleted|Cannot edit a/i.test(message);
+    return /Multiple stock lots|Selected lot is no longer|Stock changed|can only have one destination|not found|Cannot dispatch|Cannot return|Cannot change status|remains undispatched|Insufficient approved stock|Insufficient stock|Sale conversion blocked|Select at least one item|must be greater than zero|Dispatched .* already returned|hasn't dispatched yet|Only an IN_TRANSIT|Only draft delivery challans|cannot be deleted|Cannot edit a/i.test(message);
   }
 
   static async deleteDeliveryChallan(req: Request, res: Response) {

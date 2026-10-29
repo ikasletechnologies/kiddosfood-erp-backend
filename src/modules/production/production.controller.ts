@@ -278,6 +278,7 @@ export class ProductionController {
         batchId: req.params.id,
         packetSize,
         quantityPackets: Number(quantityPackets),
+        bulkLotId: req.body.bulkLotId ? String(req.body.bulkLotId) : undefined,
         productId: productId ? String(productId) : undefined,
         newProduct,
         userId: user?.userId
@@ -354,6 +355,7 @@ export class ProductionController {
         damagedQty: Number(damagedQty) || 0,
         productId: productId ? String(productId) : undefined,
         newProduct,
+        bulkLotId: req.body.bulkLotId ? String(req.body.bulkLotId) : undefined,
         expectedPackagedQty: expectedPackagedQty !== undefined && expectedPackagedQty !== null ? Number(expectedPackagedQty) : undefined,
         expenses: req.body.expenses,
         userId: user?.userId,

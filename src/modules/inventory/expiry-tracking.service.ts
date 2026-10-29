@@ -107,7 +107,9 @@ export class ExpiryTrackingService {
     const all = lots.map((l) => {
       const item = l.inventoryItem;
       const pb = l.productBatch;
-      const expiryDate = l.expDate ?? pb?.expiryDate ?? pb?.production?.expiryDate ?? null;
+      const expiryDate = item.category === 'SEMI_FINISHED'
+        ? [l.expDate, pb?.expiryDate, pb?.production?.expiryDate].filter((d): d is Date => d != null).sort((a, b) => a.getTime() - b.getTime())[0] ?? null
+        : l.expDate ?? pb?.expiryDate ?? pb?.production?.expiryDate ?? null;
       const daysLeft = expiryDate ? daysToExpiry(expiryDate, now) : null;
       const base = {
         id: l.id,

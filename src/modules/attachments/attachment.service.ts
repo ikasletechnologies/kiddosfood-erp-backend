@@ -1,4 +1,6 @@
 import prisma from '../../lib/prisma';
+import {DOCUMENT_ENTITY} from '../franchise/franchise-document.validation';
+import {FRANCHISE_PHOTO_ENTITY, ValidatedPhoto} from './franchise-photo';
 import { AppError } from '../../middleware/error.middleware';
 import { TokenPayload } from '../../lib/jwt.util';
 
@@ -32,12 +34,26 @@ type Meta = { id: string; entityType: string; entityId: string; kind: string; fi
 const META_SELECT = { id: true, entityType: true, entityId: true, kind: true, fileName: true, mimeType: true, size: true, createdAt: true, franchiseId: true } as const;
 
 export class AttachmentService {
+  static async saveFranchisePhoto(db:any, franchiseId:string, photo:ValidatedPhoto | null | undefined, userId?:string) {
+    if(photo===undefined)return;
+    // The caller locks the franchise row; replacement/removal is atomic.
+    await db.attachment.deleteMany({where:{entityType:FRANCHISE_PHOTO_ENTITY,entityId:franchiseId}});
+    if(photo)await db.attachment.create({data:{...photo,entityType:FRANCHISE_PHOTO_ENTITY,entityId:franchiseId,kind:'IMAGE',franchiseId,uploadedBy:userId || null}});
+  }
+  static async franchisePhotos(db:any, ids:string[]) {
+    if(!ids.length)return new Map<string,any>();
+    const rows=await db.attachment.findMany({where:{entityType:FRANCHISE_PHOTO_ENTITY,entityId:{in:ids}},select:{id:true,entityId:true,mimeType:true,size:true,fileName:true},orderBy:{createdAt:'desc'}});
+    const result=new Map<string,any>();
+    for(const row of rows)if(!result.has(row.entityId))result.set(row.entityId,{id:row.id,mimeType:row.mimeType,size:row.size,fileName:row.fileName,url:'/api/franchise/'+encodeURIComponent(row.entityId)+'/photo?v='+row.id});
+    return result;
+  }
+
   private static assertEntityType(entityType: string) {
     if (!ENTITY_LOOKUP[entityType]) throw new AppError(`Attachments are not supported for "${entityType}"`, 400);
   }
 
-  private static canAccess(user: TokenPayload, row: { franchiseId: string | null }) {
-    return user.role === 'SUPER_ADMIN' || row.franchiseId === (user.franchiseId || null);
+  private static canAccess(user: TokenPayload, row: { franchiseId: string | null; entityType?: string }) {
+    return row.entityType !== DOCUMENT_ENTITY && (user.role === 'SUPER_ADMIN' || row.franchiseId === (user.franchiseId || null));
   }
 
   static async list(user: TokenPayload, entityType: string, entityId: string): Promise<Meta[]> {
@@ -95,7 +111,7 @@ export class AttachmentService {
   }
 
   static async remove(user: TokenPayload, id: string) {
-    const row = await prisma.attachment.findUnique({ where: { id }, select: { id: true, franchiseId: true } });
+    const row = await prisma.attachment.findUnique({ where: { id }, select: { id: true, franchiseId: true, entityType: true } });
     if (!row || !this.canAccess(user, row)) throw new AppError('Attachment not found', 404);
     await prisma.attachment.delete({ where: { id } });
     return { success: true };

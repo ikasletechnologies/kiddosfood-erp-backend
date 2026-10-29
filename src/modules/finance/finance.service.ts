@@ -165,6 +165,8 @@ function resolveOrderItemCost(
   return { cost: 0, source: 'UNAVAILABLE' };
 }
 import { assertBillablePrice } from '../../utils/selling-price.util';
+import { InvoiceFulfilmentService } from '../sales/invoice-fulfilment.service';
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import prisma from '../../lib/prisma';
 import SocketService from '../../lib/socket';
 import { AccountService } from './account.service';
@@ -806,7 +808,8 @@ export class FinanceService {
       }
     }
 
-    return invoices.map((inv) => this.mergeAllocationsIntoPayments(inv));
+    const dispatched = new Set((await prisma.deliveryChallan.findMany({ where: { sourceInvoiceId: { in: invoices.map(i => i.orderId) }, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } }, select: { sourceInvoiceId: true } })).map(c => c.sourceInvoiceId));
+    return invoices.map(inv => ({ ...this.mergeAllocationsIntoPayments(inv), fulfilmentStatus: inv.order.inventory_deducted ? 'FULFILLED' : dispatched.has(inv.orderId) ? 'PARTIALLY_FULFILLED' : 'PENDING' }));
   }
 
   static async getInvoiceById(id: string) {
@@ -853,7 +856,8 @@ export class FinanceService {
       }
     }
 
-    return this.mergeAllocationsIntoPayments(invoice);
+    const dispatched = await prisma.deliveryChallan.count({ where: { sourceInvoiceId: invoice.orderId, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } } });
+    return { ...this.mergeAllocationsIntoPayments(invoice), fulfilmentStatus: invoice.order.inventory_deducted ? 'FULFILLED' : dispatched ? 'PARTIALLY_FULFILLED' : 'PENDING' };
   }
 
   // A multi-invoice receipt attributes its per-invoice share via
@@ -1050,6 +1054,8 @@ export class FinanceService {
       if (!invoice) throw new Error("Invoice not found");
       if (invoice.status === "CANCELLED") throw new Error("Invoice is already cancelled");
 
+      const dispatches = await tx.deliveryChallan.findMany({ where: { sourceInvoiceId: invoice.orderId, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } }, select: { id: true } });
+      if (dispatches.length && await tx.stockMovement.count({ where: { referenceType: 'INVOICE_FULFILMENT', referenceId: { in: dispatches.map(d => d.id) } } })) throw new Error('Cancel or reverse linked dispatches before cancelling this invoice.');
       const activePayments = await tx.payment.findMany({
         where: { invoiceId, status: "PAID", isCancelled: false }
       });
@@ -2188,6 +2194,8 @@ export class FinanceService {
   }
 
   static async createInvoice(data: {
+    deferFulfillment?: boolean;
+    pendingAllocationConfirmed?: boolean;
     franchiseId: string;
     partyType?: string;
     partyId?: string;
@@ -2209,6 +2217,8 @@ export class FinanceService {
       // Finished-goods lot (Set Price) this line sells from; its price and
       // the exact lot deduction replace the master price / named batch.
       inventoryBatchId?: string | null;
+      lotAllocations?: { lotId: string; quantity: number }[];
+      warehouseId?: string;
     }[];
     receivedAmount?: number;
     paymentMode?: any;
@@ -2237,6 +2247,9 @@ export class FinanceService {
     }
 
     return prisma.$transaction(async (tx) => {
+      const deferred = data.deferFulfillment === true && !data.sourceDeliveryChallanId;
+      if (deferred && (!Array.isArray(data.items) || !data.items.length || data.items.some(item => !Number.isFinite(Number(item.qty ?? item.quantity)) || Number(item.qty ?? item.quantity) <= 0))) throw new Error('Invoice items require positive, finite quantities.');
+
       let sourceChallan: any = null;
       if (data.sourceDeliveryChallanId) {
         sourceChallan = await tx.deliveryChallan.findUnique({
@@ -2245,6 +2258,7 @@ export class FinanceService {
         if (!sourceChallan) {
           throw new Error('Source delivery challan not found.');
         }
+        if (sourceChallan.sourceInvoiceId) throw new Error('This challan already fulfils an invoice. Open its source invoice instead.');
         if (sourceChallan.status === 'CONVERTED') {
           throw new Error('This delivery challan has already been converted to a sale.');
         }
@@ -2269,6 +2283,7 @@ export class FinanceService {
         batchNumber: string | null;
         inventoryBatchId: string | null;
         lotNumber: string | null;
+        totalCost?: number;
       }[] = [];
 
       // Trust boundary: this was the least-guarded financially-significant
@@ -2319,6 +2334,7 @@ export class FinanceService {
       const resolvedInvoicePartyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' =
         data.partyType === 'DEALER' ? 'DEALER' : data.partyType === 'FRANCHISE' ? 'FRANCHISE' : 'CUSTOMER';
 
+      if (deferred || (!sourceChallan && data.items.some(line => line.lotAllocations !== undefined))) data = { ...data, items: await InvoiceFulfilmentService.prepareInvoiceItems(tx, data.items, sellerFranchiseId, data.pendingAllocationConfirmed === true) };
       // 1. Validate real available stock for all items before invoice creation
       const itemsToDeduct: Array<{
         inventoryItem: any;
@@ -2341,14 +2357,14 @@ export class FinanceService {
       for (const [idx, item] of data.items.entries()) {
         const lotId = (item.inventoryBatchId || '').trim();
         if (!lotId || Number(item.qty ?? item.quantity ?? 0) <= 0) continue;
-        const lot = await LotPricingService.resolveSaleLot(tx, { productId: item.productId, productName: item.productName, inventoryBatchId: lotId, unit: item.unit }, { franchiseId: sellerFranchiseId });
+        const lot = await LotPricingService.resolveSaleLot(tx, { productId: item.productId, productName: item.productName, inventoryBatchId: lotId, unit: item.unit }, { franchiseId: sellerFranchiseId, referenceOnly: deferred || !!sourceChallan });
         lotLines.set(idx, lot);
         const prior = lotClaims.get(lotId);
         lotClaims.set(lotId, { qty: (prior?.qty || 0) + Number(item.qty ?? item.quantity ?? 0) * lot.factor, label: lot.lotNumber });
       }
-      if (lotClaims.size) await LotPricingService.assertLotStock(tx, lotClaims);
+      if (!deferred && !sourceChallan && lotClaims.size) await LotPricingService.assertLotStock(tx, lotClaims);
 
-      for (const [lineIdx, checkItem] of data.items.entries()) {
+      for (const [lineIdx, checkItem] of (deferred || sourceChallan ? [] : data.items).entries()) {
         const checkQty = Number(checkItem.qty ?? checkItem.quantity ?? 0);
         if (checkQty <= 0) continue;
         const lotLine = lotLines.get(lineIdx);
@@ -2515,11 +2531,12 @@ export class FinanceService {
             // accepting a submitted ₹1). Reject instead of guessing.
             throw new Error(`Cannot price line item "${item.productName || item.productId}" — productId "${item.productId}" does not match any known Product or InventoryItem. Remove the reference to use a free-text price, or fix the id.`);
           }
+          const prices = targetSku ? await resolveSkuPriceMaster(tx, targetSku) || inv : inv;
           const channelPrice =
-            resolvedInvoicePartyType === 'DEALER' ? inv?.dealerPrice :
-              resolvedInvoicePartyType === 'FRANCHISE' ? inv?.franchisePrice :
-                inv?.customerPrice;
-          rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+            resolvedInvoicePartyType === 'DEALER' ? prices?.dealerPrice :
+              resolvedInvoicePartyType === 'FRANCHISE' ? prices?.franchisePrice :
+                prices?.customerPrice;
+          rate = channelPrice && channelPrice > 0 ? channelPrice : (prices?.basePrice || product?.basePrice || 0);
           gst = inv?.gstRate ?? product?.taxPercent ?? 0;
           // A chosen lot only fixes which stock (and cost) the line draws
           // from; the price is the product's channel price either way.
@@ -2581,6 +2598,7 @@ export class FinanceService {
           batchNumber: lotLine ? lotLine.batchNumber : ((item.batchNumber || '').trim() || null),
           inventoryBatchId: lotLine?.lotId ?? null,
           lotNumber: lotLine?.lotNumber ?? null,
+          ...(deferred ? { totalCost: 0 } : {}),
         });
       }
 
@@ -2855,11 +2873,12 @@ export class FinanceService {
 
       await tx.order.update({
         where: { id: order.id },
-        data: { inventory_deducted: true }
+        data: { inventory_deducted: !deferred }
       });
 
       return {
         ...invoice,
+        fulfilmentStatus: deferred ? 'PENDING' : 'FULFILLED',
         order
       };
     });

@@ -1,132 +1,52 @@
 import prisma from '../../lib/prisma';
-import { Prisma } from '@prisma/client';
-import { FinanceService } from '../finance/finance.service';
+import {Prisma} from '@prisma/client';
+import {FinanceService} from '../finance/finance.service';
+import {FinishedGoodsLowStockService,finishedGoodsStockStatus} from '../settings/finished-goods-low-stock';
 
 export class DashboardInventoryService {
-  static async getInventoryStats(franchiseId?: string) {
-    const itemWhere: Prisma.InventoryItemWhereInput = franchiseId ? { franchiseId } : {};
-    const batchWhere: Prisma.ProductBatchWhereInput = franchiseId ? { franchiseId } : {};
-
-    const [inventoryItems, productBatches, lowStockBatchCount, valuation] = await Promise.all([
-      // franchise relation was fetched but never read below — dropped to
-      // avoid the join.
-      prisma.inventoryItem.findMany({ where: itemWhere }),
-      // Only the soonest-expiring 50 are ever shown (sliced to 10 below) —
-      // previously this pulled every batch with an expiry date ever
-      // created, unbounded and growing forever. lowStockCount below needs
-      // the true count across ALL batches, not just this page, so that's a
-      // separate DB-side count() rather than derived from this bounded list.
-      prisma.productBatch.findMany({
-        where: {
-          ...batchWhere,
-          expiryDate: { not: null }
-        },
-        include: { product: true },
-        orderBy: { expiryDate: 'asc' },
-        take: 50
-      }),
-      prisma.productBatch.count({ where: { ...batchWhere, expiryDate: { not: null }, quantity: { lte: 10 } } }),
-      // Reuse the authoritative Inventory Valuation report's formula
-      // (currentStock * costPrice only — no basePrice/sale-price fallback,
-      // see FinanceService.getInventoryValuationReport) instead of a second,
-      // diverging valuation formula living only in the dashboard.
-      FinanceService.getInventoryValuationReport(franchiseId)
+  static async getInventoryStats(franchiseId?:string){
+    const itemWhere:Prisma.InventoryItemWhereInput=franchiseId?{franchiseId,isActive:true,category:'FINISHED_GOOD'}:{};
+    const batchWhere:Prisma.ProductBatchWhereInput=franchiseId?{franchiseId}:{};
+    const [inventoryItems,productBatches,valuation,threshold]=await Promise.all([
+      prisma.inventoryItem.findMany({where:itemWhere}),
+      // Keep expiry/lot tracking, but never count a batch as another SKU.
+      prisma.productBatch.findMany({where:{...batchWhere,expiryDate:{not:null}},include:{product:true},orderBy:{expiryDate:'asc'},take:50}),
+      FinanceService.getInventoryValuationReport(franchiseId),
+      FinishedGoodsLowStockService.threshold(),
     ]);
-
-    const inventoryValue = valuation.summary.totalStockValue;
-    // "Active SKUs" means InventoryItem.isActive, not "has any stock" — a
-    // zero-stock but still-listed SKU is still an active item master.
-    const activeSkuCount = inventoryItems.filter(item => item.isActive).length;
-
-    // Build Inventory Alerts (finished goods / batches)
-    const inventoryAlerts = productBatches.map(batch => {
-      const currentStock = batch.quantity;
-      const minStock = 10; // Default minimum stock threshold for finished goods
-      
-      let status = 'GREEN';
-      if (currentStock <= 0) {
-        status = 'RED';
-      } else if (currentStock <= minStock) {
-        status = 'YELLOW';
-      }
-
-      let daysLeft = 'N/A';
-      if (batch.expiryDate) {
-        const diffTime = new Date(batch.expiryDate).getTime() - Date.now();
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        daysLeft = diffDays > 0 ? `${diffDays} days` : 'Expired';
-      }
-
-      return {
-        id: batch.id,
-        productName: batch.product?.name || 'Unknown Product',
-        currentStock,
-        unit: batch.product?.sku || 'Units',
-        expiryDate: batch.expiryDate ? new Date(batch.expiryDate).toLocaleDateString() : 'No Expiry',
-        daysLeft,
-        status,
-        refillSuggestion: status === 'RED' ? 'Refill Urgent' : status === 'YELLOW' ? 'Reorder Soon' : 'Safe'
-      };
-    });
-
-    // Compute low stock raw items in-memory using canonical stock vs minimumStock.
-    // Phase 4 established that InventoryItem.currentStock is always in the item's
-    // configured canonical unit — no SKU-parsing hack needed.
-    const lowStockRawItems = inventoryItems.filter(item => {
-      return item.currentStock <= item.minimumStock;
-    });
-
-    // Build Low Stock raw materials and finished goods list
-    const lowStockList: Array<{ id: string; name: string; product: string; currentStock: number; current: number; required: number; unit: string; status: string; action: string }> = lowStockRawItems.map(item => {
-      const physicalStock = item.currentStock; // already canonical
-      let status = 'GREEN';
-      if (physicalStock <= 0) {
-        status = 'RED';
-      } else if (physicalStock <= item.minimumStock) {
-        status = 'YELLOW';
-      }
-
-      const parts = item.sku ? item.sku.split('-') : [];
-      const sizePart = parts.length >= 2 ? parts[parts.length - 1] : "";
-      const match = sizePart.match(/^(\d+(?:\.\d+)?)\s*([A-Z]+)$/i);
-      const displayUnit = (item.category === 'FINISHED_GOOD' && match) ? match[2].toUpperCase() : item.unit;
-
-      return {
-        id: item.id,
-        name: item.name,
-        product: item.name,
-        currentStock: physicalStock,
-        current: physicalStock,
-        required: item.minimumStock,
-        unit: displayUnit || 'KG',
-        status,
-        action: physicalStock <= 0 ? 'Request Refill' : 'Reorder'
-      };
-    });
-
-    for (const batch of productBatches) {
-      if (batch.quantity <= 10) {
-        lowStockList.push({
-          id: batch.id,
-          name: batch.product?.name || 'Finished Good',
-          product: batch.product?.name || 'Finished Good',
-          currentStock: batch.quantity,
-          current: batch.quantity,
-          required: 10,
-          unit: batch.product?.sku || 'PC',
-          status: batch.quantity <= 0 ? 'RED' : 'YELLOW',
-          action: batch.quantity <= 0 ? 'Request Refill' : 'Reorder'
-        });
-      }
+    const finishedBySku=new Map<string,typeof inventoryItems[number]>();
+    for(const item of inventoryItems){
+      if(item.category!=='FINISHED_GOOD'||!item.isActive)continue;
+      const key=item.sku?.trim().toUpperCase()||item.id,previous=finishedBySku.get(key);
+      finishedBySku.set(key,previous?{...previous,currentStock:previous.currentStock+item.currentStock}:item);
     }
-
+    const finished=[...finishedBySku.values()];
+    const finishedLow=finished.filter(item=>finishedGoodsStockStatus(item.currentStock,threshold)==='LOW_STOCK');
+    const finishedOut=finished.filter(item=>finishedGoodsStockStatus(item.currentStock,threshold)==='OUT_OF_STOCK');
+    // Raw material thresholds, comparisons and quantities retain their rules.
+    const rawLow=inventoryItems.filter(item=>item.category!=='FINISHED_GOOD'&&item.currentStock<=item.minimumStock);
+    const lowStockList=[...rawLow,...finishedLow].map(item=>{
+      const minimum=item.category==='FINISHED_GOOD'?threshold:item.minimumStock;
+      return {id:item.id,name:item.name,product:item.name,currentStock:item.currentStock,current:item.currentStock,required:minimum,unit:item.unit||'PC',status:item.currentStock<=0?'RED':'YELLOW',action:item.currentStock<=0?'Request Refill':'Reorder'};
+    });
+    const inventoryAlerts=productBatches.map(batch=>{
+      const balance=batch.product?.sku?finishedBySku.get(batch.product.sku.trim().toUpperCase()):undefined;
+      const status=finishedGoodsStockStatus(balance?.currentStock??batch.quantity,threshold);
+      const diff=batch.expiryDate?Math.ceil((new Date(batch.expiryDate).getTime()-Date.now())/86400000):null;
+      return {
+        id:batch.id,productName:batch.product?.name||'Unknown Product',currentStock:batch.quantity,
+        unit:balance?.unit||'PC',expiryDate:batch.expiryDate?new Date(batch.expiryDate).toLocaleDateString():'No Expiry',
+        daysLeft:diff===null?'N/A':diff>0?diff+' days':'Expired',
+        status:status==='OUT_OF_STOCK'?'RED':status==='LOW_STOCK'?'YELLOW':'GREEN',
+        refillSuggestion:status==='OUT_OF_STOCK'?'Refill Urgent':status==='LOW_STOCK'?'Reorder Soon':'Safe',
+      };
+    });
     return {
-      inventoryValue,
-      inventoryItemCount: activeSkuCount,
-      lowStockCount: lowStockRawItems.length + lowStockBatchCount,
-      inventoryAlerts: inventoryAlerts.slice(0, 10), // Limit dashboard view
-      lowStockAlerts: lowStockList.slice(0, 10),
-      lowStock: lowStockList.slice(0, 10)
+      inventoryValue:valuation.summary.totalStockValue,inventoryItemCount:inventoryItems.filter(item=>item.isActive).length,
+      finishedGoodsLowStockThreshold:threshold,finishedGoodsLowStockCount:finishedLow.length,finishedGoodsOutOfStockCount:finishedOut.length,
+      lowStockCount:rawLow.length+finishedLow.length,
+      inventoryAlerts:inventoryAlerts.slice(0,10),lowStockAlerts:lowStockList.slice(0,10),lowStock:lowStockList.slice(0,10),
     };
   }
 }
+

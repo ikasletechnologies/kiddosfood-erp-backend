@@ -15,6 +15,7 @@ export class DashboardController {
 
       if (user.role !== 'SUPER_ADMIN') {
         franchiseId = user.franchiseId;
+        if (user.role === 'FRANCHISE_ADMIN' && !franchiseId) return res.status(403).json({ error: 'No franchise assigned' });
       }
 
       const summary = await DashboardService.getSummary({

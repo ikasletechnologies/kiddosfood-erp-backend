@@ -17,6 +17,28 @@ interface RecipeItemWithInventory {
 
 export class RecipeService {
   /**
+   * Confirms packaged Finished Goods as variants of one bulk recipe.
+   * Existing links are never moved: a conflict must be reviewed explicitly.
+   */
+  static async linkProducts(recipeId: string, productIds: string[], userId?: string) {
+    const ids = Array.from(new Set((productIds || []).filter(Boolean)));
+    if (!ids.length) throw new Error('Select at least one Finished Good variant.');
+    return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Recipe" WHERE id = ${recipeId} FOR UPDATE`;
+      const recipe = await tx.recipe.findUnique({ where: { id: recipeId }, select: { id: true, productId: true } });
+      if (!recipe) throw new Error('Recipe not found.');
+      const products = await tx.product.findMany({ where: { id: { in: ids }, isActive: true, productType: 'FINISHED_GOOD' }, select: { id: true, name: true } });
+      if (products.length !== ids.length) throw new Error('One or more selected variants are not active Finished Goods.');
+      const conflicts = await tx.recipeProduct.findMany({ where: { productId: { in: ids }, recipeId: { not: recipeId } }, include: { product: true, recipe: true } });
+      if (conflicts.length) throw new Error(`Variant "${conflicts[0].product.name}" is already linked to recipe "${conflicts[0].recipe.name}".`);
+      await tx.recipeProduct.createMany({
+        data: ids.filter((id) => id !== recipe.productId).map((productId) => ({ recipeId, productId, createdBy: userId || null })),
+        skipDuplicates: true,
+      });
+      return tx.recipeProduct.findMany({ where: { recipeId }, include: { product: true } });
+    });
+  }
+  /**
    * Create or Update a Recipe for a Product
    */
   static async upsertRecipe(data: {
@@ -429,6 +451,15 @@ export class RecipeService {
   }
 
   static async createCategory(name: string) {
-    return prisma.recipeCategory.create({ data: { name } });
+    const clean = String(name || '').trim();
+    if (!clean) throw new Error('Category name is required.');
+    return prisma.$transaction(async (tx) => {
+      // Serialize category creation so differently-cased concurrent retries
+      // cannot both pass the case-insensitive existence check.
+      await tx.$executeRaw`LOCK TABLE "RecipeCategory" IN SHARE ROW EXCLUSIVE MODE`;
+      const existing = await tx.recipeCategory.findFirst({ where: { name: { equals: clean, mode: 'insensitive' } } });
+      if (existing) throw new Error(`Recipe category "${existing.name}" already exists.`);
+      return tx.recipeCategory.create({ data: { name: clean } });
+    });
   }
 }

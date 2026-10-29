@@ -1,4 +1,5 @@
 import prisma from '../../lib/prisma';
+import {FinishedGoodsLowStockService} from '../settings/finished-goods-low-stock';
 import { AlertType, AlertSeverity, AlertStatus } from '@prisma/client';
 import { IsolationUtil } from '../../utils/isolation.util';
 
@@ -51,7 +52,7 @@ export class AlertService {
       0
     );
 
-    const threshold = item.minimumStock ?? 0;
+    const threshold = item.category==='FINISHED_GOOD' ? await FinishedGoodsLowStockService.threshold(tx) : item.minimumStock ?? 0;
     const scopeTag = item.franchiseId || 'HQ';
     const dedupeKey = `INV_${itemId}_${scopeTag}`;
     const metadata = {

@@ -1,3 +1,5 @@
+import { AppError } from '../../middleware/error.middleware';
+import {FRANCHISE_PHOTO_ENTITY} from '../attachments/franchise-photo';
 import { IsolationUtil } from '../../utils/isolation.util';
 import { Request, Response } from 'express';
 import { FranchiseService } from './franchise.service';
@@ -12,13 +14,13 @@ function sendFranchiseError(res: Response, error: any) {
   if (error instanceof FieldValidationError) {
     return res.status(error.statusCode).json({ error: error.message, fieldErrors: error.fieldErrors });
   }
-  return res.status(500).json({ error: error.message });
+  return res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
 }
 
 export class FranchiseController {
   static async create(req: Request, res: Response) {
     try {
-      const franchise = await FranchiseService.create(req.body);
+      const franchise = await FranchiseService.create(req.body,(req as any).user?.userId);
       res.status(201).json(franchise);
     } catch (error: any) {
       sendFranchiseError(res, error);
@@ -28,7 +30,8 @@ export class FranchiseController {
   static async getAll(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      const franchiseId = user && user.role !== 'SUPER_ADMIN' ? user.franchiseId : undefined;
+      if(!user || (user.role!=='SUPER_ADMIN' && !user.franchiseId)) return res.status(403).json({error:'Franchise assignment is required'});
+      const franchiseId = user.role !== 'SUPER_ADMIN' ? user.franchiseId : undefined;
       const franchises = await FranchiseService.getAll(franchiseId, { includeAadhaar: user?.role === 'SUPER_ADMIN' });
       res.json(franchises);
     } catch (error: any) {
@@ -39,7 +42,7 @@ export class FranchiseController {
   static async getOne(req: Request, res: Response) {
     try {
       const user = (req as any).user;
-      if (user && user.role !== 'SUPER_ADMIN' && user.franchiseId && user.franchiseId !== req.params.id) {
+      if (!user || (user.role !== 'SUPER_ADMIN' && (!user.franchiseId || user.franchiseId !== req.params.id))) {
         return res.status(403).json({ error: 'Access denied to other franchise details' });
       }
       const franchise = await FranchiseService.getById(req.params.id, { includeAadhaar: user?.role === 'SUPER_ADMIN' });
@@ -52,6 +55,8 @@ export class FranchiseController {
 
   static async update(req: Request, res: Response) {
     try {
+      const actor=(req as any).user;
+      if(!actor || (actor.role!=='SUPER_ADMIN' && (!actor.franchiseId || actor.franchiseId!==req.params.id))) return res.status(403).json({error:'Access denied to other franchise details'});
       const { name, location, ownerName, contactNum, status } = req.body;
       const updateData: any = {};
       if (name !== undefined) updateData.name = name;
@@ -76,14 +81,25 @@ export class FranchiseController {
         updateData.aadhaarLast4 = kyc.aadhaarNumber.slice(-4);
       }
 
-      const franchise = await prisma.franchise.update({
-        where: { id: req.params.id },
-        data: updateData
-      });
+      if(Object.prototype.hasOwnProperty.call(req.body,'photo')) updateData.photo=req.body.photo;
+      const franchise = await FranchiseService.update(req.params.id,updateData,actor.userId);
       res.json(FranchiseService.toSafeFranchise(franchise));
     } catch (error: any) {
       sendFranchiseError(res, error);
     }
+  }
+
+  static async getPhoto(req:Request,res:Response) {
+    try {
+      const user=(req as any).user;
+      if(!user || (user.role!=='SUPER_ADMIN' && (!user.franchiseId || user.franchiseId!==req.params.id)))return res.status(403).json({error:'Access denied to other franchise photos'});
+      const file=await prisma.attachment.findFirst({where:{entityType:FRANCHISE_PHOTO_ENTITY,entityId:req.params.id},orderBy:{createdAt:'desc'}});
+      if(!file)return res.status(404).json({error:'No franchise photo'});
+      res.setHeader('Content-Type',file.mimeType);res.setHeader('Content-Length',String(file.size));
+      res.setHeader('Content-Disposition','inline; filename="'+file.fileName+'"');
+      res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Cache-Control','private, no-store');
+      res.end(Buffer.from(file.data));
+    } catch(error:any){sendFranchiseError(res,error);}
   }
 
   static async deleteFranchise(req: Request, res: Response) {

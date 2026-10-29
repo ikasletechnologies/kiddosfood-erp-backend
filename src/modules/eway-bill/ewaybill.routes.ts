@@ -17,6 +17,8 @@ router.post('/', EWayBillController.create);
 router.get('/:id', EWayBillController.getOne);
 router.patch('/:id', EWayBillController.update);
 router.delete('/:id', EWayBillController.remove);
+router.post('/:id/validate', EWayBillController.validate);
+router.post('/:id/submit', EWayBillController.submit);
 router.post('/:id/generate', EWayBillController.generate);
 router.post('/:id/vehicle', EWayBillController.updateVehicle);
 router.post('/:id/extend', EWayBillController.extend);

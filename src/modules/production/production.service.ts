@@ -1,3 +1,6 @@
+import { consumeBulkSource } from '../inventory/bulk-stock';
+import { isLotExpired } from '../inventory/lot-eligibility';
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { WasteService } from '../waste/waste.service';
@@ -56,6 +59,7 @@ function resolveBulkIdentity(
 
 type StartPackagingInput = {
   batchId: string;
+  bulkLotId?: string;
   packetSize: string;
   quantityPackets: number;
   productId?: string;
@@ -858,7 +862,7 @@ export class ProductionService {
             referenceId: batch.productionId || batch.id,
             note: `QC Approved batch: ${batch.batchCode} (${approvedQty} units approved after ${rejection} rejected at effective unit cost ₹${effectiveBulkUnitCost.toFixed(4)})`,
             userId: data.userId,
-            warehouseId: batch.production?.warehouseId || undefined,
+            warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
             receiveAtCost: {
               unitCost: effectiveBulkUnitCost,
               batchNumber: batch.batchCode || undefined,
@@ -874,7 +878,7 @@ export class ProductionService {
             data: {
               inventoryItemId: targetItem.id,
               franchiseId,
-              warehouseId: batch.production?.warehouseId || undefined,
+              warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
               quantity: rejection,
               reason: 'QC_FAIL',
               note: data.qcRemarks || `QC rejected from batch ${batch.batchCode}`,
@@ -983,7 +987,7 @@ export class ProductionService {
       referenceId: batch.productionId || batch.id,
       note: `Released to packaging (production QC not required): ${batch.batchCode} (${releasedQty} ${finishedGoodUnit} at unit cost ₹${unitCost.toFixed(4)})`,
       userId,
-      warehouseId: batch.production?.warehouseId || undefined,
+      warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
       receiveAtCost: {
         unitCost,
         batchNumber: batch.batchCode || undefined,
@@ -1085,11 +1089,31 @@ export class ProductionService {
   // g/kg conversion below stays correct. Throws if there's no bulk item at
   // all — a batch can't be packaged (started or confirmed) without one.
   static async resolveBulkItem(tx: any, batch: any, franchiseId: string | null) {
+    const sourceLot = await tx.inventoryBatch.findFirst({ where: { productBatchId: batch.id, productPackagingId: null }, select: { inventoryItemId: true } });
+    const linkedItem = sourceLot ? await tx.inventoryItem.findUniqueOrThrow({ where: { id: sourceLot.inventoryItemId } }) : null;
     const { bulkSku, bulkName } = resolveBulkIdentity(batch.product, batch.production?.recipe);
 
-    let bulkItem = await tx.inventoryItem.findFirst({
-      where: { franchiseId, OR: [{ sku: bulkSku }, { name: bulkName }] },
+    let bulkItem = linkedItem || await tx.inventoryItem.findFirst({
+      where: {
+        franchiseId,
+        OR: [
+          { sku: bulkSku },
+          { name: bulkName },
+          ...(batch.inventoryBatches?.[0]?.inventoryItemId ? [{ id: batch.inventoryBatches[0].inventoryItemId }] : [])
+        ]
+      },
     });
+    if (!bulkItem) {
+      bulkItem = await tx.inventoryItem.findFirst({
+        where: {
+          OR: [
+            { sku: bulkSku },
+            { name: bulkName },
+            ...(batch.inventoryBatches?.[0]?.inventoryItemId ? [{ id: batch.inventoryBatches[0].inventoryItemId }] : [])
+          ]
+        }
+      });
+    }
     if (!bulkItem) throw new Error('Bulk inventory item not found');
 
     // Self-heal a bulk item still carrying the old generic 'unit' label
@@ -1126,11 +1150,13 @@ export class ProductionService {
   }
 
   private static async startPackagingTx(tx: Prisma.TransactionClient, data: StartPackagingInput) {
+    await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${data.batchId} FOR UPDATE`;
     const batch = await tx.productBatch.findUnique({
       where: { id: data.batchId },
       include: { product: true, production: { include: { recipe: true } } },
     });
     if (!batch) throw new Error('Product batch not found');
+    if (isLotExpired(batch.expiryDate)) throw new Error('This bulk batch has expired and cannot be packaged.');
 
     // APPROVED / PARTIALLY_APPROVED (QC passed) and QC_NOT_REQUIRED (QC
     // switched off) all have real bulk stock credited equal to
@@ -1250,7 +1276,10 @@ export class ProductionService {
     // Reserve the required bulk stock immediately against this run.
     // This ensures it cannot be consumed by other concurrent packaging runs
     // and acts as the transactional deduction.
+    const sourceFifo = await consumeBulkSource(tx, batch, bulkItem.id, totalWeightNeeded, data.bulkLotId);
     const { fifo } = await InventoryService.recordMovement(tx, {
+      precalculatedFifo: sourceFifo,
+      warehouseId: batch.warehouseId || batch.production?.warehouseId || undefined,
       itemId: bulkItem.id,
       type: 'PRODUCTION_OUT',
       quantity: -totalWeightNeeded,
@@ -1324,6 +1353,9 @@ export class ProductionService {
   }
 
   private static async confirmPackagingTx(tx: Prisma.TransactionClient, data: ConfirmPackagingInput) {
+    const target = await tx.productPackaging.findUnique({ where: { id: data.packagingId }, select: { batchId: true } });
+    if (!target) throw new Error('Packaging run not found');
+    await tx.$queryRaw`SELECT id FROM "ProductBatch" WHERE id = ${target.batchId} FOR UPDATE`;
     // Row-lock the packaging ticket first. Without this, two concurrent
     // Confirm calls for the same ticket (a double-click, a retried
     // request) can both read status AWAITING_CONFIRMATION before either
@@ -1350,6 +1382,12 @@ export class ProductionService {
     }
 
     const batch = packaging.batch;
+    const sourceLayerIds = Array.isArray(packaging.bulkBreakdown) ? (packaging.bulkBreakdown as any[]).map(l => l.batchId).filter(Boolean) : [];
+    const sourceLots = sourceLayerIds.length ? await tx.inventoryBatch.findMany({ where: { id: { in: sourceLayerIds } }, select: { expDate: true, status: true, warehouseId: true } }) : [];
+    if (sourceLots.some(l => l.status !== 'APPROVED' || isLotExpired(l.expDate))) throw new Error('Source bulk lot is expired or blocked and cannot be packaged.');
+    const sourceExpiry = sourceLots.map(l => l.expDate).filter((d): d is Date => d != null).sort((a, b) => a.getTime() - b.getTime())[0];
+    const finishedExpiry = sourceExpiry && (!batch.expiryDate || sourceExpiry < batch.expiryDate) ? sourceExpiry : batch.expiryDate;
+    if (isLotExpired(batch.expiryDate)) throw new Error('This bulk batch has expired and cannot be packaged.');
 
     // Re-check recall — a recall could have been initiated in the gap
     // between Start Packaging and Confirm, a gap that didn't exist under
@@ -1458,6 +1496,7 @@ export class ProductionService {
       }
     }
 
+    const skuPriceMaster = await resolveSkuPriceMaster(tx, retailSku);
     let retailItem = await tx.inventoryItem.findFirst({
       where: { franchiseId: invFranchiseId, sku: retailSku },
     });
@@ -1471,7 +1510,14 @@ export class ProductionService {
           unit: 'packet',
           minimumStock: 10,
           franchiseId: invFranchiseId,
-          basePrice: bulkItem.basePrice ? bulkItem.basePrice * unitMultiplier : 0,
+          basePrice: skuPriceMaster?.basePrice ?? 0,
+          customerPrice: skuPriceMaster?.customerPrice ?? 0,
+          dealerPrice: skuPriceMaster?.dealerPrice ?? 0,
+          franchisePrice: skuPriceMaster?.franchisePrice ?? 0,
+          upcountryFranchisePrice: skuPriceMaster?.upcountryFranchisePrice ?? null,
+          mrp: skuPriceMaster?.mrp ?? null,
+          whiteLabelCost: skuPriceMaster?.whiteLabelCost ?? null,
+          gstRate: skuPriceMaster?.gstRate ?? linkedProduct?.taxPercent ?? 5,
           costPrice: bulkItem.costPrice ? bulkItem.costPrice * unitMultiplier : 0,
         },
       });
@@ -1508,13 +1554,13 @@ export class ProductionService {
         referenceId: batch.id,
         note: `Packaging confirmed: ${good} good units from batch ${batch.batchCode} at effective unit cost ₹${effectiveRetailUnitCost.toFixed(4)}`,
         userId: data.userId,
-        warehouseId: batch.production?.warehouseId || undefined,
+        warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
         receiveAtCost: {
           unitCost: effectiveRetailUnitCost,
           batchNumber: batch.batchCode || undefined,
           lotNumber: `${batch.batchCode || 'FG'}-L${priorRunLots + 1}`,
           mfgDate: batch.mfgDate,
-          expDate: batch.expiryDate,
+          expDate: finishedExpiry,
           productBatchId: batch.id,
           productPackagingId: packaging.id,
         },
@@ -1526,7 +1572,7 @@ export class ProductionService {
       wasteEntries.push(await WasteService.createFromProductionReject(tx, {
         inventoryItemId: retailItem.id,
         franchiseId,
-        warehouseId: batch.production?.warehouseId || undefined,
+        warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
         quantity: damaged,
         reason: 'DAMAGED',
         note: `Damaged during packaging confirmation of batch ${batch.batchCode}`,
@@ -1538,7 +1584,7 @@ export class ProductionService {
       wasteEntries.push(await WasteService.createFromProductionReject(tx, {
         inventoryItemId: retailItem.id,
         franchiseId,
-        warehouseId: batch.production?.warehouseId || undefined,
+        warehouseId: batch.production?.warehouseId || batch.warehouseId || undefined,
         quantity: spoiled,
         reason: 'SPOILAGE',
         note: `Spoiled during packaging confirmation of batch ${batch.batchCode}`,
@@ -1591,6 +1637,7 @@ export class ProductionService {
   // rejected before any stock is touched.
   static async packageAndConfirm(data: {
     batchId: string;
+    bulkLotId?: string;
     rows?: PackageRowInput[];
     // Single-row form (kept for compatibility).
     packetSize?: string;
@@ -1658,6 +1705,8 @@ export class ProductionService {
           batchCode: true,
           production: { select: { status: true, recipeId: true, recipe: { select: { yieldUnit: true } } } },
           recall: { select: { status: true } },
+          goodsReceiptItem: { select: { unit: true } },
+          inventoryBatches: { where: { productPackagingId: null }, select: { inventoryItem: { select: { unit: true } } } },
         },
       });
       if (!current) throw new Error('Product batch not found');
@@ -1683,7 +1732,7 @@ export class ProductionService {
       // Whole-request capacity check up front, so the operator gets one clear
       // message instead of a failure on whichever row happens to overflow.
       // startPackagingTx still re-checks every row as the authoritative guard.
-      const batchUnit = current.production?.recipe?.yieldUnit || 'KG';
+      const batchUnit = current.inventoryBatches[0]?.inventoryItem.unit || current.production?.recipe?.yieldUnit || current.goodsReceiptItem?.unit || 'KG';
       const released = await tx.productBatch.findUniqueOrThrow({
         where: { id: data.batchId },
         select: { approvedQty: true, packagedQty: true, packagings: { where: { status: 'AWAITING_CONFIRMATION' }, select: { totalWeight: true } } },
@@ -1715,6 +1764,7 @@ export class ProductionService {
 
         const { packaging, bulkBreakdown } = await this.startPackagingTx(tx, {
           batchId: data.batchId,
+          bulkLotId: data.bulkLotId,
           packetSize: row.packetSize,
           quantityPackets: packed + damaged,
           productId,
@@ -1852,7 +1902,13 @@ export class ProductionService {
     };
 
     if (row.productId) {
-      const product = await tx.product.findUnique({ where: { id: row.productId } });
+      let product = await tx.product.findUnique({ where: { id: row.productId } });
+      if (!product) {
+        const inv = await tx.inventoryItem.findUnique({ where: { id: row.productId } });
+        if (inv?.sku) {
+          product = await tx.product.findUnique({ where: { sku: inv.sku } });
+        }
+      }
       if (!product) throw new Error(`${label}Selected finished product was not found.`);
       if (product.isActive === false) throw new Error(`${label}"${product.name}" is inactive.`);
       if (!product.sku) throw new Error(`${label}"${product.name}" has no SKU. Add one in Product Master before packing into it.`);
@@ -1975,8 +2031,14 @@ export class ProductionService {
 
       const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
 
-      // Refund / release the reserved bulk stock back to InventoryItem
-      await InventoryService.recordMovement(tx, {
+      // Restore physical source layers as well as the aggregate when cancelling a reservation.
+      const sourceLayers = Array.isArray(packaging.bulkBreakdown) ? packaging.bulkBreakdown as any[] : [];
+      if (sourceLayers.length) await InventoryService.restoreToBatches(tx, {
+        itemId: bulkItem.id, allocation: sourceLayers.map(l => ({ batchId: l.batchId, qty: Number(l.qty), unitCost: Number(l.unitCost) })),
+        movementType: 'PRODUCTION_IN', referenceType: 'PACKAGING', referenceId: batch.id,
+        warehouseId: batch.warehouseId || batch.production?.warehouseId, userId: data.userId, note: 'Cancelled packaging: restored source bulk layers',
+      });
+      else await InventoryService.recordMovement(tx, {
         itemId: bulkItem.id,
         type: 'PRODUCTION_IN',
         quantity: packaging.totalWeight,
@@ -2037,8 +2099,8 @@ export class ProductionService {
       const bulkItem = await this.resolveBulkItem(tx, batch, invFranchiseId);
 
       // Where is it? In the warehouse of the production
-      const warehouseId = batch.production?.warehouseId;
-      if (!warehouseId) throw new Error('Cannot waste balance: No warehouse assigned to this production run');
+      const warehouseId = batch.production?.warehouseId || batch.warehouseId;
+      if (!warehouseId) throw new Error('Cannot waste balance: No warehouse assigned to this batch');
 
       // 1. Record stock out for the bulk item (like WasteService does)
       await InventoryService.recordMovement(tx, {
@@ -2338,8 +2400,6 @@ export class ProductionService {
         franchise: true,
         production: {
           include: {
-            // productLinks: finished-goods variants linked to the recipe, so
-            // Packaging can offer those SKUs first.
             recipe: { include: { productLinks: { select: { productId: true } } } },
             items: { include: { inventoryItem: true } },
             stageLogs: { orderBy: { enteredAt: 'asc' } },
@@ -2347,19 +2407,26 @@ export class ProductionService {
         },
         packagings: true,
         recall: true,
+        vendor: true,
+        procurementOrder: true,
+        goodsReceipt: true,
+        warehouse: true,
+        goodsReceiptItem: { select: { unit: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    // Same canonical product/recipe fallback as getProductBatches (Batch
-    // Registry, Expiry Tracking, Batch Recall) — ProductBatch.product is
-    // legitimately null for a recipe with no linked Product, and the recipe
-    // itself is still the batch's real product identity. Packaging Queue
-    // consumes this same list, so it was showing a blank product name for
-    // any such batch instead of falling back like every other consumer does.
-    return batches.map(b => ({
-      ...b,
-      product: b.product || (b.production?.recipe ? { id: b.production.recipe.id, name: b.production.recipe.name, sku: b.production.recipe.recipeCode ?? null } : null),
-    }));
+    const bulkLots = await prisma.inventoryBatch.findMany({ where: { productBatchId: { in: batches.map(b => b.id) }, productPackagingId: null }, include: { inventoryItem: { select: { unit: true } } } });
+    const reservedBulk = await InventoryService.reservedQtyByLot(prisma, bulkLots.map(l => l.id));
+    return batches.map(b => {
+      const lots = bulkLots.filter(l => l.productBatchId === b.id);
+      const usable = lots.filter(l => l.status === 'APPROVED' && !isLotExpired(l.expDate));
+      return { ...b,
+        product: b.product || (b.production?.recipe ? { id: b.production.recipe.id, name: b.production.recipe.name, sku: b.production.recipe.recipeCode ?? null } : null),
+        unit: lots[0]?.inventoryItem.unit || b.production?.recipe?.yieldUnit || b.goodsReceiptItem?.unit || 'KG',
+        availableBulkQty: lots.length ? usable.reduce((s, l) => s + Math.max(0, l.currentQty - (reservedBulk.get(l.id) || 0)), 0) : undefined,
+        bulkLots: usable.map(l => ({ id: l.id, availableQty: Math.max(0, l.currentQty - (reservedBulk.get(l.id) || 0)), warehouseId: l.warehouseId })),
+      };
+    });
   }
 }

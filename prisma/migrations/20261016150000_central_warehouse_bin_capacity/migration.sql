@@ -1,1 +1,0 @@
-ALTER TABLE "WarehouseBin" ADD COLUMN "capacity" DOUBLE PRECISION;

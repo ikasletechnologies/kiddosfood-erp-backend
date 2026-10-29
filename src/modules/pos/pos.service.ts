@@ -1,3 +1,4 @@
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import SocketService from '../../lib/socket';
@@ -51,7 +52,8 @@ export async function resolvePosLine(
 
   // Same resolver the product catalog uses for what POS search shows,
   // so the price shown is exactly the price charged.
-  const unitPrice = resolveSellingPrice(resolvedPartyType, inv, product) ?? 0;
+  const priceMaster = product.sku ? await resolveSkuPriceMaster(tx, product.sku) : null;
+  const unitPrice = resolveSellingPrice(resolvedPartyType, priceMaster || inv, product) ?? 0;
   assertBillablePrice(product, unitPrice);
   if (unitPrice <= 0) {
     throw new Error(`"${product.name}" has no selling price configured. Please update it in Inventory before selling.`);

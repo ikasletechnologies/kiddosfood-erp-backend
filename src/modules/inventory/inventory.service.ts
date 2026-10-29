@@ -1,3 +1,4 @@
+import {FinishedGoodsLowStockService,finishedGoodsStockStatus} from '../settings/finished-goods-low-stock';
 import { FranchiseService } from '../franchise/franchise.service';
 import { AlertService } from '../alerts/alert.service';
 import prisma from
@@ -287,6 +288,7 @@ export class InventoryService {
       }
     }
 
+    const finishedThreshold = items.some(item=>item.category==='FINISHED_GOOD') ? await FinishedGoodsLowStockService.threshold() : 5;
     return items.map(item => {
       // Use recomputed stock from ledger (movements) as source of truth
       // When asOfDate is provided, any item with no movements prior to boundary has 0 stock
@@ -301,11 +303,12 @@ export class InventoryService {
       const inbound = todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) > 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0);
       const outbound = Math.abs(todayMoves.filter(m => (m.baseQty !== null ? m.baseQty : m.quantity) < 0).reduce((s, m) => s + (m.baseQty !== null ? m.baseQty : m.quantity), 0));
 
-      const minStock = Number(item.minimumStock || 0);
+      const minStock = item.category==='FINISHED_GOOD' ? finishedThreshold : Number(item.minimumStock || 0);
       const shortfall = Math.max(0, minStock - computedStock);
       const productCategory = productCategoryBySku.get(item.sku) || null;
       const effectiveCategory = productCategory || item.category;
-      const status = minStock > 0 && computedStock < minStock ? 'LOW' : 'SAFE';
+      const stockStatus = item.category==='FINISHED_GOOD' ? finishedGoodsStockStatus(computedStock,finishedThreshold) : undefined;
+      const status = stockStatus ? (stockStatus==='IN_STOCK'?'SAFE':'LOW') : minStock > 0 && computedStock < minStock ? 'LOW' : 'SAFE';
 
       const incomingStock = pendingMap.get(item.id) || 0;
 
@@ -340,7 +343,9 @@ export class InventoryService {
       return {
         ...item,
         currentStock: computedStock,
-        minimumStock: minStock,
+        minimumStock: Number(item.minimumStock || 0),
+        lowStockThreshold: minStock,
+        stockStatus,
         minStock,
         shortfall,
         productCategory,
@@ -1355,6 +1360,7 @@ export class InventoryService {
   static async getAlerts(franchiseId?: string) {
     const items = await this.getInventory(franchiseId);
     return items.filter(item => {
+      if(item.category==='FINISHED_GOOD')return item.stockStatus==='LOW_STOCK';
       const minStock = Number(item.minimumStock || 0);
       return minStock > 0 && item.currentStock < minStock;
     });

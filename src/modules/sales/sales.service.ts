@@ -1,3 +1,5 @@
+import { InvoiceFulfilmentService } from './invoice-fulfilment.service';
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
 import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
@@ -186,11 +188,14 @@ async function resolveItemChannelPricing(
     }
   }
 
+  const sku = product?.sku || inv?.sku;
+  const priceMaster = sku ? await resolveSkuPriceMaster(tx, sku) : null;
+  const prices = priceMaster || inv;
   const channelPrice =
-    partyType === 'DEALER' ? inv?.dealerPrice :
-    partyType === 'FRANCHISE' ? inv?.franchisePrice :
-    inv?.customerPrice;
-  const rate = channelPrice && channelPrice > 0 ? channelPrice : (inv?.basePrice || product?.basePrice || 0);
+    partyType === 'DEALER' ? prices?.dealerPrice :
+    partyType === 'FRANCHISE' ? prices?.franchisePrice :
+    prices?.customerPrice;
+  const rate = channelPrice && channelPrice > 0 ? channelPrice : (prices?.basePrice || product?.basePrice || 0);
   const taxPercent = inv?.gstRate ?? product?.taxPercent ?? 5;
   const discountType = inv?.discountType || product?.discountType || 'PERCENT';
   const discountValue = partyType === 'CUSTOMER' ? Number(inv?.discountValue ?? product?.discountValue ?? 0) : 0;
@@ -3631,7 +3636,7 @@ export class SalesService {
     if (!order) throw new Error('Source Tax Invoice not found.');
 
     const otherChallans = await prisma.deliveryChallan.findMany({
-      where: { sourceInvoiceId, status: { not: 'CANCELLED' }, ...(excludeChallanId ? { id: { not: excludeChallanId } } : {}) },
+      where: { sourceInvoiceId, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] }, ...(excludeChallanId ? { id: { not: excludeChallanId } } : {}) },
       include: { items: true }
     });
 
@@ -3646,7 +3651,8 @@ export class SalesService {
     const result: Record<string, { invoiceQty: number; dispatchedQty: number; remaining: number }> = {};
     for (const oi of order.orderItems) {
       const dispatchedQty = dispatchedByProduct[oi.productId] || 0;
-      result[oi.productId] = { invoiceQty: oi.quantity, dispatchedQty, remaining: Math.max(0, oi.quantity - dispatchedQty) };
+      const invoiceQty = (result[oi.productId]?.invoiceQty || 0) + oi.quantity;
+      result[oi.productId] = { invoiceQty, dispatchedQty, remaining: Math.max(0, invoiceQty - dispatchedQty) };
     }
     return result;
   }
@@ -3679,17 +3685,22 @@ export class SalesService {
     else if (order.customerId) party = order.customer;
 
     const remaining = await SalesService.getRemainingInvoiceQty(orderId);
+    const deferredState = await InvoiceFulfilmentService.isDeferred(prisma, orderId) ? await InvoiceFulfilmentService.state(prisma, orderId) : null;
     const { createOrderItemUnitResolver } = require('../../utils/order-item-unit.util');
     const resolveUnit = createOrderItemUnitResolver();
     const round2 = (n: number) => Math.round(n * 100) / 100;
 
     const items: any[] = [];
+    const remainingToAssign = new Map(Object.entries(remaining).map(([id, value]) => [id, value.remaining]));
     for (const oi of order.orderItems) {
       const rem = remaining[oi.productId];
+      const lineRemaining = deferredState ? deferredState.lines.find((l: any) => l.orderItemId === oi.id)?.pendingQty ?? 0 : Math.min(oi.quantity, remainingToAssign.get(oi.productId) ?? oi.quantity);
+      remainingToAssign.set(oi.productId, Math.max(0, (remainingToAssign.get(oi.productId) || 0) - lineRemaining));
+      const stockSuggestion = await InvoiceFulfilmentService.options(prisma, { productId: oi.productId, quantity: lineRemaining, unit: oi.unit, franchiseId: order.franchiseId }, false);
       const gross = (oi.quantity || 0) * (oi.price || 0);
       const taxable = gross * (1 - (oi.discountPct || 0) / 100);
       // The rate the saved line tax was charged at (product GST, else derived).
-      const taxPercent = oi.product?.taxPercent ?? (taxable > 0 ? round2((oi.taxAmount || 0) / taxable * 100) : 0);
+      const taxPercent = taxable > 0 ? round2((oi.taxAmount || 0) / taxable * 100) : 0;
       items.push({
         orderItemId: oi.id,
         productId: oi.productId,
@@ -3701,7 +3712,8 @@ export class SalesService {
         taxPercent,
         invoiceQty: oi.quantity,
         dispatchedQty: rem?.dispatchedQty ?? 0,
-        remainingQty: rem?.remaining ?? oi.quantity,
+        remainingQty: lineRemaining,
+        availableQty: stockSuggestion.availableQty,
         batchNumber: oi.batchNumber || null,
         // The invoice's lot travels with the goods (traceability only).
         inventoryBatchId: oi.inventoryBatchId || null,
@@ -3773,7 +3785,7 @@ export class SalesService {
     // Invoice Qty vs Dispatch Qty: only enforced going IN_TRANSIT (a DRAFT
     // is just a plan and may still change) and only for source-invoice-
     // linked challans (a DIRECT challan has no invoice qty to cap against).
-    if (data.sourceInvoiceId && data.status === 'IN_TRANSIT') {
+    if (data.sourceInvoiceId && data.status === 'IN_TRANSIT' && !(await InvoiceFulfilmentService.isDeferred(prisma, data.sourceInvoiceId))) {
       const remaining = await SalesService.getRemainingInvoiceQty(data.sourceInvoiceId);
       for (const item of data.items) {
         if (!item.productId) continue;
@@ -3794,7 +3806,8 @@ export class SalesService {
     const dcScopeFranchiseId = resolvedSourceFranchiseId
       ? await FranchiseService.toInventoryScopeId(prisma, resolvedSourceFranchiseId)
       : null;
-    const pricedDcItems = await applyAuthoritativePricing(
+    const deferredSource = data.sourceInvoiceId && await InvoiceFulfilmentService.isDeferred(prisma, data.sourceInvoiceId);
+    const pricedDcItems = deferredSource ? await InvoiceFulfilmentService.snapshotItems(prisma, data.sourceInvoiceId!, data.items, resolvedSourceFranchiseId) : await applyAuthoritativePricing(
       prisma,
       data.items.map((i) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
       dcScopeFranchiseId,
@@ -3849,7 +3862,7 @@ export class SalesService {
 
         // Delivery Challan is a dispatch/delivery document that can be created/saved even if current stock is 0.
         // Stock deduction happens when the challan is converted to a Sale Invoice.
-        if (newChallan.status === 'IN_TRANSIT' && (data as any).deductStockOnDispatch) {
+        if (newChallan.status === 'IN_TRANSIT' && ((data as any).deductStockOnDispatch || (newChallan.sourceInvoiceId && await InvoiceFulfilmentService.isDeferred(tx, newChallan.sourceInvoiceId)))) {
           await SalesService.dispatchChallanStock(newChallan, userId, tx);
         }
 
@@ -3896,7 +3909,7 @@ export class SalesService {
     // Replacement items are priced up front with the same rules as create —
     // applied only while the challan is still a DRAFT (after dispatch, stock
     // may already be committed against the original lines).
-    const pre = await prisma.deliveryChallan.findUnique({ where: { id }, select: { status: true, dealerId: true, franchiseId: true, sourceFranchiseId: true } });
+    const pre = await prisma.deliveryChallan.findUnique({ where: { id }, select: { status: true, dealerId: true, franchiseId: true, sourceFranchiseId: true, sourceInvoiceId: true } });
     if (!pre) throw new Error('Delivery challan not found');
     let priced: ReturnType<typeof calculateTotals> | null = null;
     if (wantsItems && pre.status === 'DRAFT') {
@@ -3904,7 +3917,7 @@ export class SalesService {
       const franchiseId = 'franchiseId' in header ? header.franchiseId : pre.franchiseId;
       const partyType: 'CUSTOMER' | 'DEALER' | 'FRANCHISE' = dealerId ? 'DEALER' : franchiseId ? 'FRANCHISE' : 'CUSTOMER';
       const scope = pre.sourceFranchiseId ? await FranchiseService.toInventoryScopeId(prisma, pre.sourceFranchiseId) : null;
-      const pricedItems = await applyAuthoritativePricing(
+      const pricedItems = pre.sourceInvoiceId && await InvoiceFulfilmentService.isDeferred(prisma, pre.sourceInvoiceId) ? await InvoiceFulfilmentService.snapshotItems(prisma, pre.sourceInvoiceId, data.items, pre.sourceFranchiseId) : await applyAuthoritativePricing(
         prisma,
         data.items.map((i: any) => ({ ...i, rate: i.rate || 0, taxPercent: i.taxPercent || 0 })),
         scope,
@@ -3956,7 +3969,7 @@ export class SalesService {
       // (createDeliveryChallan only checks it for a challan created
       // already-IN_TRANSIT — most challans start DRAFT then dispatch later).
       const replaceItems = priced && currentStatus === 'DRAFT';
-      if (currentChallan.sourceInvoiceId && currentStatus === 'DRAFT' && data.status === 'IN_TRANSIT') {
+      if (currentChallan.sourceInvoiceId && currentStatus === 'DRAFT' && data.status === 'IN_TRANSIT' && !(await InvoiceFulfilmentService.isDeferred(tx, currentChallan.sourceInvoiceId))) {
         const remaining = await SalesService.getRemainingInvoiceQty(currentChallan.sourceInvoiceId, id);
         // Check the lines actually being dispatched (the edited ones, if replaced).
         const linesToCheck: Array<{ productId: string | null; quantity: number; productName: string }> =
@@ -4002,11 +4015,11 @@ export class SalesService {
 
       // Handle Stock Transitions
       // A Delivery Challan is a dispatch document; stock deduction occurs when converted to Sale Invoice.
-      if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT' && (data as any).deductStockOnDispatch) {
+      if (currentStatus === 'DRAFT' && updated.status === 'IN_TRANSIT' && ((data as any).deductStockOnDispatch || (updated.sourceInvoiceId && await InvoiceFulfilmentService.isDeferred(tx, updated.sourceInvoiceId)))) {
         await SalesService.dispatchChallanStock(updated, userId, tx);
       } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CLOSED' && (data as any).receiveStockOnDelivered) {
         await SalesService.receiveChallanStock(updated, userId, tx);
-      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED' && (data as any).deductStockOnDispatch) {
+      } else if (currentStatus === 'IN_TRANSIT' && updated.status === 'CANCELLED' && ((data as any).deductStockOnDispatch || (updated.sourceInvoiceId && await InvoiceFulfilmentService.isDeferred(tx, updated.sourceInvoiceId)))) {
         await SalesService.reverseChallanStock(updated, userId, tx);
       }
 
@@ -4516,6 +4529,7 @@ export class SalesService {
         include: { items: true, returns: { include: { items: true } } }
       });
       if (!challan) throw new Error('Delivery challan not found');
+      if (challan.sourceInvoiceId) throw new Error('This delivery challan already fulfils an existing invoice and cannot generate another invoice.');
 
       const allProducts = await tx.product.findMany({ select: { id: true, name: true, sku: true } });
       const fallbackProduct = allProducts.find(p => p.name.toLowerCase() === 'general item') || allProducts[0];
@@ -4787,6 +4801,7 @@ export class SalesService {
     // A challan delivering an invoice whose stock was already issued at
     // invoice creation must not issue the same goods a second time.
     if (challan.sourceInvoiceId) {
+      if (await InvoiceFulfilmentService.isDeferred(tx, challan.sourceInvoiceId)) return InvoiceFulfilmentService.dispatch(tx, challan, userId);
       const source = await tx.order.findUnique({ where: { id: challan.sourceInvoiceId }, select: { inventory_deducted: true } });
       if (source?.inventory_deducted) return;
     }
@@ -4873,6 +4888,7 @@ export class SalesService {
   }
 
   private static async reverseChallanStock(challan: any, userId: string, tx: any = prisma) {
+    if (challan.sourceInvoiceId && await InvoiceFulfilmentService.reverse(tx, challan, userId)) return;
     const sourceId = challan.sourceFranchiseId || (await FranchiseService.getHqFranchiseOrNull())?.id;
     if (!sourceId) return; // no source franchise on the challan and no HQ configured — nothing to reverse against
     for (const item of challan.items) {

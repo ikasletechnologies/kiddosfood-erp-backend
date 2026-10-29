@@ -1,5 +1,7 @@
 import { WarehouseService } from '../warehouse/warehouse.service';
 import prisma from '../../lib/prisma';
+import {AttachmentService} from '../attachments/attachment.service';
+import {validateFranchisePhoto} from '../attachments/franchise-photo';
 import { AuthService } from '../auth/auth.service';
 import { encryptField } from '../../lib/field-crypto';
 import {
@@ -27,7 +29,8 @@ export class FranchiseService {
     }
   }
 
-  static async create(input: any) {
+  static async create(input: any, userId?:string) {
+    const photo=validateFranchisePhoto(input.photo);
     const { adminUser, aadhaarNumber, panNumber, ...franchiseData } = input;
 
     // Headquarters Setup (/setup) posts isHQ: true with no admin account — it
@@ -40,6 +43,7 @@ export class FranchiseService {
     if (isBranch) {
       const { data: kyc, errors } = validateKycFields({ aadhaarNumber, panNumber });
       adminEmail = typeof adminUser?.email === 'string' ? adminUser.email.trim() : '';
+      if(franchiseData.contactNum && !/^\d{10}$/.test(franchiseData.contactNum)) errors.contactNum='Enter a valid 10-digit mobile number.';
       const emailError = validateEmail(adminEmail);
       if (emailError) errors.email = emailError;
       const passwordError = validatePassword(adminUser?.password);
@@ -60,6 +64,7 @@ export class FranchiseService {
         // Duplicate admin email. User.email is @unique but case-sensitive in
         // Postgres, so also guard against case variants of an existing login.
         if (isBranch) {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'franchise-admin-email:'+adminEmail.toLowerCase()}))::text`;
           const emailOwner = await tx.user.findFirst({
             where: { email: { equals: adminEmail, mode: 'insensitive' } },
             select: { id: true }
@@ -77,10 +82,10 @@ export class FranchiseService {
 
         const franchise = await tx.franchise.create({
           data: {
-            name: franchiseData.name,
-            location: franchiseData.location,
-            ownerName: franchiseData.ownerName,
-            contactNum: franchiseData.contactNum,
+            name: typeof franchiseData.name === 'string' ? franchiseData.name.trim() : '',
+            location: typeof franchiseData.location === 'string' ? franchiseData.location.trim() : '',
+            ownerName: typeof franchiseData.ownerName === 'string' ? franchiseData.ownerName.trim() : '',
+            contactNum: franchiseData.contactNum || '',
             status: franchiseData.status || 'ACTIVE',
             isHQ: franchiseData.isHQ ?? false,
             dashboardPassword: dashboardPasswordHash,
@@ -95,9 +100,9 @@ export class FranchiseService {
 
           await tx.user.create({
             data: {
-              fullName: adminUser.fullName || franchiseData.ownerName,
+              fullName: adminUser.fullName || franchiseData.ownerName || franchiseData.name || adminEmail,
               email: (isBranch ? adminEmail : adminUser.email) || null,
-              phone: franchiseData.contactNum,
+              phone: franchiseData.contactNum || null,
               passwordHash,
               role: 'FRANCHISE_ADMIN',
               franchiseId: franchise.id,
@@ -106,7 +111,8 @@ export class FranchiseService {
           });
         }
 
-        return isBranch ? FranchiseService.toSafeFranchise(franchise) : franchise;
+        await AttachmentService.saveFranchisePhoto(tx,franchise.id,photo,userId);
+        return (await this.withPhotos([isBranch ? FranchiseService.toSafeFranchise(franchise) : franchise],tx))[0];
       });
     } catch (err: any) {
       // Unique-index races / clashes → clear field errors instead of a raw 500.
@@ -125,9 +131,14 @@ export class FranchiseService {
     const { dashboardPassword: _dp, aadhaarEncrypted: _ae, aadhaarLast4, ...rest } = franchise as any;
     return {
       ...rest,
-      aadhaarMasked: opts.includeAadhaar ? maskAadhaar(aadhaarLast4) : null,
-      hasAadhaar: Boolean(aadhaarLast4),
+      aadhaarMasked: opts.includeAadhaar ? maskAadhaar(aadhaarLast4) || (/^XXXX XXXX \d{4}$/.test((franchise as any).aadhaarMasked || '') ? (franchise as any).aadhaarMasked : null) : null,
+      hasAadhaar: Boolean(aadhaarLast4 || (franchise as any).hasAadhaar),
     };
+  }
+
+  static async withPhotos(rows:any[], db:any=prisma) {
+    const photos=await AttachmentService.franchisePhotos(db,rows.map(row=>row.id));
+    return rows.map(row=>({...row,photo:photos.get(row.id) || null,photoUrl:photos.get(row.id)?.url || null}));
   }
 
   // includeAadhaar: only Super Admins see the (masked) Aadhaar.
@@ -160,7 +171,7 @@ export class FranchiseService {
           select: { users: true, orders: true, inventory: true }
         }
       }
-    }).then((rows) => rows.map((f) => FranchiseService.toSafeFranchise(f, opts)));
+    }).then((rows) => this.withPhotos(rows.map((f) => FranchiseService.toSafeFranchise(f, opts))));
   }
 
   // The single source of truth for "which franchise is HQ" — replaces the
@@ -216,7 +227,7 @@ export class FranchiseService {
     });
 
     if (franchise) {
-      return FranchiseService.toSafeFranchise(franchise, opts);
+      return (await this.withPhotos([FranchiseService.toSafeFranchise(franchise, opts)]))[0];
     }
     return null;
   }
@@ -232,7 +243,8 @@ export class FranchiseService {
     return AuthService.comparePassword(password, franchise.dashboardPassword);
   }
 
-  static async update(id: string, input: any) {
+  static async update(id: string, input: any, userId?:string) {
+    const photo=validateFranchisePhoto(input.photo);
     const data: any = {
       name: input.name,
       location: input.location,
@@ -240,6 +252,7 @@ export class FranchiseService {
       contactNum: input.contactNum,
       status: input.status
     };
+    for(const key of ['aadhaarEncrypted','aadhaarLast4','panNumber']) if(input[key]!==undefined)data[key]=input[key];
     if (input.isHQ !== undefined) data.isHQ = input.isHQ;
     if (input.primaryWarehouseId !== undefined) data.primaryWarehouseId = input.primaryWarehouseId;
 
@@ -248,13 +261,13 @@ export class FranchiseService {
     }
 
     return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Franchise" WHERE id = ${id} FOR UPDATE`;
       if (input.isHQ !== undefined) {
         await FranchiseService.assertSingleHQ(tx, input.isHQ, id);
       }
-      return tx.franchise.update({
-        where: { id },
-        data
-      });
+      const row=await tx.franchise.update({where:{id},data});
+      await AttachmentService.saveFranchisePhoto(tx,id,photo,userId);
+      return (await this.withPhotos([this.toSafeFranchise(row)],tx))[0];
     });
   }
 

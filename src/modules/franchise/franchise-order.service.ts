@@ -1,3 +1,5 @@
+import { resolveSkuPriceMaster } from '../../utils/sku-pricing';
+import { resolveSellingPrice } from '../../utils/selling-price.util';
 import { assertBillablePrice } from '../../utils/selling-price.util';
 import prisma from '../../lib/prisma';
 import { FranchiseOrderStatus, FranchiseOrderType, FranchiseOrderFulfillment, PaymentType, ProductType, LedgerType, FranchiseLedgerRefType } from '@prisma/client';
@@ -264,7 +266,8 @@ export class FranchiseOrderService {
         }
         // MADE_TO_ORDER products, and any item on a REQUEST order → allowed without stock check
 
-        const unitPrice   = product.basePrice;
+        const priceMaster = product.sku ? await resolveSkuPriceMaster(tx, product.sku) : null;
+        const unitPrice = resolveSellingPrice('FRANCHISE', priceMaster, product) ?? 0;
         assertBillablePrice(product, unitPrice);
         const totalAmount = unitPrice * reqItem.quantity;
         orderItems.push({
@@ -355,11 +358,16 @@ export class FranchiseOrderService {
   }
 
   // ─── Get Orders ────────────────────────────────────────────────────────────
-  static async getOrders(filters: { franchiseId?: string; status?: FranchiseOrderStatus }) {
+  static async getOrders(filters: { franchiseId?: string; status?: FranchiseOrderStatus; search?: string }) {
     const orders = await prisma.franchiseOrder.findMany({
       where: {
         ...(filters.franchiseId ? { franchiseId: filters.franchiseId } : {}),
         ...(filters.status ? { status: filters.status } : {}),
+        ...(filters.search?.trim() ? { OR: [
+          { orderNumber: { contains: filters.search.trim(), mode: 'insensitive' as const } },
+          { franchise: { name: { contains: filters.search.trim(), mode: 'insensitive' as const } } },
+          { franchise: { location: { contains: filters.search.trim(), mode: 'insensitive' as const } } },
+        ] } : {}),
       },
       include: {
         items: {

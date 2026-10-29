@@ -194,6 +194,7 @@ model Franchise {
   wasteEntries       WasteEntry[]
   workflowRequests   WorkflowRequest[]
   alerts             Alert[]
+  documents          FranchiseDocument[]
   chatConversations  ChatConversation[]
 }
 
@@ -258,6 +259,9 @@ model InventoryItem {
   franchisePrice                  Float?                           @default(0)
   dealerPrice                     Float?                           @default(0)
   customerPrice                   Float?                           @default(0)
+  upcountryFranchisePrice         Decimal?                         @db.Decimal(14, 2)
+  mrp                             Decimal?                         @db.Decimal(14, 2)
+  whiteLabelCost                  Decimal?                         @db.Decimal(14, 2)
   discountType                    String?                          @default("PERCENT")
   discountValue                   Float?                           @default(0)
   baseUnitId                      String?
@@ -373,6 +377,7 @@ model Vendor {
   ledgerEntries          VendorLedger[]
   suppliedMaterials      VendorMaterial[]
   vendorQuotations       VendorQuotation[]
+  productBatches         ProductBatch[]
 }
 
 model VendorLedger {
@@ -453,6 +458,7 @@ model ProcurementOrder {
   poItems              ProcurementOrderItem[]
   purchaseReturns      PurchaseReturn[]
   invoices             VendorInvoice[]
+  productBatches       ProductBatch[]
 
   @@index([franchiseId, createdAt])
   @@index([createdAt])
@@ -473,6 +479,8 @@ model ProcurementOrderItem {
   sgst             Float            @default(0)
   subtotal         Float            @default(0)
   total            Float            @default(0)
+  isBulk           Boolean          @default(false)
+  productId        String?
   inventoryItem    InventoryItem?   @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
 }
@@ -492,6 +500,7 @@ model GoodsReceipt {
   procurementOrder ProcurementOrder   @relation(fields: [poId], references: [id])
   items            GoodsReceiptItem[]
   invoices         VendorInvoice[]
+  productBatches   ProductBatch[]
 }
 
 model GoodsReceiptItem {
@@ -523,6 +532,8 @@ model GoodsReceiptItem {
   warehouse           Warehouse?        @relation(fields: [warehouseId], references: [id])
   inspection          InspectionRecord?
   inventoryBatch      InventoryBatch?
+  isBulk              Boolean           @default(false)
+  productBatch        ProductBatch?
 }
 
 model VendorInvoice {
@@ -808,14 +819,25 @@ model ProductBatch {
   cartonedQty      Float?             @default(0)
   unitCost         Float?
   totalCost        Float?
-  recall           BatchRecall?
-  cartons          Carton[]
-  inventoryBatches InventoryBatch[]
-  franchise        Franchise?         @relation(fields: [franchiseId], references: [id])
-  product          Product?           @relation(fields: [productId], references: [id])
-  production       Production?        @relation(fields: [productionId], references: [id])
-  packagings       ProductPackaging[]
-  expenses         ProductionExpense[]
+  recall              BatchRecall?
+  cartons             Carton[]
+  inventoryBatches    InventoryBatch[]
+  sourceType          String?              @default("MANUFACTURED")
+  vendorId            String?
+  procurementOrderId  String?
+  goodsReceiptId      String?
+  goodsReceiptItemId  String?              @unique
+  warehouseId         String?
+  franchise           Franchise?           @relation(fields: [franchiseId], references: [id])
+  product             Product?             @relation(fields: [productId], references: [id])
+  production          Production?          @relation(fields: [productionId], references: [id])
+  vendor              Vendor?              @relation(fields: [vendorId], references: [id])
+  procurementOrder    ProcurementOrder?    @relation(fields: [procurementOrderId], references: [id])
+  goodsReceipt        GoodsReceipt?        @relation(fields: [goodsReceiptId], references: [id])
+  goodsReceiptItem    GoodsReceiptItem?    @relation(fields: [goodsReceiptItemId], references: [id])
+  warehouse           Warehouse?           @relation(fields: [warehouseId], references: [id])
+  packagings          ProductPackaging[]
+  expenses            ProductionExpense[]
 
   @@index([franchiseId, expiryDate])
 }
@@ -2029,6 +2051,7 @@ model Warehouse {
   vendorInvoices       VendorInvoice[]
   bins                 WarehouseBin[]
   wasteEntries         WasteEntry[]
+  productBatches       ProductBatch[]
 }
 
 model WarehouseBin {
@@ -2453,6 +2476,8 @@ enum POStatus {
 enum PurchaseType {
   ALL
   RAW_MATERIAL
+  FINISHED_GOOD
+  FINISHED_GOODS
   PACKAGING
   EQUIPMENT
   CONSUMABLES
@@ -2898,6 +2923,8 @@ model Attachment {
   uploadedBy  String?
   createdAt   DateTime @default(now())
 
+  franchiseDocument FranchiseDocument?
+
   @@index([entityType, entityId])
 }
 
@@ -2963,4 +2990,30 @@ enum ChatConversationType {
 
 enum ChatMessageType {
   TEXT
+}
+
+model FranchiseDocument {
+  id               String    @id @default(uuid())
+  franchiseId      String
+  category         String
+  originalFileName String
+  storageKey       String    @unique
+  mimeType         String
+  fileSize         Int
+  familyId         String
+  version          Int       @default(1)
+  status           String    @default("ACTIVE")
+  visibility       String    @default("INTERNAL")
+  uploadedBy       String
+  uploadedByName   String
+  uploadedAt       DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  issueDate        DateTime?
+  expiryDate       DateTime?
+  notes            String?
+  franchise        Franchise @relation(fields: [franchiseId], references: [id], onDelete: Restrict)
+  attachment       Attachment @relation(fields: [storageKey], references: [id], onDelete: Restrict)
+
+  @@unique([familyId, version])
+  @@index([franchiseId, status, category])
 }

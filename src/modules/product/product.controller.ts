@@ -138,4 +138,13 @@ export class ProductController {
       res.status(400).json({ error: error.message });
     }
   }
+
+  static async getBulkProducts(req: Request, res: Response) {
+    try {
+      const bulkProducts = await ProductService.getBulkProducts();
+      res.json(bulkProducts);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
 }
