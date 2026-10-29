@@ -1,3 +1,4 @@
+import { fynamics, FynamicsError, mapFynamicsDraft } from './fynamics.client';
 import { InvoiceEwbSource } from './invoice-source';
 import prisma from '../../lib/prisma';
 import { AppError } from '../../middleware/error.middleware';
@@ -15,17 +16,9 @@ import {
   isValidUqc,
 } from './ewaybill.constants';
 
-// E-Way Bill lifecycle (GST Rule 138):
-//   DRAFT      — prepared here, editable, exportable as NIC JSON.
-//   GENERATED  — the user generated it on the NIC portal (bulk-upload the
-//                exported JSON, or key it in) and recorded the 12-digit
-//                EWB number here. Only Part B can change after this.
-//   CANCELLED  — cancelled within 24h of generation.
-//   EXPIRED is never stored — it's GENERATED with validUntil in the past,
-//   derived on read so it can't go stale.
-//
-// No EWB number is ever fabricated server-side: there is no NIC/GSP API
-// integration, so the number must come from the portal.
+// Drafts are generated through the enhanced Fynamics staging API.
+// PROCESSING also represents an uncertain outcome pending provider reconciliation.
+// Historical portal-issued records keep their original stored numbers and dates.
 
 type SourceType = 'SALE_INVOICE' | 'DELIVERY_CHALLAN' | 'STOCK_TRANSFER' | 'MANUAL';
 const SOURCE_TYPES: SourceType[] = ['SALE_INVOICE', 'DELIVERY_CHALLAN', 'STOCK_TRANSFER', 'MANUAL'];
@@ -506,7 +499,7 @@ export class EWayBillService {
           const quantities=(rows:any[])=>{const result=new Map<string,number>();for(const row of rows){const key=row.productId+'|'+row.unit;result.set(key,(result.get(key)||0)+row.quantity);}return result;};
           const requested=quantities(invoice.order.orderItems),actual=quantities(lines);
           const full=siblings===1 && requested.size===actual.size && [...requested].every(([key,value])=>Math.abs(value-(actual.get(key)||0))<0.0001);
-          aliases.push({sourceType:'SALE_INVOICE',sourceId:{in:[invoice.id,invoice.orderId]},...(!full?{status:'GENERATED'}:{})});
+          aliases.push({sourceType:'SALE_INVOICE',sourceId:{in:[invoice.id,invoice.orderId]},...(!full?{status:{in:['GENERATED','PROCESSING']}}:{})});
         }
       }
       return {sourceId,franchiseId:dc.sourceFranchiseId || dc.franchiseId || await this.ownFranchiseId(user),aliases};
@@ -521,7 +514,7 @@ export class EWayBillService {
       const duplicate=await db.eWayBill.findFirst({where:{...notSelf,OR:aliases || [{sourceType:h.sourceType,sourceId:h.sourceId}],status:{not:'CANCELLED'}}});
       if (duplicate) throw new AppError('This movement already has an E-Way Bill ('+(duplicate.ewbNumber || duplicate.refNumber)+'). Open the existing record.',409);
     }
-    const duplicate=await db.eWayBill.findFirst({where:{...notSelf,docNo:h.docNo,docType:h.docType,fromGstin:h.fromGstin,status:'GENERATED'}});
+    const duplicate=await db.eWayBill.findFirst({where:{...notSelf,docNo:h.docNo,docType:h.docType,fromGstin:h.fromGstin,status:{in:['GENERATED','PROCESSING']}}});
     if (duplicate) throw new AppError('An E-Way Bill is already generated for this document',409);
   }
 
@@ -530,7 +523,11 @@ export class EWayBillService {
     const context=await this.sourceContext(user,row.sourceType,row.sourceId);
     const errors:string[]=[];
     const mode=row.sourceType === 'SALE_INVOICE' ? (row.igstValue > 0) : undefined;
-    try {this.normalize({...row,gstInterState:mode});} catch(e:any){errors.push(...e.message.split('\n'));}
+    try {
+      const normalized=this.normalize({...row,gstInterState:mode});
+      for(const key of ['totalValue','cgstValue','sgstValue','igstValue','cessValue','otherValue','totInvValue']) if(!Number.isFinite(Number((row as any)[key])) || Math.abs(Number((row as any)[key])-Number(normalized.header[key]))>0.02) errors.push('Saved '+key+' does not reconcile with draft items.');
+    } catch(e:any){errors.push(...e.message.split('\n'));}
+    if(!row.fromAddr1 || !row.toAddr1 || !row.fromPlace || !row.toPlace) errors.push('Dispatch and destination address and place are required.');
     try {this.assertPartBComplete(row);} catch(e:any){errors.push(...e.message.split('\n'));}
     await this.assertNoDuplicate(row,id,prisma,context.aliases);
     if (context.mapping) {
@@ -547,13 +544,47 @@ export class EWayBillService {
       if(!mapping.payload.actToStateCode && !row.actToStateCode) errors.push('Confirm the actual ship-to state.');
       if(row.docType==='OTH' && row.subSupplyDesc==='Verify source type') errors.push('Confirm the source transaction classification.');
     }
-    return {valid:errors.length===0,errors,warnings:context.mapping?.warnings || [],generationAvailable:false,message:'No authorised NIC/GSP API integration is configured. Save and validate the draft; export JSON for the authorised portal. No official E-Way Bill has been generated.'};
+    return {valid:errors.length===0,errors,warnings:context.mapping?.warnings || [],generationAvailable:fynamics.configured(),message:fynamics.configured()?'Draft validation complete. Submit to generate through Fynamics staging.':fynamics.configurationMessage()};
   }
 
   static async submit(user: TokenPayload,id:string) {
+    const initial=await this.load(user,id);
+    if(initial.status === 'GENERATED') return this.getById(user,id);
+    fynamics.assertConfigured(initial.fromGstin);
+    if(initial.status === 'PROCESSING') throw new AppError('Generation is processing or awaiting reconciliation. Use reconcile; do not resubmit.',409);
+    if(!['DRAFT','FAILED'].includes(initial.status)) throw new AppError('This E-Way Bill cannot be generated',409);
     const validation=await this.validateDraft(user,id);
     if(!validation.valid) throw new AppError(validation.errors.join('\n'),422);
-    throw new AppError(validation.message,503);
+    await fynamics.ready(initial.fromGstin);
+    const row=await prisma.$transaction(async(tx:any)=>{
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('EWB_SOURCE_WRITE'))::text`;
+      const fresh=await tx.eWayBill.findUnique({where:{id},include:{items:true}});
+      if(!fresh || !['DRAFT','FAILED'].includes(fresh.status) || fresh.updatedAt.getTime() !== initial.updatedAt.getTime()) throw new AppError('Draft changed or generation already started. Reload the record.',409);
+      const context=await this.sourceContext(user,fresh.sourceType,fresh.sourceId,tx);
+      await this.assertNoDuplicate(fresh,id,tx,context.aliases);
+      await tx.eWayBill.update({where:{id},data:{status:'PROCESSING',provider:'FYNAMICS_STAGING',generatorGstin:initial.fromGstin,generationError:null}});
+      return fresh;
+    });
+    let result;
+    try { result=await fynamics.generate(mapFynamicsDraft(row)); }
+    catch(e) {
+      const uncertain=!(e instanceof FynamicsError) || e.uncertain;
+      await prisma.eWayBill.update({where:{id},data:{status:uncertain?'PROCESSING':'FAILED',generationError:e instanceof FynamicsError?e.message:'Generation result unknown; reconcile before retrying.'}});
+      throw e instanceof FynamicsError?e:new AppError('Generation result unknown; reconcile before retrying.',503);
+    }
+    // Keep PROCESSING if persistence fails after provider success: never resubmit.
+    await prisma.eWayBill.update({where:{id},data:{...result,status:'GENERATED',generationError:null}});
+    return this.getById(user,id);
+  }
+
+  static async reconcile(user:TokenPayload,id:string) {
+    const row=await this.load(user,id);
+    if(row.status === 'GENERATED') return this.getById(user,id);
+    if(row.status !== 'PROCESSING') throw new AppError('Only an uncertain processing request needs reconciliation',409);
+    await fynamics.ready(row.fromGstin);
+    const result=await fynamics.reconcile(row.docType,row.docNo);
+    await prisma.eWayBill.update({where:{id},data:{...result,status:'GENERATED',generationError:null}});
+    return this.getById(user,id);
   }
 
   // ── Writes ──────────────────────────────────────────────────────────────
@@ -587,59 +618,38 @@ export class EWayBillService {
 
   static async update(user: TokenPayload, id: string, data: any) {
     const row = await this.load(user, id);
-    if (row.status !== 'DRAFT') throw new AppError('Only draft E-Way Bills can be edited. Use "Update Vehicle" for Part B changes.', 409);
+    if (!['DRAFT','FAILED'].includes(row.status)) throw new AppError('Only draft E-Way Bills can be edited. Use "Update Vehicle" for Part B changes.', 409);
     const { header, items } = this.normalize({...data,sourceType:row.sourceType});
     await prisma.$transaction(async (tx: any) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('EWB_SOURCE_WRITE'))::text`;
       const fresh=await tx.eWayBill.findUnique({where:{id}});
-      if(fresh?.status !== 'DRAFT') throw new AppError('Only draft E-Way Bills can be edited',409);
+      if(!['DRAFT','FAILED'].includes(fresh?.status)) throw new AppError('Only draft E-Way Bills can be edited',409);
       const context=await this.sourceContext(user,row.sourceType,row.sourceId,tx);
       await this.assertNoDuplicate({...header,sourceType:row.sourceType,sourceId:row.sourceId},id,tx,context.aliases);
       if(context.mapping && header.docNo !== context.mapping.invoice.order.invoiceNum) throw new AppError('Document number must match the source invoice',422);
       if(context.mapping && fmtDate(header.docDate) !== fmtDate(context.mapping.invoice.order.createdAt)) throw new AppError('Document date must match the source invoice',422);
       await tx.eWayBillItem.deleteMany({ where: { ewayBillId: id } });
-      await tx.eWayBill.update({ where: { id }, data: { ...header, items: { create: items } } });
+      await tx.eWayBill.update({ where: { id }, data: { ...header, status:'DRAFT', generationError:null, items: { create: items } } });
     });
     return this.getById(user, id);
   }
 
   static async remove(user: TokenPayload, id: string) {
     const row = await this.load(user, id);
-    if (row.status !== 'DRAFT') throw new AppError('Only draft E-Way Bills can be deleted — cancel a generated one instead', 409);
-    await prisma.eWayBill.delete({ where: { id } });
+    if (!['DRAFT','FAILED'].includes(row.status)) throw new AppError('Only draft E-Way Bills can be deleted — cancel a generated one instead', 409);
+    const removed=await prisma.eWayBill.deleteMany({ where: { id, status:{in:['DRAFT','FAILED']} } });
+    if(!removed.count) throw new AppError('Draft is processing or no longer editable',409);
     return { success: true };
   }
 
   // Records the EWB number issued by the NIC portal.
-  static async markGenerated(user: TokenPayload, id: string, body: { ewbNumber?: string; ewbDate?: string; validUntil?: string }) {
-    const row = await this.load(user, id);
-    if (row.status !== 'DRAFT') throw new AppError(`E-Way Bill is already ${row.status.toLowerCase()}`, 409);
-    if(row.sourceType === 'SALE_INVOICE') throw new AppError('No authorised NIC/GSP API integration is configured. Invoice-sourced records remain drafts; a typed number is not a confirmed official response.',503);
-    const ewbNumber = String(body.ewbNumber || '').replace(/\s/g, '');
-    if (!EWB_NO_RE.test(ewbNumber)) throw new AppError('E-Way Bill number must be exactly 12 digits', 422);
-    const taken = await prisma.eWayBill.findUnique({ where: { ewbNumber } });
-    if (taken) throw new AppError(`EWB number ${ewbNumber} is already recorded on ${taken.refNumber}`, 409);
-    this.assertPartBComplete(row);
-    await this.assertNoDuplicate(row, id);
-
-    const ewbDate = body.ewbDate ? new Date(body.ewbDate) : new Date();
-    if (isNaN(ewbDate.getTime()) || ewbDate.getTime() > Date.now() + 5 * 60 * 1000) throw new AppError('Generation date/time is invalid or in the future', 422);
-    if (ewbDate.getTime() < row.docDate.getTime() - 24 * HOUR_MS) throw new AppError('E-Way Bill cannot be generated before the document date', 422);
-    // Part-A-only slips (no vehicle yet) have no validity until Part B is entered.
-    const hasPartB = !!(row.vehicleNo || row.transDocNo);
-    let validUntil: Date | null = hasPartB ? computeValidUntil(ewbDate, row.transDistance, row.vehicleType) : null;
-    if (body.validUntil) {
-      // Portal's printed validity wins if the user supplies it.
-      const v = new Date(body.validUntil);
-      if (isNaN(v.getTime()) || v <= ewbDate) throw new AppError('Valid-until must be after the generation time', 422);
-      validUntil = v;
-    }
-    await prisma.eWayBill.update({ where: { id }, data: { status: 'GENERATED', ewbNumber, ewbDate, validUntil } });
-    return this.getById(user, id);
+  static async markGenerated(user: TokenPayload, id: string, _body: unknown) {
+    return this.submit(user,id);
   }
 
   static async updateVehicle(user: TokenPayload, id: string, body: any) {
     const row = await this.load(user, id);
+    if(row.provider) throw new AppError('Use the authorised provider portal for this operation; ERP provider lifecycle integration is not configured.',409);
     if (row.status !== 'GENERATED') throw new AppError('Vehicle can only be updated on a generated E-Way Bill', 409);
     if (row.validUntil && row.validUntil.getTime() < Date.now()) throw new AppError('E-Way Bill has expired — extend its validity first', 409);
     const reasonCode = String(body.reasonCode || '');
@@ -684,6 +694,7 @@ export class EWayBillService {
   // new validity is computed from now over the remaining distance.
   static async extendValidity(user: TokenPayload, id: string, body: any) {
     const row = await this.load(user, id);
+    if(row.provider) throw new AppError('Use the authorised provider portal for this operation; ERP provider lifecycle integration is not configured.',409);
     if (row.status !== 'GENERATED' || !row.validUntil) throw new AppError('Only a generated E-Way Bill with a validity period can be extended', 409);
     const now = Date.now();
     const exp = row.validUntil.getTime();
@@ -713,6 +724,7 @@ export class EWayBillService {
 
   static async cancel(user: TokenPayload, id: string, body: { reasonCode?: string; remarks?: string }) {
     const row = await this.load(user, id);
+    if(row.provider) throw new AppError('Use the authorised provider portal for this operation; ERP provider lifecycle integration is not configured.',409);
     if (row.status !== 'GENERATED') throw new AppError('Only a generated E-Way Bill can be cancelled (delete drafts instead)', 409);
     if (row.ewbDate && Date.now() - row.ewbDate.getTime() > 24 * HOUR_MS) {
       throw new AppError('E-Way Bill can only be cancelled within 24 hours of generation', 409);

@@ -1,3 +1,4 @@
+import { fynamics } from './fynamics.client';
 import { Request, Response, NextFunction } from 'express';
 import { EWayBillService } from './ewaybill.service';
 import {
@@ -24,7 +25,7 @@ export class EWayBillController {
     vehicleUpdateReasons: VEHICLE_UPDATE_REASONS,
     extensionReasons: EXTENSION_REASONS,
     threshold: EWB_THRESHOLD,
-    generationAvailable: false,
+    generationAvailable: fynamics.configured(),
     consignor: await EWayBillService.consignorDefaults(),
   }));
 
@@ -37,6 +38,7 @@ export class EWayBillController {
   static update = handle((req, user) => EWayBillService.update(user, req.params.id, req.body));
   static remove = handle((req, user) => EWayBillService.remove(user, req.params.id));
   static validate = handle((req,user) => EWayBillService.validateDraft(user,req.params.id));
+  static reconcile = handle((req,user) => EWayBillService.reconcile(user,req.params.id));
   static submit = handle((req,user) => EWayBillService.submit(user,req.params.id));
   static generate = handle((req, user) => EWayBillService.markGenerated(user, req.params.id, req.body));
   static updateVehicle = handle((req, user) => EWayBillService.updateVehicle(user, req.params.id, req.body));

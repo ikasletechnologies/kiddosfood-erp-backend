@@ -1,6 +1,6 @@
 import prisma from '../../lib/prisma';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
-import { FormulationService } from './formulation.service';
+import { FormulationInput, FormulationService } from './formulation.service';
 import { ProductionCostingService } from '../production/production-costing.service';
 import { normalizeRecipeExpenses, readRecipeExpenses, sameRecipeExpenses, RecipeExpenseItem, ExpenseCategory } from '../production/production-costing';
 
@@ -163,9 +163,9 @@ export class RecipeService {
 
   /**
    * Simplified Recipe Master save: name, category, instructions and the
-   * selected raw materials only. Never touches quantities: the legacy BOM
-   * (RecipeItem / yieldQty / yieldUnit) and formulation versions are only
-   * written by FormulationService from real, user-entered values.
+   * selected raw materials, optional reference formulation and expenses.
+   * Quantity-bearing manual forms use the existing formulation versioning
+   * within this transaction; older selection-only clients remain supported.
    */
   static async saveSimplifiedRecipe(data: {
     id?: string;
@@ -173,6 +173,7 @@ export class RecipeService {
     category: string;
     instructions?: string;
     ingredientIds: string[];
+    formulation?: FormulationInput;
     productId?: string | null;
     recipeCode?: string;
     estimatedDurationMinutes?: number | null;
@@ -187,6 +188,14 @@ export class RecipeService {
     const ids = (data.ingredientIds || []).filter(Boolean);
     if (ids.length === 0) throw new Error('Select at least one ingredient.');
     if (new Set(ids).size !== ids.length) throw new Error('Each ingredient can only be selected once.');
+    if (data.formulation !== undefined) {
+      const f = data.formulation;
+      if (!f || !Number.isFinite(Number(f.yieldQty)) || Number(f.yieldQty) <= 0) throw new Error('Reference yield must be greater than zero.');
+      if (!['KG','G','L','ML','PCS','BOX'].includes(f.yieldUnit)) throw new Error('Unsupported reference yield unit.');
+      if (!Array.isArray(f.items) || !f.items.length || f.items.some(i => !Number.isFinite(Number(i.quantity)) || Number(i.quantity) <= 0)) throw new Error('Every ingredient reference quantity must be greater than zero.');
+      if (f.items.some(i => !['KG','G','L','ML','PCS'].includes(i.unit))) throw new Error('Unsupported ingredient measurement unit.');
+      if (new Set(f.items.map(i => i.inventoryItemId)).size !== ids.length || f.items.length !== ids.length || f.items.some(i => !ids.includes(i.inventoryItemId))) throw new Error('Formulation must contain each selected ingredient exactly once.');
+    }
     const categories = await ProductionCostingService.getExpenseCategories();
     // A new recipe saved without an expense list starts with the defaults
     // (₹5/packet), persisted like any other configuration.
@@ -195,6 +204,7 @@ export class RecipeService {
       : !data.id ? await ProductionCostingService.getDefaultRecipeExpenses(categories) : undefined;
 
     return prisma.$transaction(async (tx) => {
+      if (data.id) await tx.$queryRaw`SELECT id FROM "Recipe" WHERE id = ${data.id} FOR UPDATE`;
       const found = await tx.inventoryItem.findMany({ where: { id: { in: ids } }, select: { id: true } });
       if (found.length !== ids.length) throw new Error('One or more selected ingredients no longer exist in the Raw Material Master.');
 
@@ -237,12 +247,13 @@ export class RecipeService {
       }
 
       await RecipeService.syncIngredients(tx, recipeId!, ids);
+      if (data.formulation) await FormulationService.saveVersionInTransaction(tx, recipeId!, data.formulation, userId, 'RECIPE_FORM');
       if (expenses) await RecipeService.saveExpenseConfig(tx, recipeId!, expenses, categories, userId);
       const saved = await tx.recipe.findUnique({
         where: { id: recipeId },
         include: RecipeService.recipeInclude,
       });
-      return saved ? { ...saved, additionalExpenses: readRecipeExpenses(saved.expenseConfig, categories) } : saved;
+      return saved ? { ...RecipeService.withActiveFormulation(saved), additionalExpenses: readRecipeExpenses(saved.expenseConfig, categories) } : saved;
     });
   }
 

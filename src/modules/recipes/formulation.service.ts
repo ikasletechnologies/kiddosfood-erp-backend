@@ -90,7 +90,10 @@ export class FormulationService {
    * referenced them are kept untouched.
    */
   static async saveVersion(recipeId: string, input: FormulationInput, userId?: string) {
-    return prisma.$transaction(async (tx) => {
+    return prisma.$transaction(tx => this.saveVersionInTransaction(tx, recipeId, input, userId));
+  }
+
+  static async saveVersionInTransaction(tx: Prisma.TransactionClient, recipeId: string, input: FormulationInput, userId?: string, source: 'PLANNING' | 'RECIPE_FORM' = 'PLANNING') {
       await tx.$queryRaw`SELECT id FROM "Recipe" WHERE id = ${recipeId} FOR UPDATE`;
       const recipe = await tx.recipe.findUnique({
         where: { id: recipeId },
@@ -150,8 +153,12 @@ export class FormulationService {
       // lines and source ingredient names carry over when it is re-saved here.
       const previous = await tx.recipeFormulation.findFirst({
         where: { recipeId, isActive: true },
-        select: { outputStage: true, unresolvedItems: true, items: { select: { inventoryItemId: true, sourceName: true, sourceText: true } } },
+        select: { notes: true, outputStage: true, unresolvedItems: true, items: { select: { inventoryItemId: true, sourceName: true, sourceText: true } } },
       });
+      if (source === 'RECIPE_FORM') {
+        const active = await this.getActive(tx, recipeId);
+        if (active && active.yieldQty === yieldQty && active.yieldUnit === yieldUnit && active.items.length === clean.length && clean.every(c => active.items.some((i: any) => i.inventoryItemId === c.inventoryItemId && i.quantity === c.quantity && i.unit === c.unit && i.sortOrder === c.sortOrder))) return active;
+      }
       await tx.recipeFormulation.updateMany({ where: { recipeId, isActive: true }, data: { isActive: false } });
       const created = await tx.recipeFormulation.create({
         data: {
@@ -159,8 +166,8 @@ export class FormulationService {
           version: (last?.version || 0) + 1,
           yieldQty,
           yieldUnit,
-          notes: input.notes?.trim() || null,
-          source: 'PLANNING',
+          notes: input.notes === undefined && source === 'RECIPE_FORM' ? previous?.notes ?? null : input.notes?.trim() || null,
+          source,
           isActive: true,
           createdBy: userId || null,
           outputStage: previous?.outputStage ?? null,
@@ -177,7 +184,6 @@ export class FormulationService {
 
       await this.mirrorToLegacyBom(tx, recipeId, created);
       return created;
-    });
   }
 
   /** Writes the active formulation into Recipe.yieldQty/yieldUnit + RecipeItem. */
