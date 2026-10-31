@@ -3,6 +3,7 @@ import prisma from '../../lib/prisma';
 import { ProcurementService } from '../procurement/procurement.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { PurchaseLotsService } from '../inventory/purchase-lots.service';
+import { purchaseLineTax } from '../procurement/purchase-tax';
 
 type ReturnItemInput = {
   itemName: string;
@@ -209,12 +210,10 @@ export class PurchaseService {
   /**
    * Backfill a Purchase Return's GST breakdown once it's APPROVED/COMPLETED
    * — the point it becomes an "applicable" debit note (see PurchaseReturn's
-   * schema comment). Approximated (matches PurchaseReturnItem to the
-   * originating PO's line by item name, since neither carries per-line tax
-   * of its own): taxableValue is the refund total, gstRate is a
-   * quantity-weighted average of the matched PO lines' own rates, and the
-   * CGST/SGST vs IGST split reuses the same canonical util as every other
-   * GST report/write path.
+   * schema comment). Resolve the original lot/PO and stable material ID,
+   * rejecting missing or ambiguous source rates. Sum the original per-line
+   * tax; gstRate is only the effective display rate for that saved total.
+   * The CGST/SGST vs IGST split uses the shared GST utility.
    */
   static async backfillPurchaseReturnTax(tx: any, returnId: string) {
     const { splitGstAmount, resolveSellerState } = require('../../utils/gst-tax.util');
@@ -230,20 +229,33 @@ export class PurchaseService {
 
     const sellerState = await resolveSellerState(pr.procurementOrder?.franchiseId || null);
     const poItems = pr.procurementOrder?.poItems || [];
-    const rateMap = new Map(poItems.map((pi: any) => [(pi.itemName || '').toLowerCase(), pi.gstRate]));
-
-    const taxableValue = Number(pr.refundAmount) || 0;
-    let weightedRateSum = 0;
-    let weightTotal = 0;
+    const { Decimal } = Prisma;
+    const taxableValue = Number(pr.refundAmount ?? 0);
+    let lineTaxTotal = new Decimal(0);
+    let lineValueTotal = new Decimal(0);
     for (const item of pr.items) {
-      const key = (item.itemName || '').toLowerCase();
-      const rate = rateMap.has(key) ? (rateMap.get(key) as number) : 5;
-      const lineValue = item.totalAmount || item.quantity * item.rate;
-      weightedRateSum += rate * lineValue;
-      weightTotal += lineValue;
+      let sourceItems = poItems;
+      let materialId = item.materialId;
+      if (item.inventoryBatchId) {
+        const lot = await tx.inventoryBatch.findUnique({ where:{id:item.inventoryBatchId}, include:{ procurementOrder:{include:{poItems:true}}, goodsReceiptItem:{include:{grn:{include:{procurementOrder:{include:{poItems:true}}}}}} } });
+        if (!lot || lot.vendorId !== pr.vendorId) throw new Error('Purchase return lot does not match its original supplier.');
+        materialId = lot.inventoryItemId;
+        sourceItems = lot.procurementOrder?.poItems || lot.goodsReceiptItem?.grn?.procurementOrder?.poItems || [];
+      }
+      if (!materialId && sourceItems.length) {
+        const matches = sourceItems.filter((p:any)=>(p.itemName || '').trim().toLowerCase() === item.itemName.trim().toLowerCase());
+        const ids = [...new Set(matches.map((p:any)=>p.inventoryItemId).filter(Boolean))];
+        if (ids.length !== 1) throw new Error('Purchase return source is ambiguous. Select the original purchase lot or PO line.');
+        materialId = ids[0];
+      }
+      if (!sourceItems.length && materialId) sourceItems = await tx.procurementOrderItem.findMany({ where:{inventoryItemId:materialId,procurementOrder:{vendorId:pr.vendorId,goodsReceipts:{some:{status:'COMPLETED'}}}} });
+      const rate = purchaseLineTax(sourceItems,materialId,item.itemName);
+      const lineValue = new Decimal(item.totalAmount ?? item.quantity * item.rate);
+      lineValueTotal = lineValueTotal.plus(lineValue);
+      lineTaxTotal = lineTaxTotal.plus(lineValue.times(rate).div(100));
     }
-    const gstRate = weightTotal > 0 ? Number((weightedRateSum / weightTotal).toFixed(2)) : 0;
-    const taxAmount = Number(((taxableValue * gstRate) / 100).toFixed(2));
+    const taxAmount = lineValueTotal.gt(0) ? lineTaxTotal.times(taxableValue).div(lineValueTotal).toDecimalPlaces(2).toNumber() : 0;
+    const gstRate = taxableValue > 0 ? Number((taxAmount/taxableValue*100).toFixed(4)) : 0;
     const split = splitGstAmount(taxAmount, pr.vendor?.state, sellerState);
 
     await tx.purchaseReturn.update({
@@ -271,8 +283,7 @@ export class PurchaseService {
       (sum: number, item: any) => sum + (Number(item.quantity) || 0) * (Number(item.rate) || 0),
       0
     );
-    const returnTaxAmount = Number(pr.taxAmount) ||
-      (Number(pr.cgst) || 0) + (Number(pr.sgst) || 0) + (Number(pr.igst) || 0);
+    const returnTaxAmount = Number(pr.taxAmount ?? ((Number(pr.cgst) || 0) + (Number(pr.sgst) || 0) + (Number(pr.igst) || 0)));
     const returnAmount = taxableReturnAmount + returnTaxAmount;
     if (returnAmount <= 0) return pr;
 
@@ -295,25 +306,7 @@ export class PurchaseService {
       }
     });
     if (alreadyPosted) {
-      // Repair historical GRN return audit rows that were intentionally saved
-      // with amount 0. Apply only the missing delta and carry it forward to
-      // later running balances, keeping retries idempotent.
-      const delta = returnAmount - (Number(alreadyPosted.amount) || 0);
-      if (Math.abs(delta) > 0.0001) {
-        await tx.vendorLedger.update({
-          where: { id: alreadyPosted.id },
-          data: {
-            amount: returnAmount,
-            balanceAfterTransaction: (alreadyPosted.balanceAfterTransaction || 0) - delta,
-            invoiceId,
-            note: `Purchase Return ${pr.returnNumber}${billRefNote}: ${pr.reason}`
-          }
-        });
-        await tx.vendorLedger.updateMany({
-          where: { vendorId: pr.vendorId, createdAt: { gt: alreadyPosted.createdAt } },
-          data: { balanceAfterTransaction: { decrement: delta } }
-        });
-      }
+      if (Math.abs(returnAmount - Number(alreadyPosted.amount || 0)) > 0.011) throw new Error('A posted return ledger amount differs from its tax snapshot. An authorised, audited accounting correction is required.');
       return pr;
     }
 
@@ -403,6 +396,7 @@ export class PurchaseService {
           if (!lot || lot.vendorId !== data.vendorId || lot.inventoryItemId !== match.materialId) {
             throw new Error(`The selected lot is not a lot of "${item.itemName}" received from this vendor.`);
           }
+          if (data.procurementOrderId && lot.procurementOrderId && lot.procurementOrderId !== data.procurementOrderId) throw new Error('The selected return lot belongs to a different Purchase Order.');
           const lotLabel = lot.lotNumber || lot.batchNumber;
           if (lot.status === 'REJECTED' || lot.status === 'RETURNED') {
             throw new Error(`Lot ${lotLabel} is ${lot.status} and cannot be returned.`);
@@ -418,7 +412,7 @@ export class PurchaseService {
           return { itemName: item.itemName, quantity: item.quantity, unit: match.unit, rate: lotCost, materialId: match.materialId, inventoryBatchId: lot.id, baseQty: item.quantity, unitCost: lotCost };
         }
         // Authoritative rate always wins over whatever the client sent.
-        return { itemName: item.itemName, quantity: item.quantity, unit: match.unit, rate: match.rate };
+        return { itemName: item.itemName, quantity: item.quantity, unit: match.unit, rate: match.rate, materialId: match.materialId };
       });
     }
 
@@ -438,7 +432,8 @@ export class PurchaseService {
           if (!gi.materialId) continue;
           const lineValue = new Decimal(gi.acceptedQty).times(gi.price);
           const ratio = totalBilledValue.isZero() ? new Decimal(1) : lineValue.dividedBy(totalBilledValue);
-          const allocatedBillAmount = new Decimal(bill.amount).times(ratio);
+          const billGoodsValue = new Decimal(bill.subtotal ?? totalBilledValue).minus(bill.discountAmount ?? 0).plus(bill.freightCost ?? 0);
+          const allocatedBillAmount = billGoodsValue.times(ratio);
           const effectiveRate = allocatedBillAmount.dividedBy(new Decimal(gi.acceptedQty));
           effectiveRateMap.set(gi.materialId, effectiveRate);
         }

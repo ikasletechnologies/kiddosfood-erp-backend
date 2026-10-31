@@ -1,4 +1,6 @@
 import prisma from '../../lib/prisma';
+import { isPOReceiptEligible } from '../procurement/po-receipt-status';
+import { purchaseLineTax } from '../procurement/purchase-tax';
 import { InventoryService } from '../inventory/inventory.service';
 import { ProcurementService } from '../procurement/procurement.service';
 import { VendorInvoiceService } from '../vendor-invoices/vendor-invoices.service';
@@ -55,7 +57,7 @@ export class GRNService {
         ...dateFilter
       },
       include: {
-        procurementOrder: { include: { vendor: true } },
+        procurementOrder: { include: { vendor: true, poItems: true } },
         items: { include: { inventoryItem: true, warehouse: true, warehouseBin: true } }
       },
       orderBy: { createdAt: 'desc' }
@@ -257,8 +259,7 @@ export class GRNService {
         include: { poItems: true }
       });
       if (!po) throw new Error('Purchase Order not found');
-      if (po.status === 'CANCELLED') throw new Error('Cannot create GRN for a cancelled PO');
-      if (po.status === 'CLOSED') throw new Error('PO is already closed');
+      if (!isPOReceiptEligible(po.status)) throw new Error(`Cannot receive goods for a PO in status ${po.status}. Complete drafts before receiving; finalized orders cannot be received again.`);
 
       // Authoritative cap: a GRN can never request more than what's still
       // outstanding on the PO line (ordered − cumulative received from
@@ -270,6 +271,7 @@ export class GRNService {
       for (const item of data.items) {
         const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
         if (!poItem) throw new Error(`Item ${item.materialId} does not belong to Purchase Order ${po.poNumber || poId}`);
+        purchaseLineTax(po.poItems, item.materialId, poItem.itemName || 'GRN line');
 
         if (item.warehouseId) {
           await this.validateWarehouseScope(tx, item.warehouseId, data.user);
@@ -378,7 +380,7 @@ export class GRNService {
           items: { create: itemsData }
         },
         include: {
-          procurementOrder: { include: { vendor: true } },
+          procurementOrder: { include: { vendor: true, poItems: true } },
           items: { include: { inventoryItem: true } }
         }
       });
@@ -408,6 +410,8 @@ export class GRNService {
       // have their approvals serialized too, or both could complete and
       // together push cumulative received past what was ever ordered.
       await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${grn.poId} FOR UPDATE`;
+      const currentPO = await tx.procurementOrder.findUniqueOrThrow({ where: { id: grn.poId }, select: { status: true } });
+      if (!isPOReceiptEligible(currentPO.status)) throw new Error(`Cannot post a GRN for a PO in status ${currentPO.status}`);
 
       // Full rejection: goods arrived but nothing was accepted. Finalized as
       // REJECTED with a mandatory reason — no inventory batch, stock
@@ -426,7 +430,7 @@ export class GRNService {
         const rejected = await tx.goodsReceipt.update({
           where: { id: grnId },
           data: { status: 'REJECTED', rejectionReason: reason, rejectedAt: new Date(), rejectedBy: user?.userId || null },
-          include: { procurementOrder: { include: { vendor: true } }, items: { include: { inventoryItem: true } } }
+          include: { procurementOrder: { include: { vendor: true, poItems: true } }, items: { include: { inventoryItem: true } } }
         });
         await tx.auditLog.create({
           data: {
@@ -744,7 +748,7 @@ export class GRNService {
         where: { id: grnId },
         data: { status: 'COMPLETED' },
         include: {
-          procurementOrder: { include: { vendor: true } },
+          procurementOrder: { include: { vendor: true, poItems: true } },
           items: { include: { inventoryItem: true } }
         }
       });
@@ -774,7 +778,7 @@ export class GRNService {
       where: { id: grnId },
       data: { status: 'CANCELLED' },
       include: {
-        procurementOrder: { include: { vendor: true } },
+        procurementOrder: { include: { vendor: true, poItems: true } },
         items: { include: { inventoryItem: true } }
       }
     });

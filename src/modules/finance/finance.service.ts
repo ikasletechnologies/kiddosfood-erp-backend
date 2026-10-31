@@ -808,7 +808,9 @@ export class FinanceService {
       }
     }
 
-    const dispatched = new Set((await prisma.deliveryChallan.findMany({ where: { sourceInvoiceId: { in: invoices.map(i => i.orderId) }, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } }, select: { sourceInvoiceId: true } })).map(c => c.sourceInvoiceId));
+    const challans = await prisma.deliveryChallan.findMany({ where: { sourceInvoiceId: { in: invoices.map(i => i.orderId) }, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } }, select: { id: true, sourceInvoiceId: true } });
+    const posted = new Set((await prisma.stockMovement.findMany({ where: { referenceType: 'INVOICE_FULFILMENT', referenceId: { in: challans.map(c => c.id) }, quantity: { lt: 0 } }, select: { referenceId: true } })).map(m => m.referenceId));
+    const dispatched = new Set(challans.filter(c => posted.has(c.id)).map(c => c.sourceInvoiceId));
     return invoices.map(inv => ({ ...this.mergeAllocationsIntoPayments(inv), fulfilmentStatus: inv.order.inventory_deducted ? 'FULFILLED' : dispatched.has(inv.orderId) ? 'PARTIALLY_FULFILLED' : 'PENDING' }));
   }
 
@@ -856,8 +858,8 @@ export class FinanceService {
       }
     }
 
-    const dispatched = await prisma.deliveryChallan.count({ where: { sourceInvoiceId: invoice.orderId, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } } });
-    return { ...this.mergeAllocationsIntoPayments(invoice), fulfilmentStatus: invoice.order.inventory_deducted ? 'FULFILLED' : dispatched ? 'PARTIALLY_FULFILLED' : 'PENDING' };
+    const fulfilment = await InvoiceFulfilmentService.state(prisma, invoice.orderId);
+    return { ...this.mergeAllocationsIntoPayments(invoice), fulfilmentStatus: fulfilment.status };
   }
 
   // A multi-invoice receipt attributes its per-invoice share via

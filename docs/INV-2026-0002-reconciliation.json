@@ -1,0 +1,66 @@
+{
+  "generatedAt": "2026-10-31T10:33:13.077Z",
+  "invoiceNumber": "INV-2026-0002",
+  "invoiceId": "41c069e9-ea58-4efa-9bfc-319fe5f253e1",
+  "review": {
+    "invoiceId": "41c069e9-ea58-4efa-9bfc-319fe5f253e1",
+    "orderId": "70a4c4df-edd7-4a15-bcaa-67dc00e68261",
+    "invoiceNumber": "INV-2026-0002",
+    "paymentStatus": "PAID",
+    "inventoryStatus": "PENDING",
+    "canPost": true,
+    "warnings": [],
+    "lines": [
+      {
+        "orderItemId": "eaa78488-78cf-4b39-9525-85e25c504c03",
+        "productId": "9391ebfb-fcef-4865-9561-fa1535a4207d",
+        "productName": "APPAM",
+        "inventoryBatchId": "3a7afee5-ea2b-4d63-a10f-66a8d0517fe7",
+        "lotNumber": "LOT-20261031-00001",
+        "quantity": 1,
+        "unit": "PC",
+        "warehouseId": "8218b7e5-f584-4c85-9f8e-e85bbb355947",
+        "beforeQty": 10,
+        "afterQty": 9
+      },
+      {
+        "orderItemId": "c750814e-9c66-4868-8237-f31cc69fbfe7",
+        "productId": "9391ebfb-fcef-4865-9561-fa1535a4207d",
+        "productName": "APPAM",
+        "inventoryBatchId": "adcfcf13-fcd2-40b4-b598-f2a56ac325b6",
+        "lotNumber": "LOT-20261031-00003",
+        "quantity": 1,
+        "unit": "PC",
+        "warehouseId": "8218b7e5-f584-4c85-9f8e-e85bbb355947",
+        "beforeQty": 1,
+        "afterQty": 0
+      }
+    ],
+    "challans": []
+  },
+  "applied": true,
+  "alreadyPosted": false,
+  "challanId": "445d799a-55db-4ec3-b2d8-dfbbe94b053c",
+  "challanNumber": "DC-2026-00002",
+  "inventoryPostingTrigger": "Delivery Challan IN_TRANSIT dispatch",
+  "ledgerBefore": 26,
+  "ledgerAfter": 24,
+  "lotCostIssued": 70,
+  "lots": [
+    {
+      "id": "3a7afee5-ea2b-4d63-a10f-66a8d0517fe7",
+      "lotNumber": "LOT-20261031-00001",
+      "before": 10,
+      "after": 9,
+      "unitCost": 35
+    },
+    {
+      "id": "adcfcf13-fcd2-40b4-b598-f2a56ac325b6",
+      "lotNumber": "LOT-20261031-00003",
+      "before": 1,
+      "after": 0,
+      "unitCost": 35
+    }
+  ],
+  "amountsAndPaymentsUnchanged": true
+}

@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import prisma from '../../lib/prisma';
 import { splitGstAmount, resolveSellerState } from '../../utils/gst-tax.util';
+import { purchaseLineTax } from '../procurement/purchase-tax';
 
 
 export class VendorInvoiceService {
@@ -50,7 +51,7 @@ export class VendorInvoiceService {
     for (const gi of grnItems) {
       if (!gi.acceptedQty || gi.acceptedQty <= 0) continue;
       const poItem = po.poItems.find(p => p.inventoryItemId === gi.materialId);
-      const gstRate = new Decimal(poItem?.gstRate ?? 0);
+      const gstRate = new Decimal(purchaseLineTax(po.poItems, gi.materialId, 'Purchase Bill line'));
 
       const lineSubtotal = new Decimal(gi.acceptedQty).times(gi.price);
       const lineTax = lineSubtotal.times(gstRate).dividedBy(100);
@@ -116,31 +117,11 @@ export class VendorInvoiceService {
       orderBy: { createdAt: 'desc' }
     });
 
-    // Deduplicate any existing PENDING invoices with the same grnId (keep the newest/manual bill)
-    const seenGrnIds = new Set<string>();
-    const cleanedInvoices: typeof invoices = [];
-    const duplicateIdsToDelete: string[] = [];
-
-    for (const inv of invoices) {
-      if (inv.grnId && inv.status === 'PENDING') {
-        if (seenGrnIds.has(inv.grnId)) {
-          duplicateIdsToDelete.push(inv.id);
-          continue;
-        }
-        seenGrnIds.add(inv.grnId);
-      }
-      cleanedInvoices.push(inv);
-    }
-
-    if (duplicateIdsToDelete.length > 0) {
-      prisma.vendorInvoice.deleteMany({ where: { id: { in: duplicateIdsToDelete } } }).catch(e => console.error("Error deduplicating vendor invoices", e));
-    }
-
     // Outstanding = gross amount - advance already applied - cash/bank
     // payments already recorded. This is what "Make Payment" should default
     // to, not the invoice's raw gross `amount` (which ignores any advance
     // or partial payment already settled against it).
-    return cleanedInvoices.map((inv: any) => {
+    return invoices.map((inv: any) => {
       const paidAmount = (inv.payments || []).reduce((s: number, p: any) => s + (p.paidAmount || 0), 0);
       const outstanding = Math.max(0, Number((inv.amount - (inv.advanceApplied || 0) - paidAmount).toFixed(2)));
       return { ...inv, paidAmount, outstanding };
@@ -166,6 +147,12 @@ export class VendorInvoiceService {
   }) {
     return prisma.$transaction(async (tx) => {
       let actualPoId = data.poId;
+      if (data.grnId) {
+        const source = await tx.goodsReceipt.findUnique({where:{id:data.grnId},select:{poId:true,status:true}});
+        if (!source || source.status !== 'COMPLETED') throw new Error('Purchase Bills require a confirmed GRN.');
+        if (actualPoId && actualPoId !== source.poId) throw new Error('The GRN does not belong to this Purchase Order.');
+        actualPoId = source.poId;
+      }
       let commercials: { subtotal: number; cgst: number; sgst: number; igst: number; taxAmount: number; discountAmount: number; freightCost: number; amount: number; warehouseId: string | null } | null = null;
 
       if (!actualPoId) {
@@ -223,6 +210,7 @@ export class VendorInvoiceService {
       } else {
         const po = await tx.procurementOrder.findUnique({ where: { id: actualPoId }, include: { poItems: true, vendor: { select: { state: true } } } });
         if (!po) throw new Error('Purchase Order not found');
+        if (po.vendorId !== data.vendorId) throw new Error('The vendor does not match the original Purchase Order.');
 
         // Bill tied to a real PO — derive subtotal/tax/gross SERVER-SIDE from
         // the PO (and GRN accepted quantities, if this bill came from one)
@@ -264,15 +252,12 @@ export class VendorInvoiceService {
           // Find existing PENDING invoice to update instead of creating a duplicate
           const targetInvoice = existingInvoices.find((inv: any) => inv.status === 'PENDING') || existingInvoices[0];
 
-          // Delete any extra duplicate PENDING invoices for this same GRN
-          const extraPendingIds = existingInvoices
-            .filter((inv: any) => inv.status === 'PENDING' && inv.id !== targetInvoice.id)
-            .map((inv: any) => inv.id);
-
-          if (extraPendingIds.length > 0) {
-            await tx.vendorInvoice.deleteMany({
-              where: { id: { in: extraPendingIds } }
-            });
+          if (existingInvoices.length > 1) throw new Error('Multiple bills already reference this GRN. Review original records before making an audited correction.');
+          const recognised = await tx.vendorLedger.count({ where: { invoiceId: targetInvoice.id, referenceType: 'PURCHASE' } });
+          if (recognised || targetInvoice.status !== 'PENDING') {
+            const changed = Math.abs(targetInvoice.amount-finalAmount)>0.011 || Math.abs((targetInvoice.taxAmount ?? 0)-finalTaxAmount)>0.011;
+            if (changed) throw new Error('This Purchase Bill is already posted. Tax or amount changes require an authorised, audited correction.');
+            return tx.vendorInvoice.findUnique({ where:{id:targetInvoice.id}, include:{vendor:true,procurementOrder:true,grn:true} });
           }
 
           await tx.vendorInvoice.update({

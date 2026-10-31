@@ -1,5 +1,8 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
+import { isPOReceiptEligible, savedPOStatus, RECEIPT_READY_PO_STATUSES } from './po-receipt-status';
+import { purchaseGstRate, purchaseLineTax, validateTaxTotals } from './purchase-tax';
+import { purchaseBusinessDate, purchaseDateValue, validateDeliveryDate, validatePurchaseDate } from './purchase-dates';
 import { PurchaseLotsService } from '../inventory/purchase-lots.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
@@ -165,7 +168,7 @@ export class ProcurementService {
           const acceptedQty = Number(item.acceptedQty) || 0;
           const price = Number(item.price) || 0;
           const poItem = (order.poItems || []).find((pi: any) => pi.inventoryItemId === item.materialId);
-          const gstRate = Number(poItem?.gstRate ?? item.inventoryItem?.gstRate ?? 0);
+          const gstRate = purchaseLineTax(order.poItems || [], item.materialId, item.inventoryItem.name);
 
           const lineGoodsValue = acceptedQty * price;
           const lineGst = (lineGoodsValue * gstRate) / 100;
@@ -618,7 +621,7 @@ export class ProcurementService {
     }
 
     const pendingOrders = await prisma.procurementOrder.count({
-      where: { vendorId: id, status: 'PENDING_APPROVAL' }
+      where: { vendorId: id, status: { in: [...RECEIPT_READY_PO_STATUSES] } }
     });
     if (pendingOrders > 0) {
       throw new Error("Cannot delete vendor with pending Purchase Orders.");
@@ -678,6 +681,7 @@ export class ProcurementService {
   }
 
   static async createPurchaseOrder(data: {
+    purchaseDate?: string;
     vendorId: string;
     franchiseId?: string;
     advancePaid?: number;
@@ -708,6 +712,9 @@ export class ProcurementService {
       throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
     }
 
+    const now = new Date();
+    validatePurchaseDate(data.purchaseDate, purchaseBusinessDate(now));
+    const deliveryDate = validateDeliveryDate(data.expectedDeliveryDate, purchaseBusinessDate(now), now);
     const purchaseType = (data.purchaseType as string) || 'RAW_MATERIAL';
     const isFinishedGoodsPO = purchaseType === 'FINISHED_GOOD' || purchaseType === 'FINISHED_GOODS';
     const isRawMaterialPO = purchaseType === 'RAW_MATERIAL';
@@ -793,7 +800,7 @@ export class ProcurementService {
         }
       }
 
-      const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
+      const gstRate = purchaseGstRate(item.gstRate, inventoryItem?.name || 'PO line');
       const subtotal = item.quantity * item.price;
       const split = computeGstFromRate(subtotal, gstRate, vendor?.state, sellerState);
 
@@ -816,9 +823,10 @@ export class ProcurementService {
     }));
 
     const totalSubtotal = poItemsData.reduce((acc, item) => acc + item.subtotal, 0);
-    const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
-    const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
-    const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
+    const totalCGST = poItemsData.reduce((acc, item) => acc + item.cgst, 0);
+    const totalSGST = poItemsData.reduce((acc, item) => acc + item.sgst, 0);
+    const totalIGST = poItemsData.reduce((acc, item) => acc + item.igst, 0);
+    validateTaxTotals(data.manualTax, {cgst:totalCGST,sgst:totalSGST,igst:totalIGST});
 
     const discountAmount = data.discountAmount !== undefined && data.discountAmount !== null ? Number(data.discountAmount) : 0;
     if (isNaN(discountAmount) || !isFinite(discountAmount) || discountAmount < 0) {
@@ -863,6 +871,7 @@ export class ProcurementService {
       const po = await tx.procurementOrder.create({
         data: {
           poNumber,
+          createdAt: now,
           vendorId: data.vendorId,
           franchiseId: data.franchiseId || null,
           warehouseId: data.warehouseId || null,
@@ -878,13 +887,13 @@ export class ProcurementService {
           advanceApplied: appliedFromCredit, // Portion of the above that was pre-existing credit, not fresh cash
           paid: providedAmount,
           balance: totalAmount - providedAmount,
-          expectedDeliveryDate: data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null,
+          expectedDeliveryDate: deliveryDate,
           notes: data.notes,
           internalNotes: data.internalNotes,
           vendorNotes: data.vendorNotes,
           deliveryInstructions: data.deliveryInstructions,
           paymentTerms: data.paymentTerms || 'IMMEDIATE',
-          status: (data.status as any) || 'PENDING_APPROVAL',
+          status: savedPOStatus(data.status) as any,
           poItems: {
             create: poItemsData.map((item) => ({
               inventoryItemId: item.inventoryItemId,
@@ -976,6 +985,8 @@ export class ProcurementService {
    * changed via cancellation/return flows instead of a silent edit.
    */
   static async updatePO(poId: string, data: {
+    purchaseDate?: string;
+    status?: string;
     vendorId?: string;
     franchiseId?: string;
     expectedDeliveryDate?: string;
@@ -1007,6 +1018,13 @@ export class ProcurementService {
       }
 
       const updateData: any = {};
+      validatePurchaseDate(data.purchaseDate, purchaseBusinessDate(po.createdAt));
+      if (data.status !== undefined) {
+        const status = savedPOStatus(data.status);
+        if (!['DRAFT', 'APPROVED'].includes(status)) throw new Error('Save a PO as Draft or Ready for Receipt. Receipt status is maintained by GRN.');
+        if (status === 'DRAFT' && po.status !== 'DRAFT') throw new Error('A saved PO cannot be moved back to Draft.');
+        updateData.status = status;
+      }
       if (data.vendorId) {
         const newVendor = await tx.vendor.findUnique({ where: { id: data.vendorId }, select: { id: true, status: true } });
         if (!newVendor) throw new Error('Vendor not found.');
@@ -1019,7 +1037,10 @@ export class ProcurementService {
       if (data.warehouseId !== undefined) updateData.warehouseId = data.warehouseId || null;
       if (data.purchaseType !== undefined) updateData.purchaseType = data.purchaseType;
       if (data.expectedDeliveryDate !== undefined) {
-        updateData.expectedDeliveryDate = data.expectedDeliveryDate ? new Date(data.expectedDeliveryDate) : null;
+        const unchanged = po.expectedDeliveryDate && purchaseDateValue(data.expectedDeliveryDate,'Expected Delivery') === purchaseBusinessDate(po.expectedDeliveryDate);
+        if (!unchanged || (po.status === 'DRAFT' && data.status === 'APPROVED')) updateData.expectedDeliveryDate = validateDeliveryDate(data.expectedDeliveryDate, purchaseBusinessDate(po.createdAt));
+      } else if (po.status === 'DRAFT' && data.status === 'APPROVED') {
+        updateData.expectedDeliveryDate = validateDeliveryDate(po.expectedDeliveryDate?.toISOString(), purchaseBusinessDate(po.createdAt));
       }
       if (data.notes !== undefined) updateData.notes = data.notes;
       if (data.internalNotes !== undefined) updateData.internalNotes = data.internalNotes;
@@ -1102,7 +1123,7 @@ export class ProcurementService {
              }
           }
 
-          const gstRate = item.gstRate ?? inventoryItem?.gstRate ?? 5;
+          const gstRate = purchaseGstRate(item.gstRate, inventoryItem?.name || 'PO line');
           const subtotal = item.quantity * item.price;
           const split = computeGstFromRate(subtotal, gstRate, vendorForTax?.state, sellerState);
           return {
@@ -1123,9 +1144,10 @@ export class ProcurementService {
         }));
 
         const totalSubtotal = poItemsData.reduce((acc, item) => acc + item.subtotal, 0);
-        const totalCGST = data.manualTax ? data.manualTax.cgst : poItemsData.reduce((acc, item) => acc + item.cgst, 0);
-        const totalSGST = data.manualTax ? data.manualTax.sgst : poItemsData.reduce((acc, item) => acc + item.sgst, 0);
-        const totalIGST = data.manualTax ? data.manualTax.igst : poItemsData.reduce((acc, item) => acc + item.igst, 0);
+        const totalCGST = poItemsData.reduce((acc, item) => acc + item.cgst, 0);
+        const totalSGST = poItemsData.reduce((acc, item) => acc + item.sgst, 0);
+        const totalIGST = poItemsData.reduce((acc, item) => acc + item.igst, 0);
+        validateTaxTotals(data.manualTax, {cgst:totalCGST,sgst:totalSGST,igst:totalIGST});
 
         const discount = data.discountAmount !== undefined ? Number(data.discountAmount) : (po.discountAmount || 0);
         if (isNaN(discount) || !isFinite(discount) || discount < 0) {
@@ -1255,6 +1277,7 @@ export class ProcurementService {
       
       const updateData: any = { status };
       if (status === 'APPROVED') {
+        if (!['PENDING_APPROVAL', 'APPROVED'].includes(po.status)) throw new Error('This PO cannot be approved. Complete drafts through the PO editor; finalized orders cannot be reopened.');
         const vendor = await tx.vendor.findUnique({ where: { id: po.vendorId }, select: { status: true } });
         if (vendor && vendor.status !== 'ACTIVE') {
           throw new Error('This vendor is blocked and cannot be used for Purchase Orders.');
@@ -1460,10 +1483,11 @@ export class ProcurementService {
         allFulfilled = totalItemsCount > 0 && receivedItemsCount + 0.0001 >= totalItemsCount;
       }
 
-      const effectiveStatus = allFulfilled && !['CANCELLED', 'CLOSED'].includes(po.status) ? 'RECEIVED' : po.status;
+      const effectiveStatus = allFulfilled && isPOReceiptEligible(po.status) ? 'RECEIVED' : po.status;
       return {
         ...po,
         status: effectiveStatus,
+        canReceive: isPOReceiptEligible(effectiveStatus) && !allFulfilled && totalItemsCount > receivedItemsCount,
         received: allFulfilled || po.received,
         paid: livePaid,
         balanceDue: Math.max(0, Number((po.totalAmount - livePaid).toFixed(2))),

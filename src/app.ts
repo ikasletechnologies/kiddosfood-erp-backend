@@ -780,6 +780,15 @@ app.get('/api/sales/invoices/:id/fulfilment', authenticate, authorizeRole(['SUPE
   } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 app.get('/api/sales/invoices/:id', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.getInvoiceById);
+app.get('/api/sales/invoices/:id/dispatch-review', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), async (req, res) => {
+  try { const { InvoiceDispatchService } = await import('./modules/sales/invoice-dispatch.service'); res.json(await InvoiceDispatchService.review(req.params.id, (req as any).user)); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.post('/api/sales/invoices/:id/dispatch-selected', authenticate, authorizeRole(['SUPER_ADMIN']), async (req, res) => {
+  if (req.body?.confirm !== true) return res.status(400).json({ error: 'Explicit dispatch confirmation is required.' });
+  try { const { InvoiceDispatchService } = await import('./modules/sales/invoice-dispatch.service'); res.json(await InvoiceDispatchService.post(req.params.id, (req as any).user)); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
 app.post('/api/sales/invoices', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.createInvoice);
 app.post('/api/sales/invoices/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN', 'FRANCHISE_ADMIN']), FinanceController.cancelInvoice);
 

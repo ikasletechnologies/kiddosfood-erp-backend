@@ -172,7 +172,11 @@ export class InventoryController {
       const franchiseFilter = IsolationUtil.getFranchiseFilter(user);
       const franchiseId = franchiseFilter.franchiseId || (req.query.franchiseId as string);
 
-      const alerts = await InventoryService.getAlerts(franchiseId);
+      const alerts = await InventoryService.getAlerts(franchiseId, {
+        category: req.query.category as any,
+        asOfDate: (req.query.asOfDate || req.query.endDate || req.query.dateTo) as string | undefined
+      });
+      res.setHeader('Cache-Control', 'no-store');
       res.json(alerts);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

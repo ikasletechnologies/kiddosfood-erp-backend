@@ -74,7 +74,7 @@ CREATE TYPE "InvoiceStatus" AS ENUM ('PENDING', 'MATCHED', 'MISMATCH', 'APPROVED
 CREATE TYPE "POStatus" AS ENUM ('DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'ORDERED', 'SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PAID', 'CLOSED', 'CANCELLED');
 
 -- CreateEnum
-CREATE TYPE "PurchaseType" AS ENUM ('ALL', 'RAW_MATERIAL', 'PACKAGING', 'EQUIPMENT', 'CONSUMABLES', 'SERVICES', 'OTHERS');
+CREATE TYPE "PurchaseType" AS ENUM ('ALL', 'RAW_MATERIAL', 'FINISHED_GOOD', 'FINISHED_GOODS', 'PACKAGING', 'EQUIPMENT', 'CONSUMABLES', 'SERVICES', 'OTHERS');
 
 -- CreateEnum
 CREATE TYPE "POPaymentStatus" AS ENUM ('UNPAID', 'PARTIAL', 'PAID', 'OVERDUE');
@@ -391,6 +391,9 @@ CREATE TABLE "InventoryItem" (
     "franchisePrice" DOUBLE PRECISION DEFAULT 0,
     "dealerPrice" DOUBLE PRECISION DEFAULT 0,
     "customerPrice" DOUBLE PRECISION DEFAULT 0,
+    "upcountryFranchisePrice" DECIMAL(14,2),
+    "mrp" DECIMAL(14,2),
+    "whiteLabelCost" DECIMAL(14,2),
     "discountType" TEXT DEFAULT 'PERCENT',
     "discountValue" DOUBLE PRECISION DEFAULT 0,
     "baseUnitId" TEXT,
@@ -556,6 +559,8 @@ CREATE TABLE "ProcurementOrderItem" (
     "sgst" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "subtotal" DOUBLE PRECISION NOT NULL DEFAULT 0,
     "total" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "isBulk" BOOLEAN NOT NULL DEFAULT false,
+    "productId" TEXT,
 
     CONSTRAINT "ProcurementOrderItem_pkey" PRIMARY KEY ("id")
 );
@@ -601,6 +606,7 @@ CREATE TABLE "GoodsReceiptItem" (
     "vendorBatchNo" TEXT,
     "warehouseId" TEXT,
     "warehouseBinId" TEXT,
+    "isBulk" BOOLEAN NOT NULL DEFAULT false,
 
     CONSTRAINT "GoodsReceiptItem_pkey" PRIMARY KEY ("id")
 );
@@ -833,6 +839,12 @@ CREATE TABLE "ProductBatch" (
     "cartonedQty" DOUBLE PRECISION DEFAULT 0,
     "unitCost" DOUBLE PRECISION,
     "totalCost" DOUBLE PRECISION,
+    "sourceType" TEXT DEFAULT 'MANUFACTURED',
+    "vendorId" TEXT,
+    "procurementOrderId" TEXT,
+    "goodsReceiptId" TEXT,
+    "goodsReceiptItemId" TEXT,
+    "warehouseId" TEXT,
 
     CONSTRAINT "ProductBatch_pkey" PRIMARY KEY ("id")
 );
@@ -2177,6 +2189,9 @@ CREATE TABLE "Alert" (
 
 -- CreateTable
 CREATE TABLE "EWayBill" (
+    "provider" TEXT,
+    "generatorGstin" TEXT,
+    "generationError" TEXT,
     "id" TEXT NOT NULL,
     "refNumber" TEXT NOT NULL,
     "ewbNumber" TEXT,
@@ -2333,6 +2348,30 @@ CREATE TABLE "ChatReadState" (
     CONSTRAINT "ChatReadState_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "FranchiseDocument" (
+    "id" TEXT NOT NULL,
+    "franchiseId" TEXT NOT NULL,
+    "category" TEXT NOT NULL,
+    "originalFileName" TEXT NOT NULL,
+    "storageKey" TEXT NOT NULL,
+    "mimeType" TEXT NOT NULL,
+    "fileSize" INTEGER NOT NULL,
+    "familyId" TEXT NOT NULL,
+    "version" INTEGER NOT NULL DEFAULT 1,
+    "status" TEXT NOT NULL DEFAULT 'ACTIVE',
+    "visibility" TEXT NOT NULL DEFAULT 'INTERNAL',
+    "uploadedBy" TEXT NOT NULL,
+    "uploadedByName" TEXT NOT NULL,
+    "uploadedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    "issueDate" TIMESTAMP(3),
+    "expiryDate" TIMESTAMP(3),
+    "notes" TEXT,
+
+    CONSTRAINT "FranchiseDocument_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
@@ -2440,6 +2479,9 @@ CREATE INDEX "Production_franchiseId_status_producedAt_idx" ON "Production"("fra
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ProductBatch_productionId_key" ON "ProductBatch"("productionId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProductBatch_goodsReceiptItemId_key" ON "ProductBatch"("goodsReceiptItemId");
 
 -- CreateIndex
 CREATE INDEX "ProductBatch_franchiseId_expiryDate_idx" ON "ProductBatch"("franchiseId", "expiryDate");
@@ -2729,6 +2771,15 @@ CREATE INDEX "ChatReadState_userId_idx" ON "ChatReadState"("userId");
 -- CreateIndex
 CREATE UNIQUE INDEX "ChatReadState_conversationId_userId_key" ON "ChatReadState"("conversationId", "userId");
 
+-- CreateIndex
+CREATE UNIQUE INDEX "FranchiseDocument_storageKey_key" ON "FranchiseDocument"("storageKey");
+
+-- CreateIndex
+CREATE INDEX "FranchiseDocument_franchiseId_status_category_idx" ON "FranchiseDocument"("franchiseId", "status", "category");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "FranchiseDocument_familyId_version_key" ON "FranchiseDocument"("familyId", "version");
+
 -- AddForeignKey
 ALTER TABLE "User" ADD CONSTRAINT "User_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
@@ -2917,6 +2968,21 @@ ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_productId_fkey" FOREIGN 
 
 -- AddForeignKey
 ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_productionId_fkey" FOREIGN KEY ("productionId") REFERENCES "Production"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_vendorId_fkey" FOREIGN KEY ("vendorId") REFERENCES "Vendor"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_procurementOrderId_fkey" FOREIGN KEY ("procurementOrderId") REFERENCES "ProcurementOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_goodsReceiptId_fkey" FOREIGN KEY ("goodsReceiptId") REFERENCES "GoodsReceipt"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_goodsReceiptItemId_fkey" FOREIGN KEY ("goodsReceiptItemId") REFERENCES "GoodsReceiptItem"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "Warehouse"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "BatchRecall" ADD CONSTRAINT "BatchRecall_productBatchId_fkey" FOREIGN KEY ("productBatchId") REFERENCES "ProductBatch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -3253,3 +3319,9 @@ ALTER TABLE "ChatReadState" ADD CONSTRAINT "ChatReadState_conversationId_fkey" F
 
 -- AddForeignKey
 ALTER TABLE "ChatReadState" ADD CONSTRAINT "ChatReadState_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "FranchiseDocument" ADD CONSTRAINT "FranchiseDocument_franchiseId_fkey" FOREIGN KEY ("franchiseId") REFERENCES "Franchise"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "FranchiseDocument" ADD CONSTRAINT "FranchiseDocument_storageKey_fkey" FOREIGN KEY ("storageKey") REFERENCES "Attachment"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
