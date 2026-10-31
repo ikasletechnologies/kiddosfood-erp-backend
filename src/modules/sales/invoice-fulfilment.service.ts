@@ -28,7 +28,9 @@ export class InvoiceFulfilmentService {
     const allReserved = await tx.inventoryReservationAllocation.aggregate({ where: { inventoryItemId: item.id, reservation: { status: 'ACTIVE' } }, _sum: { reservedQty: true, consumedQty: true, releasedQty: true } });
     const outstanding = Math.max(0, (allReserved._sum.reservedQty || 0) - (allReserved._sum.consumedQty || 0) - (allReserved._sum.releasedQty || 0));
     const lotReserved = [...reserved.values()].reduce((s: number, n) => s + n, 0);
-    let stockCap = Math.max(0, item.currentStock - Math.max(0, outstanding - lotReserved));
+    const ledger = await tx.stockMovement.findMany({ where: { itemId: item.id }, select: { quantity: true, baseQty: true } });
+    const balance = ledger.length ? ledger.reduce((sum: number, m: any) => sum + (m.baseQty ?? m.quantity), 0) : item.currentStock;
+    let stockCap = Math.max(0, balance - Math.max(0, outstanding - lotReserved));
     const lots = eligible.map((l: any) => {
       const baseAvailable = Math.min(stockCap, Math.max(0, l.currentQty - (reserved.get(l.id) || 0))); stockCap -= baseAvailable;
       return { id: l.id, lotNumber: l.lotNumber || l.batchNumber, batchNumber: l.batchNumber, productId: product?.id || input.productId, productName: product?.name || item.name, sku: item.sku, unit,
@@ -95,15 +97,31 @@ export class InvoiceFulfilmentService {
       if (!sourceItems.has(productId)) { const p = await tx.product.findUnique({ where: { id: productId } }); sourceItems.set(productId, p?.sku ? await tx.inventoryItem.findFirst({ where: { sku: p.sku, ...(await scopeWhere(tx, order.franchiseId)) } }) : null); }
       const item = sourceItems.get(productId); return item ? (await InventoryService.convertUnitToBase(item.id, unit || 'NONE', quantity, tx)).requiredBaseQty : quantity;
     };
+    // A document's status is not evidence that stock was issued. Count only
+    // challans backed by posted ledger movements, and retain each lot identity.
+    const posted = await tx.stockMovement.findMany({ where: { referenceType: REF, referenceId: { in: challans.map((c: any) => c.id) }, quantity: { lt: 0 } }, include: { item: { select: { sku: true } } } });
     const dispatched = new Map<string, number>();
-    for (const dc of challans) for (const line of dc.items) if (line.productId) dispatched.set(line.productId, (dispatched.get(line.productId) || 0) + await base(line.productId, line.unit, line.quantity));
+    const legacyFulfilled = order.inventory_deducted && posted.length === 0;
+    const key = (productId: string, lotId?: string | null) => `${productId}:${lotId || '*'}`;
+    for (const movement of posted) {
+      const productId = order.orderItems.find((l: any) => l.product?.sku === movement.item?.sku)?.productId;
+      if (!productId) continue;
+      const k = key(productId, movement.batchId);
+      dispatched.set(k, (dispatched.get(k) || 0) + Math.abs(movement.baseQty ?? movement.quantity));
+    }
     const lines: any[] = [];
     for (const line of order.orderItems) {
       const required = await base(line.productId, line.unit, line.quantity);
       const factor = line.quantity > 0 ? required / line.quantity : 1;
-      const fulfilledBase = order.inventory_deducted ? required : Math.min(required, dispatched.get(line.productId) || 0);
-      dispatched.set(line.productId, Math.max(0, (dispatched.get(line.productId) || 0) - fulfilledBase));
-      lines.push({ orderItemId: line.id, productId: line.productId, productName: line.product?.name || 'Item', unit: line.unit, quantity: line.quantity, fulfilledQty: round(fulfilledBase / factor), pendingQty: round(Math.max(0, required - fulfilledBase) / factor), requiredBase: required, fulfilledBase, factor, netUnitPrice: line.price * (1 - (line.discountPct || 0) / 100), totalCost: line.totalCost });
+      const exactKey = key(line.productId, line.inventoryBatchId);
+      let fulfilledBase = legacyFulfilled ? required : Math.min(required, dispatched.get(exactKey) || 0);
+      dispatched.set(exactKey, Math.max(0, (dispatched.get(exactKey) || 0) - fulfilledBase));
+      if (!legacyFulfilled && !line.inventoryBatchId) {
+        for (const [k, available] of dispatched) if (k.startsWith(`${line.productId}:`) && fulfilledBase < required) {
+          const take = Math.min(required - fulfilledBase, available); fulfilledBase += take; dispatched.set(k, available - take);
+        }
+      }
+      lines.push({ orderItemId: line.id, productId: line.productId, inventoryBatchId: line.inventoryBatchId, lotNumber: line.lotNumber, productName: line.product?.name || 'Item', unit: line.unit, quantity: line.quantity, fulfilledQty: round(fulfilledBase / factor), pendingQty: round(Math.max(0, required - fulfilledBase) / factor), requiredBase: required, fulfilledBase, factor, netUnitPrice: line.price * (1 - (line.discountPct || 0) / 100), totalCost: line.totalCost });
     }
     return { status: lines.every(l => l.pendingQty <= 0.0001) ? 'FULFILLED' : lines.some(l => l.fulfilledQty > 0.0001) ? 'PARTIALLY_FULFILLED' : 'PENDING', lines };
   }
@@ -111,7 +129,8 @@ export class InvoiceFulfilmentService {
     const order = await tx.order.findUnique({ where: { id: orderId }, include: { orderItems: true } });
     if (!order || (sellerId && sellerId !== order.franchiseId)) throw new Error('Dispatch seller does not match the source invoice.');
     return Promise.all(lines.map(async line => {
-      const original = order.orderItems.find((l: any) => l.productId === line.productId);
+      const original = order.orderItems.find((l: any) => l.productId === line.productId && l.inventoryBatchId === line.inventoryBatchId)
+        || order.orderItems.find((l: any) => l.productId === line.productId);
       if (!original) throw new Error('Dispatch SKU is not on the source invoice.');
       const product = await tx.product.findUnique({ where: { id: line.productId } });
       const item = product?.sku ? await tx.inventoryItem.findFirst({ where: { sku: product.sku, ...(await scopeWhere(tx, order.franchiseId)) } }) : null;
@@ -142,10 +161,13 @@ export class InvoiceFulfilmentService {
       const factor = (await InventoryService.convertUnitToBase(item.id, line.unit || 'NONE', 1, tx)).requiredBaseQty;
       const required = line.quantity * factor;
       if (!(required > 0) || required > (remaining.get(line.productId) || 0) + 0.0001) throw new Error('Dispatch quantity exceeds the outstanding invoice quantity for ' + line.productName + '.');
-      const suggestion = await this.options(tx, { productId: line.productId, quantity: line.quantity, unit: line.unit, franchiseId: order.franchiseId }, true);
+      const suggestion = await this.options(tx, { productId: line.productId, quantity: line.quantity, unit: line.unit, franchiseId: order.franchiseId, warehouseId: line.warehouseId || undefined }, true);
       if (suggestion.availableQty + 0.0001 < line.quantity) throw new Error('Stock changed or is insufficient for ' + line.productName + '. Refresh the lot allocation before dispatch.');
       if (!line.inventoryBatchId && suggestion.lots.length > 1) throw new Error('Multiple stock lots are available. Select lots before dispatch.');
       const choices = line.inventoryBatchId ? [{ lotId: line.inventoryBatchId, quantity: line.quantity }] : suggestion.allocations;
+      const invoiceLines = state.lines.filter((l: any) => l.productId === line.productId);
+      const selectedCapacity = invoiceLines.filter((l: any) => l.inventoryBatchId === choices[0]?.lotId || !l.inventoryBatchId).reduce((sum: number, l: any) => sum + l.pendingQty * l.factor, 0);
+      if (selectedCapacity + 0.0001 < required) throw new Error('Dispatch lot does not match the outstanding invoice lot allocations.');
       let cost = 0;
       for (const choice of choices) {
         if (!suggestion.lots.some((l: any) => l.id === choice.lotId && l.availableQty + 0.0001 >= choice.quantity)) throw new Error('Selected lot is no longer available. Refresh the lot allocation.');
@@ -153,9 +175,9 @@ export class InvoiceFulfilmentService {
         cost += issued.totalCost;
         await InventoryService.recordMovement(tx, { itemId: item.id, type: 'SALES_OUT', quantity: -choice.quantity, baseQty: -choice.quantity * factor, transactionUnit: line.unit, referenceType: REF, referenceId: challan.id, warehouseId: (await tx.inventoryBatch.findUnique({ where: { id: choice.lotId }, select: { warehouseId: true } }))?.warehouseId || undefined, userId, note: 'Invoice fulfilment ' + order.invoiceNum, precalculatedFifo: issued });
       }
-      await tx.deliveryChallanItem.update({ where: { id: line.id }, data: { lotUnitCost: line.quantity > 0 ? cost / line.quantity : null } });
+      await tx.deliveryChallanItem.update({ where: { id: line.id }, data: { inventoryBatchId: choices[0]?.lotId || null, lotUnitCost: line.quantity > 0 ? cost / line.quantity : null } });
       let toAssign = required;
-      for (const invoiceLine of state.lines.filter((l: any) => l.productId === line.productId)) {
+      for (const invoiceLine of state.lines.filter((l: any) => l.productId === line.productId).sort((a: any, b: any) => Number(b.inventoryBatchId === line.inventoryBatchId) - Number(a.inventoryBatchId === line.inventoryBatchId))) {
         const take = Math.min(toAssign, invoiceLine.pendingQty * invoiceLine.factor);
         if (take <= 0) continue;
         await tx.orderItem.update({ where: { id: invoiceLine.orderItemId }, data: { totalCost: { increment: cost * take / required }, unitCost: null } });
@@ -179,10 +201,16 @@ export class InvoiceFulfilmentService {
     await tx.order.update({ where: { id: challan.sourceInvoiceId }, data: { inventory_deducted: false } });
     // Remove only the cancelled dispatch's actual costs, distributed over its invoiced SKU lines.
     const lines = await tx.orderItem.findMany({ where: { orderId: challan.sourceInvoiceId } });
-    const reversed = new Map<string, number>();
-    for (const line of challan.items) reversed.set(line.productId, (reversed.get(line.productId) || 0) + (line.lotUnitCost || 0) * line.quantity);
-    for (const [productId, reversalCost] of reversed) {
-      const matches = lines.filter((l: any) => l.productId === productId); const total = matches.reduce((s: number, l: any) => s + (l.totalCost || 0), 0);
+    const reversed = new Map<string, { productId: string; lotId: string | null; cost: number }>();
+    for (const line of challan.items) {
+      const key = `${line.productId}:${line.inventoryBatchId || '*'}`;
+      const previous = reversed.get(key);
+      reversed.set(key, { productId: line.productId, lotId: line.inventoryBatchId, cost: (previous?.cost || 0) + (line.lotUnitCost || 0) * line.quantity });
+    }
+    for (const { productId, lotId, cost: reversalCost } of reversed.values()) {
+      const exact = lines.filter((l: any) => l.productId === productId && l.inventoryBatchId === lotId);
+      const matches = exact.length ? exact : lines.filter((l: any) => l.productId === productId && !l.inventoryBatchId);
+      const total = matches.reduce((s: number, l: any) => s + (l.totalCost || 0), 0);
       for (const l of matches) await tx.orderItem.update({ where: { id: l.id }, data: { totalCost: Math.max(0, (l.totalCost || 0) - (total > 0 ? reversalCost * (l.totalCost || 0) / total : 0)) } });
     }
     return true;

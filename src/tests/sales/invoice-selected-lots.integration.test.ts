@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import prisma from '../../lib/prisma';
+import { withRollback } from '../with-rollback';
+import { FinanceService } from '../../modules/finance/finance.service';
+import { SalesService } from '../../modules/sales/sales.service';
+import { ProductService } from '../../modules/product/product.service';
+import { InventoryService } from '../../modules/inventory/inventory.service';
+import { InvoiceFulfilmentService } from '../../modules/sales/invoice-fulfilment.service';
+import { InvoiceDispatchService } from '../../modules/sales/invoice-dispatch.service';
+
+async function main() {
+  const tag = `LOT-VERIFY-${Date.now()}`;
+  await withRollback(async tx => {
+    const hq = await tx.franchise.findFirstOrThrow({ where: { isHQ: true } });
+    const customer = await tx.customer.create({ data: { name: tag, phone: '9000000000' } });
+    const warehouse = await tx.warehouse.create({ data: { name: tag, nameKey: tag.toLowerCase() } });
+    const product = await ProductService.create({ name: tag, sku: tag, basePrice: 100, taxPercent: 5, productType: 'FINISHED_GOOD' });
+    const item = await tx.inventoryItem.findFirstOrThrow({ where: { sku: tag } });
+    await tx.inventoryItem.update({ where: { id: item.id }, data: { customerPrice: 100 } });
+    const receive = async (qty: number, cost: number, suffix: string, expired = false) => {
+      await InventoryService.recordMovement(tx, { itemId: item.id, type: 'PURCHASE_IN', quantity: qty, warehouseId: warehouse.id, receiveAtCost: { unitCost: cost, batchNumber: `${tag}-${suffix}`, lotNumber: `${tag}-${suffix}`, expDate: new Date(Date.now() + (expired ? -86400000 : 86400000 * 30)) } });
+      return tx.inventoryBatch.findFirstOrThrow({ where: { inventoryItemId: item.id, batchNumber: `${tag}-${suffix}` } });
+    };
+    const a = await receive(10, 20, 'A'), b = await receive(1, 30, 'B');
+    const actor = { role: 'SUPER_ADMIN', userId: 'TEST_LOT_POSTING' };
+    const create = (lots: any[], paid = false) => FinanceService.createInvoice({ franchiseId: hq.id, customerId: customer.id, partyType: 'CUSTOMER', partyId: customer.id, deferFulfillment: true, pendingAllocationConfirmed: true, receivedAmount: paid ? 210 : 0, items: [{ productId: product.id, quantity: lots.reduce((n,l) => n+l.quantity,0), unit: 'PC', lotAllocations: lots }] });
+    const invoice = await create([{ lotId: a.id, quantity: 1 }, { lotId: b.id, quantity: 1 }], true);
+    assert.equal((await tx.order.findUniqueOrThrow({ where: { id: invoice.orderId } })).paymentStatus, 'PAID');
+    assert.equal(await InventoryService.computeStock(item.id, tx), 11);
+    assert.equal((await InvoiceDispatchService.review(invoice.id, actor)).canPost, true);
+    const valueBefore = (await tx.inventoryBatch.findMany({where:{inventoryItemId:item.id}})).reduce((sum:number,l:any)=>sum+l.currentQty*(l.unitCost||0),0);
+    const payments = JSON.stringify(await tx.payment.findMany({ where: { invoiceId: invoice.id } }));
+    await FinanceService.getInvoiceById(invoice.id); await FinanceService.getInvoiceById(invoice.id);
+    assert.equal(await InventoryService.computeStock(item.id, tx), 11); // reload / print reads never issue stock
+    const posted = await InvoiceDispatchService.post(invoice.id, actor);
+    assert.equal((await tx.inventoryBatch.findUniqueOrThrow({ where: { id: a.id } })).currentQty, 9);
+    assert.equal((await tx.inventoryBatch.findUniqueOrThrow({ where: { id: b.id } })).currentQty, 0);
+    assert.equal(await InventoryService.computeStock(item.id, tx), 9);
+    const valueAfter = (await tx.inventoryBatch.findMany({where:{inventoryItemId:item.id}})).reduce((sum:number,l:any)=>sum+l.currentQty*(l.unitCost||0),0);
+    assert.equal(valueBefore-valueAfter,50,'Valuation must fall by the exact two historical lot costs');
+    const moves = await tx.stockMovement.findMany({ where: { referenceType: 'INVOICE_FULFILMENT', referenceId: posted.challan!.id } });
+    assert.deepEqual(moves.map((m:any) => [m.batchId, m.baseQty]).sort(), [[a.id,-1],[b.id,-1]].sort());
+    const lines = await tx.orderItem.findMany({ where: { orderId: invoice.orderId } });
+    assert.equal(lines.find((l:any) => l.inventoryBatchId === a.id).totalCost, 20);
+    assert.equal(lines.find((l:any) => l.inventoryBatchId === b.id).totalCost, 30);
+    assert.equal((await InvoiceFulfilmentService.state(tx, invoice.orderId)).status, 'FULFILLED');
+    assert.equal((await InvoiceDispatchService.post(invoice.id, actor)).alreadyPosted, true);
+    assert.equal(await InventoryService.computeStock(item.id, tx), 9);
+    assert.equal(JSON.stringify(await tx.payment.findMany({ where: { invoiceId: invoice.id } })), payments);
+    assert.equal((await tx.invoice.findUniqueOrThrow({ where: { id: invoice.id } })).finalAmount, 210);
+    await assert.rejects(() => FinanceService.cancelInvoice(invoice.id), /Cancel or reverse linked dispatches/);
+    await SalesService.updateDeliveryChallan(posted.challan!.id, { status: 'CANCELLED' });
+    assert.equal(await InventoryService.computeStock(item.id, tx), 11);
+    assert.equal((await tx.inventoryBatch.findUniqueOrThrow({ where: { id: b.id } })).currentQty, 1);
+    assert.ok((await tx.orderItem.findMany({ where: { orderId: invoice.orderId } })).every((l:any) => l.totalCost === 0));
+    const partial = await create([{ lotId: a.id, quantity: 1 }, { lotId: b.id, quantity: 1 }]);
+    const dc = await SalesService.createDeliveryChallan({ sourceInvoiceId: partial.orderId, sourceFranchiseId: hq.id, customerId: customer.id, status: 'IN_TRANSIT', items: [{ productId: product.id, productName: tag, quantity: 1, unit: 'PC', inventoryBatchId: b.id }] });
+    const state = await InvoiceFulfilmentService.state(tx, partial.orderId);
+    assert.equal(state.lines.find((l:any) => l.inventoryBatchId === b.id).pendingQty, 0);
+    assert.equal(state.lines.find((l:any) => l.inventoryBatchId === a.id).pendingQty, 1);
+    await SalesService.updateDeliveryChallan(dc.id, { status: 'IN_TRANSIT' });
+    assert.equal(await tx.stockMovement.count({ where: { referenceType:'INVOICE_FULFILMENT', referenceId:dc.id } }),1);
+    await SalesService.updateDeliveryChallan(dc.id, { status:'CANCELLED' });
+    const expired = await receive(2, 99, 'EXPIRED', true);
+    await assert.rejects(() => create([{ lotId: expired.id, quantity:1 }]), /unavailable/);
+    const insufficient = await create([{ lotId: b.id, quantity:1 }]);
+    await tx.inventoryBatch.update({ where:{id:b.id},data:{currentQty:0} });
+    const review = await InvoiceDispatchService.review(insufficient.id,actor); assert.equal(review.canPost,false);
+    await assert.rejects(() => InvoiceDispatchService.post(insufficient.id,actor), /insufficient/);
+    await tx.inventoryBatch.update({ where:{id:b.id},data:{currentQty:1} });
+    const one = await create([{ lotId:a.id, quantity:1 }]); const single = await InvoiceDispatchService.post(one.id,actor);
+    assert.ok(single.challan); assert.equal((await InvoiceFulfilmentService.state(tx,one.orderId)).status,'FULFILLED');
+    await assert.rejects(() => InvoiceDispatchService.post(one.id,{role:'FRANCHISE_ADMIN',franchiseId:hq.id}),/Super Admin/);
+  });
+  assert.equal(await prisma.product.count({ where:{sku:tag} }),0);
+  console.log('PASS: one/two lots, paid invoice pending, lot-specific costs/partial fulfilment, ledger stock, duplicate calls/reload, cancellation restoration, expiry/insufficient stock, role guard; fixtures rolled back');
+}
+main().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>prisma.$disconnect());

@@ -1,0 +1,73 @@
+{
+  "generatedAt": "2026-10-31T11:32:38.706Z",
+  "readOnly": true,
+  "billsReviewed": 6,
+  "completedGrnsReviewed": 6,
+  "postedFinancialCandidates": 0,
+  "findings": [],
+  "zeroGstGrns": [
+    {
+      "grnId": "b8eda0ba-240e-4e96-8397-29cb2e1d356e",
+      "poId": "d1d384fb-674b-44e5-85ac-2c051d5bce7b",
+      "zeroRateLines": [
+        {
+          "poLineId": "5056db0a-f25c-44e2-9afb-462d7396c88b",
+          "materialId": "267cc3fd-44e4-429f-9488-c551a22038bc",
+          "name": "APPAM",
+          "savedGstRate": 0,
+          "currentMasterGst": 5
+        }
+      ]
+    },
+    {
+      "grnId": "e5aec3dc-6a6b-43b4-9b91-17a4907a363b",
+      "poId": "13a6e8a6-cf3e-400a-803f-747761bb0c61",
+      "zeroRateLines": [
+        {
+          "poLineId": "190b875b-76a0-4a7b-b40c-7ab347c9a34b",
+          "materialId": "267cc3fd-44e4-429f-9488-c551a22038bc",
+          "name": "APPAM",
+          "savedGstRate": 0,
+          "currentMasterGst": 5
+        }
+      ]
+    },
+    {
+      "grnId": "770acaa7-7a78-4729-966b-8e6bc60f861e",
+      "poId": "076bebe2-6351-453d-8ab9-77ab25e97813",
+      "zeroRateLines": [
+        {
+          "poLineId": "5b3fee9b-f2e4-4445-9606-337cd72b47f4",
+          "materialId": "b1b1088d-79d8-46ed-8158-9e8028295d84",
+          "name": "test",
+          "savedGstRate": 0,
+          "currentMasterGst": 5
+        }
+      ]
+    }
+  ],
+  "testPOs": [
+    {
+      "id": "076bebe2-6351-453d-8ab9-77ab25e97813",
+      "poNumber": "PO-2026-008",
+      "createdAt": "2026-10-31T10:55:47.398Z",
+      "subtotal": 100,
+      "cgst": 0,
+      "sgst": 0,
+      "igst": 0,
+      "totalAmount": 100,
+      "poItems": [
+        {
+          "id": "5b3fee9b-f2e4-4445-9606-337cd72b47f4",
+          "itemName": "test",
+          "gstRate": 0,
+          "subtotal": 100,
+          "total": 100
+        }
+      ]
+    }
+  ],
+  "correctionApplied": false,
+  "limitations": "A consistently stored 5% PO cannot prove that a user originally intended 0%. Source-entry evidence is needed. Mixed-rate returns without source lot/PO identities require manual review. Posted records are never repaired by this report.",
+  "procedure": "Review exact original PO line snapshots, GRN accepted quantities, bill, return and ledger references; obtain explicit Super Admin approval for a specific correction; retain original rows and references and record linked compensating adjustments and an audit entry. Vendor ledger adjustment alone does not correct GST reporting. A separately approved tax-report correction plan is required for genuinely misposted tax."
+}

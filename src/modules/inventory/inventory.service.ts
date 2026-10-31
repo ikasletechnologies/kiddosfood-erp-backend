@@ -1357,12 +1357,19 @@ export class InventoryService {
     });
   }
 
-  static async getAlerts(franchiseId?: string) {
-    const items = await this.getInventory(franchiseId);
+  static async getAlerts(franchiseId?: string, options: { category?: ItemCategory; asOfDate?: string } = {}) {
+    const items = await this.getInventory(franchiseId, false, undefined, options.category, options.asOfDate);
     return items.filter(item => {
-      if(item.category==='FINISHED_GOOD')return item.stockStatus==='LOW_STOCK';
+      if(item.category==='FINISHED_GOOD')return item.stockStatus==='LOW_STOCK' || item.stockStatus==='OUT_OF_STOCK';
       const minStock = Number(item.minimumStock || 0);
       return minStock > 0 && item.currentStock < minStock;
+    }).map(item => {
+      // Preserve the stored item minimum; only the report's effective minimum
+      // follows the global Finished Goods setting. Never write SKU minimums.
+      const minimumStock = item.lowStockThreshold;
+      const stockStatus = item.stockStatus ?? (item.currentStock <= 0 ? 'OUT_OF_STOCK' : 'LOW_STOCK');
+      return { ...item, itemMinimumStock: item.minimumStock, minimumStock, minStock: minimumStock,
+        shortfall: Math.max(0, minimumStock - item.currentStock), stockStatus, status: stockStatus };
     });
   }
 
