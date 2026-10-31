@@ -712,7 +712,7 @@ export class ProcurementService {
     const isFinishedGoodsPO = purchaseType === 'FINISHED_GOOD' || purchaseType === 'FINISHED_GOODS';
     const isRawMaterialPO = purchaseType === 'RAW_MATERIAL';
 
-    const poItemsData = await Promise.all(data.items.map(async (rawItem) => {
+    const poItemsData = await Promise.all(data.items.map(async (rawItem, itemIndex) => {
       let item = { ...rawItem };
       let inventoryItem = item.inventoryItemId
         ? await prisma.inventoryItem.findUnique({ where: { id: item.inventoryItemId } })
@@ -760,6 +760,12 @@ export class ProcurementService {
           }
           item.inventoryItemId = inventoryItem.id;
         }
+      }
+
+      // A browser draft may retain IDs for inventory deleted since it was saved.
+      // Reject before numbering, creating the PO, or applying any advance.
+      if (!inventoryItem) {
+        throw new Error(`Item ${itemIndex + 1} is no longer available in inventory. Remove it and select the material again before saving the purchase order.`);
       }
 
       // Check category compatibility with PO purchaseType:

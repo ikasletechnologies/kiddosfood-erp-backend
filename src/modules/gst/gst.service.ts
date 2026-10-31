@@ -55,6 +55,7 @@ export interface GstinDetails {
   address: string;
   state: string;
   city: string;
+  district: string;
   pinCode: string;
   natureOfBusiness: string[];
 }
@@ -78,6 +79,7 @@ type CachedRow = {
   address: string | null;
   state: string | null;
   natureOfBusiness: unknown;
+  raw?: unknown;
 };
 
 export class GstService {
@@ -112,6 +114,7 @@ export class GstService {
     const response = await axios.get(`${GSTIN_API_BASE_URL}/v1/gstin/${encodeURIComponent(gstin)}`, {
       headers: { 'x-api-key': apiKey },
       params: { include: 'profile' },
+      timeout: 15000,
       validateStatus: () => true,
     });
 
@@ -135,16 +138,17 @@ export class GstService {
       constitution: raw.business_constitution || '',
       taxpayerType: raw.taxpayer_type || 'Regular',
       registrationDate: raw.registration_date || '',
-      pan: raw.pan || '',
+      pan: raw.pan || gstin.substring(2, 12),
       address,
       state,
-      city: raw.address_details?.city || raw.city || derived.city,
-      pinCode: raw.address_details?.pincode || raw.pincode || derived.pinCode,
+      city: raw.address_details?.city || raw.city || '',
+      district: raw.address_details?.district || raw.district || '',
+      pinCode: String(raw.address_details?.pincode || raw.pincode || derived.pinCode),
       natureOfBusiness: Array.isArray(raw.nature_of_business) ? raw.nature_of_business : [],
     };
 
     // Save to gstinCache for instant subsequent hits
-    const { gstin: _gstin, city: _city, pinCode: _pinCode, ...persisted } = details;
+    const { gstin: _gstin, city: _city, district: _district, pinCode: _pinCode, ...persisted } = details;
     await prisma.gstinCache.upsert({
       where: { gstin },
       create: { gstin, ...persisted, raw },
@@ -155,7 +159,10 @@ export class GstService {
   }
 
   private static toDetails(cached: CachedRow): GstinDetails {
-    const address = cached.address || '';
+    // Location fields are preserved in raw because the cache has no dedicated columns.
+    const raw = cached.raw && typeof cached.raw === 'object' && !Array.isArray(cached.raw)
+      ? cached.raw as Record<string, any> : {};
+    const address = cached.address || raw.address || '';
     const state = cached.state || GST_STATE_MAP[cached.gstin.substring(0, 2)] || '';
     const derived = this.deriveLocation(address, state);
 
@@ -170,8 +177,9 @@ export class GstService {
       pan: cached.pan || (cached.gstin.length >= 12 ? cached.gstin.substring(2, 12) : ''),
       address,
       state,
-      city: derived.city,
-      pinCode: derived.pinCode,
+      city: raw.address_details?.city || raw.city || '',
+      district: raw.address_details?.district || raw.district || '',
+      pinCode: String(raw.address_details?.pincode || raw.pincode || derived.pinCode),
       natureOfBusiness: Array.isArray(cached.natureOfBusiness)
         ? (cached.natureOfBusiness as string[])
         : [],
