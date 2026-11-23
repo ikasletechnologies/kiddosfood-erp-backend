@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { FranchiseOrderStatus, FranchiseOrderType, LedgerType } from '@prisma/client';
 import { FranchiseService } from '../../modules/franchise/franchise.service';
 
@@ -69,7 +69,7 @@ async function runPostDispatchPaymentTestSuite() {
   // STEP 2: APPROVE ORDER (RESERVE STOCK)
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n3️⃣ STEP 2: HQ Approves Order (Verifies & reserves stock)...');
-  const approvedOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.APPROVED);
+  const approvedOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Order Status: ${approvedOrder?.status}`);
   if (approvedOrder?.status !== 'APPROVED') throw new Error('Expected order status to be APPROVED');
 
@@ -84,7 +84,7 @@ async function runPostDispatchPaymentTestSuite() {
   // STEP 3: MARK DISPATCHED (NO PAYMENT RECORDED HERE)
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n4️⃣ STEP 3: Super Admin Marks Dispatched (No payment modal/action here)...');
-  const dispatchedOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DISPATCHED);
+  const dispatchedOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Order Status: ${dispatchedOrder?.status}`);
   if (dispatchedOrder?.status !== 'DISPATCHED') throw new Error('Expected order status to be DISPATCHED');
 
@@ -160,7 +160,7 @@ async function runPostDispatchPaymentTestSuite() {
   // STEP 6: MARK DELIVERED (COMPLETES DELIVERY FLOW)
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n7️⃣ STEP 6: Complete Delivery Flow (DISPATCHED -> DELIVERED)...');
-  const deliveredOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DELIVERED);
+  const deliveredOrder = await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DELIVERED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Final Order Status: ${deliveredOrder?.status}`);
   if (deliveredOrder?.status !== 'DELIVERED') throw new Error('Expected order status to be DELIVERED');
   console.log('   ✅ PASS: Order delivery finished successfully.');

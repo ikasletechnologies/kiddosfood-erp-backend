@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { InventoryService } from '../../modules/inventory/inventory.service';
 import { POSService } from '../../modules/pos/pos.service';
 import { IsolationUtil } from '../../utils/isolation.util';
@@ -117,9 +117,9 @@ async function runDualFranchiseBusinessSimulation() {
     });
     orderAId = orderA.id;
 
-    await FranchiseOrderService.updateStatus(orderA.id, 'APPROVED' as any);
-    await FranchiseOrderService.updateStatus(orderA.id, 'DISPATCHED' as any);
-    await FranchiseOrderService.updateStatus(orderA.id, 'DELIVERED' as any);
+    await FranchiseOrderService.updateStatus(orderA.id, 'APPROVED' as any, undefined, INTERNAL_HQ_ACTOR);
+    await FranchiseOrderService.updateStatus(orderA.id, 'DISPATCHED' as any, undefined, INTERNAL_HQ_ACTOR);
+    await FranchiseOrderService.updateStatus(orderA.id, 'DELIVERED' as any, undefined, INTERNAL_HQ_ACTOR);
 
     // Auto-generate intercompany GST invoice for Franchise A
     const invoiceA = await GSTInvoiceService.generateFranchiseInvoice(orderA.id, false);
@@ -148,9 +148,9 @@ async function runDualFranchiseBusinessSimulation() {
     });
     orderBId = orderB.id;
 
-    await FranchiseOrderService.updateStatus(orderB.id, 'APPROVED' as any);
-    await FranchiseOrderService.updateStatus(orderB.id, 'DISPATCHED' as any);
-    await FranchiseOrderService.updateStatus(orderB.id, 'DELIVERED' as any);
+    await FranchiseOrderService.updateStatus(orderB.id, 'APPROVED' as any, undefined, INTERNAL_HQ_ACTOR);
+    await FranchiseOrderService.updateStatus(orderB.id, 'DISPATCHED' as any, undefined, INTERNAL_HQ_ACTOR);
+    await FranchiseOrderService.updateStatus(orderB.id, 'DELIVERED' as any, undefined, INTERNAL_HQ_ACTOR);
 
     const invoiceB = await GSTInvoiceService.generateFranchiseInvoice(orderB.id, true); // Inter-state
     console.log(`   - Franchise B GST Inter-State Invoice Generated: IGST ₹${invoiceB.igst.toFixed(2)}, Total ₹${invoiceB.grandTotal.toFixed(2)}`);

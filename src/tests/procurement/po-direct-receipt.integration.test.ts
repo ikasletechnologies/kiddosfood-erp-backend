@@ -49,7 +49,7 @@ async function main() {
           await GRNService.approve(grn.id);
           assert.equal((await tx.procurementOrder.findUniqueOrThrow({ where: { id: po.id } })).status, 'PARTIALLY_RECEIVED');
           assert.equal((await tx.inventoryItem.findUniqueOrThrow({ where: { id: material.id } })).currentStock, 4);
-          await assert.rejects(() => createReceipt(7), /only 6/);
+          await assert.rejects(() => createReceipt(7), /Received quantity cannot exceed pending quantity.*pending 6/);
           const rest = await createReceipt(6); await GRNService.approve(rest.id);
           const after = await tx.inventoryItem.findUniqueOrThrow({ where: { id: material.id } });
           assert.equal(after.currentStock, 10); assert.equal(after.category, category); assert.equal(after.basePrice, 87); assert.equal(after.gstRate, 12);

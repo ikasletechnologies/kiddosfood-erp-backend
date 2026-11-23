@@ -1,6 +1,8 @@
 import prisma from '../../lib/prisma';
 import { AppError } from '../../middleware/error.middleware';
 import { AuthService } from '../auth/auth.service';
+import { assertStrongPassword } from '../users/user.service';
+import crypto from 'crypto';
 
 async function generateEmployeeCode() {
   const lastEmp = await prisma.employee.findFirst({
@@ -58,7 +60,14 @@ export class EmployeeService {
 
       // 1. If no userId provided, create a new User account for the employee
       if (!userId || userId.trim() === '' || userId === 'null' || userId === 'undefined') {
-        const passwordHash = await AuthService.hashPassword('emp123');
+        // No shared default password: every employee login used to be created
+        // ACTIVE as a FRANCHISE_ADMIN with password "emp123" and a guessable
+        // email. Now a login is active only if a strong password is supplied;
+        // otherwise it is created disabled with a random, unknowable password
+        // until an admin sets one (reset-password) and activates it.
+        const hasPassword = typeof data.password === 'string' && data.password.length > 0;
+        if (hasPassword) assertStrongPassword(data.password);
+        const passwordHash = await AuthService.hashPassword(hasPassword ? data.password : crypto.randomBytes(32).toString('base64'));
 
         const newUser = await tx.user.create({
           data: {
@@ -67,7 +76,7 @@ export class EmployeeService {
             phone: data.mobile,
             passwordHash,
             role: 'FRANCHISE_ADMIN',
-            is_active: true
+            is_active: hasPassword
           }
         });
         userId = newUser.id;

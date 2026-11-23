@@ -1,10 +1,12 @@
 import prisma from '../../lib/prisma';
 
 export class KDSService {
-  static async getActiveOrders() {
+  /** Open kitchen orders, scoped to one branch when franchiseId is given. */
+  static async getActiveOrders(franchiseId?: string) {
     return prisma.order.findMany({
       where: {
-        status: { in: ['PENDING', 'PREPARING'] }
+        status: { in: ['PENDING', 'PREPARING'] },
+        ...(franchiseId ? { franchiseId } : {})
       },
       include: {
         orderItems: {
@@ -15,15 +17,5 @@ export class KDSService {
       orderBy: { createdAt: 'asc' }
     });
   }
-
-  static async updateOrderStatus(id: string, status: 'PENDING' | 'PREPARING' | 'COMPLETED') {
-    return prisma.order.update({
-      where: { id },
-      data: { status },
-      include: {
-        orderItems: { include: { product: true } },
-        customer: true
-      }
-    });
-  }
+  // Status changes go through POSService.updateOrderStatus (guarded, audited).
 }

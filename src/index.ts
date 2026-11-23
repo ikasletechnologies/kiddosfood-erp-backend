@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import './lib/startup-checks'; // must stay first after dotenv: fails fast on bad JWT config
 import app from './app';
 import { createServer } from 'http';
 import SocketService from './lib/socket';

@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { FranchiseOrderStatus } from '@prisma/client';
 
 async function runPaymentTests() {
@@ -105,8 +105,8 @@ async function runPaymentTests() {
 
     // STEP 4: Super Admin Approves and Dispatches Order
     console.log('5️⃣ STEP 4: Super Admin Approves & Dispatches Order...');
-    await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.APPROVED);
-    await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DISPATCHED);
+    await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
+    await FranchiseOrderService.updateStatus(order.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
 
     const hqBalAfterDispatch = (await prisma.account.findUnique({ where: { id: hqAccount.id } }))!.balance;
     const paymentsAfterDispatch = await prisma.payment.findMany({

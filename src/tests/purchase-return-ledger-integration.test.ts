@@ -84,11 +84,11 @@ async function runTests() {
     vendorId: vendor.id,
     procurementOrderId: poA.id,
     reason: 'Damaged Goods in Batch A',
-    status: 'COMPLETED',
     items: [
       { itemName: 'Item Alpha', quantity: 5, unit: 'kg', rate: 100 }
     ]
   });
+  await PurchaseService.updatePurchaseReturn(prA.id, { status: 'COMPLETED' });
   console.log(`Created Completed PR A: ${prA.returnNumber}, RefundAmount: ${prA.refundAmount}`);
 
   // 4. Test Idempotency (re-recognize PR A should not duplicate)

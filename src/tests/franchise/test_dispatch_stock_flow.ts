@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { FranchiseOrderStatus, FranchiseOrderType } from '@prisma/client';
 import { FranchiseService } from '../../modules/franchise/franchise.service';
 
@@ -53,7 +53,7 @@ async function runDispatchTestSuite() {
   console.log(`   - Created Order: ${order1.orderNumber} (Status: ${order1.status})`);
 
   // Approve
-  const approved1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.APPROVED);
+  const approved1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Order Status after approval: ${approved1?.status}`);
 
   const res1 = await prisma.inventoryReservation.findUnique({
@@ -64,7 +64,7 @@ async function runDispatchTestSuite() {
   if (!res1 || res1.status !== 'ACTIVE') throw new Error('Reservation should be ACTIVE after approval');
 
   // Dispatch
-  const dispatched1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED);
+  const dispatched1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Order Status after dispatch: ${dispatched1?.status}`);
 
   const appamInvAfter = await prisma.inventoryItem.findFirstOrThrow({
@@ -88,7 +88,15 @@ async function runDispatchTestSuite() {
   // TEST 2: IDEMPOTENCY ON DISPATCH
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n3️⃣ TEST 2: Idempotency (Calling DISPATCHED a second time on order1)...');
-  const dispatchedAgain = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED);
+  // Phase 1 (audit C-03): a repeated dispatch is now REJECTED (409) instead of
+  // silently accepted; either way it must not move stock a second time.
+  let repeatRejected = false;
+  try {
+    await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
+  } catch (e: any) {
+    repeatRejected = e?.statusCode === 409;
+  }
+  if (!repeatRejected) throw new Error('Repeated dispatch was not rejected with 409');
   const appamInvAfterIdemp = await prisma.inventoryItem.findFirstOrThrow({
     where: { sku: appamProduct.sku, OR: [{ franchiseId: hq.id }, { franchiseId: null }] } as any
   });
@@ -101,7 +109,7 @@ async function runDispatchTestSuite() {
   // TEST 3: DELIVER ORDER (FRANCHISE INWARD)
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n4️⃣ TEST 3: Delivery (DISPATCHED -> DELIVERED receiving into franchise)...');
-  const delivered1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DELIVERED);
+  const delivered1 = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DELIVERED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   - Order Status after delivery: ${delivered1?.status}`);
   if (delivered1?.status !== 'DELIVERED') throw new Error('Order should be DELIVERED');
   console.log('   ✅ PASS: Franchise inward receipt completed successfully.');
@@ -127,8 +135,8 @@ async function runDispatchTestSuite() {
     ]
   });
 
-  await FranchiseOrderService.updateStatus(order2.id, FranchiseOrderStatus.APPROVED);
-  await FranchiseOrderService.updateStatus(order2.id, FranchiseOrderStatus.DISPATCHED);
+  await FranchiseOrderService.updateStatus(order2.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
+  await FranchiseOrderService.updateStatus(order2.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
 
   const banyInvAfter = await prisma.inventoryItem.findFirstOrThrow({
     where: { sku: banyardProduct.sku, OR: [{ franchiseId: hq.id }, { franchiseId: null }] } as any
@@ -155,12 +163,12 @@ async function runDispatchTestSuite() {
     ]
   });
 
-  await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.APPROVED);
-  await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.CANCELLED);
+  await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
+  await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.CANCELLED, undefined, INTERNAL_HQ_ACTOR);
 
   let cancelDispatchBlocked = false;
   try {
-    await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.DISPATCHED);
+    await FranchiseOrderService.updateStatus(order3.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
   } catch (err: any) {
     cancelDispatchBlocked = true;
     console.log(`   - Dispatching cancelled order rejected as expected: "${err.message}"`);

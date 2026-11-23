@@ -20,24 +20,30 @@ export class AccountService {
     amount: number, 
     action: 'INFLOW' | 'OUTFLOW'
   ) {
-    if (amount <= 0) return; // No zero or negative adjustments
+    if (!(amount > 0) || !Number.isFinite(amount)) return; // No zero, negative or NaN adjustments
 
-    const account = await tx.account.findUnique({ where: { id: accountId } });
-    if (!account) throw new Error(`Financial Account not found: ${accountId}`);
-
-    const newBalance = action === 'INFLOW' 
-      ? account.balance + amount 
-      : account.balance - amount;
-
-    // Safety: Prevent overdrafts if business rules require it (optional)
-    // if (newBalance < 0 && account.type === 'CASH') {
-    //   throw new Error(`Insufficient funds in account: ${account.name}`);
-    // }
-
-    return tx.account.update({
+    // Atomic increment/decrement: the previous read-then-write let two
+    // concurrent movements on the same account overwrite each other.
+    const result = await tx.account.updateMany({
       where: { id: accountId },
-      data: { balance: newBalance }
+      data: { balance: action === 'INFLOW' ? { increment: amount } : { decrement: amount } }
     });
+    if (result.count === 0) throw new Error(`Financial Account not found: ${accountId}`);
+    return tx.account.findUnique({ where: { id: accountId } });
+  }
+
+  /**
+   * Conditional atomic debit: succeeds only if the balance covers `amount`
+   * at the moment of the write (no read-check-write race). Returns false
+   * when funds are insufficient.
+   */
+  static async debitIfSufficient(tx: any, accountId: string, amount: number): Promise<boolean> {
+    if (!(amount > 0) || !Number.isFinite(amount)) return true;
+    const result = await tx.account.updateMany({
+      where: { id: accountId, balance: { gte: amount - 0.0001 } },
+      data: { balance: { decrement: amount } }
+    });
+    return result.count === 1;
   }
 
   static async getAccounts(franchiseId?: any) {

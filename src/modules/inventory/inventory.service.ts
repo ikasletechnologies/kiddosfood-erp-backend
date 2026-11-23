@@ -7,6 +7,8 @@ import { ItemCategory, StockMovementType, Prisma } from '@prisma/client';
 import { areUnitsEquivalent, normalizeUnit, convertUnit, areUnitsConvertible } from '../../lib/conversion';
 import { expiryCutoff, isLotExpired } from './lot-eligibility';
 import { PurchaseLotsService } from './purchase-lots.service';
+import { writeAuditLog, AuditActor } from '../../lib/audit-log';
+import { AppError } from '../../middleware/error.middleware';
 
 export interface FifoConsumption {
   batchId: string;
@@ -698,12 +700,32 @@ export class InventoryService {
     return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
 
-  // SUPER_ADMIN only: physical count adjustment
-  static async adjustStock(data: { itemId: string; newQuantity: number; unit?: string; note?: string; userId?: string }) {
-    return prisma.$transaction(async tx => {
+  // Physical count adjustment. Callers (controller) enforce item ownership;
+  // this validates the count, serializes concurrent adjustments of the same
+  // item with a row lock, and writes an audit record in the same transaction.
+  static async adjustStock(
+    data: { itemId: string; newQuantity: number; unit?: string; note?: string; userId?: string; actor?: AuditActor },
+    externalTx?: any
+  ) {
+    if (typeof data.newQuantity !== 'number' || !Number.isFinite(data.newQuantity) || data.newQuantity < 0) {
+      throw new AppError('newQuantity must be a finite number of zero or more.', 400);
+    }
+    const run = async (tx: any) => {
+      // Two concurrent adjustments would otherwise both read the same stock
+      // and both apply their full difference.
+      await tx.$queryRaw`SELECT id FROM "InventoryItem" WHERE id = ${data.itemId} FOR UPDATE`;
       const computedStock = await this.computeStock(data.itemId, tx);
       const difference = data.newQuantity - computedStock;
       if (difference === 0) return { message: 'No change needed' };
+
+      await writeAuditLog(tx, {
+        module: 'INVENTORY',
+        action: 'STOCK_ADJUSTMENT',
+        recordId: data.itemId,
+        oldValue: { stock: computedStock },
+        newValue: { stock: data.newQuantity, difference, note: data.note || null },
+        actor: data.actor || { userId: data.userId }
+      });
 
       // A positive adjustment (physical count found MORE stock, or an
       // opening balance) must land in an APPROVED InventoryBatch, not just
@@ -730,7 +752,8 @@ export class InventoryService {
         userId: data.userId,
         receiveAtCost,
       });
-    });
+    };
+    return externalTx ? run(externalTx) : prisma.$transaction(run);
   }
 
   /**
@@ -765,20 +788,26 @@ export class InventoryService {
    */
   static async submitReconciliation(
     entries: { itemId: string; physicalCount: number; note?: string }[],
-    userId?: string
+    userId?: string,
+    actor?: AuditActor
   ) {
-    const results: { itemId: string; systemStockBefore: number; physicalCount: number; variance: number; result: any }[] = [];
-    for (const entry of entries) {
-      const before = await this.computeStock(entry.itemId);
-      const result = await this.adjustStock({
-        itemId: entry.itemId,
-        newQuantity: entry.physicalCount,
-        note: entry.note || 'Stock reconciliation count',
-        userId
-      });
-      results.push({ itemId: entry.itemId, systemStockBefore: before, physicalCount: entry.physicalCount, variance: entry.physicalCount - before, result });
-    }
-    return results;
+    // All-or-nothing: a failure on one line no longer leaves the sheet
+    // half-applied.
+    return prisma.$transaction(async (tx) => {
+      const results: { itemId: string; systemStockBefore: number; physicalCount: number; variance: number; result: any }[] = [];
+      for (const entry of entries) {
+        const before = await this.computeStock(entry.itemId, tx);
+        const result = await this.adjustStock({
+          itemId: entry.itemId,
+          newQuantity: entry.physicalCount,
+          note: entry.note || 'Stock reconciliation count',
+          userId,
+          actor
+        }, tx);
+        results.push({ itemId: entry.itemId, systemStockBefore: before, physicalCount: entry.physicalCount, variance: entry.physicalCount - before, result });
+      }
+      return results;
+    }, { timeout: 120000 });
   }
 
   // Core engine: record movement and keep currentStock in sync as cache

@@ -378,6 +378,7 @@ model Vendor {
   suppliedMaterials      VendorMaterial[]
   vendorQuotations       VendorQuotation[]
   productBatches         ProductBatch[]
+  goodsReceipts          GoodsReceipt[]
 }
 
 model VendorLedger {
@@ -449,6 +450,12 @@ model ProcurementOrder {
   franchiseId          String?
   purchaseType         PurchaseType           @default(RAW_MATERIAL)
   discountAmount       Float                  @default(0)
+  cancelReason         String?
+  cancelledAt          DateTime?
+  cancelledBy          String?
+  shortCloseReason     String?
+  shortClosedAt        DateTime?
+  shortClosedBy        String?
   expenses             Expense[]
   goodsReceipts        GoodsReceipt[]
   inventoryBatches     InventoryBatch[]
@@ -481,13 +488,27 @@ model ProcurementOrderItem {
   total            Float            @default(0)
   isBulk           Boolean          @default(false)
   productId        String?
+  // Receipt counters, maintained by syncPOReceiptState (po-fulfilment.ts)
+  // under the PO + PO-line row locks whenever a GRN is posted, a GRN
+  // rejection return completes or the PO is short-closed. receivedQty is
+  // fulfilled quantity (accepted on posted GRNs + completed GRN-rejection
+  // returns); pendingQty = quantity - receivedQty (0 once short-closed).
+  receivedQty      Float            @default(0)
+  pendingQty       Float            @default(0)
   inventoryItem    InventoryItem?   @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
   procurementOrder ProcurementOrder @relation(fields: [poId], references: [id])
+  grnItems         GoodsReceiptItem[]
+
+  @@index([poId])
 }
 
 model GoodsReceipt {
   id               String             @id @default(uuid())
+  // Human-facing GRN number (GRN-YYYY-NNNNN or operator supplied). Unique.
+  grnNumber        String?            @unique
   poId             String
+  // Always the PO's vendor; validated on create.
+  vendorId         String?
   receivedAt       DateTime           @default(now())
   createdAt        DateTime           @default(now())
   receivedBy       String?
@@ -498,14 +519,20 @@ model GoodsReceipt {
   rejectedAt       DateTime?
   rejectedBy       String?
   procurementOrder ProcurementOrder   @relation(fields: [poId], references: [id])
+  vendor           Vendor?            @relation(fields: [vendorId], references: [id])
   items            GoodsReceiptItem[]
   invoices         VendorInvoice[]
   productBatches   ProductBatch[]
+  purchaseReturn   PurchaseReturn?
+
+  @@index([poId])
 }
 
 model GoodsReceiptItem {
   id                  String            @id @default(uuid())
   grnId               String
+  // The PO line this receipt line fulfils (must belong to the GRN's PO).
+  poItemId            String?
   materialId          String?
   quantity            Float
   receivedQty         Float
@@ -527,6 +554,7 @@ model GoodsReceiptItem {
   warehouseId         String?
   warehouseBinId      String?
   grn                 GoodsReceipt      @relation(fields: [grnId], references: [id])
+  poItem              ProcurementOrderItem? @relation(fields: [poItemId], references: [id])
   inventoryItem       InventoryItem?    @relation(fields: [materialId], references: [id], onDelete: Cascade)
   warehouseBin        WarehouseBin?     @relation(fields: [warehouseBinId], references: [id])
   warehouse           Warehouse?        @relation(fields: [warehouseId], references: [id])
@@ -534,6 +562,8 @@ model GoodsReceiptItem {
   inventoryBatch      InventoryBatch?
   isBulk              Boolean           @default(false)
   productBatch        ProductBatch?
+
+  @@index([poItemId])
 }
 
 model VendorInvoice {
@@ -1147,6 +1177,10 @@ model Payment {
   reversalOfPaymentId String?
   sourceModule        PaymentSourceModule   @default(MANUAL)
   vendorInvoiceId     String?
+  /// Direction of the money movement relative to accountId (IN = balance up,
+  /// OUT = balance down). NULL only for legacy rows the backfill could not
+  /// classify; those refuse cancellation instead of guessing.
+  flow                PaymentFlow?
   account             Account?              @relation(fields: [accountId], references: [id])
   invoice             Invoice?              @relation(fields: [invoiceId], references: [id])
   order               Order?                @relation(fields: [orderId], references: [id])
@@ -1900,7 +1934,10 @@ model PurchaseReturn {
   taxAmount          Float?
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
+  /// Set only on server-generated GRN_REJECTION returns: at most one per GRN.
+  goodsReceiptId     String?              @unique
   procurementOrder   ProcurementOrder?    @relation(fields: [procurementOrderId], references: [id])
+  goodsReceipt       GoodsReceipt?        @relation(fields: [goodsReceiptId], references: [id])
   vendor             Vendor               @relation(fields: [vendorId], references: [id])
   items              PurchaseReturnItem[]
 }
@@ -2390,6 +2427,11 @@ enum AccountingPaymentType {
   REVERSAL
   INTERNAL_TRANSFER
   REFUND
+}
+
+enum PaymentFlow {
+  IN
+  OUT
 }
 
 enum LedgerType {

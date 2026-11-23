@@ -23,35 +23,27 @@ async function verifyPurchaseReturns() {
     const initialStock1 = await InventoryService.computeStock(testItem.id);
     console.log(`Initial Stock before GRN Rejection Return: ${initialStock1} g`);
     
-    // Simulate auto-generated PR from GRN (frontend passes returnSource: GRN_REJECTION)
-    const grnPr = await PurchaseService.createPurchaseReturn({
-      vendorId: vendor.id,
-      reason: "AUTO-GENERATED FROM GRN REJECTION",
-      returnSource: "GRN_REJECTION",
-      items: [
-        { itemName: testItem.name, quantity: 2, unit: "kg", rate: 10 }
-      ]
-    });
-    
-    // Complete the PR
-    await PurchaseService.updatePurchaseReturn(grnPr.id, { status: "COMPLETED" });
-    
-    const postGrnPrStock = await InventoryService.computeStock(testItem.id);
-    console.log(`Stock after GRN Rejection Return Completed: ${postGrnPrStock} g`);
-    
-    if (postGrnPrStock !== initialStock1) {
-       console.error("❌ FAILED: GRN Rejection return modified inventory stock!");
-    } else {
-       console.log("✅ SUCCESS: GRN Rejection return correctly ignored inventory.");
+    // Phase 1 (audit C-04): GRN-rejection returns are generated server-side by
+    // GRNService.approve from the GRN's own rejected quantities. A client
+    // submission (the old frontend path) must be refused outright. The
+    // generated-return behaviour (no stock, no vendor debit) is covered by
+    // src/tests/phase1/integration/c04-c05-purchase.test.ts.
+    let refused = false;
+    try {
+      await PurchaseService.createPurchaseReturn({
+        vendorId: vendor.id,
+        reason: "AUTO-GENERATED FROM GRN REJECTION",
+        returnSource: "GRN_REJECTION",
+        items: [{ itemName: testItem.name, quantity: 2, unit: "kg", rate: 10 }]
+      });
+    } catch (e: any) {
+      refused = e?.statusCode === 400;
     }
-    
-    // Check Vendor Ledger — rejected goods were never billed (GRN bill = accepted
-    // qty only), so a GRN-rejection return must post no DEBIT.
-    const grnLedger = await prisma.vendorLedger.findFirst({ where: { referenceId: grnPr.id, type: 'DEBIT' } });
-    if (!grnLedger) {
-      console.log("✅ SUCCESS: GRN Rejection return posted no Vendor Ledger debit.");
+    const postGrnPrStock = await InventoryService.computeStock(testItem.id);
+    if (refused && postGrnPrStock === initialStock1) {
+      console.log("✅ SUCCESS: client-submitted GRN Rejection return refused; inventory untouched.");
     } else {
-      console.error(`❌ FAILED: GRN Rejection return debited the Vendor Ledger ₹${grnLedger.amount}.`);
+      console.error("❌ FAILED: client-submitted GRN Rejection return was accepted or changed stock.");
     }
 
     // === Case 2: Manual Return (KG converted to G) ===

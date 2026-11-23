@@ -51,7 +51,8 @@ async function main() {
       assert.deepEqual(await tx.vendorInvoice.findUnique({where:{id:bill.id}}),beforeBill,'Reopening a posted bill must preserve its amount and reference');
       await assert.rejects(()=>VendorInvoiceService.create({vendorId:vendor.id,poId:po.id,grnId:grn.id,amount:1,discountAmount:1}),/already posted/);
       const lot=await tx.inventoryBatch.findFirstOrThrow({where:{goodsReceiptItemId:grn.items[0].id}});
-      const ret=await PurchaseService.createPurchaseReturn({vendorId:vendor.id,procurementOrderId:po.id,status:'COMPLETED',reason:'GST regression return',items:[{itemName:item.name,materialId:item.id,inventoryBatchId:lot.id,quantity:10,unit:'PC',rate:999}]});
+      const ret=await PurchaseService.createPurchaseReturn({vendorId:vendor.id,procurementOrderId:po.id,reason:'GST regression return',items:[{itemName:item.name,materialId:item.id,inventoryBatchId:lot.id,quantity:10,unit:'PC',rate:999}]});
+      await PurchaseService.updatePurchaseReturn(ret.id,{status:'COMPLETED'});
       const saved=await tx.purchaseReturn.findUniqueOrThrow({where:{id:ret.id}});
       assert.equal(saved.taxableValue,100);assert.equal(saved.taxAmount,rate);assert.equal(saved.gstRate,rate);
       const debit=await tx.vendorLedger.findFirstOrThrow({where:{referenceType:'RETURN',referenceId:saved.returnNumber}});
@@ -65,7 +66,8 @@ async function main() {
         const partialBill=await tx.vendorInvoice.findFirstOrThrow({where:{grnId:partialGRN.id}});
         assert.equal(partialBill.subtotal,60);assert.equal(partialBill.taxAmount,0);assert.equal(partialBill.amount,60);
         const partialLot=await tx.inventoryBatch.findFirstOrThrow({where:{goodsReceiptItemId:partialGRN.items[0].id}});
-        const partialReturn=await PurchaseService.createPurchaseReturn({vendorId:vendor.id,procurementOrderId:partialPO.id,status:'COMPLETED',reason:'Accepted quantity return',items:[{itemName:item.name,materialId:item.id,inventoryBatchId:partialLot.id,quantity:6,unit:'PC',rate:10}]});
+        const partialReturn=await PurchaseService.createPurchaseReturn({vendorId:vendor.id,procurementOrderId:partialPO.id,reason:'Accepted quantity return',items:[{itemName:item.name,materialId:item.id,inventoryBatchId:partialLot.id,quantity:6,unit:'PC',rate:10}]});
+        await PurchaseService.updatePurchaseReturn(partialReturn.id,{status:'COMPLETED'});
         assert.equal((await tx.purchaseReturn.findUniqueOrThrow({where:{id:partialReturn.id}})).taxAmount,0);
         assert.equal(await ProcurementService.getVendorBalance(vendor.id),0);
         const oldDate=new Date('2020-01-02T10:00:00Z');

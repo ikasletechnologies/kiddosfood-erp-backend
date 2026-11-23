@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { actorFromUser } from '../../lib/audit-log';
 import { PurchaseService } from './purchase.service';
 
 export class PurchaseController {
@@ -80,19 +81,20 @@ export class PurchaseController {
 
   static async createPurchaseReturn(req: Request, res: Response) {
     try {
-      const ret = await PurchaseService.createPurchaseReturn(req.body);
+      const ret = await PurchaseService.createPurchaseReturn(req.body, actorFromUser((req as any).user));
       res.status(201).json(ret);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      res.status((error as any).statusCode || 400).json({ error: (error as Error).message });
     }
   }
 
   static async updatePurchaseReturn(req: Request, res: Response) {
     try {
-      const ret = await PurchaseService.updatePurchaseReturn(req.params.id, req.body);
+      const { status, reason } = req.body || {};
+      const ret = await PurchaseService.updatePurchaseReturn(req.params.id, { status, reason }, actorFromUser((req as any).user));
       res.json(ret);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      res.status((error as any).statusCode || 400).json({ error: (error as Error).message });
     }
   }
 

@@ -1,12 +1,21 @@
 import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import { isPOReceiptEligible, savedPOStatus, RECEIPT_READY_PO_STATUSES } from './po-receipt-status';
+import { syncPOReceiptState } from './po-fulfilment';
 import { purchaseGstRate, purchaseLineTax, validateTaxTotals } from './purchase-tax';
 import { purchaseBusinessDate, purchaseDateValue, validateDeliveryDate, validatePurchaseDate } from './purchase-dates';
 import { PurchaseLotsService } from '../inventory/purchase-lots.service';
 import { FinanceService } from '../finance/finance.service';
 import { AccountService } from '../finance/account.service';
 import { computeGstFromRate, resolveSellerState } from '../../utils/gst-tax.util';
+import { AppError } from '../../middleware/error.middleware';
+import { writeAuditLog, AuditActor } from '../../lib/audit-log';
+
+/** Statuses in which a PO has had no receipt/billing effect and may be cancelled (audit C-05). */
+export const PO_CANCELLABLE_STATUSES: string[] = ['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'ORDERED', 'SENT'];
+
+/** Open statuses in which an advance may still be paid against a PO (audit H-04). */
+export const PO_ADVANCE_STATUSES: string[] = ['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'ORDERED', 'SENT', 'PARTIALLY_RECEIVED'];
 
 export class ProcurementService {
   /**
@@ -700,6 +709,20 @@ export class ProcurementService {
     items: Array<{ inventoryItemId: string; quantity: number; price: number; gstRate?: number; unit?: string; isBulk?: boolean; productId?: string }>;
     manualTax?: { cgst: number, sgst: number, igst: number };
   }) {
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      throw new Error('A Purchase Order must contain at least one item.');
+    }
+    const seenLineKeys = new Set<string>();
+    data.items.forEach((rawItem, index) => {
+      const quantity = Number(rawItem.quantity);
+      const price = Number(rawItem.price);
+      if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('Item ' + (index + 1) + ' quantity must be a number greater than zero.');
+      if (!Number.isFinite(price) || price < 0) throw new Error('Item ' + (index + 1) + ' price must be a valid non-negative number.');
+      const identity = rawItem.inventoryItemId ? 'inventory:' + rawItem.inventoryItemId : rawItem.productId ? 'product:' + rawItem.productId + ':' + Boolean(rawItem.isBulk) : '';
+      if (!identity) throw new Error('Item ' + (index + 1) + ' must reference an inventory item or product.');
+      if (seenLineKeys.has(identity)) throw new Error('Duplicate Purchase Order item on line ' + (index + 1) + '. Merge duplicate products into one line.');
+      seenLineKeys.add(identity);
+    });
     const [vendor, sellerState] = await Promise.all([
       prisma.vendor.findUnique({ where: { id: data.vendorId }, select: { id: true, name: true, state: true, status: true } }),
       resolveSellerState(data.franchiseId)
@@ -890,7 +913,13 @@ export class ProcurementService {
           freightCost,
           totalAmount,
           advancePaid: providedAmount, // Real money provided
-          advanceApplied: appliedFromCredit, // Portion of the above that was pre-existing credit, not fresh cash
+          // ALL advance attributed to this PO is reserved against it — both the
+          // pre-existing credit spent here (appliedFromCredit) and the fresh
+          // cash paid now (newMoneyPayment). Reserving only the credit part let
+          // getAvailableAdvance() offer the fresh cash to other POs again, and
+          // left the bill's outstanding un-netted of this advance (overpayment
+          // risk). Released automatically when the PO is CANCELLED/CLOSED.
+          advanceApplied: providedAmount,
           paid: providedAmount,
           balance: totalAmount - providedAmount,
           expectedDeliveryDate: deliveryDate,
@@ -908,6 +937,8 @@ export class ProcurementService {
               itemName: item.itemName,
               gstRate: item.gstRate,
               quantity: item.quantity,
+              receivedQty: 0,
+              pendingQty: item.quantity,
               price: item.price,
               unit: item.unit,
               subtotal: item.subtotal,
@@ -1139,6 +1170,8 @@ export class ProcurementService {
             itemName: inventoryItem?.name || 'Unknown Material',
             gstRate,
             quantity: item.quantity,
+            receivedQty: 0,
+            pendingQty: item.quantity,
             price: item.price,
             unit: item.unit || inventoryItem?.unit || 'UNIT',
             subtotal,
@@ -1231,44 +1264,137 @@ export class ProcurementService {
     });
   }
 
-  static async recordAdvancePayment(poId: string, advancePaid: number) {
-    return prisma.$transaction(async (tx) => {
-      const po = await tx.procurementOrder.findUnique({ where: { id: poId } });
-      if (!po) throw new Error('Purchase Order not found');
-      if (po.status === 'CANCELLED') throw new Error('Cannot record advance on a cancelled PO');
+  /**
+   * Record an advance paid to the vendor against an open PO (audit H-04).
+   *
+   * The previous version only wrote a vendor-ledger DEBIT: no Payment row and
+   * no cash/bank movement, so the cash book was overstated by every advance.
+   * Now the money moves through FinanceService.createPayment (Payment row,
+   * vendor-ledger DEBIT, source-account debit with balance check), the advance
+   * is reserved against this PO (advanceApplied), and the call is limited to
+   * POs that are still open and to the PO's unpaid balance. Row-locked and
+   * audited. Cancelling the resulting payment reverses all of it.
+   */
+  static async recordAdvancePayment(poId: string, input: { amount: unknown; accountId?: unknown; paymentMode?: unknown; actor?: AuditActor }) {
+    const amount = typeof input.amount === 'number' ? input.amount : Number(input.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new AppError('Advance amount must be a number greater than zero.', 400);
+    if (typeof input.accountId !== 'string' || !input.accountId) throw new AppError('Select the account the advance is paid from.', 400);
+    const method = typeof input.paymentMode === 'string' && input.paymentMode ? input.paymentMode.toUpperCase() : 'CASH';
 
-      // balanceAfterTransaction must be computed, not left to its schema
-      // default of 0 — getNextBalance() reads the most recent ledger row's
-      // balanceAfterTransaction as the running balance, so a row with a bare
-      // 0 here would corrupt every balance computed after it.
-      const nextBalance = await this.getNextBalance(tx, po.vendorId, advancePaid, 'DEBIT');
-      await tx.vendorLedger.create({
-        data: {
-          vendorId: po.vendorId,
-          type: 'DEBIT',
-          amount: advancePaid,
-          balanceAfterTransaction: nextBalance,
-          paymentMode: 'CASH',
-          referenceType: 'ADVANCE',
-          referenceId: po.poNumber || po.id,
-          note: `Advance Payment for PO #${po.poNumber || po.id.substring(0, 8)}`
-        }
+    return prisma.$transaction(async (tx) => {
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${poId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Purchase Order not found', 404);
+      const po = await tx.procurementOrder.findUniqueOrThrow({ where: { id: poId } });
+      if (!PO_ADVANCE_STATUSES.includes(po.status)) {
+        throw new AppError(`An advance can only be recorded on an open purchase order (this one is ${po.status}). Pay received goods against their bill instead.`, 409);
+      }
+      const unpaid = Number((po.totalAmount - (po.paid || 0)).toFixed(2));
+      if (amount > unpaid + 0.01) {
+        throw new AppError(`Advance of ₹${amount} exceeds the PO's unpaid balance of ₹${Math.max(0, unpaid).toFixed(2)}.`, 400);
+      }
+
+      const payment = await FinanceService.createPayment({
+        tx,
+        amount,
+        type: 'ADVANCE',
+        flow: 'OUT',
+        status: 'PAID',
+        sourceAccount: input.accountId,
+        method,
+        sourceModule: 'PROCUREMENT',
+        linkedDocType: 'PO',
+        linkedDocId: po.id,
+        entityType: 'VENDOR',
+        entityId: po.vendorId,
+        note: `Advance Payment for PO #${po.poNumber || po.id.substring(0, 8)}`,
+        createdBy: input.actor?.label || input.actor?.userId || 'PROCUREMENT_MODULE'
       });
 
-      const newAdvancePaid = Math.min(po.totalAmount, po.advancePaid + advancePaid);
-      const newPaid = Math.min(po.totalAmount, po.paid + advancePaid);
-      const newBalance = Math.max(0, po.totalAmount - newPaid);
-
-      return tx.procurementOrder.update({
+      const newPaid = Number(((po.paid || 0) + amount).toFixed(2));
+      const updated = await tx.procurementOrder.update({
         where: { id: poId },
-        data: { 
-          advancePaid: newAdvancePaid,
+        data: {
+          advancePaid: { increment: amount },
+          advanceApplied: { increment: amount },
           paid: newPaid,
-          balance: newBalance,
-          status: (newBalance <= 0.01 && po.status === 'RECEIVED') ? 'CLOSED' : po.status
+          balance: Math.max(0, Number((po.totalAmount - newPaid).toFixed(2))),
         },
         include: { poItems: { include: { inventoryItem: true } }, vendor: true }
       });
+
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_ORDER',
+        action: 'ADVANCE_RECORDED',
+        recordId: poId,
+        newValue: { amount, paymentId: payment.id, accountId: input.accountId, poNumber: po.poNumber },
+        actor: input.actor
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Short-close a partially received PO (audit F-03 / M-04): the vendor will
+   * not deliver the rest. The undelivered balance is cancelled with a
+   * mandatory reason; the PO moves to RECEIVED (fulfilled as far as it goes),
+   * so no further GRN can be raised and normal bill payment settles it.
+   * Pending GRNs are cancelled. Advance reserved beyond what the posted bills
+   * have absorbed is released back to vendor credit. Nothing is posted to the
+   * vendor ledger — liability already exists only for what was billed.
+   */
+  static async shortClosePO(poId: string, opts: { reason?: unknown; actor?: AuditActor } = {}) {
+    const reason = typeof opts.reason === 'string' ? opts.reason.trim() : '';
+    if (reason.length < 3) throw new AppError('A short-close reason (at least 3 characters) is required.', 400);
+
+    return prisma.$transaction(async (tx) => {
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${poId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Purchase Order not found', 404);
+      const po = await tx.procurementOrder.findUniqueOrThrow({ where: { id: poId } });
+      if (po.shortClosedAt) throw new AppError('This purchase order is already short-closed.', 409);
+      const postedReceipts = await tx.goodsReceipt.count({ where: { poId, status: 'COMPLETED' } });
+      if (!isPOReceiptEligible(po.status) || postedReceipts === 0) {
+        throw new AppError(postedReceipts === 0
+          ? 'Nothing has been received on this purchase order yet — cancel it instead of short-closing.'
+          : `A ${po.status} purchase order cannot be short-closed.`, 409);
+      }
+
+      const pendingGrns = await tx.goodsReceipt.updateMany({ where: { poId, status: 'PENDING' }, data: { status: 'CANCELLED' } });
+
+      // Keep only the advance the posted bills actually absorbed reserved;
+      // the rest becomes free vendor credit again.
+      const billed = await tx.vendorInvoice.aggregate({ where: { poId }, _sum: { advanceApplied: true } });
+      const keepReserved = Math.min(po.advanceApplied || 0, billed._sum.advanceApplied || 0);
+      const bills = await tx.vendorInvoice.aggregate({ where: { poId }, _sum: { amount: true } });
+      const billedTotal = bills._sum.amount || 0;
+
+      const updated = await tx.procurementOrder.update({
+        where: { id: poId },
+        data: {
+          status: 'RECEIVED',
+          received: true,
+          advanceApplied: keepReserved,
+          balance: Math.max(0, Number((billedTotal - (po.paid || 0)).toFixed(2))),
+          shortCloseReason: reason,
+          shortClosedAt: new Date(),
+          shortClosedBy: opts.actor?.userId || opts.actor?.label || null,
+        },
+        include: { vendor: true, poItems: { include: { inventoryItem: true } } }
+      });
+      // Undelivered balance is cancelled: PO lines' pendingQty becomes 0.
+      await syncPOReceiptState(tx, poId);
+
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_ORDER',
+        action: 'SHORT_CLOSED',
+        recordId: poId,
+        oldValue: { status: po.status, advanceApplied: po.advanceApplied },
+        newValue: { reason, pendingGrnsCancelled: pendingGrns.count, advanceReleased: Number(((po.advanceApplied || 0) - keepReserved).toFixed(2)), billedTotal },
+        actor: opts.actor
+      });
+
+      // Advance released above may now settle this PO's own bills.
+      await this.settleVendorOrders(po.vendorId, tx);
+      return updated;
     });
   }
 
@@ -1531,53 +1657,98 @@ export class ProcurementService {
     };
   }
 
-  static async cancelPO(poId: string) {
+  /**
+   * Cancel a PO (audit C-05).
+   *
+   * A PO posts NO vendor liability (liability is recognised only when a bill
+   * is created from an approved GRN), so cancelling one must not touch the
+   * vendor ledger. The previous version wrote a CREDIT of the full PO value —
+   * a phantom payable — with balanceAfterTransaction left at 0, corrupting the
+   * running balance, and allowed cancelling partially received / billed POs.
+   *
+   * Now: a reason is mandatory; only POs with no posted receipt and no bill
+   * can be cancelled; pending (unapproved) GRNs are cancelled with it; any
+   * advance paid stays in the vendor ledger as vendor credit (advance reserved
+   * on a CANCELLED PO is released automatically by getAvailableAdvance /
+   * settleVendorOrders). Row-locked, transactional, audited.
+   */
+  static async cancelPO(poId: string, opts: { reason?: unknown; actor?: AuditActor } = {}) {
+    const reason = typeof opts.reason === 'string' ? opts.reason.trim() : '';
+    if (reason.length < 3) {
+      throw new AppError('A cancellation reason (at least 3 characters) is required.', 400);
+    }
     return prisma.$transaction(async (tx) => {
-      const po = await tx.procurementOrder.findUnique({ where: { id: poId } });
-      if (!po) throw new Error('Purchase Order not found');
-      if (po.status === 'RECEIVED') throw new Error('Cannot cancel a received PO');
-      if (po.status === 'CANCELLED') throw new Error('PO is already cancelled');
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${poId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Purchase Order not found', 404);
+      const po = await tx.procurementOrder.findUniqueOrThrow({ where: { id: poId } });
 
-      await tx.vendorLedger.create({
-        data: {
-          vendorId: po.vendorId,
-          type: 'CREDIT',
-          amount: po.totalAmount,
-          paymentMode: 'CASH',
-          referenceType: 'ADJUSTMENT',
-          referenceId: po.id,
-          note: `PO Cancelled — Reversal of PO #${po.id.substring(0, 8)}`
-        }
-      });
-      return tx.procurementOrder.update({
+      if (po.status === 'CANCELLED') throw new AppError('PO is already cancelled', 409);
+      if (!PO_CANCELLABLE_STATUSES.includes(po.status)) {
+        throw new AppError(`A ${po.status} purchase order cannot be cancelled: goods have been received or billed. Use a purchase return for received goods.`, 409);
+      }
+      const [postedReceipts, bills] = await Promise.all([
+        tx.goodsReceipt.count({ where: { poId, status: 'COMPLETED' } }),
+        tx.vendorInvoice.count({ where: { poId } }),
+      ]);
+      if (postedReceipts > 0 || bills > 0) {
+        throw new AppError('This purchase order already has an approved goods receipt or a vendor bill and cannot be cancelled. Use a purchase return instead.', 409);
+      }
+
+      const pendingGrns = await tx.goodsReceipt.updateMany({ where: { poId, status: 'PENDING' }, data: { status: 'CANCELLED' } });
+
+      const cancelled = await tx.procurementOrder.update({
         where: { id: poId },
-        data: { status: 'CANCELLED' },
+        data: { status: 'CANCELLED', cancelReason: reason, cancelledAt: new Date(), cancelledBy: opts.actor?.userId || opts.actor?.label || null },
         include: { vendor: true, poItems: { include: { inventoryItem: true } } }
       });
+
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_ORDER',
+        action: 'CANCELLED',
+        recordId: poId,
+        oldValue: { status: po.status, totalAmount: po.totalAmount, advancePaid: po.advancePaid, advanceApplied: po.advanceApplied },
+        newValue: { status: 'CANCELLED', reason, pendingGrnsCancelled: pendingGrns.count, poNumber: po.poNumber },
+        actor: opts.actor
+      });
+      return cancelled;
     });
   }
 
-  static async deletePO(poId: string) {
+  /**
+   * Hard delete is allowed only for a DRAFT PO with nothing attached (no
+   * receipts, bills, payments, returns or lots) — i.e. one that never had any
+   * operational or financial effect. Everything else must be cancelled with a
+   * reason so its history is preserved (audit C-05). Never posts to the
+   * vendor ledger.
+   */
+  static async deletePO(poId: string, actor?: AuditActor) {
     return prisma.$transaction(async (tx) => {
-      const po = await tx.procurementOrder.findUnique({ where: { id: poId } });
-      if (!po) throw new Error('Purchase Order not found');
-      if (po.status === 'RECEIVED') throw new Error('Cannot delete a received PO');
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${poId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Purchase Order not found', 404);
+      const po = await tx.procurementOrder.findUniqueOrThrow({ where: { id: poId } });
 
-      if (po.status === 'PENDING_APPROVAL') {
-        await tx.vendorLedger.create({
-          data: {
-            vendorId: po.vendorId,
-            type: 'CREDIT',
-            amount: po.totalAmount,
-            paymentMode: 'CASH',
-            referenceType: 'ADJUSTMENT',
-            referenceId: po.id,
-            note: `PO Deleted — Reversal of PO #${po.id.substring(0, 8)}`
-          }
-        });
+      const linkedDocIds = [po.id, ...(po.poNumber ? [po.poNumber] : [])];
+      const [grns, bills, payments, returns, lots, expenses] = await Promise.all([
+        tx.goodsReceipt.count({ where: { poId } }),
+        tx.vendorInvoice.count({ where: { poId } }),
+        tx.payment.count({ where: { linkedDocId: { in: linkedDocIds } } }),
+        tx.purchaseReturn.count({ where: { procurementOrderId: poId } }),
+        tx.inventoryBatch.count({ where: { procurementOrderId: poId } }),
+        tx.expense.count({ where: { purchaseOrderId: poId } }),
+      ]);
+      const hasHistory = grns + bills + payments + returns + lots + expenses > 0 || (po.advancePaid || 0) > 0 || (po.paid || 0) > 0;
+      if (po.status !== 'DRAFT' || hasHistory) {
+        throw new AppError('Only an untouched Draft purchase order can be deleted. Cancel this purchase order with a reason instead.', 409);
       }
+
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_ORDER',
+        action: 'DELETED',
+        recordId: poId,
+        oldValue: { poNumber: po.poNumber, status: po.status, totalAmount: po.totalAmount, vendorId: po.vendorId },
+        actor
+      });
       await tx.procurementOrderItem.deleteMany({ where: { poId } });
-      await tx.goodsReceipt.deleteMany({ where: { poId } });
       return tx.procurementOrder.delete({ where: { id: poId } });
     });
   }

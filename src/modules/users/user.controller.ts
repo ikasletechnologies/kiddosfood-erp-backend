@@ -15,10 +15,10 @@ export class UserController {
 
   static async getByFranchise(req: Request, res: Response) {
     try {
-      const users = await UserService.getByFranchise(req.params.id);
+      const users = await UserService.getByFranchiseAsActor(req.params.id, (req as any).user || {});
       res.json(users);
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      res.status((error as any).statusCode || 500).json({ error: (error as Error).message });
     }
   }
 
@@ -48,10 +48,10 @@ export class UserController {
       if (!password) {
         return res.status(400).json({ error: 'Password is required' });
       }
-      await UserService.updatePassword(req.params.id, password);
+      await UserService.resetPasswordAsActor(req.params.id, password, (req as any).user || {});
       res.json({ message: 'Password reset successfully' });
     } catch (error) {
-      res.status(400).json({ error: (error as Error).message });
+      res.status((error as any).statusCode || 400).json({ error: (error as Error).message });
     }
   }
 

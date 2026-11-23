@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { FranchiseOrderStatus, FranchiseOrderType } from '@prisma/client';
 import { InventoryReservationService } from '../../modules/inventory/inventory-reservation.service';
 import { FranchiseService } from '../../modules/franchise/franchise.service';
@@ -74,7 +74,7 @@ async function runTest() {
   try {
     // Step 3: Approve Order
     console.log('\nApproving Order...');
-    const approvedOrder = await FranchiseOrderService.updateStatus(createdOrder.id, FranchiseOrderStatus.APPROVED);
+    const approvedOrder = await FranchiseOrderService.updateStatus(createdOrder.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
     console.log(`Order Status after approval: ${approvedOrder?.status}`);
 
     // Step 4: Verify Reservation & Allocations
@@ -136,7 +136,7 @@ async function runTest() {
 
     // Step 6: Test Cancellation and Release
     console.log('\nTesting Order Cancellation and Reservation Release...');
-    const cancelledOrder = await FranchiseOrderService.updateStatus(createdOrder.id, FranchiseOrderStatus.CANCELLED);
+    const cancelledOrder = await FranchiseOrderService.updateStatus(createdOrder.id, FranchiseOrderStatus.CANCELLED, undefined, INTERNAL_HQ_ACTOR);
     console.log(`Order Status after cancellation: ${cancelledOrder?.status}`);
 
     const reservationAfterCancel = await prisma.inventoryReservation.findUnique({

@@ -9,6 +9,8 @@ import { AccountService } from '../finance/account.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { FranchiseService } from './franchise.service';
 import SocketService from '../../lib/socket';
+import { AppError } from '../../middleware/error.middleware';
+import { writeAuditLog } from '../../lib/audit-log';
 
 function generateOrderNumber(): string {
   const ts = Date.now().toString(36).toUpperCase();
@@ -206,6 +208,156 @@ function computeFulfillmentForOrderSync(order: any, hqInventoryMap: { bySku: Map
   const materialsReady = shortfalls.every(s => s.recipeConfigured && s.materials.every(m => m.shortBy <= 0));
   return { fulfillmentPath: FranchiseOrderFulfillment.PRODUCTION, materialsReady, materialsShortfall: shortfalls };
 }
+
+// ─── Franchise-order lifecycle rules (audit C-03) ───────────────────────────
+// The only legal moves. Anything else — skipping a step, moving backwards,
+// repeating a state, cancelling after dispatch — is rejected.
+export const FRANCHISE_ORDER_TRANSITIONS: Record<FranchiseOrderStatus, FranchiseOrderStatus[]> = {
+  PENDING: [FranchiseOrderStatus.APPROVED, FranchiseOrderStatus.CANCELLED],
+  APPROVED: [FranchiseOrderStatus.IN_PRODUCTION, FranchiseOrderStatus.DISPATCHED, FranchiseOrderStatus.CANCELLED],
+  IN_PRODUCTION: [FranchiseOrderStatus.DISPATCHED, FranchiseOrderStatus.CANCELLED],
+  DISPATCHED: [FranchiseOrderStatus.DELIVERED],
+  DELIVERED: [],
+  CANCELLED: [],
+};
+
+/**
+ * Explicit HQ identity for trusted server-side callers (maintenance scripts,
+ * test harnesses). HTTP requests never use this — the controller always passes
+ * the authenticated user. Transition rules still apply, and the audit log
+ * records the actor as SYSTEM.
+ */
+export const INTERNAL_HQ_ACTOR = Object.freeze({ userId: 'SYSTEM', role: 'SUPER_ADMIN', franchiseId: null, label: 'system' });
+
+// What a franchise admin may do on its OWN order. Everything else is HQ-only.
+const FRANCHISE_ADMIN_TRANSITIONS = new Set<string>([
+  `${FranchiseOrderStatus.PENDING}->${FranchiseOrderStatus.CANCELLED}`,
+  `${FranchiseOrderStatus.DISPATCHED}->${FranchiseOrderStatus.DELIVERED}`,
+]);
+
+export function assertFranchiseOrderTransition(
+  order: { status: FranchiseOrderStatus; franchiseId: string },
+  next: FranchiseOrderStatus,
+  actor: { role?: string; franchiseId?: string | null }
+) {
+  const from = order.status;
+  if (from === next) {
+    throw new AppError(`Order is already ${from}.`, 409);
+  }
+  if (!(FRANCHISE_ORDER_TRANSITIONS[from] || []).includes(next)) {
+    if (next === FranchiseOrderStatus.CANCELLED && (from === FranchiseOrderStatus.DISPATCHED || from === FranchiseOrderStatus.DELIVERED)) {
+      throw new AppError(`A ${from} order cannot be cancelled. Use Sales Returns to take back dispatched goods.`, 409);
+    }
+    throw new AppError(`A franchise order cannot move from ${from} to ${next}.`, 409);
+  }
+  if (actor.role === 'SUPER_ADMIN') return;
+  if (actor.role !== 'FRANCHISE_ADMIN' || !actor.franchiseId || actor.franchiseId !== order.franchiseId) {
+    throw new AppError('Forbidden: you can only act on your own franchise\'s orders.', 403);
+  }
+  if (!FRANCHISE_ADMIN_TRANSITIONS.has(`${from}->${next}`)) {
+    throw new AppError(`Forbidden: only HQ can move an order from ${from} to ${next}.`, 403);
+  }
+}
+
+// Receipt at the franchise: credit its stock from the lots HQ dispatched
+// (reservation allocations), falling back to the order price for any
+// untracked remainder. Runs inside updateStatus's locked transaction.
+async function creditFranchiseStockOnDelivery(tx: any, order: { id: string; franchiseId: string; orderNumber: string }, hq: any) {
+  const id = order.id;
+  const fullOrder = await tx.franchiseOrder.findUniqueOrThrow({
+    where: { id },
+    include: { items: { include: { product: true } } },
+  });
+
+  const reservation = await tx.inventoryReservation.findUnique({
+    where: { franchiseOrderId: id },
+    include: { allocations: { include: { inventoryBatch: true } } }
+  });
+
+  for (const item of fullOrder.items) {
+    if (item.productType !== ProductType.FINISHED_GOOD) continue;
+    const product = item.product;
+    // Match by SKU alone when the product has one (name matching collapsed
+    // distinct weight variants onto one row).
+    const invItem = product.sku
+      ? await tx.inventoryItem.findFirst({ where: { franchiseId: order.franchiseId, sku: product.sku } })
+      : await tx.inventoryItem.findFirst({ where: { franchiseId: order.franchiseId, name: { equals: product.name, mode: 'insensitive' } } });
+
+    let targetInvItem = invItem;
+    if (!targetInvItem) {
+      const sku = product.sku || `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+      targetInvItem = await tx.inventoryItem.create({
+        data: {
+          name: product.name,
+          sku,
+          category: 'FINISHED_GOOD',
+          currentStock: 0,
+          unit: 'PC',
+          franchiseId: order.franchiseId,
+          basePrice: product.basePrice,
+          costPrice: item.unitPrice,
+          isActive: true
+        }
+      });
+    }
+
+    const hqInvItem = await findHqStockItem(tx, hq?.id || null, product);
+    let totalProcessedQty = 0;
+
+    if (reservation && hqInvItem) {
+      const itemAllocs = reservation.allocations.filter((a: any) => a.inventoryItemId === hqInvItem.id && a.consumedQty > 0);
+      for (const alloc of itemAllocs) {
+        if (totalProcessedQty >= item.quantity) break;
+        const receiptQty = Math.min(alloc.consumedQty, item.quantity - totalProcessedQty);
+        const trueUnitCost = alloc.inventoryBatch.unitCost || item.unitPrice;
+        const batchNum = alloc.inventoryBatch.batchNumber;
+
+        await InventoryService.recordMovement(tx, {
+          itemId: targetInvItem.id,
+          type: 'TRANSFER_IN',
+          quantity: receiptQty,
+          referenceType: 'FRANCHISE_ORDER',
+          referenceId: id,
+          note: `Received from HQ dispatch (Order ${fullOrder.orderNumber} Batch ${batchNum})`,
+          receiveAtCost: { unitCost: trueUnitCost, batchNumber: batchNum }
+        });
+        await tx.productBatch.create({
+          data: {
+            productId: item.productId,
+            franchiseId: order.franchiseId,
+            quantity: receiptQty,
+            batchCode: batchNum,
+            expiryDate: alloc.inventoryBatch.expDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          }
+        });
+        totalProcessedQty += receiptQty;
+      }
+    }
+
+    if (totalProcessedQty < item.quantity) {
+      const fallbackQty = item.quantity - totalProcessedQty;
+      await InventoryService.recordMovement(tx, {
+        itemId: targetInvItem.id,
+        type: 'TRANSFER_IN',
+        quantity: fallbackQty,
+        referenceType: 'FRANCHISE_ORDER',
+        referenceId: id,
+        note: `Received from HQ dispatch (Order ${fullOrder.orderNumber})`,
+        receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder.orderNumber}` }
+      });
+      await tx.productBatch.create({
+        data: {
+          productId: item.productId,
+          franchiseId: order.franchiseId,
+          quantity: fallbackQty,
+          batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
+          expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        }
+      });
+    }
+  }
+}
+
 
 export class FranchiseOrderService {
   // ─── Create Order ──────────────────────────────────────────────────────────
@@ -649,153 +801,130 @@ export class FranchiseOrderService {
   }
 
   // ─── Status Transitions ────────────────────────────────────────────────────
+  /**
+   * Franchise-order status change (audit C-03).
+   *
+   * Every transition runs in ONE transaction holding a row lock on the order,
+   * is checked against FRANCHISE_ORDER_TRANSITIONS (no skipping, no going
+   * back, no repeats) and against the caller's role:
+   *   - FRANCHISE_ADMIN (own orders only): cancel a PENDING order, confirm
+   *     receipt of a DISPATCHED order. Nothing else.
+   *   - SUPER_ADMIN (HQ): approve, start production, dispatch, cancel before
+   *     dispatch, and confirm receipt on the franchise's behalf.
+   * Cancellation after dispatch is rejected: dispatched goods come back
+   * through the Sales Returns flow (ReturnOrder.franchiseOrderId).
+   */
   static async updateStatus(
     id: string,
     status: FranchiseOrderStatus,
-    extra?: { actualDispatchDate?: string }
+    extra?: { actualDispatchDate?: string; notes?: string },
+    actor?: { userId?: string; role?: string; franchiseId?: string | null; label?: string | null }
   ) {
-    const order = await prisma.franchiseOrder.findUnique({ where: { id } });
-    if (!order) throw new Error('Order not found');
-
-    // Receiving is a one-way, strictly-gated transition: only a currently
-    // DISPATCHED order can be marked DELIVERED. Blocks double-click, browser
-    // retry, and duplicate/concurrent requests from re-running the inventory
-    // credit below — checked here (before any work) and re-checked inside
-    // the transaction below (against a fresh read) to close the race window.
-    if (status === FranchiseOrderStatus.DELIVERED && order.status !== FranchiseOrderStatus.DISPATCHED) {
-      throw new Error(`Cannot mark order as DELIVERED: order is currently "${order.status}", not "DISPATCHED". This receipt may have already been processed.`);
+    if (!Object.values(FranchiseOrderStatus).includes(status as any)) {
+      throw new AppError(`Invalid franchise order status "${status}".`, 400);
     }
+    if (!actor || !actor.role) throw new AppError('Unauthorized', 401);
 
-    const updateData: any = { status };
+    const updatedOrder = await prisma.$transaction(async tx => {
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "FranchiseOrder" WHERE id = ${id} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Order not found', 404);
+      const order = await tx.franchiseOrder.findUniqueOrThrow({ where: { id } });
 
-    // On approval, decide the fulfillment path (straight from stock vs. needs production)
-    // and, if production is needed, whether the raw materials for the shortfall are on hand.
-    // Re-checked on the move into production too, in case stock shifted since approval.
-    if (status === FranchiseOrderStatus.APPROVED || status === FranchiseOrderStatus.IN_PRODUCTION) {
-      const fulfillment = await computeFulfillment(prisma, id);
-      updateData.fulfillmentPath = fulfillment.fulfillmentPath;
-      updateData.materialsReady = fulfillment.materialsReady;
-      updateData.materialsShortfall = fulfillment.materialsShortfall;
+      assertFranchiseOrderTransition(order, status, actor);
 
-      // Production can't start on a shortfall the system can't back up with raw materials —
-      // this mirrors the disabled state in the UI, but enforced here so it can't be bypassed.
-      if (status === FranchiseOrderStatus.IN_PRODUCTION && !fulfillment.materialsReady) {
-        throw new Error('Cannot start production: raw materials are insufficient (or no recipe is configured) for this order.');
-      }
-      
-      // If order is newly APPROVED and we are fulfilling from STOCK, reserve physical FIFO layers now.
-      if (status === FranchiseOrderStatus.APPROVED && order.status === FranchiseOrderStatus.PENDING) {
-        if (fulfillment.fulfillmentPath === FranchiseOrderFulfillment.STOCK) {
-          const hq = await FranchiseService.getHqFranchiseOrNull(prisma as any);
-          const fullOrder = await prisma.franchiseOrder.findUnique({
-            where: { id },
-            include: { items: { include: { product: true } } },
-          });
+      const updateData: any = { status };
+      const hq = await FranchiseService.getHqFranchiseOrNull(tx);
+
+      if (status === FranchiseOrderStatus.APPROVED || status === FranchiseOrderStatus.IN_PRODUCTION) {
+        // Decide the fulfillment path (stock vs. production) and, for
+        // production, whether raw materials are on hand — under the lock.
+        const fulfillment = await computeFulfillment(tx, id);
+        updateData.fulfillmentPath = fulfillment.fulfillmentPath;
+        updateData.materialsReady = fulfillment.materialsReady;
+        updateData.materialsShortfall = fulfillment.materialsShortfall;
+
+        if (status === FranchiseOrderStatus.IN_PRODUCTION && !fulfillment.materialsReady) {
+          throw new AppError('Cannot start production: raw materials are insufficient (or no recipe is configured) for this order.', 409);
+        }
+
+        // Newly APPROVED and fulfilled from STOCK: reserve physical FIFO layers now.
+        if (status === FranchiseOrderStatus.APPROVED && fulfillment.fulfillmentPath === FranchiseOrderFulfillment.STOCK) {
+          const fullOrder = await tx.franchiseOrder.findUniqueOrThrow({ where: { id }, include: { items: { include: { product: true } } } });
           const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
-          for (const item of fullOrder!.items) {
+          for (const item of fullOrder.items) {
             if (item.productType === ProductType.FINISHED_GOOD) {
-              const product = item.product;
-              const invItem = await findHqStockItem(prisma, hq?.id, product);
-              if (invItem) {
-                itemsToReserve.push({ productId: product.id, inventoryItemId: invItem.id, quantity: item.quantity });
-              } else {
-                throw new Error(`HQ Inventory item not found for product ${product.name}`);
-              }
+              const invItem = await findHqStockItem(tx, hq?.id, item.product);
+              if (!invItem) throw new AppError(`HQ Inventory item not found for product ${item.product.name}`, 409);
+              itemsToReserve.push({ productId: item.product.id, inventoryItemId: invItem.id, quantity: item.quantity });
             }
           }
-          
-          const updatedOrder = await prisma.$transaction(async tx => {
-            if (itemsToReserve.length > 0) {
-              await InventoryReservationService.reserveStock(tx, id, itemsToReserve);
-            }
-            return await tx.franchiseOrder.update({
-              where: { id },
-              data: updateData,
-              include: { items: { include: { product: true } }, franchise: true },
-            });
-          });
-
-          try {
-            SocketService.io.emit('franchise-order-updated', updatedOrder);
-          } catch (err) {
-            console.error('[Socket] Failed to emit franchise-order-updated', err);
+          if (itemsToReserve.length > 0) {
+            await InventoryReservationService.reserveStock(tx, id, itemsToReserve);
           }
-          return updatedOrder;
         }
       }
-    }
 
-    if (status === FranchiseOrderStatus.CANCELLED) {
-      const updatedOrder = await prisma.$transaction(async tx => {
+      if (status === FranchiseOrderStatus.CANCELLED) {
+        // Money already paid on the order must be reversed first (payment
+        // cancellation reverses the franchise ledger and both accounts).
+        const paid = await tx.payment.aggregate({
+          where: { OR: [{ linkedDocId: order.orderNumber }, { linkedDocId: order.id }], status: 'SUCCESS', isCancelled: false },
+          _sum: { paidAmount: true }
+        });
+        if ((paid._sum.paidAmount || 0) > 0.009) {
+          throw new AppError('This order has payments recorded against it. Cancel those payments before cancelling the order.', 409);
+        }
+
         await InventoryReservationService.releaseReservation(tx, id);
-        return await tx.franchiseOrder.update({
-          where: { id },
-          data: updateData,
-          include: { items: { include: { product: true } }, franchise: true },
+
+        // Reverse the receivable posted when the order was created
+        // (FranchiseLedger ORDER debit + Franchise.outstandingAmount).
+        const orderDebit = await tx.franchiseLedger.aggregate({
+          where: { franchiseId: order.franchiseId, referenceType: FranchiseLedgerRefType.ORDER, referenceId: order.orderNumber, type: LedgerType.DEBIT },
+          _sum: { amount: true }
         });
-      });
-
-      try {
-        SocketService.io.emit('franchise-order-updated', updatedOrder);
-      } catch (err) {
-        console.error('[Socket] Failed to emit franchise-order-updated', err);
-      }
-      return updatedOrder;
-    }
-
-    if (status === FranchiseOrderStatus.DISPATCHED) {
-      if (order.status === FranchiseOrderStatus.DISPATCHED) {
-        // Idempotent: already dispatched, return order immediately
-        return prisma.franchiseOrder.findUnique({
-          where: { id },
-          include: { items: { include: { product: true } }, franchise: true },
+        const alreadyReversed = await tx.franchiseLedger.aggregate({
+          where: { franchiseId: order.franchiseId, referenceType: FranchiseLedgerRefType.ADJUSTMENT, referenceId: order.orderNumber, type: LedgerType.CREDIT },
+          _sum: { amount: true }
         });
-      }
-
-      if (order.status === FranchiseOrderStatus.CANCELLED) {
-        throw new Error('Cannot dispatch a cancelled order.');
-      }
-
-      if (order.status === FranchiseOrderStatus.DELIVERED) {
-        throw new Error('Cannot dispatch an order that has already been marked as DELIVERED.');
-      }
-
-      const actual = extra?.actualDispatchDate
-        ? new Date(extra.actualDispatchDate)
-        : new Date();
-      updateData.actualDispatchDate = actual;
-
-      // Phase 8: auto-flag delays
-      if (order.expectedDispatchDate && actual > order.expectedDispatchDate) {
-        updateData.delayStatus = 'DELAYED';
-      } else {
-        updateData.delayStatus = 'ON_TIME';
-      }
-
-      // Deduct batch stock for FINISHED_GOOD items (FIFO)
-      await prisma.$transaction(async tx => {
-        const fullOrder = await tx.franchiseOrder.findUnique({
-          where: { id },
-          include: { items: true },
-        });
-        if (!fullOrder) throw new Error('Order not found');
-        if (fullOrder.status === FranchiseOrderStatus.DISPATCHED) {
-          return; // Idempotency check inside transaction
+        const toReverse = Number(((orderDebit._sum.amount || 0) - (alreadyReversed._sum.amount || 0)).toFixed(2));
+        if (toReverse > 0.009) {
+          const franchise = await tx.franchise.findUniqueOrThrow({ where: { id: order.franchiseId }, select: { outstandingAmount: true } });
+          const newOutstanding = (franchise.outstandingAmount || 0) - toReverse;
+          await tx.franchiseLedger.create({
+            data: {
+              franchiseId: order.franchiseId,
+              type: LedgerType.CREDIT,
+              amount: toReverse,
+              balanceAfter: newOutstanding,
+              referenceType: FranchiseLedgerRefType.ADJUSTMENT,
+              referenceId: order.orderNumber,
+              note: `Order ${order.orderNumber} cancelled — reversal of order debit`,
+            }
+          });
+          await tx.franchise.update({ where: { id: order.franchiseId }, data: { outstandingAmount: newOutstanding } });
         }
 
-        const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-        
-        let hasActiveReservation = false;
+        const reason = typeof extra?.notes === 'string' ? extra.notes.trim().slice(0, 500) : '';
+        if (reason) updateData.notes = order.notes ? `${order.notes}\nCancelled: ${reason}` : `Cancelled: ${reason}`;
+      }
+
+      if (status === FranchiseOrderStatus.DISPATCHED) {
+        const actual = extra?.actualDispatchDate ? new Date(extra.actualDispatchDate) : new Date();
+        if (isNaN(actual.getTime())) throw new AppError('Invalid actualDispatchDate.', 400);
+        updateData.actualDispatchDate = actual;
+        updateData.delayStatus = order.expectedDispatchDate && actual > order.expectedDispatchDate ? 'DELAYED' : 'ON_TIME';
+
+        // Deduct HQ batch stock for FINISHED_GOOD items (FIFO), from the
+        // reservation made at approval (or one made now if none is active).
+        const fullOrder = await tx.franchiseOrder.findUniqueOrThrow({ where: { id }, include: { items: true } });
         const existingReservation = await tx.inventoryReservation.findUnique({
           where: { franchiseOrderId: id },
           include: { allocations: true }
         });
-        if (existingReservation && existingReservation.status === 'ACTIVE' && existingReservation.allocations.length > 0) {
-          hasActiveReservation = true;
-        }
+        const hasActiveReservation = !!existingReservation && existingReservation.status === 'ACTIVE' && existingReservation.allocations.length > 0;
 
         if (!hasActiveReservation) {
-          // If the order jumped straight to dispatch, or was in production, or had no reservation from approval, reserve now before consumption
           const itemsToReserve: { productId: string, inventoryItemId: string, quantity: number }[] = [];
           for (const item of fullOrder.items) {
             if (item.productType === ProductType.FINISHED_GOOD) {
@@ -810,9 +939,9 @@ export class FranchiseOrderService {
             await InventoryReservationService.reserveStock(tx, id, itemsToReserve);
           }
         }
-        
+
         const fifoResultByItem = await InventoryReservationService.consumeReservation(tx, id);
-        
+
         for (const item of fullOrder.items) {
           if (item.productType === ProductType.FINISHED_GOOD) {
             const product = await tx.product.findUnique({ where: { id: item.productId } });
@@ -823,157 +952,28 @@ export class FranchiseOrderService {
             }
           }
         }
-        await tx.franchiseOrder.update({ where: { id }, data: updateData });
-      });
+      }
 
-      return prisma.franchiseOrder.findUnique({
+      if (status === FranchiseOrderStatus.DELIVERED) {
+        await creditFranchiseStockOnDelivery(tx, order, hq);
+      }
+
+      const saved = await tx.franchiseOrder.update({
         where: { id },
+        data: updateData,
         include: { items: { include: { product: true } }, franchise: true },
       });
-    }
 
-    if (status === FranchiseOrderStatus.DELIVERED) {
-      await prisma.$transaction(async tx => {
-        const fullOrder = await tx.franchiseOrder.findUnique({
-          where: { id },
-          include: { items: { include: { product: true } } },
-        });
-
-        // Re-check inside the transaction against a fresh read, in case a
-        // concurrent request already delivered this order between the
-        // pre-check above and this transaction acquiring the row.
-        if (fullOrder!.status !== FranchiseOrderStatus.DISPATCHED) {
-          throw new Error(`Cannot mark order as DELIVERED: order is currently "${fullOrder!.status}", not "DISPATCHED". This receipt may have already been processed.`);
-        }
-
-        const reservation = await tx.inventoryReservation.findUnique({
-          where: { franchiseOrderId: id },
-          include: { allocations: { include: { inventoryBatch: true } } }
-        });
-
-        // Loop through all order items to fulfill inventory updates
-        for (const item of fullOrder!.items) {
-          if (item.productType === ProductType.FINISHED_GOOD) {
-            // STOCK IMPACT: Branch Stock INCREASE
-            // Increment/create the Franchise's local InventoryItem for this finished good product.
-            const product = item.product;
-            // Match by SKU alone when the product has one — OR-ing in a name match
-            // let two distinctly-SKU'd weight variants sharing the same product name
-            // (e.g. 450G/900G) collide, collapsing different variants onto a single row.
-            const invItem = product.sku
-              ? await tx.inventoryItem.findFirst({
-                  where: {
-                    franchiseId: order.franchiseId,
-                    sku: product.sku,
-                  },
-                })
-              : await tx.inventoryItem.findFirst({
-                  where: {
-                    franchiseId: order.franchiseId,
-                    name: { equals: product.name, mode: 'insensitive' },
-                  },
-                });
-
-            let targetInvItem = invItem;
-            if (!targetInvItem) {
-              // Create new inventory item for the franchise if it doesn't exist.
-              let sku = product.sku || `SKU-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-
-              targetInvItem = await tx.inventoryItem.create({
-                data: {
-                  name: product.name,
-                  sku,
-                  category: 'FINISHED_GOOD',
-                  currentStock: 0,
-                  unit: 'PC', // Default or fetch from product
-                  franchiseId: order.franchiseId,
-                  basePrice: product.basePrice,
-                  costPrice: item.unitPrice,
-                  isActive: true
-                }
-              });
-            }
-
-            // Find HQ's inventory item for this product to map allocations
-            const hq = await FranchiseService.getHqFranchiseOrNull(tx);
-            const hqInvItem = await findHqStockItem(tx, hq?.id || null, product);
-            
-            let totalProcessedQty = 0;
-
-            if (reservation && hqInvItem) {
-              const itemAllocs = reservation.allocations.filter(a => a.inventoryItemId === hqInvItem.id && a.consumedQty > 0);
-              for (const alloc of itemAllocs) {
-                if (totalProcessedQty >= item.quantity) break;
-                
-                const receiptQty = Math.min(alloc.consumedQty, item.quantity - totalProcessedQty);
-                const trueUnitCost = alloc.inventoryBatch.unitCost || item.unitPrice;
-                const batchNum = alloc.inventoryBatch.batchNumber;
-
-                await InventoryService.recordMovement(tx, {
-                  itemId: targetInvItem.id,
-                  type: 'TRANSFER_IN',
-                  quantity: receiptQty,
-                  referenceType: 'FRANCHISE_ORDER',
-                  referenceId: id,
-                  note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber} Batch ${batchNum})`,
-                  receiveAtCost: { unitCost: trueUnitCost, batchNumber: batchNum }
-                });
-                
-                // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
-                await tx.productBatch.create({
-                  data: {
-                    productId: item.productId,
-                    franchiseId: order.franchiseId,
-                    quantity: receiptQty,
-                    batchCode: batchNum,
-                    expiryDate: alloc.inventoryBatch.expDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-                  }
-                });
-
-                totalProcessedQty += receiptQty;
-              }
-            }
-
-            if (totalProcessedQty < item.quantity) {
-              const fallbackQty = item.quantity - totalProcessedQty;
-              // Every stock change must leave a ledger trail — record receiveAtCost so
-              // the receiving franchise lot carries the wholesale acquisition price (item.unitPrice).
-              await InventoryService.recordMovement(tx, {
-                itemId: targetInvItem.id,
-                type: 'TRANSFER_IN',
-                quantity: fallbackQty,
-                referenceType: 'FRANCHISE_ORDER',
-                referenceId: id,
-                note: `Received from HQ dispatch (Order ${fullOrder!.orderNumber})`,
-                receiveAtCost: { unitCost: item.unitPrice, batchNumber: `FO-${fullOrder!.orderNumber}` }
-              });
-
-              // Create a ProductBatch for the franchise so it shows up in the Branch Stock Registry
-              await tx.productBatch.create({
-                data: {
-                  productId: item.productId,
-                  franchiseId: order.franchiseId,
-                  quantity: fallbackQty,
-                  batchCode: `RECV-${order.orderNumber.substring(3)}-${item.productId.substring(0, 4)}`,
-                  expiryDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // Default 7 days for now
-                }
-              });
-            }
-          }
-        }
-        await tx.franchiseOrder.update({ where: { id }, data: updateData });
+      await writeAuditLog(tx, {
+        module: 'FRANCHISE_ORDER',
+        action: `STATUS_${status}`,
+        recordId: id,
+        oldValue: { status: order.status },
+        newValue: { status, orderNumber: order.orderNumber, notes: extra?.notes || null },
+        actor
       });
 
-      return prisma.franchiseOrder.findUnique({
-        where: { id },
-        include: { items: { include: { product: true } }, franchise: true },
-      });
-    }
-
-    const updatedOrder = await prisma.franchiseOrder.update({
-      where: { id },
-      data: updateData,
-      include: { items: { include: { product: true } }, franchise: true },
+      return saved;
     });
 
     try {
@@ -981,9 +981,9 @@ export class FranchiseOrderService {
     } catch (err) {
       console.error('[Socket] Failed to emit franchise-order-updated', err);
     }
-
     return updatedOrder;
   }
+
 
   // ─── Payment ───────────────────────────────────────────────────────────
   static async recordPayment(id: string, amount?: number, accountId?: string, paidBy?: string, isHqAdmin: boolean = false) {
@@ -1136,6 +1136,7 @@ export class FranchiseOrderService {
         await tx.payment.create({
           data: {
             paidAmount: payAmount,
+            flow: 'OUT', // money leaves the franchise account (audit C-07)
             status: 'SUCCESS',
             accountId: franchiseAcc.id,
             paymentMode: (franchiseAcc.type === 'BANK' ? 'BANK_TRANSFER' : (franchiseAcc.type === 'UPI' ? 'UPI' : 'CASH')) as any,

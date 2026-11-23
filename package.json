@@ -14,7 +14,10 @@
     "db:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",
     "db:cleanup": "tsx scripts/guard-destructive-db-command.ts && tsx prisma/cleanup_data.ts",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit -p .",
+    "test:phase1": "tsx scripts/run-phase1-tests.ts",
+    "test:phase1:unit": "tsx scripts/run-phase1-tests.ts --unit-only"
   },
   "dependencies": {
     "@businessgroupikasle/erp-units": "file:erp-units.tgz",

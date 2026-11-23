@@ -1,5 +1,5 @@
 import prisma from '../../lib/prisma';
-import { FranchiseOrderService } from '../../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../../modules/franchise/franchise-order.service';
 import { InventoryService } from '../../modules/inventory/inventory.service';
 import { POSService } from '../../modules/pos/pos.service';
 import { IsolationUtil } from '../../utils/isolation.util';
@@ -149,7 +149,7 @@ async function runE2EFranchiseAcceptanceTest() {
     console.log(`   - Order Created: ${order.orderNumber} (Total Amount: ₹${order.totalAmount})`);
     console.log(`   - Order Status: ${order.status}`);
 
-    const approvedOrder = await FranchiseOrderService.updateStatus(order.id, 'APPROVED' as any);
+    const approvedOrder = await FranchiseOrderService.updateStatus(order.id, 'APPROVED' as any, undefined, INTERNAL_HQ_ACTOR);
     if (!approvedOrder) throw new Error('Failed to approve order');
     console.log(`   - Order Status after Approval: ${approvedOrder.status} (Path: ${approvedOrder.fulfillmentPath})`);
     if (approvedOrder.status === 'APPROVED' && approvedOrder.fulfillmentPath === 'STOCK') {
@@ -161,7 +161,7 @@ async function runE2EFranchiseAcceptanceTest() {
 
     // 4. CASE E: HQ Dispatch (HQ Stock 100 -> 80)
     console.log('\n4️⃣ CASE E — HQ Dispatches Order (Fulfillment)...');
-    await FranchiseOrderService.updateStatus(order.id, 'DISPATCHED' as any);
+    await FranchiseOrderService.updateStatus(order.id, 'DISPATCHED' as any, undefined, INTERNAL_HQ_ACTOR);
     
     const reloadedHqItem = await prisma.inventoryItem.findUniqueOrThrow({ where: { id: hqInvItem.id } });
     console.log(`   - HQ Stock Remaining: ${reloadedHqItem.currentStock} units (Exp: 80 units)`);
@@ -174,7 +174,7 @@ async function runE2EFranchiseAcceptanceTest() {
 
     // 5. CASE F, G, H: Franchise Delivery & Receiving (Stock 0 -> 20, Cost = ₹80, SKU = product.sku)
     console.log('\n5️⃣ CASE F, G, H — Franchise Receives Stock...');
-    await FranchiseOrderService.updateStatus(order.id, 'DELIVERED' as any);
+    await FranchiseOrderService.updateStatus(order.id, 'DELIVERED' as any, undefined, INTERNAL_HQ_ACTOR);
 
     const productSku = product.sku || `BATTER-1KG-${testId}`;
     const franchiseItem = await prisma.inventoryItem.findFirst({

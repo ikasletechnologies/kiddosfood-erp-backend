@@ -4,6 +4,9 @@ import { IsolationUtil } from '../../utils/isolation.util';
 import { LotPricingError } from '../sales/lot-pricing.service';
 import { PartyLedgerService, PARTY_TYPES } from './party-ledger.service';
 import { businessDayRangeFilter } from '../../utils/business-date.util';
+import prisma from '../../lib/prisma';
+import { AppError } from '../../middleware/error.middleware';
+import { assertCanActOnFranchise, isSuperAdmin } from '../../utils/ownership.util';
 
 export class FinanceController {
   static async getPL(req: Request, res: Response) {
@@ -389,11 +392,12 @@ export class FinanceController {
       const user = (req as any).user;
       const result = await FinanceService.recordExpensePayment(id, {
         ...req.body,
-        createdBy: user?.fullName || user?.email || 'System'
+        createdBy: user?.fullName || user?.email || 'System',
+        actor: user
       });
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 
@@ -401,10 +405,10 @@ export class FinanceController {
     try {
       const { id } = req.params;
       const user = (req as any).user;
-      const result = await FinanceService.cancelExpense(id, user?.fullName || user?.email || 'System');
+      const result = await FinanceService.cancelExpense(id, user?.fullName || user?.email || 'System', user);
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 
@@ -441,14 +445,27 @@ export class FinanceController {
     try {
       const user = (req as any).user;
       const franchiseId = await IsolationUtil.enforceFranchiseMatch(user, req.body.franchiseId);
+      // `tx` must never come from the client (createPayment treats it as a
+      // transaction handle).
+      const { tx: _ignoredTx, ...body } = req.body || {};
+      // Only HQ may backdate a payment (still bounded by resolvePaymentDate);
+      // a franchise payment is always recorded at server time.
+      if (!isSuperAdmin(user)) delete body.createdAt;
+
+      // Audit H-13: a franchise admin may move money only through its own
+      // accounts and only against its own documents.
+      await FinanceController.assertPaymentTargetsOwned(user, body);
 
       const payment = await FinanceService.createPayment({
-        ...req.body, 
+        ...body,
         franchiseId,
         createdBy: user?.fullName || user?.email || 'System'
       });
       res.status(201).json(payment);
     } catch (error: any) {
+      if (error.statusCode === 401 || error.statusCode === 403 || error.statusCode === 404) {
+        return res.status(error.statusCode).json({ statusCode: error.statusCode, message: error.message, error: error.message });
+      }
       if (error.statusCode === 400 || error.code || (error.message && (
         error.message.startsWith('Insufficient') ||
         error.message.startsWith('Invalid payment') ||
@@ -472,20 +489,26 @@ export class FinanceController {
       const result = await FinanceService.cancelInvoice(req.params.id, user);
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ statusCode: 400, message: error.message });
+      const code = error.statusCode || 400;
+      res.status(code).json({ statusCode: code, message: error.message, error: error.message });
     }
   }
 
   static async transferFunds(req: Request, res: Response) {
     try {
       const user = (req as any).user;
+      const { fromAccountId, toAccountId, amount, note } = req.body || {};
       const result = await FinanceService.transferFunds({
-        ...req.body,
-        createdBy: user?.fullName || user?.email || 'System'
+        fromAccountId,
+        toAccountId,
+        amount,
+        note,
+        createdBy: user?.fullName || user?.email || 'System',
+        actor: user
       });
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 
@@ -493,10 +516,40 @@ export class FinanceController {
     try {
       const user = (req as any).user;
       const { id } = req.params;
-      const result = await FinanceService.cancelPayment(id, user?.fullName || user?.email || 'System');
+      const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : undefined;
+      const result = await FinanceService.cancelPayment(id, { ...user, label: user?.fullName || user?.email || null }, reason);
       res.json(result);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Ownership checks for a manual payment (POST /api/accounting/payments):
+   * the source account, any customer invoice(s) it settles and any vendor
+   * bill it pays must belong to the caller's franchise (SUPER_ADMIN: any).
+   */
+  private static async assertPaymentTargetsOwned(user: any, body: any) {
+    if (isSuperAdmin(user)) return;
+    const sourceAccount = body.sourceAccount;
+    if (typeof sourceAccount === 'string' && sourceAccount.length > 20) {
+      const acc = await prisma.account.findUnique({ where: { id: sourceAccount }, select: { franchiseId: true } });
+      if (!acc) throw new AppError('Payment account not found', 404);
+      await assertCanActOnFranchise(user, acc.franchiseId, 'payment account');
+    }
+    const invoiceIds = [
+      ...(typeof body.invoiceId === 'string' ? [body.invoiceId] : []),
+      ...(Array.isArray(body.allocations) ? body.allocations.map((a: any) => a?.invoiceId).filter((x: any) => typeof x === 'string') : []),
+    ];
+    for (const id of invoiceIds) {
+      const inv = await prisma.invoice.findUnique({ where: { id }, select: { order: { select: { franchiseId: true } } } });
+      if (!inv) throw new AppError('Invoice not found', 404);
+      await assertCanActOnFranchise(user, inv.order?.franchiseId, 'invoice');
+    }
+    if (typeof body.vendorInvoiceId === 'string') {
+      const vInv = await prisma.vendorInvoice.findUnique({ where: { id: body.vendorInvoiceId }, select: { procurementOrder: { select: { franchiseId: true } } } });
+      if (!vInv) throw new AppError('Vendor bill not found', 404);
+      await assertCanActOnFranchise(user, vInv.procurementOrder?.franchiseId, 'vendor bill');
     }
   }
 

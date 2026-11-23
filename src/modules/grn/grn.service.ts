@@ -4,7 +4,54 @@ import { purchaseLineTax } from '../procurement/purchase-tax';
 import { InventoryService } from '../inventory/inventory.service';
 import { ProcurementService } from '../procurement/procurement.service';
 import { VendorInvoiceService } from '../vendor-invoices/vendor-invoices.service';
+import { PurchaseService } from '../purchase/purchase.service';
+import { AppError } from '../../middleware/error.middleware';
+import { writeAuditLog, AuditActor } from '../../lib/audit-log';
 import { resolveSellerState } from '../../utils/gst-tax.util';
+import {
+  computePOFulfilment, lockPOForReceipt, resolvePOLine, syncPOReceiptState,
+  receiptBlockReason, poReceiptStatus, grnDisplayStatus
+} from '../procurement/po-fulfilment';
+
+const EPS = 0.0001;
+// Create + post (stock, lots, bill) in one transaction can exceed Prisma's
+// default 5 s interactive-transaction timeout on a busy database.
+const GRN_TX_OPTIONS = { maxWait: 10000, timeout: 60000 };
+
+export interface GRNLineInput {
+  poItemId?: string;
+  materialId?: string;
+  productId?: string;
+  purchaseOrderId?: string;
+  poId?: string;
+  orderedQty?: number;
+  receivedQty: number;
+  acceptedQty?: number;
+  rejectedQty?: number;
+  price?: number;
+  priceOverrideReason?: string;
+  qcStatus?: string;
+  vendorBatchNo?: string;
+  mfgDate?: string;
+  expDate?: string;
+  lotNumber?: string;
+  warehouseId?: string;
+  binId?: string;
+}
+
+export interface GRNCreateInput {
+  grnNumber?: string;
+  vendorId?: string;
+  purchaseOrderId?: string;
+  poId?: string;
+  receivedAt?: string;
+  receivedBy?: string;
+  freightCost?: number;
+  unloadingCost?: number;
+  performedBy?: string;
+  user?: any;
+  items: GRNLineInput[];
+}
 
 export class GRNService {
   /**
@@ -75,105 +122,90 @@ export class GRNService {
   }
 
   /**
-   * Cumulative received quantity per PO line, from COMPLETED GRNs only —
-   * the exact same basis `approve()` already uses to decide PO status
-   * (PARTIALLY_RECEIVED vs RECEIVED, see the receivedMap logic below). A
-   * PENDING GRN hasn't posted inventory yet and a CANCELLED one never will,
-   * so neither counts against what's still receivable — matching
-   * `approve()`'s own `status: 'COMPLETED'` filter.
+   * Remaining receivable quantity per PO line, for the New Receipt screen
+   * (legacy shape, kept for GET /api/grn/po/:poId/remaining). Same numbers as
+   * GET /api/purchase-orders/:poId/pending-items; see po-fulfilment.ts.
+   * Read-only and advisory: creation and posting re-validate under row locks.
    */
-  private static async getCumulativeReceived(tx: any, poId: string, excludeGrnId?: string): Promise<Map<string, number>> {
-    // A PO line is fulfilled by usable stock accepted through completed GRNs
-    // plus rejected stock whose GRN Purchase Return has been completed. Using
-    // raw receivedQty here left returned/damaged balances open forever and
-    // made the same PO reappear in New Receipt.
-    const [completedItems, completedReturns, poItems] = await Promise.all([
-      tx.goodsReceiptItem.findMany({
-        where: {
-          grn: {
-            poId,
-            status: 'COMPLETED',
-            ...(excludeGrnId ? { id: { not: excludeGrnId } } : {})
-          }
-        },
-        select: { materialId: true, acceptedQty: true }
-      }),
-      tx.purchaseReturn.findMany({
-        where: {
-          procurementOrderId: poId,
-          returnSource: 'GRN_REJECTION',
-          status: 'COMPLETED'
-        },
-        include: { items: true }
-      }),
-      tx.procurementOrderItem.findMany({
-        where: { poId },
-        include: { inventoryItem: { select: { name: true } } }
-      })
-    ]);
+  static async getRemainingQuantities(poId: string) {
+    const f = await computePOFulfilment(prisma, poId);
+    if (!f) throw new AppError('Purchase Order not found', 404);
+    return f.lines.map(l => ({
+      poItemId: l.poItemId,
+      materialId: l.materialId,
+      productId: l.productId,
+      itemName: l.itemName,
+      unit: l.unit,
+      ordered: l.orderedQty,
+      previouslyReceived: l.receivedQty,
+      remaining: l.pendingQty
+    }));
+  }
 
-    const map = new Map<string, number>();
-    for (const item of completedItems) {
-      if (!item.materialId) continue;
-      map.set(item.materialId, (map.get(item.materialId) || 0) + item.acceptedQty);
-    }
-
-    const materialByName = new Map<string, string>();
-    for (const item of poItems) {
-      if (!item.inventoryItemId) continue;
-      const name = (item.itemName || item.inventoryItem?.name || '').toLowerCase().trim();
-      if (name) materialByName.set(name, item.inventoryItemId);
-    }
-    // Historical duplicate documents must not over-fulfil a line. Cap the
-    // completed-return contribution at the ordered balance after accepted qty.
-    const returnedByMaterial = new Map<string, number>();
-    for (const purchaseReturn of completedReturns) {
-      for (const item of purchaseReturn.items) {
-        const materialId = materialByName.get((item.itemName || '').toLowerCase().trim());
-        if (!materialId) continue;
-        returnedByMaterial.set(materialId, (returnedByMaterial.get(materialId) || 0) + item.quantity);
-      }
-    }
-    for (const poItem of poItems) {
-      if (!poItem.inventoryItemId) continue;
-      const accepted = map.get(poItem.inventoryItemId) || 0;
-      const returnQty = returnedByMaterial.get(poItem.inventoryItemId) || 0;
-      const returnNeeded = Math.max(0, poItem.quantity - accepted);
-      map.set(poItem.inventoryItemId, accepted + Math.min(returnNeeded, returnQty));
-    }
-    return map;
+  /** GRNs recorded against one PO, newest first, with per-GRN totals. */
+  static async getGRNsForPO(poId: string) {
+    const po = await prisma.procurementOrder.findUnique({ where: { id: poId }, select: { id: true } });
+    if (!po) throw new AppError('Purchase Order not found', 404);
+    const grns = await prisma.goodsReceipt.findMany({
+      where: { poId },
+      include: {
+        vendor: { select: { id: true, name: true } },
+        items: { include: { inventoryItem: { select: { name: true, unit: true } }, poItem: { select: { id: true, itemName: true } } } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    return grns.map(g => ({
+      ...g,
+      displayStatus: grnDisplayStatus(g.status),
+      totalReceivedQty: Number(g.items.reduce((s, i) => s + (i.receivedQty || 0), 0).toFixed(4)),
+      totalAcceptedQty: Number(g.items.reduce((s, i) => s + (i.acceptedQty || 0), 0).toFixed(4)),
+      totalRejectedQty: Number(g.items.reduce((s, i) => s + (i.rejectedQty || 0), 0).toFixed(4))
+    }));
   }
 
   /**
-   * Remaining receivable quantity per PO line — ordered minus cumulative
-   * received (see getCumulativeReceived) — for the New Receipt screen to
-   * display/cap against. Read-only; no lock needed here since this is
-   * advisory for the UI, not the authoritative gate (createFromPO
-   * re-validates under a row lock at actual submission time).
+   * PO receipt summary: per-line ordered / received / pending, totals, the
+   * PO's GRNs, and whether a new GRN may be created (with the reason if not).
    */
-  static async getRemainingQuantities(poId: string) {
-    const po = await prisma.procurementOrder.findUnique({
-      where: { id: poId },
-      include: { poItems: { include: { inventoryItem: true } } }
-    });
-    if (!po) throw new Error('Purchase Order not found');
-
-    const receivedMap = await this.getCumulativeReceived(prisma, poId);
-
-    return po.poItems.map((item) => {
-      const received = receivedMap.get(item.inventoryItemId || '') || 0;
-      const remaining = Math.max(0, item.quantity - received);
-      return {
-        materialId: item.inventoryItemId,
-        itemName: item.itemName || item.inventoryItem?.name || null,
-        unit: item.unit,
-        ordered: item.quantity,
-        previouslyReceived: received,
-        remaining
-      };
-    });
+  static async getPOSummary(poId: string) {
+    const f = await computePOFulfilment(prisma, poId);
+    if (!f) throw new AppError('Purchase Order not found', 404);
+    const grns = await this.getGRNsForPO(poId);
+    const blockReason = receiptBlockReason(f.po, f.fullyReceived);
+    return {
+      poId: f.po.id,
+      poNumber: f.po.poNumber,
+      vendorId: f.po.vendorId,
+      vendorName: f.po.vendor?.name || null,
+      status: f.po.status,
+      receiptStatus: poReceiptStatus(f.po.status),
+      orderedAt: f.po.createdAt,
+      shortClosed: f.shortClosed,
+      shortClosedQty: f.shortClosedQty,
+      canReceive: !blockReason,
+      message: blockReason,
+      totals: f.totals,
+      lines: f.lines.map(l => ({ ...l, selectable: !blockReason && l.pendingQty > 0 })),
+      grns
+    };
   }
 
+  /** Only the PO lines that still have pendingQty > 0. */
+  static async getPendingItems(poId: string) {
+    const f = await computePOFulfilment(prisma, poId);
+    if (!f) throw new AppError('Purchase Order not found', 404);
+    const blockReason = receiptBlockReason(f.po, f.fullyReceived);
+    return {
+      poId: f.po.id,
+      poNumber: f.po.poNumber,
+      vendorId: f.po.vendorId,
+      status: f.po.status,
+      receiptStatus: poReceiptStatus(f.po.status),
+      canReceive: !blockReason,
+      message: blockReason,
+      items: blockReason ? [] : f.lines.filter(l => l.pendingQty > 0)
+    };
+  }
   /**
    * Authoritative backend scope validation for GRN warehouse assignments.
    * Ensures HQ users cannot receive goods into Franchise warehouses, and
@@ -219,176 +251,276 @@ export class GRNService {
     }
   }
 
-  static async createFromPO(
-    poId: string,
-    data: {
-      receivedBy?: string;
-      freightCost?: number;
-      unloadingCost?: number;
-      performedBy?: string;
-      user?: any;
-      items: Array<{
-        materialId: string;
-        orderedQty: number;
-        receivedQty: number;
-        acceptedQty: number;
-        rejectedQty: number;
-        price: number;
-        priceOverrideReason?: string;
-        qcStatus?: string;
-        vendorBatchNo?: string;
-        mfgDate?: string;
-        expDate?: string;
-        lotNumber?: string;
-        warehouseId?: string;
-        binId?: string;
-      }>;
+  /** Next GRN number GRN-YYYY-NNNNN from the atomic GRN_<year> sequence. */
+  private static async nextGrnNumber(tx: any): Promise<string> {
+    const year = new Date().getFullYear();
+    // A manually entered number may already occupy a generated value; skip it.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const seq = await this.nextSequence(tx, `GRN_${year}`);
+      const candidate = `GRN-${year}-${String(seq).padStart(5, '0')}`;
+      const taken = await tx.goodsReceipt.findUnique({ where: { grnNumber: candidate }, select: { id: true } });
+      if (!taken) return candidate;
     }
-  ) {
-    return prisma.$transaction(async (tx) => {
-      // Row lock on the parent PO — same pattern as sales.service.ts's
-      // _lockDeliveryChallanForReturn — so two concurrent createFromPO calls
-      // against the same PO serialize instead of both reading the same
-      // "remaining" snapshot and both passing validation (the exact race
-      // this feature exists to close: remaining=2, two GRNs both for 2,
-      // both "valid" if read concurrently without a lock).
-      await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${poId} FOR UPDATE`;
-
-      const po = await tx.procurementOrder.findUnique({
-        where: { id: poId },
-        include: { poItems: true }
-      });
-      if (!po) throw new Error('Purchase Order not found');
-      if (!isPOReceiptEligible(po.status)) throw new Error(`Cannot receive goods for a PO in status ${po.status}. Complete drafts before receiving; finalized orders cannot be received again.`);
-
-      // Authoritative cap: a GRN can never request more than what's still
-      // outstanding on the PO line (ordered − cumulative received from
-      // COMPLETED GRNs). Computed fresh, under the lock above, from
-      // persisted GoodsReceiptItem rows — never trusted from the client.
-      const receivedMap = await this.getCumulativeReceived(tx, poId);
-
-      const itemsData: any[] = [];
-      for (const item of data.items) {
-        const poItem = po.poItems.find(p => p.inventoryItemId === item.materialId);
-        if (!poItem) throw new Error(`Item ${item.materialId} does not belong to Purchase Order ${po.poNumber || poId}`);
-        purchaseLineTax(po.poItems, item.materialId, poItem.itemName || 'GRN line');
-
-        if (item.warehouseId) {
-          await this.validateWarehouseScope(tx, item.warehouseId, data.user);
-        }
-
-        const qty = Number(item.orderedQty ?? poItem.quantity ?? 0);
-        const poPrice = Number(poItem.price ?? 0);
-        const price = Number(item.price ?? poPrice);
-        const received = Number(item.receivedQty ?? 0);
-        const rejected = Number(item.rejectedQty ?? 0);
-        const accepted = Number(item.acceptedQty ?? Math.max(0, received - rejected));
-
-        if (price < 0) throw new Error(`Actual unit price for ${poItem.inventoryItemId} cannot be negative`);
-        if (received < 0) throw new Error(`Received quantity for ${poItem.inventoryItemId} cannot be negative`);
-        if (rejected < 0 || rejected > received) throw new Error(`Rejected quantity for ${poItem.inventoryItemId} must be between 0 and received quantity`);
-
-        const alreadyReceived = receivedMap.get(item.materialId) || 0;
-        const remaining = Math.max(0, poItem.quantity - alreadyReceived);
-        if (received > remaining + 0.0001) {
-          const label = poItem.itemName || item.materialId;
-          throw new Error(`Cannot receive ${received} ${poItem.unit} of "${label}" — only ${remaining} ${poItem.unit} remains on this Purchase Order (ordered ${poItem.quantity}, already received ${alreadyReceived}).`);
-        }
-
-        const priceOverridden = Math.abs(price - poPrice) > 0.001;
-        if (priceOverridden && !(item.priceOverrideReason || '').trim()) {
-          throw new Error(`Actual unit price for ${poItem.inventoryItemId} differs from PO price (₹${poPrice}) — an override reason is required`);
-        }
-
-        const mfgDate = item.mfgDate ? new Date(item.mfgDate) : null;
-        const expDate = item.expDate ? new Date(item.expDate) : null;
-
-        if (mfgDate && isNaN(mfgDate.getTime())) {
-          throw new Error(`Invalid Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
-        }
-        if (expDate && isNaN(expDate.getTime())) {
-          throw new Error(`Invalid Expiry (EXP) date for ${poItem.inventoryItemId}`);
-        }
-        if (mfgDate && expDate && expDate.getTime() < mfgDate.getTime()) {
-          throw new Error(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for ${poItem.inventoryItemId}`);
-        }
-
-        let assignedLotNumber: string | null = null;
-        const rawLot = (item.lotNumber || '').trim();
-        const isAutoLot = !rawLot || rawLot === '[AUTO]' || rawLot.toUpperCase().endsWith('-[AUTO]') || rawLot.toUpperCase() === 'AUTO' || rawLot === 'Auto-Generated on Save' || /^LOT-\d{8}-\d{5}$/i.test(rawLot);
-
-        if (accepted > 0) {
-          if (isAutoLot) {
-            const seq = await this.nextSequence(tx, 'GRN_LOT');
-            const now = new Date();
-            const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-            assignedLotNumber = `LOT-${ymd}-${String(seq).padStart(5, '0')}`;
-          } else {
-            // Validate manual lot number for duplicates against existing non-cancelled GRN items & Inventory Batches
-            const manualLot = rawLot;
-            const existingGrnItem = await tx.goodsReceiptItem.findFirst({
-              where: {
-                lotNumber: manualLot,
-                grn: { status: { not: 'CANCELLED' } }
-              }
-            });
-            const existingBatch = await tx.inventoryBatch.findFirst({
-              where: { lotNumber: manualLot }
-            });
-
-            if (existingGrnItem || existingBatch) {
-              const label = poItem.itemName || item.materialId;
-              throw new Error(`Batch/Lot Number "${manualLot}" already exists for item "${label}". Manual lot numbers must be unique.`);
-            }
-            assignedLotNumber = manualLot;
-          }
-        } else {
-          assignedLotNumber = isAutoLot ? null : rawLot;
-        }
-
-        itemsData.push({
-          materialId: item.materialId,
-          isBulk: Boolean(poItem?.isBulk),
-          quantity: qty,
-          receivedQty: received,
-          acceptedQty: accepted,
-          rejectedQty: rejected,
-          price: price,
-          poPrice: poPrice,
-          priceOverridden,
-          priceOverrideReason: priceOverridden ? item.priceOverrideReason!.trim() : null,
-          priceOverrideBy: priceOverridden ? (data.performedBy || null) : null,
-          priceOverrideAt: priceOverridden ? new Date() : null,
-          unit: poItem?.unit || 'UNIT',
-          qcStatus: (item.qcStatus as any) || 'PENDING',
-          vendorBatchNo: item.vendorBatchNo ? item.vendorBatchNo.trim() : null,
-          mfgDate,
-          expDate,
-          lotNumber: assignedLotNumber,
-          warehouseId: item.warehouseId,
-          binId: item.binId
-        });
-      }
-
-      return tx.goodsReceipt.create({
-        data: {
-          poId,
-          receivedBy: data.receivedBy,
-          freightCost: data.freightCost || 0,
-          unloadingCost: data.unloadingCost || 0,
-          status: 'PENDING',
-          items: { create: itemsData }
-        },
-        include: {
-          procurementOrder: { include: { vendor: true, poItems: true } },
-          items: { include: { inventoryItem: true } }
-        }
-      });
-    });
+    throw new AppError('Could not allocate a GRN number. Please retry.', 409);
   }
 
+  /**
+   * Legacy create (POST /api/grn/from-po/:poId): creates a DRAFT (PENDING)
+   * GRN; posting is a separate PATCH /api/grn/:id/approve. Lines with zero
+   * received and zero rejected quantity are ignored (the old screen sends
+   * every PO line). Same validation and locking as the new endpoint.
+   */
+  static async createFromPO(poId: string, data: GRNCreateInput) {
+    return prisma.$transaction(tx => this.createDraftInTx(tx, poId, data, { strict: false }), GRN_TX_OPTIONS);
+  }
+
+  /**
+   * POST /api/purchase-orders/:poId/grns. Creates the GRN against exactly one
+   * PO and, unless `post` is false, posts it (stock, lots, vendor bill, PO
+   * receipt counters and status) in the SAME transaction. Any failure rolls
+   * back the GRN, the PO changes and the stock together.
+   */
+  static async receiveAgainstPO(poId: string, data: GRNCreateInput, opts: { post?: boolean; rejectionReason?: string; user?: any } = {}) {
+    const post = opts.post !== false;
+    if (post) {
+      const role = String(opts.user?.role?.name || opts.user?.role || '').toUpperCase();
+      if (opts.user && role !== 'SUPER_ADMIN') throw new AppError('Only a Super Admin can post a GRN. Save it as a draft instead.', 403);
+    }
+    const grnId = await prisma.$transaction(async tx => {
+      const grn = await this.createDraftInTx(tx, poId, data, { strict: true });
+      if (post) await this.approveInTx(tx, grn.id, opts.user, { rejectionReason: opts.rejectionReason });
+      return grn.id;
+    }, GRN_TX_OPTIONS);
+    const [grn, summary] = await Promise.all([
+      prisma.goodsReceipt.findUniqueOrThrow({
+        where: { id: grnId },
+        include: { vendor: { select: { id: true, name: true } }, items: { include: { inventoryItem: { select: { name: true, unit: true } } } } }
+      }),
+      this.getPOSummary(poId)
+    ]);
+    return { grn: { ...grn, displayStatus: grnDisplayStatus(grn.status) }, summary };
+  }
+
+  /**
+   * Shared GRN creation core. Runs inside the caller's transaction:
+   *  1. locks the PO row and every PO line (FOR UPDATE) before reading
+   *     pendingQty, so two concurrent receipts serialize;
+   *  2. rejects CANCELLED / CLOSED / DRAFT / fully received POs;
+   *  3. validates vendor, GRN number, single PO, PO-line ownership, product
+   *     match, duplicate lines and receivedQty <= pendingQty;
+   *  4. creates the GRN as PENDING (draft). Stock is only touched by
+   *     approveInTx (posting).
+   */
+  private static async createDraftInTx(tx: any, poId: string, data: GRNCreateInput, opts: { strict: boolean }) {
+    const headerPoIds = [data.purchaseOrderId, data.poId].filter(v => v !== undefined && v !== null && v !== '');
+    if (headerPoIds.some(v => v !== poId)) {
+      throw new AppError('A GRN can belong to only one Purchase Order. The purchaseOrderId in the request does not match the Purchase Order being received.', 400);
+    }
+
+    if (!(await lockPOForReceipt(tx, poId))) throw new AppError('Purchase Order not found', 404);
+    const fulfilment = await computePOFulfilment(tx, poId);
+    if (!fulfilment) throw new AppError('Purchase Order not found', 404);
+    const po = fulfilment.po;
+    const poLabel = po.poNumber || poId;
+
+    const blockReason = receiptBlockReason(po, fulfilment.fullyReceived);
+    if (blockReason) throw new AppError(`${blockReason} (status ${po.status})`, 409);
+
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      throw new AppError('Add at least one PO item to receive.', 400);
+    }
+
+    if (data.vendorId && data.vendorId !== po.vendorId) {
+      throw new AppError(`GRN vendor must be the Purchase Order's vendor (${po.vendor?.name || po.vendorId}).`, 400);
+    }
+
+    let grnNumber: string;
+    const manualNumber = typeof data.grnNumber === 'string' ? data.grnNumber.trim() : '';
+    if (manualNumber) {
+      if (manualNumber.length > 50 || !/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(manualNumber)) {
+        throw new AppError('GRN number may contain only letters, digits and - / _ . (max 50 characters).', 400);
+      }
+      const taken = await tx.goodsReceipt.findUnique({ where: { grnNumber: manualNumber }, select: { id: true } });
+      if (taken) throw new AppError(`GRN number "${manualNumber}" already exists.`, 409);
+      grnNumber = manualNumber;
+    } else {
+      grnNumber = await this.nextGrnNumber(tx);
+    }
+
+    let receivedAt: Date | undefined;
+    if (data.receivedAt) {
+      receivedAt = new Date(data.receivedAt);
+      if (isNaN(receivedAt.getTime())) throw new AppError('Invalid received date.', 400);
+    }
+
+    const lineById = new Map<string, any>(fulfilment.lines.map(l => [l.poItemId, l]));
+    const seenLines = new Set<string>();
+    const itemsData: any[] = [];
+
+    for (const item of data.items) {
+      const linePoIds = [item.purchaseOrderId, item.poId].filter(v => v !== undefined && v !== null && v !== '');
+      if (linePoIds.some(v => v !== poId)) {
+        throw new AppError(`A GRN cannot contain products from another Purchase Order. Every line must belong to ${poLabel}.`, 400);
+      }
+
+      // --- Resolve the PO line this GRN line receives against -------------
+      const productKey = item.materialId || item.productId || null;
+      let poItem: any;
+      if (item.poItemId) {
+        poItem = po.poItems.find((p: any) => p.id === item.poItemId);
+        if (!poItem) {
+          throw new AppError(`PO line ${item.poItemId} does not belong to Purchase Order ${poLabel}. A GRN cannot contain products from another Purchase Order.`, 400);
+        }
+        const keys = [item.materialId, item.productId].filter(Boolean);
+        if (keys.some(k => k !== poItem.inventoryItemId && k !== poItem.productId)) {
+          throw new AppError(`Product does not match PO line "${poItem.itemName || poItem.id}".`, 400);
+        }
+      } else {
+        if (!productKey) throw new AppError('Each GRN line needs the poItemId (or productId) of the PO line it receives.', 400);
+        const matches = po.poItems.filter((p: any) => p.inventoryItemId === productKey || p.productId === productKey);
+        if (matches.length === 0) {
+          throw new AppError(`Item ${productKey} does not belong to Purchase Order ${poLabel}. A GRN cannot contain products from another Purchase Order.`, 400);
+        }
+        if (matches.length > 1) throw new AppError(`Purchase Order ${poLabel} has more than one line for this product. Send the poItemId of the line being received.`, 400);
+        poItem = matches[0];
+      }
+      const label = poItem.itemName || poItem.inventoryItemId || poItem.id;
+      const line = lineById.get(poItem.id)!;
+
+      // --- Quantities -------------------------------------------------------
+      const received = Number(item.receivedQty ?? 0);
+      const rejected = Number(item.rejectedQty ?? 0);
+      if (!Number.isFinite(received) || !Number.isFinite(rejected)) {
+        throw new AppError(`Quantities for "${label}" must be numbers.`, 400);
+      }
+      if (opts.strict && received <= 0) {
+        throw new AppError(`Received quantity for "${label}" must be greater than zero.`, 400);
+      }
+      if (received < 0) throw new AppError(`Received quantity for "${label}" cannot be negative.`, 400);
+      if (!opts.strict && received === 0 && rejected === 0) continue; // nothing on this line
+      if (rejected < 0 || rejected > received + EPS) {
+        throw new AppError(`Rejected quantity for "${label}" must be between 0 and the received quantity.`, 400);
+      }
+      const accepted = item.acceptedQty === undefined || item.acceptedQty === null ? received - rejected : Number(item.acceptedQty);
+      if (!Number.isFinite(accepted) || accepted < 0 || Math.abs(accepted + rejected - received) > EPS) {
+        throw new AppError(`For "${label}", accepted + rejected must equal the received quantity.`, 400);
+      }
+
+      if (seenLines.has(poItem.id)) {
+        throw new AppError(`Duplicate line for "${label}". Enter each PO item once per GRN.`, 400);
+      }
+      seenLines.add(poItem.id);
+
+      // Authoritative cap, computed under the locks above from persisted rows.
+      if (received > line.pendingQty + EPS) {
+        throw new AppError(
+          `Received quantity cannot exceed pending quantity. "${label}": pending ${line.pendingQty} ${line.unit} ` +
+          `(ordered ${line.orderedQty}, already received ${line.receivedQty}), tried to receive ${received}.`, 400);
+      }
+
+      purchaseLineTax(po.poItems, poItem.inventoryItemId, poItem.itemName || 'GRN line');
+
+      if (item.warehouseId) {
+        await this.validateWarehouseScope(tx, item.warehouseId, data.user);
+      }
+
+      const poPrice = Number(poItem.price ?? 0);
+      const price = Number(item.price ?? poPrice);
+      if (!Number.isFinite(price) || price < 0) throw new AppError(`Actual unit price for "${label}" cannot be negative.`, 400);
+
+      const priceOverridden = Math.abs(price - poPrice) > 0.001;
+      if (priceOverridden && !(item.priceOverrideReason || '').trim()) {
+        throw new AppError(`Actual unit price for "${label}" differs from PO price (₹${poPrice}). An override reason is required.`, 400);
+      }
+
+      const mfgDate = item.mfgDate ? new Date(item.mfgDate) : null;
+      const expDate = item.expDate ? new Date(item.expDate) : null;
+      if (mfgDate && isNaN(mfgDate.getTime())) throw new AppError(`Invalid Manufacturing (MFG) date for "${label}".`, 400);
+      if (expDate && isNaN(expDate.getTime())) throw new AppError(`Invalid Expiry (EXP) date for "${label}".`, 400);
+      if (mfgDate && expDate && expDate.getTime() < mfgDate.getTime()) {
+        throw new AppError(`Expiry (EXP) date cannot be earlier than Manufacturing (MFG) date for "${label}".`, 400);
+      }
+
+      let assignedLotNumber: string | null;
+      const rawLot = (item.lotNumber || '').trim();
+      const isAutoLot = !rawLot || rawLot === '[AUTO]' || rawLot.toUpperCase().endsWith('-[AUTO]') || rawLot.toUpperCase() === 'AUTO' || rawLot === 'Auto-Generated on Save' || /^LOT-\d{8}-\d{5}$/i.test(rawLot);
+
+      if (accepted > 0) {
+        if (isAutoLot) {
+          const seq = await this.nextSequence(tx, 'GRN_LOT');
+          const now = new Date();
+          const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+          assignedLotNumber = `LOT-${ymd}-${String(seq).padStart(5, '0')}`;
+        } else {
+          // Manual lot numbers must be unique across non-cancelled GRN lines and lots.
+          const existingGrnItem = await tx.goodsReceiptItem.findFirst({ where: { lotNumber: rawLot, grn: { status: { not: 'CANCELLED' } } } });
+          const existingBatch = await tx.inventoryBatch.findFirst({ where: { lotNumber: rawLot } });
+          if (existingGrnItem || existingBatch) {
+            throw new AppError(`Batch/Lot Number "${rawLot}" already exists for item "${label}". Manual lot numbers must be unique.`, 400);
+          }
+          assignedLotNumber = rawLot;
+        }
+      } else {
+        assignedLotNumber = isAutoLot ? null : rawLot;
+      }
+
+      itemsData.push({
+        poItemId: poItem.id,
+        materialId: poItem.inventoryItemId,
+        isBulk: Boolean(poItem.isBulk),
+        quantity: poItem.quantity,
+        receivedQty: received,
+        acceptedQty: accepted,
+        rejectedQty: rejected,
+        price,
+        poPrice,
+        priceOverridden,
+        priceOverrideReason: priceOverridden ? item.priceOverrideReason!.trim() : null,
+        priceOverrideBy: priceOverridden ? (data.performedBy || null) : null,
+        priceOverrideAt: priceOverridden ? new Date() : null,
+        unit: poItem.unit || 'UNIT',
+        qcStatus: (item.qcStatus as any) || 'PENDING',
+        vendorBatchNo: item.vendorBatchNo ? item.vendorBatchNo.trim() : null,
+        mfgDate,
+        expDate,
+        lotNumber: assignedLotNumber,
+        warehouseId: item.warehouseId,
+        binId: item.binId
+      });
+    }
+
+    if (itemsData.length === 0) throw new AppError('Enter a received quantity for at least one PO item.', 400);
+
+    return tx.goodsReceipt.create({
+      data: {
+        grnNumber,
+        poId,
+        vendorId: po.vendorId,
+        ...(receivedAt ? { receivedAt } : {}),
+        receivedBy: data.receivedBy,
+        freightCost: data.freightCost || 0,
+        unloadingCost: data.unloadingCost || 0,
+        status: 'PENDING',
+        items: { create: itemsData }
+      },
+      include: {
+        procurementOrder: { include: { vendor: true, poItems: true } },
+        items: { include: { inventoryItem: true } }
+      }
+    });
+  }
+  /** Post a draft GRN (PATCH /api/grn/:id/approve). */
   static async approve(grnId: string, user?: any, options: { rejectionReason?: string } = {}) {
-    return prisma.$transaction(async (tx) => {
+    return prisma.$transaction(tx => this.approveInTx(tx, grnId, user, options), GRN_TX_OPTIONS);
+  }
+
+  /**
+   * Posting core, run inside the caller's transaction (so create + post can
+   * be one atomic unit). Stock, lots, the vendor bill and the PO receipt
+   * counters are written only here, and only once per GRN.
+   */
+  private static async approveInTx(tx: any, grnId: string, user?: any, options: { rejectionReason?: string } = {}) {
+    {
       // Lock the GRN row BEFORE reading its status: two concurrent approvals
       // (double-click, retry) would otherwise both read PENDING and both
       // post lots, stock and a bill. The second waits here and then sees
@@ -405,13 +537,14 @@ export class GRNService {
       if (grn.status === 'REJECTED') throw new Error('GRN already finalized as fully rejected');
       if (grn.status === 'CANCELLED') throw new Error('Cannot approve a cancelled GRN');
 
-      // Same row lock createFromPO takes — two GRNs against the same PO
-      // (e.g. two created back-to-back before either was approved) must
-      // have their approvals serialized too, or both could complete and
-      // together push cumulative received past what was ever ordered.
-      await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${grn.poId} FOR UPDATE`;
-      const currentPO = await tx.procurementOrder.findUniqueOrThrow({ where: { id: grn.poId }, select: { status: true } });
-      if (!isPOReceiptEligible(currentPO.status)) throw new Error(`Cannot post a GRN for a PO in status ${currentPO.status}`);
+      // Same PO + PO-line row locks GRN creation takes: two GRNs against the
+      // same PO (e.g. two drafts created before either was posted) must have
+      // their postings serialized, or both could complete and together push
+      // received past what was ordered.
+      await lockPOForReceipt(tx, grn.poId);
+      const currentPO = await tx.procurementOrder.findUniqueOrThrow({ where: { id: grn.poId }, select: { status: true, shortClosedAt: true } });
+      if (!isPOReceiptEligible(currentPO.status)) throw new AppError(`Cannot post a GRN for a PO in status ${currentPO.status}`, 409);
+      if (currentPO.shortClosedAt) throw new AppError('Cannot post a GRN for a short-closed Purchase Order.', 409);
 
       // Full rejection: goods arrived but nothing was accepted. Finalized as
       // REJECTED with a mandatory reason — no inventory batch, stock
@@ -441,6 +574,9 @@ export class GRNService {
             performedBy: user?.userId || 'SYSTEM'
           }
         });
+        // Audit C-04: the return document is generated here, from this GRN's
+        // own rejected quantities, in the same transaction.
+        await PurchaseService.createGrnRejectionReturn(tx, grnId, `GRN FULL REJECTION: ${reason}`);
         return rejected;
       }
       if (nothingAccepted) throw new Error('Nothing was received on this GRN — there is nothing to approve.');
@@ -452,16 +588,20 @@ export class GRNService {
       // created (and left PENDING) before the first is approved, so this
       // is the last real gate before stock/ledger entries are made.
       {
-        const priorReceived = await this.getCumulativeReceived(tx, grn.poId, grnId);
+        const prior = await computePOFulfilment(tx, grn.poId, { excludeGrnId: grnId });
+        const thisGrnByLine = new Map<string, number>();
         for (const item of grn.items) {
-          if (!item.materialId) continue;
-          const poItem = grn.procurementOrder.poItems.find(p => p.inventoryItemId === item.materialId);
-          if (!poItem) continue;
-          const already = priorReceived.get(item.materialId) || 0;
-          const projected = already + item.receivedQty;
-          if (projected > poItem.quantity + 0.0001) {
-            const label = poItem.itemName || item.materialId;
-            throw new Error(`Cannot approve: "${label}" would receive ${projected} against an ordered quantity of ${poItem.quantity} (already completed elsewhere: ${already}). Reduce this GRN's received quantity or cancel a duplicate GRN first.`);
+          const poItem = resolvePOLine(grn.procurementOrder.poItems, item);
+          if (!poItem) throw new AppError(`GRN line ${item.id} does not belong to Purchase Order ${grn.procurementOrder.poNumber || grn.poId}.`, 400);
+          thisGrnByLine.set(poItem.id, (thisGrnByLine.get(poItem.id) || 0) + (item.receivedQty || 0));
+        }
+        for (const [poItemId, receiving] of thisGrnByLine) {
+          const line = prior!.lines.find(l => l.poItemId === poItemId)!;
+          if (receiving > line.pendingQty + EPS) {
+            throw new AppError(
+              `Received quantity cannot exceed pending quantity. Cannot post: "${line.itemName || poItemId}" would receive ${receiving} ` +
+              `but only ${line.pendingQty} ${line.unit} is pending (ordered ${line.orderedQty}, already received ${line.receivedQty}). ` +
+              `Reduce this GRN's received quantity or cancel a duplicate GRN first.`, 400);
           }
         }
       }
@@ -492,9 +632,6 @@ export class GRNService {
           }
         }
       }
-
-      let allReceived = true;
-      let someReceived = false;
 
       // Computed once up front so every batch created below AND the vendor
       // invoice generated later carry the exact same reference — FIFO
@@ -550,7 +687,7 @@ export class GRNService {
         const lineValue = item.acceptedQty * item.price;
         const unitCostPerStockUnit = canonicalQty > 0 ? lineValue / canonicalQty : item.price;
 
-        const poItem = grn.procurementOrder.poItems.find(p => p.inventoryItemId === item.materialId);
+        const poItem: any = resolvePOLine(grn.procurementOrder.poItems, item);
         const isBulkItem = Boolean(
           item.isBulk ||
           poItem?.isBulk ||
@@ -711,76 +848,83 @@ export class GRNService {
         }
       }
 
-      // Check PO fulfillment status
-      const allGRNsForPO = await tx.goodsReceiptItem.findMany({
-         where: { 
-           grn: { 
-             poId: grn.poId, 
-             status: 'COMPLETED',
-             id: { not: grnId } // Exclude current GRN to avoid double counting
-           } 
-         }
-      });
-      
-      const receivedMap = new Map();
-      // Add previous GRNs
-      allGRNsForPO.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty));
-      // Rejected units are fulfilled only after the linked Purchase Return is submitted.
-      grn.items.forEach(i => receivedMap.set(i.materialId, (receivedMap.get(i.materialId) || 0) + i.acceptedQty));
-
-      for (const poItem of grn.procurementOrder.poItems) {
-         const totalRcvd = receivedMap.get(poItem.inventoryItemId) || 0;
-         if (totalRcvd > 0) someReceived = true;
-         if (totalRcvd < poItem.quantity) allReceived = false;
-      }
-
-      const newPOStatus = allReceived ? 'RECEIVED' : (someReceived ? 'PARTIALLY_RECEIVED' : grn.procurementOrder.status);
-
-      await tx.procurementOrder.update({
-        where: { id: grn.poId },
-        data: { status: newPOStatus, received: allReceived }
-      });
+      // Mark the GRN posted first, then recompute the PO receipt state from
+      // persisted rows (this GRN now included): PO line receivedQty /
+      // pendingQty and PO status (PARTIALLY_RECEIVED / RECEIVED). Must run
+      // before settleVendorOrders, which settles RECEIVED POs only.
+      await tx.goodsReceipt.update({ where: { id: grnId }, data: { status: 'COMPLETED' } });
+      await syncPOReceiptState(tx, grn.poId);
 
       // Settle against any available advance
       await ProcurementService.settleVendorOrders(grn.procurementOrder.vendorId, tx);
 
-      const updatedGRN = await tx.goodsReceipt.update({
-        where: { id: grnId },
-        data: { status: 'COMPLETED' },
-        include: {
-          procurementOrder: { include: { vendor: true, poItems: true } },
-          items: { include: { inventoryItem: true } }
-        }
-      });
+      // Audit C-04: rejected lines on a partially accepted GRN get their
+      // return document server-side (quantity = rejectedQty, rate = GRN price).
+      // Only QC-rejected goods: an undelivered balance stays pending on the PO.
+      await PurchaseService.createGrnRejectionReturn(tx, grnId, null);
 
-      // Add Audit log
       await tx.auditLog.create({
          data: {
             module: 'GRN',
             action: 'APPROVE',
             recordId: grnId,
             newValue: { status: 'COMPLETED', inventoryState: 'QC_HOLD' },
-            performedBy: 'SYSTEM'
+            performedBy: user?.userId || 'SYSTEM'
          }
       });
 
-      return updatedGRN;
-    });
+      return tx.goodsReceipt.findUniqueOrThrow({
+        where: { id: grnId },
+        include: {
+          procurementOrder: { include: { vendor: true, poItems: true } },
+          items: { include: { inventoryItem: true } }
+        }
+      });
+    }
   }
 
-  static async cancel(grnId: string) {
-    const grn = await prisma.goodsReceipt.findUnique({ where: { id: grnId } });
-    if (!grn) throw new Error('GRN not found');
-    if (grn.status === 'COMPLETED') throw new Error('Cannot cancel an approved GRN');
-    if (grn.status === 'REJECTED') throw new Error('Cannot cancel a GRN already finalized as fully rejected');
+  /**
+   * Cancel a PENDING GRN (audit M-01). The previous version read the status
+   * outside any transaction and then wrote CANCELLED unconditionally, so a
+   * cancel racing an approval could stamp CANCELLED over a COMPLETED GRN —
+   * whose stock and bill were already posted — reopening the PO quantity for
+   * a second receipt. Now: same row locks as approve() (GRN, then PO), a
+   * conditional PENDING -> CANCELLED claim, a mandatory reason, and an audit
+   * record, all in one transaction.
+   */
+  static async cancel(grnId: string, opts: { reason?: unknown; actor?: AuditActor } = {}) {
+    const reason = typeof opts.reason === 'string' ? opts.reason.trim() : '';
+    if (reason.length < 3) throw new AppError('A cancellation reason (at least 3 characters) is required.', 400);
 
-    return prisma.goodsReceipt.update({
-      where: { id: grnId },
-      data: { status: 'CANCELLED' },
-      include: {
-        procurementOrder: { include: { vendor: true, poItems: true } },
-        items: { include: { inventoryItem: true } }
-      }
+    return prisma.$transaction(async (tx) => {
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "GoodsReceipt" WHERE id = ${grnId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('GRN not found', 404);
+      const grn = await tx.goodsReceipt.findUniqueOrThrow({ where: { id: grnId } });
+      await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${grn.poId} FOR UPDATE`;
+
+      if (grn.status === 'COMPLETED') throw new AppError('Cannot cancel an approved GRN. Use a purchase return for received goods.', 409);
+      if (grn.status === 'REJECTED') throw new AppError('Cannot cancel a GRN already finalized as fully rejected', 409);
+      if (grn.status === 'CANCELLED') throw new AppError('GRN is already cancelled', 409);
+
+      const claimed = await tx.goodsReceipt.updateMany({ where: { id: grnId, status: 'PENDING' }, data: { status: 'CANCELLED' } });
+      if (claimed.count !== 1) throw new AppError('GRN status changed concurrently — reload and try again.', 409);
+
+      await writeAuditLog(tx, {
+        module: 'GRN',
+        action: 'CANCELLED',
+        recordId: grnId,
+        oldValue: { status: grn.status },
+        newValue: { status: 'CANCELLED', reason, poId: grn.poId },
+        actor: opts.actor
+      });
+
+      return tx.goodsReceipt.findUniqueOrThrow({
+        where: { id: grnId },
+        include: {
+          procurementOrder: { include: { vendor: true, poItems: true } },
+          items: { include: { inventoryItem: true } }
+        }
+      });
     });
   }
 

@@ -1,6 +1,6 @@
 import prisma from '../lib/prisma';
 import { FranchiseService } from '../modules/franchise/franchise.service';
-import { FranchiseOrderService } from '../modules/franchise/franchise-order.service';
+import { FranchiseOrderService, INTERNAL_HQ_ACTOR } from '../modules/franchise/franchise-order.service';
 import { ProductService } from '../modules/product/product.service';
 import { FranchiseOrderStatus, FranchiseOrderType, ItemCategory, ProductType } from '@prisma/client';
 
@@ -171,14 +171,14 @@ async function runTests() {
   });
 
   // Approve order1
-  const approvedOrder = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.APPROVED);
+  const approvedOrder = await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.APPROVED, undefined, INTERNAL_HQ_ACTOR);
   console.log(`   Order approved: fulfillmentPath = ${approvedOrder?.fulfillmentPath} (Expected: STOCK)`);
   if (approvedOrder?.fulfillmentPath !== 'STOCK') {
     throw new Error(`FAIL Test 6: Expected fulfillmentPath STOCK, got: ${approvedOrder?.fulfillmentPath}`);
   }
 
   // Dispatch order1
-  await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED);
+  await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DISPATCHED, undefined, INTERNAL_HQ_ACTOR);
   const hqItemAfterDispatch = await prisma.inventoryItem.findUnique({ where: { id: hqInvItem.id } });
   console.log(`   HQ InventoryItem stock after dispatch: ${hqItemAfterDispatch?.currentStock} (Expected: 84)`);
   if (hqItemAfterDispatch?.currentStock !== 84) {
@@ -186,7 +186,7 @@ async function runTests() {
   }
 
   // Deliver order1
-  await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DELIVERED);
+  await FranchiseOrderService.updateStatus(order1.id, FranchiseOrderStatus.DELIVERED, undefined, INTERNAL_HQ_ACTOR);
   const branchItem = await prisma.inventoryItem.findFirst({
     where: { franchiseId: branch.id, name: productName }
   });

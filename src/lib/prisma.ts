@@ -8,7 +8,10 @@ const prismaClientSingleton = () => {
   const adapter = new PrismaPg(pool);
   // Franchise.aadhaarEncrypted is omitted from every query result by default so
   // the ciphertext never leaks through an `include: { franchise: true }`.
-  const client = new PrismaClient({ adapter, omit: { franchise: { aadhaarEncrypted: true } } });
+  // User.passwordHash is likewise omitted everywhere (it was returned by
+  // /api/users, /api/franchise/:id/users and any `include: { user: true }`);
+  // AuthService.login opts back in explicitly.
+  const client = new PrismaClient({ adapter, omit: { franchise: { aadhaarEncrypted: true }, user: { passwordHash: true } } });
 
   // Globally increase interactive transaction timeouts to prevent expiration errors
   const originalTransaction = client.$transaction.bind(client);

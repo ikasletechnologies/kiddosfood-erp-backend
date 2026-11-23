@@ -4,6 +4,8 @@ import { IsolationUtil } from '../../utils/isolation.util';
 import { WarehouseService } from '../warehouse/warehouse.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import prisma from '../../lib/prisma';
+import { assertCanActOnFranchise, requireNonNegativeNumber } from '../../utils/ownership.util';
+import { actorFromUser } from '../../lib/audit-log';
 
 function normalizeWarehouseName(s: string) {
   return s.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -35,9 +37,11 @@ export class InventoryController {
     try {
       const item = await InventoryService.getItemById(req.params.id);
       if (!item) return res.status(404).json({ error: 'Item not found' });
+      // Audit C-08: franchise admins may only read their own franchise's items.
+      await assertCanActOnFranchise((req as any).user, item.franchiseId, 'inventory item');
       res.json(item);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 
@@ -89,17 +93,33 @@ export class InventoryController {
 
   static async adjustment(req: Request, res: Response) {
     try {
-      const { itemId, newQuantity, unit, note } = req.body;
+      const user = (req as any).user;
+      const { itemId, unit, note } = req.body || {};
+      if (typeof itemId !== 'string' || !itemId.trim()) {
+        return res.status(400).json({ error: 'itemId is required' });
+      }
+      // Audit C-08: reject NaN / negative / non-numeric counts outright.
+      const newQuantity = requireNonNegativeNumber(req.body?.newQuantity, 'newQuantity');
+      if (note !== undefined && note !== null && typeof note !== 'string') {
+        return res.status(400).json({ error: 'note must be text' });
+      }
+
+      const item = await prisma.inventoryItem.findUnique({ where: { id: itemId }, select: { id: true, franchiseId: true } });
+      if (!item) return res.status(404).json({ error: 'Item not found' });
+      // Audit C-08: a franchise admin may adjust only its own franchise's stock.
+      await assertCanActOnFranchise(user, item.franchiseId, 'inventory item');
+
       const result = await InventoryService.adjustStock({
         itemId,
         newQuantity,
         unit,
         note,
-        userId: (req as any).user?.userId
+        userId: user?.userId,
+        actor: actorFromUser(user)
       });
       res.json(result);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 
@@ -119,8 +139,15 @@ export class InventoryController {
 
   static async submitReconciliation(req: Request, res: Response) {
     try {
-      const { entries } = req.body;
-      const results = await InventoryService.submitReconciliation(entries, (req as any).user?.userId);
+      const { entries } = req.body || {};
+      if (!Array.isArray(entries) || entries.length === 0) {
+        return res.status(400).json({ error: 'entries must be a non-empty array' });
+      }
+      for (const e of entries) {
+        if (!e || typeof e.itemId !== 'string') return res.status(400).json({ error: 'Each entry needs an itemId' });
+        e.physicalCount = requireNonNegativeNumber(e.physicalCount, `physicalCount for ${e.itemId}`);
+      }
+      const results = await InventoryService.submitReconciliation(entries, (req as any).user?.userId, actorFromUser((req as any).user));
       res.json(results);
     } catch (error: any) {
       res.status(400).json({ error: error.message });

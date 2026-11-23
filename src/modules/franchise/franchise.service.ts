@@ -3,6 +3,7 @@ import prisma from '../../lib/prisma';
 import {AttachmentService} from '../attachments/attachment.service';
 import {validateFranchisePhoto} from '../attachments/franchise-photo';
 import { AuthService } from '../auth/auth.service';
+import { assertStrongPassword } from '../users/user.service';
 import { encryptField } from '../../lib/field-crypto';
 import {
   FieldValidationError,
@@ -38,6 +39,10 @@ export class FranchiseService {
     // (mandatory admin Email ID + Password, optional Aadhaar/PAN) apply only
     // to branch (non-HQ) creation.
     const isBranch = franchiseData.isHQ !== true;
+    // Any admin login created here needs a real password — the HQ path used
+    // to fall back to the shared default 'franchise123'. Checked before any
+    // database work.
+    if (adminUser && (adminUser.email || franchiseData.contactNum)) assertStrongPassword(adminUser.password);
     let kycColumns: Record<string, string | null> = {};
     let adminEmail = '';
     if (isBranch) {
@@ -96,7 +101,8 @@ export class FranchiseService {
         // 2. Create Franchise Admin User if provided (requires email or phone).
         // Branches always reach here with a validated email + password.
         if (adminUser && (adminUser.email || franchiseData.contactNum)) {
-          const passwordHash = await AuthService.hashPassword(adminUser.password || 'franchise123');
+          // Password validated up front (no 'franchise123' default any more).
+          const passwordHash = await AuthService.hashPassword(adminUser.password);
 
           await tx.user.create({
             data: {

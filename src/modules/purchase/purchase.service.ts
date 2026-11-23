@@ -4,6 +4,9 @@ import { ProcurementService } from '../procurement/procurement.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { PurchaseLotsService } from '../inventory/purchase-lots.service';
 import { purchaseLineTax } from '../procurement/purchase-tax';
+import { syncPOReceiptState } from '../procurement/po-fulfilment';
+import { AppError } from '../../middleware/error.middleware';
+import { writeAuditLog, AuditActor } from '../../lib/audit-log';
 
 type ReturnItemInput = {
   itemName: string;
@@ -26,12 +29,27 @@ async function generateRFQNumber() {
   return `RFQ-${year}-${(count + 1).toString().padStart(5, '0')}`;
 }
 
-async function generateReturnNumber() {
+/**
+ * Transaction-safe purchase return number (PR-YYYY-NNNNN). The previous
+ * count-based number collided under concurrency (returnNumber is unique). The
+ * sequence row is seeded from the highest existing number on first use so
+ * numbering continues where it left off.
+ */
+async function generateReturnNumber(tx: any): Promise<string> {
   const year = new Date().getFullYear();
-  const count = await prisma.purchaseReturn.count({
-    where: { createdAt: { gte: new Date(year, 0, 1) } }
-  });
-  return `PR-${year}-${(count + 1).toString().padStart(5, '0')}`;
+  const key = `PURCHASE_RETURN_${year}`;
+  const prefix = `PR-${year}-`;
+  const existingSeq = await tx.numberSequence.findUnique({ where: { key } });
+  if (!existingSeq) {
+    const rows = await tx.purchaseReturn.findMany({ where: { returnNumber: { startsWith: prefix } }, select: { returnNumber: true } });
+    const max = rows.reduce((m: number, r: any) => {
+      const n = parseInt(String(r.returnNumber).slice(prefix.length), 10);
+      return Number.isFinite(n) && n > m ? n : m;
+    }, 0);
+    await tx.numberSequence.upsert({ where: { key }, create: { key, value: max }, update: {} });
+  }
+  const seq = await tx.numberSequence.update({ where: { key }, data: { value: { increment: 1 } } });
+  return `${prefix}${seq.value.toString().padStart(5, '0')}`;
 }
 
 export class PurchaseService {
@@ -226,6 +244,8 @@ export class PurchaseService {
       }
     });
     if (!pr) return;
+    // GRN-rejection returns are non-financial (see recognizeReturn): no debit note, no GST.
+    if (pr.returnSource === 'GRN_REJECTION') return;
 
     const sellerState = await resolveSellerState(pr.procurementOrder?.franchiseId || null);
     const poItems = pr.procurementOrder?.poItems || [];
@@ -278,6 +298,13 @@ export class PurchaseService {
       }
     });
     if (!pr) throw new Error('Purchase Return not found');
+
+    // Audit C-04: rejected goods were never billed — GRNService.approve bills
+    // ACCEPTED quantity only — so a GRN-rejection return must not reduce the
+    // vendor payable (that would be a second, phantom reduction). It is a
+    // physical/logistics document only. (Matches the documented expectation
+    // in src/tests/purchase-return-simplified-workflow.test.ts, check 7c.)
+    if (pr.returnSource === 'GRN_REJECTION') return pr;
 
     const taxableReturnAmount = Number(pr.taxableValue ?? pr.refundAmount) || pr.items.reduce(
       (sum: number, item: any) => sum + (Number(item.quantity) || 0) * (Number(item.rate) || 0),
@@ -343,10 +370,29 @@ export class PurchaseService {
     returnSource?: string;
     status?: string;
     items: Array<ReturnItemInput>;
-  }) {
+  }, actor?: AuditActor) {
     const { Decimal } = Prisma;
-    const returnSource = data.returnSource || 'MANUAL';
-    const initialStatus = data.status || 'PENDING';
+    // Audit C-04: the API creates MANUAL returns only. GRN-rejection returns
+    // are generated server-side inside GRNService.approve from the GRN's own
+    // rejected quantities (createGrnRejectionReturn) — a client-supplied
+    // GRN_REJECTION used to bypass every quantity/rate check.
+    const returnSource = data.returnSource ?? 'MANUAL';
+    if (returnSource !== 'MANUAL') {
+      throw new AppError('GRN rejection returns are created automatically when the GRN is approved; they cannot be submitted directly.', 400);
+    }
+    // Status is never client-controlled on create; completion (stock out +
+    // vendor debit) goes through updatePurchaseReturn.
+    if (data.status !== undefined && data.status !== 'PENDING') {
+      throw new AppError('A purchase return is always created as PENDING. Complete it with PATCH /api/purchase/returns/:id.', 400);
+    }
+    const initialStatus = 'PENDING';
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      throw new AppError('At least one return item is required.', 400);
+    }
+    for (const item of data.items) {
+      const q = Number(item?.quantity);
+      if (!Number.isFinite(q) || q <= 0) throw new AppError('Every return item needs a quantity greater than zero.', 400);
+    }
 
     // Lot fields are only ever set below, after server-side validation.
     let resolvedItems: ReturnItemInput[] = data.items.map(({ itemName, quantity, unit, rate }) => ({ itemName, quantity, unit, rate }));
@@ -462,33 +508,9 @@ export class PurchaseService {
       new Decimal(s).plus(new Decimal(i.quantity).times(i.rate)).toNumber(), 0);
 
     return prisma.$transaction(async (tx) => {
-      // A GRN approval can be retried by the client after a slow response.
-      // Serialize on the PO and return the existing equivalent document so
-      // the same rejected products never create duplicate Purchase Returns.
-      if (returnSource === 'GRN_REJECTION' && data.procurementOrderId) {
-        await tx.$queryRaw`SELECT id FROM "ProcurementOrder" WHERE id = ${data.procurementOrderId} FOR UPDATE`;
-        const existingReturns = await tx.purchaseReturn.findMany({
-          where: {
-            procurementOrderId: data.procurementOrderId,
-            vendorId: data.vendorId,
-            returnSource: 'GRN_REJECTION',
-            status: { not: 'CANCELLED' }
-          },
-          include: { vendor: true, items: true, procurementOrder: true },
-          orderBy: { createdAt: 'desc' }
-        });
-        const signature = (items: Array<{ itemName: string; quantity: number }>) => items
-          .map(item => `${(item.itemName || '').toLowerCase().trim()}:${Number(item.quantity)}`)
-          .sort()
-          .join('|');
-        const requestedSignature = signature(resolvedItems);
-        const duplicate = existingReturns.find((purchaseReturn: any) => signature(purchaseReturn.items) === requestedSignature);
-        if (duplicate) return duplicate;
-      }
-
       const created = await tx.purchaseReturn.create({
         data: {
-          returnNumber: await generateReturnNumber(),
+          returnNumber: await generateReturnNumber(tx),
           procurementOrderId: data.procurementOrderId,
           vendorId: data.vendorId,
           reason: data.reason,
@@ -512,16 +534,70 @@ export class PurchaseService {
         include: { vendor: true, items: true, procurementOrder: true }
       });
 
-      if (initialStatus === 'COMPLETED') {
-        if (returnSource !== 'GRN_REJECTION') {
-          await this.postReturnStock(tx, created);
-        }
-
-        await this.backfillPurchaseReturnTax(tx, created.id);
-        await this.recognizeReturn(tx, created.id);
-      }
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_RETURN',
+        action: 'CREATED',
+        recordId: created.id,
+        newValue: { returnNumber: created.returnNumber, vendorId: created.vendorId, refundAmount, returnSource },
+        actor
+      });
 
       return created;
+    });
+  }
+
+  /**
+   * Server-side GRN-rejection return (audit C-04). Called by GRNService.approve
+   * inside its transaction. Quantity = the GRN line's own rejectedQty, rate =
+   * the GRN line price; nothing comes from the client. One return per GRN
+   * (PurchaseReturn.goodsReceiptId is unique), so approval retries are no-ops.
+   * Created PENDING: the operator confirms the reason and submits it, which
+   * closes the PO quantity (no stock or vendor-ledger effect — rejected goods
+   * never entered stock and were never billed).
+   */
+  static async createGrnRejectionReturn(tx: any, grnId: string, reason?: string | null) {
+    const existing = await tx.purchaseReturn.findUnique({ where: { goodsReceiptId: grnId }, include: { items: true } });
+    if (existing) return existing;
+
+    const grn = await tx.goodsReceipt.findUnique({
+      where: { id: grnId },
+      include: { items: { include: { inventoryItem: { select: { name: true } } } }, procurementOrder: { include: { poItems: true } } }
+    });
+    if (!grn) throw new AppError('GRN not found', 404);
+
+    const lines = grn.items.filter((i: any) => i.materialId && (i.rejectedQty || 0) > 0);
+    if (!lines.length) return null;
+
+    const { Decimal } = Prisma;
+    const items = lines.map((i: any) => {
+      const poItem = grn.procurementOrder.poItems.find((p: any) => p.inventoryItemId === i.materialId);
+      const quantity = Number(i.rejectedQty);
+      const rate = Number(i.price);
+      return {
+        // Same name the PO-fulfilment matcher keys on (poItem.itemName first).
+        itemName: poItem?.itemName || i.inventoryItem?.name || 'Unknown Material',
+        quantity,
+        unit: i.unit || poItem?.unit || 'UNIT',
+        rate,
+        totalAmount: new Decimal(quantity).times(rate).toDecimalPlaces(4).toNumber(),
+        materialId: i.materialId,
+      };
+    });
+    const refundAmount = items.reduce((s: number, i: any) => new Decimal(s).plus(i.totalAmount).toNumber(), 0);
+
+    return tx.purchaseReturn.create({
+      data: {
+        returnNumber: await generateReturnNumber(tx),
+        procurementOrderId: grn.poId,
+        vendorId: grn.procurementOrder.vendorId,
+        goodsReceiptId: grn.id,
+        reason: (reason || '').trim() || 'PENDING_RETURN_REASON',
+        returnSource: 'GRN_REJECTION',
+        status: 'PENDING',
+        refundAmount,
+        items: { create: items }
+      },
+      include: { items: true }
     });
   }
 
@@ -570,7 +646,7 @@ export class PurchaseService {
     }
   }
 
-  static async updatePurchaseReturn(id: string, data: { status: string; reason?: string }) {
+  static async updatePurchaseReturn(id: string, data: { status: string; reason?: string }, actor?: AuditActor) {
     const { status } = data;
     if (status === 'APPROVED') {
       throw new Error('APPROVED status is no longer supported. Use COMPLETED instead.');
@@ -597,6 +673,15 @@ export class PurchaseService {
       }
       if (existing.status === 'COMPLETED') throw new Error('Cannot update a completed return');
       if (existing.status === 'CANCELLED') throw new Error('Cannot update a cancelled return');
+
+      await writeAuditLog(tx, {
+        module: 'PURCHASE_RETURN',
+        action: `STATUS_${status}`,
+        recordId: id,
+        oldValue: { status: existing.status },
+        newValue: { status, returnSource: existing.returnSource, reason: submittedReason || existing.reason },
+        actor
+      });
 
       if (status === 'COMPLETED') {
         // Atomic status claim: update status from PENDING to COMPLETED only if it is currently PENDING.
@@ -628,54 +713,13 @@ export class PurchaseService {
         await this.backfillPurchaseReturnTax(tx, id);
         await this.recognizeReturn(tx, id);
 
-        // A GRN rejection closes the PO balance only after the operator enters
-        // the reason and submits the product return. Fulfilment is accepted
-        // stock plus completed GRN-return quantity, so rejected goods cannot
-        // keep reappearing on the GRN ready-to-receive screen.
+        // A GRN rejection closes the PO line balance only after the operator
+        // enters the reason and submits the product return. Fulfilment is
+        // accepted stock plus completed GRN-return quantity; the shared
+        // po-fulfilment sync recomputes PO line receivedQty / pendingQty and
+        // the PO status (PARTIALLY_RECEIVED -> RECEIVED) under row locks.
         if (existing.returnSource === 'GRN_REJECTION' && existing.procurementOrderId) {
-          const po = await tx.procurementOrder.findUnique({
-            where: { id: existing.procurementOrderId },
-            include: {
-              poItems: { include: { inventoryItem: true } },
-              goodsReceipts: {
-                where: { status: 'COMPLETED' },
-                include: { items: { include: { inventoryItem: true } } }
-              },
-              purchaseReturns: {
-                where: { status: 'COMPLETED', returnSource: 'GRN_REJECTION' },
-                include: { items: true }
-              }
-            }
-          });
-
-          if (po) {
-            const fulfilledByName = new Map<string, number>();
-            for (const receipt of po.goodsReceipts) {
-              for (const item of receipt.items) {
-                const key = (item.inventoryItem?.name || '').toLowerCase().trim();
-                if (key) fulfilledByName.set(key, (fulfilledByName.get(key) || 0) + (item.acceptedQty || 0));
-              }
-            }
-            for (const purchaseReturn of po.purchaseReturns) {
-              for (const item of purchaseReturn.items) {
-                const key = (item.itemName || '').toLowerCase().trim();
-                if (key) fulfilledByName.set(key, (fulfilledByName.get(key) || 0) + (item.quantity || 0));
-              }
-            }
-
-            const allFulfilled = po.poItems.every((item: any) => {
-              const key = (item.itemName || item.inventoryItem?.name || '').toLowerCase().trim();
-              return (fulfilledByName.get(key) || 0) + 0.0001 >= item.quantity;
-            });
-            const anyFulfilled = Array.from(fulfilledByName.values()).some(quantity => quantity > 0);
-            await tx.procurementOrder.update({
-              where: { id: po.id },
-              data: {
-                status: allFulfilled ? 'RECEIVED' : (anyFulfilled ? 'PARTIALLY_RECEIVED' : po.status),
-                received: allFulfilled
-              }
-            });
-          }
+          await syncPOReceiptState(tx, existing.procurementOrderId);
         }
 
         return tx.purchaseReturn.findUnique({

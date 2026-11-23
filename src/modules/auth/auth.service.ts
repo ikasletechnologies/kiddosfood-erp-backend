@@ -3,6 +3,7 @@ import prisma from '../../lib/prisma';
 import { JwtUtil, TokenPayload } from '../../lib/jwt.util';
 import { AppError } from '../../middleware/error.middleware';
 import { UserRole } from '@prisma/client';
+import { writeAuditLog } from '../../lib/audit-log';
 
 export class AuthService {
   static async hashPassword(password: string): Promise<string> {
@@ -22,7 +23,9 @@ export class AuthService {
           { email: identifier },
           { phone: identifier }
         ]
-      }
+      },
+      // passwordHash is globally omitted (src/lib/prisma.ts); login is the one reader.
+      omit: { passwordHash: false }
     });
 
     if (!user) throw new AppError('Invalid credentials', 401);
@@ -96,6 +99,8 @@ export class AuthService {
     }
 
     const user = storedToken.user;
+    // A deactivated account must not keep minting tokens via refresh.
+    if (!user.is_active) throw new AppError('Account is inactive. Please contact admin.', 403);
     const newPayload: TokenPayload = {
       userId: user.id,
       email: user.email || undefined,
@@ -127,7 +132,17 @@ export class AuthService {
     });
   }
 
-  static async register(data: { fullName: string; email: string; phone?: string; password: string; role?: UserRole }) {
+  static async register(
+    data: { fullName: string; email: string; phone?: string; password: string; role?: UserRole },
+    actingUser?: { userId?: string; role?: string; franchiseId?: string | null } | null
+  ) {
+    // Audit C-01 (defence in depth behind the route guard): only an
+    // authenticated SUPER_ADMIN may create accounts, and only that caller's
+    // request may carry a role. No anonymous path can reach the insert below.
+    if (!actingUser || actingUser.role !== 'SUPER_ADMIN') {
+      throw new AppError('Forbidden: only a Super Admin can create user accounts', 403);
+    }
+
     // 1. Check if user exists
     const existing = await prisma.user.findFirst({
       where: {
@@ -145,16 +160,26 @@ export class AuthService {
     // 2. Hash password
     const passwordHash = await this.hashPassword(data.password);
 
-    // 3. Create user
-    const user = await prisma.user.create({
-      data: {
-        fullName: data.fullName,
-        email: data.email,
-        phone: data.phone,
-        passwordHash,
-        role: data.role || UserRole.FRANCHISE_ADMIN,
-        is_active: true
-      }
+    // 3. Create user + audit record atomically
+    const user = await prisma.$transaction(async (tx) => {
+      const created = await tx.user.create({
+        data: {
+          fullName: data.fullName,
+          email: data.email,
+          phone: data.phone,
+          passwordHash,
+          role: data.role || UserRole.FRANCHISE_ADMIN,
+          is_active: true
+        }
+      });
+      await writeAuditLog(tx, {
+        module: 'AUTH',
+        action: 'USER_REGISTERED',
+        recordId: created.id,
+        newValue: { email: created.email, role: created.role },
+        actor: { userId: actingUser.userId, role: actingUser.role, franchiseId: actingUser.franchiseId ?? null }
+      });
+      return created;
     });
 
     return {

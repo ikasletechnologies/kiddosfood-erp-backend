@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { ProcurementService } from './procurement.service';
 import { IsolationUtil } from '../../utils/isolation.util';
+import { actorFromUser } from '../../lib/audit-log';
 
 export class ProcurementController {
   // --- Supplier (Vendor) Management ---
@@ -150,19 +151,22 @@ export class ProcurementController {
 
   static async cancelPO(req: Request, res: Response) {
     try {
-      const po = await ProcurementService.cancelPO(req.params.id);
+      const po = await ProcurementService.cancelPO(req.params.id, {
+        reason: req.body?.reason,
+        actor: actorFromUser((req as any).user)
+      });
       res.json(po);
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 
   static async deletePO(req: Request, res: Response) {
     try {
-      await ProcurementService.deletePO(req.params.id);
+      await ProcurementService.deletePO(req.params.id, actorFromUser((req as any).user));
       res.json({ message: 'Purchase Order deleted' });
     } catch (error: any) {
-      res.status(400).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 
@@ -172,14 +176,28 @@ export class ProcurementController {
    */
   static async recordAdvance(req: Request, res: Response) {
     try {
-      const { advancePaid } = req.body;
-      if (typeof advancePaid !== 'number' || advancePaid < 0) {
-        return res.status(400).json({ error: 'advancePaid must be a non-negative number' });
-      }
-      const po = await ProcurementService.recordAdvancePayment(req.params.id, advancePaid);
+      const { advancePaid, amount, accountId, paymentMode } = req.body || {};
+      const po = await ProcurementService.recordAdvancePayment(req.params.id, {
+        amount: amount ?? advancePaid,
+        accountId,
+        paymentMode,
+        actor: actorFromUser((req as any).user)
+      });
       res.json(po);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 400).json({ error: error.message });
+    }
+  }
+
+  static async shortClosePO(req: Request, res: Response) {
+    try {
+      const po = await ProcurementService.shortClosePO(req.params.id, {
+        reason: req.body?.reason,
+        actor: actorFromUser((req as any).user)
+      });
+      res.json(po);
+    } catch (error: any) {
+      res.status(error.statusCode || 400).json({ error: error.message });
     }
   }
 

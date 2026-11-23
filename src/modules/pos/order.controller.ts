@@ -30,7 +30,7 @@ export class OrderController {
       const order = await POSService.addItemsToOrder(req.params.id, items);
       res.status(200).json(order);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 
@@ -43,14 +43,14 @@ export class OrderController {
         return res.status(403).json({ error: 'Forbidden: Access denied to this order' });
       }
 
-      const { status } = req.body;
-      const order = await POSService.updateOrderStatus(req.params.id, status);
+      const { status } = req.body || {};
+      const order = await POSService.updateOrderStatus(req.params.id, status, user);
       res.json(order);
     } catch (error: any) {
       // Meaningful status codes for Out of Stock or Missing Inventory conditions
       const cleanMsg = error.message.toLowerCase();
       const isBadRequest = cleanMsg.includes('out of stock') || cleanMsg.includes('already completed') || cleanMsg.includes('not found');
-      res.status(isBadRequest ? 400 : 500).json({ error: error.message });
+      res.status(error.statusCode || (isBadRequest ? 400 : 500)).json({ error: error.message });
     }
   }
 
@@ -69,7 +69,7 @@ export class OrderController {
       const order = await POSService.payOrder(req.params.id, method, accountId, user?.userId);
       res.status(200).json(order);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   }
 

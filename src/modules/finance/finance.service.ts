@@ -178,6 +178,10 @@ import { ItemCategory, PaymentMode, LedgerType, FranchiseLedgerRefType } from '@
 import { PaymentValidationError } from '../../utils/errors';
 import { splitGstAmount, computeGstUtilization, resolveSellerStatesFor } from '../../utils/gst-tax.util';
 import { isLotExpired } from '../inventory/lot-eligibility';
+import { writeAuditLog, AuditActor } from '../../lib/audit-log';
+import { AppError } from '../../middleware/error.middleware';
+import { assertCanActOnFranchise, ownerKeyOf, requirePositiveAmount, isSuperAdmin, ActingUser } from '../../utils/ownership.util';
+import { resolvePaymentFlow, isPostedPayment } from './payment-flow';
 
 
 // Shared Category Resolver
@@ -316,6 +320,29 @@ function finalSaleWhere(extra: Record<string, any> = {}) {
   };
 }
 
+
+/**
+ * Effective date of a payment. Backdating is allowed only within
+ * PAYMENT_BACKDATE_MAX_DAYS (default 31) and never into the future; every
+ * backdated payment is audited. (Controllers additionally strip the date for
+ * non-HQ users.) Returns undefined for "now".
+ */
+export const PAYMENT_BACKDATE_MAX_DAYS = (() => {
+  const n = Number(process.env.PAYMENT_BACKDATE_MAX_DAYS ?? 31);
+  return Number.isFinite(n) && n >= 0 ? n : 31;
+})();
+export function resolvePaymentDate(value: unknown): Date | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const d = value instanceof Date ? value : new Date(value as any);
+  if (isNaN(d.getTime())) throw new AppError('Invalid payment date.', 400);
+  const now = Date.now();
+  if (d.getTime() > now + 5 * 60 * 1000) throw new AppError('Payment date cannot be in the future.', 400);
+  if (d.getTime() < now - PAYMENT_BACKDATE_MAX_DAYS * 24 * 60 * 60 * 1000) {
+    throw new AppError(`Payment date cannot be more than ${PAYMENT_BACKDATE_MAX_DAYS} days in the past.`, 400);
+  }
+  return d;
+}
+
 export class FinanceService {
   /**
    * Automatically generate an Invoice for a completed order
@@ -332,7 +359,10 @@ export class FinanceService {
       const subTotal = order.subTotal;
       const taxAmount = order.taxAmount ?? Number((subTotal * 0.05).toFixed(2));
       const finalAmount = order.totalAmount ?? (subTotal + taxAmount);
-      const invoiceStatus = order.paymentStatus === 'PAID' ? 'PAID' : (order.status === 'COMPLETED' ? 'PAID' : 'UNPAID');
+      // Paid status comes from actual money only: a COMPLETED (served) order
+      // is not a paid one — this used to mark every completed order's invoice
+      // PAID, hiding the receivable.
+      const invoiceStatus = order.paymentStatus === 'PAID' ? 'PAID' : order.paymentStatus === 'PARTIAL' ? 'PARTIAL' : 'UNPAID';
 
       // 2. Create Invoice
       const invoice = await tx.invoice.upsert({
@@ -939,10 +969,20 @@ export class FinanceService {
     });
   }
 
-  static async recordExpensePayment(expenseId: string, data: { amount: number, accountId: string, paymentMode: any, note?: string, createdBy?: string }) {
+  static async recordExpensePayment(expenseId: string, data: { amount: number, accountId: string, paymentMode: any, note?: string, createdBy?: string, actor?: ActingUser }) {
+    data.amount = requirePositiveAmount(data.amount, 'Payment amount');
     return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Expense" WHERE id = ${expenseId} FOR UPDATE`;
       const expense = await tx.expense.findUnique({ where: { id: expenseId } });
-      if (!expense) throw new Error("Expense not found");
+      if (!expense) throw new AppError("Expense not found", 404);
+      if (data.actor) {
+        await assertCanActOnFranchise(data.actor, expense.franchiseId, 'expense', tx);
+        if (data.accountId) {
+          const acc = await tx.account.findUnique({ where: { id: data.accountId }, select: { franchiseId: true } });
+          if (!acc) throw new AppError('Payment account not found', 404);
+          await assertCanActOnFranchise(data.actor, acc.franchiseId, 'payment account', tx);
+        }
+      }
       if (expense.isCancelled) throw new Error("Cannot pay a cancelled expense");
 
       const remaining = expense.amount - expense.paidAmount;
@@ -984,11 +1024,27 @@ export class FinanceService {
     });
   }
 
-  static async cancelExpense(expenseId: string, cancelledBy?: string) {
+  static async cancelExpense(expenseId: string, cancelledBy?: string, actor?: ActingUser) {
     return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Expense" WHERE id = ${expenseId} FOR UPDATE`;
       const expense = await tx.expense.findUnique({ where: { id: expenseId } });
-      if (!expense) throw new Error("Expense not found");
-      if (expense.status === "PAID") throw new Error("Cannot cancel a fully paid expense. Please cancel the payments first.");
+      if (!expense) throw new AppError("Expense not found", 404);
+      // Audit H-13: franchise admins may cancel only their own franchise's expenses.
+      if (actor) await assertCanActOnFranchise(actor, expense.franchiseId, 'expense', tx);
+      if (expense.isCancelled) return { success: true, alreadyCancelled: true };
+      // Any money already paid against the bill must be reversed first (via
+      // payment cancellation) — otherwise cash stays spent against a bill
+      // that no longer exists. Previously only a FULLY paid bill was blocked.
+      if (expense.paidAmount > 0.009) {
+        throw new AppError("Cannot cancel an expense that has payments recorded against it. Cancel those payments first.", 400);
+      }
+      await writeAuditLog(tx, {
+        module: 'FINANCE',
+        action: 'EXPENSE_CANCELLED',
+        recordId: expense.id,
+        oldValue: { status: expense.status, amount: expense.amount },
+        actor: actor ? { ...actor, label: cancelledBy } : { label: cancelledBy }
+      });
 
       // 1. Mark as cancelled
       await tx.expense.update({
@@ -1052,9 +1108,19 @@ export class FinanceService {
 
   static async cancelInvoice(invoiceId: string, user?: any) {
     return prisma.$transaction(async (tx) => {
-      const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
-      if (!invoice) throw new Error("Invoice not found");
+      await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${invoiceId} FOR UPDATE`;
+      const invoice = await tx.invoice.findUnique({ where: { id: invoiceId }, include: { order: { select: { franchiseId: true, invoiceNum: true } } } });
+      if (!invoice) throw new AppError("Invoice not found", 404);
+      // Audit H-13: franchise admins may cancel only their own franchise's invoices.
+      if (user) await assertCanActOnFranchise(user, invoice.order?.franchiseId, 'invoice', tx);
       if (invoice.status === "CANCELLED") throw new Error("Invoice is already cancelled");
+      await writeAuditLog(tx, {
+        module: 'FINANCE',
+        action: 'INVOICE_CANCELLED',
+        recordId: invoice.id,
+        oldValue: { status: invoice.status, invoiceNum: invoice.order?.invoiceNum, finalAmount: invoice.finalAmount },
+        actor: user ? { userId: user.userId, role: user.role, franchiseId: user.franchiseId ?? null } : null
+      });
 
       const dispatches = await tx.deliveryChallan.findMany({ where: { sourceInvoiceId: invoice.orderId, status: { in: ['IN_TRANSIT', 'OPEN', 'CLOSED', 'CONVERTED'] } }, select: { id: true } });
       if (dispatches.length && await tx.stockMovement.count({ where: { referenceType: 'INVOICE_FULFILMENT', referenceId: { in: dispatches.map(d => d.id) } } })) throw new Error('Cancel or reverse linked dispatches before cancelling this invoice.');
@@ -1070,6 +1136,13 @@ export class FinanceService {
       if (activePayments.length > 0 || activeAllocations.length > 0) {
         throw new Error("Cannot cancel an invoice with active payments. Please cancel payments first.");
       }
+      // Goods already taken back through Sales Returns have had their stock
+      // restored by the return; cancelling the invoice on top would restore
+      // it a second time (audit H-07).
+      const returns = await tx.returnOrder.count({ where: { posOrderId: invoice.orderId, status: { not: 'REJECTED' } } });
+      if (returns > 0) {
+        throw new AppError('This invoice has sales returns recorded against it and cannot be cancelled. Settle it through Sales Returns instead.', 409);
+      }
 
       await tx.invoice.update({
         where: { id: invoiceId },
@@ -1077,10 +1150,17 @@ export class FinanceService {
       });
 
       if (invoice.orderId) {
+        // Release the unique link to a source Sales Order (Order.sourceSalesOrderId
+        // is @unique) so the order can be invoiced again (audit H-07).
         const order = await tx.order.update({
           where: { id: invoice.orderId },
-          data: { status: "CANCELLED", paymentStatus: "CANCELLED" }
+          data: { status: "CANCELLED", paymentStatus: "CANCELLED", sourceSalesOrderId: null }
         });
+
+        // Audit H-07: put the invoiced goods back into stock, onto the exact
+        // lots (and at the exact cost) the sale consumed.
+        await this.restoreInvoiceStock(tx, order.id, order.invoiceNum, user?.userId || 'system');
+        await this.reopenSourceDocuments(tx, order.id);
 
         // Reverse the receivable this invoice put on the customer ledger
         // (its SALE debit, plus any payment credit keyed to the order
@@ -1096,6 +1176,59 @@ export class FinanceService {
 
       return { success: true, message: "Invoice cancelled successfully" };
     });
+  }
+
+  /**
+   * Reverses every SALES_OUT movement an invoice posted (referenceType ORDER),
+   * crediting each consumed lot back at its own historical cost. Idempotent:
+   * a second call finds the INVOICE_CANCEL restock already present and does
+   * nothing.
+   */
+  private static async restoreInvoiceStock(tx: any, orderId: string, invoiceNum: string, userId: string) {
+    const already = await tx.stockMovement.count({ where: { referenceType: 'INVOICE_CANCEL', referenceId: orderId } });
+    if (already > 0) return;
+
+    const sales = await tx.stockMovement.findMany({
+      where: { referenceType: 'ORDER', referenceId: orderId, movementType: 'SALES_OUT' },
+      orderBy: { createdAt: 'asc' }
+    });
+    for (const m of sales) {
+      const qty = Math.abs(m.baseQty ?? m.quantity);
+      if (!(qty > 0)) continue;
+      const allocation: Array<{ batchId: string | null; qty: number; unitCost: number }> = [];
+      const breakdown = Array.isArray(m.consumptionBreakdown) ? (m.consumptionBreakdown as any[]) : null;
+      if (breakdown && breakdown.length) {
+        for (const c of breakdown) allocation.push({ batchId: c.batchId || null, qty: Number(c.qty) || 0, unitCost: Number(c.unitCost) || 0 });
+      } else if (m.batchId) {
+        allocation.push({ batchId: m.batchId, qty, unitCost: m.unitCost || 0 });
+      }
+      const covered = allocation.reduce((s, a) => s + a.qty, 0);
+      if (qty - covered > 0.0001) allocation.push({ batchId: null, qty: qty - covered, unitCost: m.unitCost || 0 });
+
+      await InventoryService.restoreToBatches(tx, {
+        itemId: m.itemId,
+        allocation,
+        movementType: 'SALES_RETURN_IN',
+        referenceType: 'INVOICE_CANCEL',
+        referenceId: orderId,
+        note: `Stock restored — Invoice ${invoiceNum} cancelled`,
+        userId,
+        warehouseId: m.warehouseId,
+      });
+    }
+    if (sales.length) await tx.order.update({ where: { id: orderId }, data: { inventory_deducted: false } });
+  }
+
+  /**
+   * After an invoice is cancelled, the document it was converted from must be
+   * convertible again — otherwise the sale can never be re-invoiced (the
+   * converted* links are unique / terminal statuses).
+   */
+  private static async reopenSourceDocuments(tx: any, orderId: string) {
+    await tx.salesOrder.updateMany({ where: { convertedInvoiceId: orderId }, data: { status: 'CONFIRMED', convertedInvoiceId: null } });
+    await tx.proformaInvoice.updateMany({ where: { convertedInvoiceId: orderId }, data: { status: 'SENT', convertedInvoiceId: null } });
+    await tx.quotation.updateMany({ where: { convertedInvoiceId: orderId }, data: { status: 'ACCEPTED', convertedInvoiceId: null } });
+    await tx.deliveryChallan.updateMany({ where: { convertedOrderId: orderId, status: 'CONVERTED' }, data: { status: 'CLOSED', convertedOrderId: null, convertedInvoiceId: null } });
   }
 
   static async getExpenseDetails(expenseId: string) {
@@ -1648,6 +1781,9 @@ export class FinanceService {
     const singleInvoiceId: string | undefined =
       data.invoiceId || (rawAllocations && rawAllocations.length === 1 ? rawAllocations[0].invoiceId : undefined);
 
+    // Audit: payment dates are validated (no future dates, bounded backdating).
+    const paymentDate = resolvePaymentDate(data.createdAt);
+
     const operation = async (tx: any) => {
       // 0. Idempotency: a retry/double-click/API re-entry carrying the same
       // key must return the ALREADY-created payment instead of posting a
@@ -1804,6 +1940,8 @@ export class FinanceService {
         data: {
           paymentNumber,
           paidAmount: amount,
+          // Persisted direction (audit C-07) — cancellation reverses exactly this.
+          flow,
           type: paymentType as any,
           sourceModule: sourceModule as any,
           linkedDocType: linkedDocType as any,
@@ -1822,7 +1960,7 @@ export class FinanceService {
           accountId: account?.id ?? undefined,
           createdBy: data.createdBy,
           idempotencyKey: data.idempotencyKey || undefined,
-          createdAt: data.createdAt ? new Date(data.createdAt) : undefined,
+          createdAt: paymentDate,
         },
       });
 
@@ -1869,7 +2007,7 @@ export class FinanceService {
               accountId: account?.id,
               paymentMode: resolvedPaymentMode as any,
               note: data.note || `Payment #${paymentNumber} recorded`,
-              createdAt: data.createdAt ? new Date(data.createdAt) : undefined
+              createdAt: paymentDate
             }
           });
 
@@ -1919,7 +2057,7 @@ export class FinanceService {
               referenceId: payment.id,
               accountId: account?.id,
               note: data.note || `Payment #${paymentNumber} recorded`,
-              createdAt: data.createdAt ? new Date(data.createdAt) : undefined,
+              createdAt: paymentDate,
             },
           });
         }
@@ -1963,6 +2101,16 @@ export class FinanceService {
         );
       }
 
+      if (paymentDate && paymentDate.getTime() < Date.now() - 60 * 60 * 1000) {
+        await writeAuditLog(tx, {
+          module: 'FINANCE',
+          action: 'PAYMENT_BACKDATED',
+          recordId: payment.id,
+          newValue: { paymentNumber, amount, effectiveDate: paymentDate.toISOString() },
+          actor: { label: data.createdBy || null }
+        });
+      }
+
       return payment;
     };
 
@@ -1989,13 +2137,42 @@ export class FinanceService {
   /**
    * Internal Fund Transfer (Cash to Bank, etc)
    */
-  static async transferFunds(data: { fromAccountId: string, toAccountId: string, amount: number, note?: string, createdBy?: string }) {
+  static async transferFunds(data: { fromAccountId: string, toAccountId: string, amount: number, note?: string, createdBy?: string, actor?: ActingUser }) {
+    // Audit H-13: validate before touching anything. A negative amount used to
+    // run the transfer backwards AND skip the balance check.
+    const amount = requirePositiveAmount(data.amount, 'Transfer amount');
+    if (typeof data.fromAccountId !== 'string' || typeof data.toAccountId !== 'string' || !data.fromAccountId || !data.toAccountId) {
+      throw new AppError('Source and destination accounts are required.', 400);
+    }
+    if (data.fromAccountId === data.toAccountId) {
+      throw new AppError('Source and destination accounts must be different.', 400);
+    }
+    if (!data.actor) throw new AppError('Unauthorized', 401);
+
     return prisma.$transaction(async (tx) => {
+      // Lock both accounts in a fixed order (no deadlock between opposite transfers).
+      for (const id of [data.fromAccountId, data.toAccountId].sort()) {
+        await tx.$queryRaw`SELECT id FROM "Account" WHERE id = ${id} FOR UPDATE`;
+      }
       const fromAcc = await tx.account.findUnique({ where: { id: data.fromAccountId } });
       const toAcc = await tx.account.findUnique({ where: { id: data.toAccountId } });
 
-      if (!fromAcc || !toAcc) throw new Error("Source or Destination account not found");
-      if (fromAcc.balance < data.amount) throw new Error(`Insufficient balance in ${fromAcc.name}`);
+      if (!fromAcc || !toAcc) throw new AppError("Source or Destination account not found", 404);
+      if (fromAcc.status !== 'ACTIVE' || toAcc.status !== 'ACTIVE') throw new AppError('Both accounts must be active.', 400);
+
+      // Ownership: the caller must own both accounts, and money may only move
+      // between accounts of the SAME owner (franchise ↔ HQ settlement has its
+      // own documented flows; a "transfer" must not bypass them).
+      await assertCanActOnFranchise(data.actor, fromAcc.franchiseId, 'source account', tx);
+      await assertCanActOnFranchise(data.actor, toAcc.franchiseId, 'destination account', tx);
+      if ((await ownerKeyOf(fromAcc.franchiseId, tx)) !== (await ownerKeyOf(toAcc.franchiseId, tx))) {
+        throw new AppError('Transfers are only allowed between accounts of the same franchise/HQ.', 403);
+      }
+
+      if (!(await AccountService.debitIfSufficient(tx, fromAcc.id, amount))) {
+        throw new AppError(`Insufficient balance in ${fromAcc.name}`, 400);
+      }
+      await AccountService.adjustBalance(tx, toAcc.id, amount, 'INFLOW');
 
       const pNum = await this.generatePaymentNumber(tx);
 
@@ -2003,7 +2180,8 @@ export class FinanceService {
       await tx.payment.create({
         data: {
           paymentNumber: pNum,
-          paidAmount: data.amount,
+          paidAmount: amount,
+          flow: 'OUT',
           type: 'INTERNAL_TRANSFER' as any,
           sourceModule: 'TRANSFER' as any,
           linkedDocType: 'TRANSFER' as any,
@@ -2021,7 +2199,8 @@ export class FinanceService {
       await tx.payment.create({
         data: {
           paymentNumber: pNum + "-IN", // Sub-ref
-          paidAmount: data.amount,
+          paidAmount: amount,
+          flow: 'IN',
           type: 'INTERNAL_TRANSFER' as any,
           sourceModule: 'TRANSFER' as any,
           linkedDocType: 'TRANSFER' as any,
@@ -2035,86 +2214,342 @@ export class FinanceService {
         }
       });
 
-      // 3. Update balances
-      await tx.account.update({ where: { id: fromAcc.id }, data: { balance: { decrement: data.amount } } });
-      await tx.account.update({ where: { id: toAcc.id }, data: { balance: { increment: data.amount } } });
+      // 3. Balances were already moved atomically above.
+      await writeAuditLog(tx, {
+        module: 'FINANCE',
+        action: 'FUND_TRANSFER',
+        recordId: pNum,
+        newValue: { fromAccountId: fromAcc.id, toAccountId: toAcc.id, amount, note: data.note || null },
+        actor: data.actor
+      });
 
-      return { success: true };
+      return { success: true, paymentNumber: pNum };
     });
   }
 
   /**
    * Payment Cancellation (Soft Delete + Reversal Entry)
    */
-  static async cancelPayment(paymentId: string, cancelledBy?: string) {
+  static async cancelPayment(
+    paymentId: string,
+    actor?: (ActingUser & { label?: string | null }) | null,
+    reason?: string
+  ) {
+    // Audit C-07. The previous version guessed the direction from entityType
+    // (wrong for vendor refunds, customer refunds, payroll, transfers),
+    // never reversed vendor/franchise ledgers, and left invoices, bills, POs,
+    // expenses and payslips marked paid. This version:
+    //  - row-locks the payment (concurrent/double cancels serialize; a repeat
+    //    is a no-op that reports alreadyCancelled — idempotent);
+    //  - reverses the cash/bank movement using the PERSISTED flow (legacy rows
+    //    without a classifiable flow are refused, never guessed);
+    //  - reverses vendor, customer and franchise sub-ledger postings;
+    //  - recomputes every linked document's paid status;
+    //  - does all of it in one transaction, with an audit record.
+    const label = actor?.label || actor?.userId || 'SYSTEM';
     return prisma.$transaction(async (tx) => {
-      const original = await tx.payment.findUnique({
-        where: { id: paymentId },
-        include: { account: true }
-      });
+      const peek = await tx.payment.findUnique({ where: { id: paymentId }, select: { type: true, paymentNumber: true } });
+      if (!peek) throw new AppError('Payment not found', 404);
+      // Lock this payment — and, for an internal transfer, its sibling leg —
+      // in a fixed (id-sorted) order so cancelling the two legs concurrently
+      // cannot deadlock.
+      const lockIds = [paymentId];
+      if (peek.type === 'INTERNAL_TRANSFER' && peek.paymentNumber) {
+        const siblingNumber = peek.paymentNumber.endsWith('-IN') ? peek.paymentNumber.slice(0, -3) : `${peek.paymentNumber}-IN`;
+        const sib = await tx.payment.findUnique({ where: { paymentNumber: siblingNumber }, select: { id: true } });
+        if (sib) lockIds.push(sib.id);
+      }
+      for (const lockId of [...lockIds].sort()) {
+        await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${lockId} FOR UPDATE`;
+      }
+      const original = await tx.payment.findUniqueOrThrow({ where: { id: paymentId } });
 
-      if (!original) throw new Error("Payment not found");
-      if (original.isCancelled) throw new Error("Payment already cancelled");
+      if (actor) {
+        await assertCanActOnFranchise(actor, await this.paymentOwnerFranchiseId(tx, original), 'payment', tx);
+        if (original.sourceModule === 'FRANCHISE' && original.approvedBy && !isSuperAdmin(actor)) {
+          throw new AppError('HQ has already confirmed receipt of this payment; only HQ can cancel it.', 403);
+        }
+      }
 
-      // 1. Mark original as cancelled
-      await tx.payment.update({
-        where: { id: paymentId },
-        data: { isCancelled: true, cancelledAt: new Date() }
-      });
+      if (original.isCancelled) return { success: true, alreadyCancelled: true, paymentId };
+      if (original.type === 'REVERSAL') throw new AppError('A reversal entry cannot itself be cancelled.', 400);
 
-      // 2. If it was PAID, create reversal entry and restore balance
-      if (original.status === 'PAID' && original.accountId) {
-        const flow = original.entityType === 'VENDOR' ? 'OUT' : 'IN'; // Simplification
-        const reversalAmount = original.paidAmount;
+      // An internal transfer is two rows (OUT leg + "-IN" leg); cancelling
+      // either cancels both so the two accounts stay balanced.
+      const legs: any[] = [original];
+      if (original.type === 'INTERNAL_TRANSFER' && original.paymentNumber) {
+        const siblingNumber = original.paymentNumber.endsWith('-IN')
+          ? original.paymentNumber.slice(0, -3)
+          : `${original.paymentNumber}-IN`;
+        const sibling = await tx.payment.findUnique({ where: { paymentNumber: siblingNumber } });
+        if (sibling) {
+          // Already locked above (id-sorted together with the original).
+          if (actor) await assertCanActOnFranchise(actor, await this.paymentOwnerFranchiseId(tx, sibling), 'payment', tx);
+          if (!sibling.isCancelled) legs.push(sibling);
+        }
+      }
 
-        const pNum = await this.generatePaymentNumber(tx);
+      // Refuse before writing anything if any posted leg has no known direction.
+      for (const leg of legs) {
+        if (isPostedPayment(leg.status) && leg.accountId && !resolvePaymentFlow(leg)) {
+          throw new AppError(
+            `Payment ${leg.paymentNumber || leg.id} predates direction tracking and could not be classified automatically. Set its "flow" (IN/OUT) after accounting review before cancelling it.`,
+            409
+          );
+        }
+      }
 
-        await tx.payment.create({
-          data: {
-            paymentNumber: pNum,
-            type: 'REVERSAL' as any,
-            sourceModule: original.sourceModule,
-            linkedDocType: original.linkedDocType,
-            linkedDocId: original.linkedDocId,
-            paidAmount: reversalAmount,
-            paymentMode: original.paymentMode,
-            status: 'PAID',
-            accountId: original.accountId,
-            transactionRef: `REVERSAL of ${original.paymentNumber || original.id}`,
-            reversalOfPaymentId: original.id,
-            entityType: original.entityType,
-            entityId: original.entityId,
-            createdBy: cancelledBy
-          }
+      const reversed: Array<{ paymentId: string; flow: string | null; amount: number; accountId: string | null }> = [];
+      for (const leg of legs) {
+        const claim = await tx.payment.updateMany({
+          where: { id: leg.id, isCancelled: false },
+          data: { isCancelled: true, cancelledAt: new Date() }
         });
+        if (claim.count === 0) continue;
 
-        // Restore balance: 
-        // If original was OUT (decreased balance) -> Inflow (increase balance)
-        // If original was IN (increased balance) -> Outflow (decrease balance)
-        const isOriginalOutflow = (original.entityType === 'VENDOR' || original.type === 'EXPENSE');
+        const flow = resolvePaymentFlow(leg);
+        const posted = isPostedPayment(leg.status);
+        const amount = leg.paidAmount;
 
-        await tx.account.update({
-          where: { id: original.accountId },
-          data: {
-            balance: {
-              increment: isOriginalOutflow ? reversalAmount : -reversalAmount
+        if (posted && leg.accountId && flow) {
+          if (flow === 'IN') {
+            // Undoing a receipt takes the money back out of the account.
+            if (!(await AccountService.debitIfSufficient(tx, leg.accountId, amount))) {
+              throw new AppError(`Cannot cancel payment ${leg.paymentNumber || leg.id}: reversing it would overdraw the receiving account. Fund the account first.`, 409);
             }
+          } else {
+            await AccountService.adjustBalance(tx, leg.accountId, amount, 'INFLOW');
+          }
+          await tx.payment.create({
+            data: {
+              paymentNumber: await this.generatePaymentNumber(tx),
+              type: 'REVERSAL' as any,
+              flow: flow === 'IN' ? 'OUT' : 'IN',
+              sourceModule: leg.sourceModule,
+              linkedDocType: leg.linkedDocType,
+              linkedDocId: leg.linkedDocId,
+              paidAmount: amount,
+              paymentMode: leg.paymentMode,
+              status: 'PAID',
+              accountId: leg.accountId,
+              transactionRef: `REVERSAL of ${leg.paymentNumber || leg.id}${reason ? ` — ${reason}` : ''}`,
+              reversalOfPaymentId: leg.id,
+              entityType: leg.entityType,
+              entityId: leg.entityId,
+              createdBy: label
+            }
+          });
+        }
+
+        // A franchise payment that HQ confirmed was also credited to an HQ
+        // account (franchise-order.service stores that account id in
+        // reversalOfPaymentId); that inflow must come back out too.
+        if (posted && leg.sourceModule === 'FRANCHISE' && leg.approvedBy && leg.reversalOfPaymentId) {
+          const hqAccount = await tx.account.findUnique({ where: { id: leg.reversalOfPaymentId }, select: { id: true } });
+          if (hqAccount && !(await AccountService.debitIfSufficient(tx, hqAccount.id, amount))) {
+            throw new AppError(`Cannot cancel payment ${leg.paymentNumber || leg.id}: the HQ account that received it has insufficient balance.`, 409);
+          }
+        }
+
+        await this.reversePaymentSubLedgers(tx, leg, label);
+        await this.recomputeDocumentsAfterPaymentCancel(tx, leg, flow);
+        reversed.push({ paymentId: leg.id, flow, amount, accountId: leg.accountId });
+      }
+
+      await writeAuditLog(tx, {
+        module: 'FINANCE',
+        action: 'PAYMENT_CANCELLED',
+        recordId: original.id,
+        oldValue: { paymentNumber: original.paymentNumber, amount: original.paidAmount, status: original.status, sourceModule: original.sourceModule },
+        newValue: { reason: reason || null, reversed },
+        actor: actor ? { userId: actor.userId, role: actor.role, franchiseId: actor.franchiseId ?? null, label: actor.label } : { label }
+      });
+
+      return { success: true, paymentId: original.id, reversed };
+    });
+  }
+
+  /** Franchise that owns a payment: its account's owner, else its order's, else its expense's. */
+  private static async paymentOwnerFranchiseId(tx: any, p: any): Promise<string | null> {
+    if (p.accountId) {
+      const acc = await tx.account.findUnique({ where: { id: p.accountId }, select: { franchiseId: true } });
+      if (acc) return acc.franchiseId;
+    }
+    if (p.orderId) {
+      const order = await tx.order.findUnique({ where: { id: p.orderId }, select: { franchiseId: true } });
+      if (order) return order.franchiseId;
+    }
+    if (p.linkedDocType === 'EXPENSE_BILL' && p.linkedDocId) {
+      const exp = await tx.expense.findUnique({ where: { id: p.linkedDocId }, select: { franchiseId: true } });
+      if (exp) return exp.franchiseId;
+    }
+    return null;
+  }
+
+  /**
+   * Nets and reverses every sub-ledger row a payment posted. Vendor and
+   * customer rows are keyed by payment id (createPayment); netting includes
+   * earlier reversals, so a repeat call posts nothing.
+   */
+  private static async reversePaymentSubLedgers(tx: any, p: any, label: string) {
+    const note = `Reversal — Payment #${p.paymentNumber || p.id} cancelled`;
+
+    const vendorRows = await tx.vendorLedger.findMany({ where: { referenceId: p.id } });
+    const netByVendor = new Map<string, number>();
+    for (const r of vendorRows) {
+      netByVendor.set(r.vendorId, (netByVendor.get(r.vendorId) || 0) + (r.type === 'CREDIT' ? r.amount : -r.amount));
+    }
+    for (const [vendorId, net] of netByVendor) {
+      const amount = Math.round(Math.abs(net) * 100) / 100;
+      if (amount < 0.01) continue;
+      const all = await tx.vendorLedger.findMany({ where: { vendorId }, select: { type: true, amount: true } });
+      const balance = all.reduce((s: number, e: any) => s + (e.type === 'CREDIT' ? e.amount : -e.amount), 0);
+      const type = net > 0 ? 'DEBIT' : 'CREDIT';
+      await tx.vendorLedger.create({
+        data: {
+          vendorId,
+          type,
+          amount,
+          balanceAfterTransaction: type === 'CREDIT' ? balance + amount : balance - amount,
+          sourceModule: 'FINANCE',
+          referenceType: 'ADJUSTMENT',
+          referenceId: p.id,
+          invoiceId: p.vendorInvoiceId || undefined,
+          paymentMode: p.paymentMode || 'CASH',
+          note: `${note} (by ${label})`
+        }
+      });
+    }
+
+    await this.reverseCustomerLedgerEntries(tx, { referenceId: p.id, referenceTypes: ['PAYMENT'], note });
+
+    // Franchise payments post a CREDIT keyed by the order number (not the
+    // payment id), so reverse by amount, keyed to this payment for idempotency.
+    if (p.sourceModule === 'FRANCHISE' && p.entityType === 'FRANCHISE' && p.entityId && isPostedPayment(p.status)) {
+      const already = await tx.franchiseLedger.findFirst({ where: { referenceId: p.id, referenceType: 'ADJUSTMENT' } });
+      if (!already) {
+        const franchise = await tx.franchise.findUnique({ where: { id: p.entityId }, select: { outstandingAmount: true } });
+        if (franchise) {
+          const newOutstanding = (franchise.outstandingAmount || 0) + p.paidAmount;
+          await tx.franchiseLedger.create({
+            data: {
+              franchiseId: p.entityId,
+              type: LedgerType.DEBIT,
+              amount: p.paidAmount,
+              balanceAfter: newOutstanding,
+              referenceType: FranchiseLedgerRefType.ADJUSTMENT,
+              referenceId: p.id,
+              note
+            }
+          });
+          await tx.franchise.update({ where: { id: p.entityId }, data: { outstandingAmount: newOutstanding } });
+        }
+      }
+    }
+  }
+
+  /** Recomputes paid status of everything a (now cancelled) payment settled. */
+  private static async recomputeDocumentsAfterPaymentCancel(tx: any, p: any, flow: string | null) {
+    // Customer tax invoices (direct, allocated, or via the order).
+    const invoiceIds = new Set<string>();
+    if (p.invoiceId) invoiceIds.add(p.invoiceId);
+    const allocs = await tx.paymentAllocation.findMany({ where: { paymentId: p.id }, select: { invoiceId: true } });
+    allocs.forEach((a: any) => invoiceIds.add(a.invoiceId));
+    if (p.orderId) {
+      const inv = await tx.invoice.findUnique({ where: { orderId: p.orderId }, select: { id: true } });
+      if (inv) invoiceIds.add(inv.id);
+    }
+    for (const id of invoiceIds) {
+      const inv = await tx.invoice.findUnique({ where: { id } });
+      if (!inv || inv.status === 'CANCELLED') continue;
+      const paid = await this.getInvoicePaidAmount(tx, id);
+      const status = paid >= inv.finalAmount - 0.01 ? 'PAID' : paid > 0 ? 'PARTIAL' : 'UNPAID';
+      await tx.invoice.update({ where: { id }, data: { status } });
+      await tx.order.update({ where: { id: inv.orderId }, data: { paymentStatus: status } });
+    }
+    if (p.orderId && invoiceIds.size === 0) {
+      const order = await tx.order.findUnique({ where: { id: p.orderId } });
+      if (order && order.status !== 'CANCELLED') {
+        const agg = await tx.payment.aggregate({ where: { orderId: order.id, status: 'PAID', isCancelled: false }, _sum: { paidAmount: true } });
+        const paid = agg._sum.paidAmount || 0;
+        await tx.order.update({ where: { id: order.id }, data: { paymentStatus: paid >= order.totalAmount - 0.01 ? 'PAID' : paid > 0 ? 'PARTIAL' : 'UNPAID' } });
+      }
+    }
+
+    // Vendor bill.
+    let poId: string | null = null;
+    if (p.vendorInvoiceId) {
+      const vInv = await tx.vendorInvoice.findUnique({ where: { id: p.vendorInvoiceId } });
+      if (vInv) {
+        poId = vInv.poId;
+        const agg = await tx.payment.aggregate({ where: { vendorInvoiceId: vInv.id, status: 'PAID', isCancelled: false }, _sum: { paidAmount: true } });
+        const settled = (agg._sum.paidAmount || 0) + (vInv.advanceApplied || 0);
+        if (vInv.status === 'PAID' && settled < vInv.amount - 0.01) {
+          await tx.vendorInvoice.update({ where: { id: vInv.id }, data: { status: 'PENDING' } });
+        }
+      }
+    } else if (p.linkedDocType === 'PO' && p.linkedDocId) {
+      const po = await tx.procurementOrder.findFirst({ where: { OR: [{ id: p.linkedDocId }, { poNumber: p.linkedDocId }] }, select: { id: true } });
+      poId = po?.id || null;
+    }
+    // Purchase order paid/balance (money that went OUT to the vendor).
+    if (poId && flow === 'OUT' && isPostedPayment(p.status)) {
+      const po = await tx.procurementOrder.findUnique({ where: { id: poId } });
+      if (po) {
+        const dec = Math.min(p.paidAmount, po.paid || 0);
+        const newPaid = Number(((po.paid || 0) - dec).toFixed(2));
+        const newBalance = Math.max(0, Number((po.totalAmount - newPaid).toFixed(2)));
+        await tx.procurementOrder.update({
+          where: { id: po.id },
+          data: {
+            paid: newPaid,
+            balance: newBalance,
+            // A cancelled advance is no longer paid nor reserved against the PO.
+            ...(p.type === 'ADVANCE' ? {
+              advancePaid: Math.max(0, (po.advancePaid || 0) - p.paidAmount),
+              advanceApplied: Math.max(0, (po.advanceApplied || 0) - p.paidAmount)
+            } : {}),
+            status: po.status === 'CLOSED' && newBalance > 0.01 ? 'RECEIVED' : po.status
           }
         });
       }
+    }
 
-      // A cancelled customer payment no longer settles anything: reverse the
-      // ledger row createPayment posted for it (keyed by payment id).
-      if (original.entityType === 'CUSTOMER') {
-        await this.reverseCustomerLedgerEntries(tx, {
-          referenceId: original.id,
-          referenceTypes: ['PAYMENT'],
-          note: `Reversal — Payment #${original.paymentNumber || original.id} cancelled`
+    // Expense bill.
+    if (p.linkedDocType === 'EXPENSE_BILL' && p.linkedDocId) {
+      const exp = await tx.expense.findUnique({ where: { id: p.linkedDocId } });
+      if (exp) {
+        const newPaid = Math.max(0, Number((exp.paidAmount - p.paidAmount).toFixed(2)));
+        await tx.expense.update({
+          where: { id: exp.id },
+          data: {
+            paidAmount: newPaid,
+            status: exp.isCancelled ? exp.status : newPaid >= exp.amount - 0.01 ? 'PAID' : newPaid > 0 ? 'PARTIAL' : 'UNPAID'
+          }
         });
       }
+    }
 
-      return { success: true };
-    });
+    // Payslip.
+    if (p.linkedDocType === 'PAYSLIP' && p.linkedDocId) {
+      await tx.payslip.updateMany({ where: { id: p.linkedDocId, status: 'PAID' }, data: { status: 'PENDING', paidAt: null } });
+    }
+
+    // Franchise order (franchise payments are linked by order number).
+    if (p.sourceModule === 'FRANCHISE' && p.linkedDocId) {
+      const fo = await tx.franchiseOrder.findFirst({ where: { OR: [{ orderNumber: p.linkedDocId }, { id: p.linkedDocId }] } });
+      if (fo) {
+        const agg = await tx.payment.aggregate({
+          where: { OR: [{ linkedDocId: fo.orderNumber }, { linkedDocId: fo.id }], status: 'SUCCESS', isCancelled: false },
+          _sum: { paidAmount: true }
+        });
+        const paid = agg._sum.paidAmount || 0;
+        await tx.franchiseOrder.update({
+          where: { id: fo.id },
+          data: { paymentStatus: paid >= fo.totalAmount - 0.001 ? 'PAID' : paid > 0 ? 'PARTIAL' : 'UNPAID' }
+        });
+      }
+    }
   }
 
   // Throws unless `batchNumber` is a sellable lot of this exact inventory item

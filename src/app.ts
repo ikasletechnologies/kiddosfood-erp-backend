@@ -177,7 +177,10 @@ app.patch('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), I
 app.delete('/api/warehouses/:id', authenticate, authorizeRole(['SUPER_ADMIN']), InventoryController.deleteWarehouse);
 
 // Auth Routes (Production Flow)
-app.post('/api/auth/register', validate(registerSchema), AuthController.register);
+// Audit C-01: there is no public self-registration. Accounts are created only
+// by an authenticated SUPER_ADMIN (same as POST /api/users); the role in the
+// body is honoured only for that caller.
+app.post('/api/auth/register', authenticate, authorizeRole(['SUPER_ADMIN']), validate(registerSchema), AuthController.register);
 app.post('/api/auth/login', validate(loginSchema), AuthController.login);
 app.post('/api/auth/refresh', AuthController.refresh);
 app.post('/api/auth/logout', AuthController.logout);
@@ -529,7 +532,14 @@ app.patch('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN'
 app.patch('/api/purchase-orders/:id/approve', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.approvePO);
 app.patch('/api/purchase-orders/:id/advance', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.recordAdvance);
 app.patch('/api/purchase-orders/:id/cancel', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.cancelPO);
+// Cancel the undelivered balance of a partially received PO (reason required).
+app.patch('/api/purchase-orders/:id/short-close', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.shortClosePO);
 app.delete('/api/purchase-orders/:id', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.deletePO);
+// PO-scoped goods receipt: one PO -> many GRNs, each GRN -> exactly one PO.
+app.get('/api/purchase-orders/:poId/summary', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.getPOSummary);
+app.get('/api/purchase-orders/:poId/pending-items', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.getPOPendingItems);
+app.get('/api/purchase-orders/:poId/grns', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.getPOGRNs);
+app.post('/api/purchase-orders/:poId/grns', authenticate, authorizeRole(['SUPER_ADMIN']), GRNController.receiveAgainstPO);
 // Manual reconciliation: Pay this PO using existing vendor advance balance
 app.post('/api/purchase-orders/:id/apply-advance', authenticate, authorizeRole(['SUPER_ADMIN']), ProcurementController.applyAdvance);
 // Legacy receive endpoint (kept for backward compat; prefer GRN flow)
@@ -823,9 +833,12 @@ app.get('/api/purchase/rfqs/:id', authenticate, authorizeRole(['SUPER_ADMIN']), 
 app.patch('/api/purchase/rfqs/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.updateRFQ);
 app.post('/api/purchase/rfqs/:id/convert-to-po', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.convertQuotationToPO);
 
-app.get('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.getPurchaseReturns);
-app.post('/api/purchase/returns', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.createPurchaseReturn);
-app.patch('/api/purchase/returns/:id', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.updatePurchaseReturn);
+// Purchase returns act on HQ vendors' payables and HQ lots (vendors are
+// SUPER_ADMIN-only), so they are HQ-only too (audit C-04 / H-17). These were
+// FRANCHISE_ADMIN routes with no franchise scoping.
+app.get('/api/purchase/returns', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.getPurchaseReturns);
+app.post('/api/purchase/returns', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.createPurchaseReturn);
+app.patch('/api/purchase/returns/:id', authenticate, authorizeRole(['SUPER_ADMIN']), PurchaseController.updatePurchaseReturn);
 
 app.post('/api/purchase/requisitions', authenticate, authorizeRole(['FRANCHISE_ADMIN']), PurchaseController.createRequisition);
 

@@ -3,13 +3,23 @@ import prisma from '../../lib/prisma';
 import { InventoryService } from '../inventory/inventory.service';
 import SocketService from '../../lib/socket';
 import { FinanceService } from '../finance/finance.service';
-import { AuditService } from '../audit/audit.service';
 import { AccountService } from '../finance/account.service';
 import { FranchiseService } from '../franchise/franchise.service';
 import { isRealUnit } from '../../utils/order-item-unit.util';
 import { assertBillablePrice, resolveSellingPrice } from '../../utils/selling-price.util';
 import { LotPricingService } from '../sales/lot-pricing.service';
 import { convertMeasurement, ValidUnit } from '@businessgroupikasle/erp-units';
+import { AppError } from '../../middleware/error.middleware';
+import { writeAuditLog } from '../../lib/audit-log';
+import { assertCanActOnFranchise, ownerKeyOf, ActingUser } from '../../utils/ownership.util';
+
+// Legacy step-by-step POS order (audit H-08): only forward kitchen progress.
+const POS_KITCHEN_TARGETS = ['PREPARING', 'READY', 'COMPLETED'];
+const POS_KITCHEN_TRANSITIONS: Record<string, string[]> = {
+  PENDING: ['PREPARING', 'READY', 'COMPLETED'],
+  PREPARING: ['READY', 'COMPLETED'],
+  READY: ['COMPLETED'],
+};
 
 // Atomic, collision-safe document numbering using NumberSequence table
 async function nextDocumentNumber(tx: any, key: string, prefix: string, pad = 5): Promise<string> {
@@ -146,38 +156,49 @@ export class POSService {
 
   // Step 2: Add Items
   static async addItemsToOrder(orderId: string, items: { productId: string, quantity: number, price?: number }[]) {
+     if (!Array.isArray(items) || items.length === 0) throw new AppError('At least one item is required.', 400);
      return prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        const current = await tx.order.findUnique({ where: { id: orderId }, select: { status: true } });
+        if (!current) throw new AppError('Order not found', 404);
+        // Only an open kitchen order can still take items (audit H-08): a
+        // completed sale / tax invoice must never be altered this way.
+        if (!['PENDING', 'PREPARING'].includes(current.status)) {
+          throw new AppError(`Items cannot be added to a ${current.status} order.`, 409);
+        }
         for (const it of items) {
-           // Resolve price if not provided
-           let price = it.price;
+           const quantity = Number(it?.quantity);
+           if (!Number.isFinite(quantity) || quantity <= 0) throw new AppError('Every item needs a quantity greater than zero.', 400);
            const prod = await tx.product.findUnique({ where: { id: it.productId } });
-           if (!prod) throw new Error(`Product ${it.productId} not found`);
-           if (price === undefined) {
-             price = prod.basePrice;
-           }
-           if (price <= 0) {
-             throw new Error(`Product "${prod.name}" does not have a valid selling price configured. Please update its Customer Retail price in inventory.`);
+           if (!prod) throw new AppError(`Product ${it.productId} not found`, 404);
+           // Server-side price (audit H-08): the client-supplied `price` used
+           // to be taken as-is. Same channel price resolution as checkout.
+           const priceMaster = prod.sku ? await resolveSkuPriceMaster(tx, prod.sku) : null;
+           const price = resolveSellingPrice('CUSTOMER', priceMaster, prod) ?? 0;
+           assertBillablePrice(prod, price);
+           if (!(price > 0)) {
+             throw new AppError(`Product "${prod.name}" does not have a valid selling price configured. Please update its Customer Retail price in inventory.`, 400);
            }
 
-           const tax = Number((price! * 0.05).toFixed(2));
-           const total = Number((price! * it.quantity).toFixed(2));
+           const total = Number((price * quantity).toFixed(2));
+           const tax = Number((total * ((prod.taxPercent ?? 0) / 100)).toFixed(2));
 
            await tx.orderItem.create({
               data: {
                  orderId,
                  productId: it.productId,
-                 quantity: it.quantity,
-                 price: price,
+                 quantity,
+                 price,
                  taxAmount: tax,
                  totalAmount: total
               }
            });
         }
 
-        // Recalculate totals
+        // Recalculate totals from the server-priced lines (per-product GST).
         const orderItems = await tx.orderItem.findMany({ where: { orderId } });
         const finalSubTotal = orderItems.reduce((acc, obj) => acc + (obj.totalAmount || 0), 0);
-        const finalTax = Number((finalSubTotal * 0.05).toFixed(2)); // 5% flat overall tax
+        const finalTax = Number(orderItems.reduce((acc, obj) => acc + (obj.taxAmount || 0), 0).toFixed(2));
         const finalTotal = Math.ceil(Number((finalSubTotal + finalTax).toFixed(2))); // round-off always up
 
         const updatedOrder = await tx.order.update({
@@ -201,61 +222,75 @@ export class POSService {
   }
 
   // Step 3 & 4: Status Updates and Inventory Deduction Enforcement
-  static async updateOrderStatus(orderId: string, status: string) {
-    // Phase 3: Trigger deduction on READY or COMPLETED
-    if (status === 'READY' || status === 'COMPLETED') {
-      await this.deductInventoryIfNecessary(orderId);
+  /**
+   * Kitchen progress for an open POS order (audit H-08).
+   *
+   * This route used to write ANY status to ANY Order — including B2B tax
+   * invoices (same table) — so CANCELLED/REFUNDED bypassed cancelInvoice's
+   * payment/dispatch/return checks and reversed nothing, and every repeated
+   * COMPLETED posted another CustomerLedger SALE debit; side effects ran
+   * outside any transaction with failures swallowed. Now: only forward
+   * kitchen moves (PENDING -> PREPARING -> READY -> COMPLETED), row-locked,
+   * owner-checked, all side effects in the same transaction, exactly once.
+   * A sale is cancelled by cancelling its invoice; goods come back through
+   * Sales Returns.
+   */
+  static async updateOrderStatus(orderId: string, status: string, actor?: ActingUser | null) {
+    if (!POS_KITCHEN_TARGETS.includes(status)) {
+      throw new AppError('Only kitchen progress (PREPARING, READY, COMPLETED) can be set here. Cancel a sale by cancelling its invoice; take goods back through Sales Returns.', 400);
     }
+    const order = await prisma.$transaction(async (tx) => {
+      const locked: any[] = await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      if (!locked.length) throw new AppError('Order not found', 404);
+      const before = await tx.order.findUniqueOrThrow({ where: { id: orderId } });
+      if (actor) await assertCanActOnFranchise(actor, before.franchiseId, 'order', tx);
+      if (!(POS_KITCHEN_TRANSITIONS[before.status] || []).includes(status)) {
+        throw new AppError(`An order cannot move from ${before.status} to ${status}.`, 409);
+      }
 
-    const order = await prisma.order.update({
-      where: { id: orderId },
-      data: { status: status as any }
+      if (status === 'READY' || status === 'COMPLETED') {
+        await this.deductInventoryIfNecessary(orderId, tx);
+      }
+
+      const updated = await tx.order.update({ where: { id: orderId }, data: { status: status as any } });
+
+      if (status === 'COMPLETED') {
+        // Receivable posted exactly once per sale (a walk-in has no customer).
+        if (updated.customerId) {
+          const posted = await tx.customerLedger.count({ where: { referenceType: 'SALE', referenceId: updated.id } });
+          if (!posted) {
+            await tx.customerLedger.create({
+              data: {
+                customerId: updated.customerId,
+                type: 'DEBIT',
+                amount: updated.totalAmount,
+                paymentMode: 'CASH',
+                referenceType: 'SALE',
+                referenceId: updated.id,
+                note: `POS Sale — Invoice #${updated.invoiceNum}`
+              }
+            });
+          }
+        }
+        await FinanceService.createInvoiceFromOrder(orderId, tx);
+      }
+
+      await writeAuditLog(tx, {
+        module: 'POS_ORDER',
+        action: `STATUS_${status}`,
+        recordId: orderId,
+        oldValue: { status: before.status },
+        newValue: { status, invoiceNum: before.invoiceNum },
+        actor
+      });
+      return updated;
     });
 
-    // Audit log for sensitive status changes
-    if (status === 'CANCELLED' || status === 'COMPLETED') {
-        await AuditService.log({
-            userId: 'system', // Ideally pass userId from controller
-            action: `ORDER_${status}`,
-            entityType: 'ORDER',
-            entityId: order.id,
-            targetFranchiseId: order.franchiseId,
-            details: { status }
-        });
+    try {
+      SocketService.io.emit('order-updated', order);
+    } catch (err) {
+      console.error('[Socket] Failed to emit order-updated', err);
     }
-
-    SocketService.io.emit('order-updated', order);
-
-    // Phase 5: Trigger Accounting (Invoice & Payment) after update succeeds.
-    // Ledger and invoice creation are posted independently — a walk-in order
-    // has no customerId, so CustomerLedger (which requires one) is skipped
-    // for it, but the Invoice (the record P&L/reports actually read) must
-    // still get created regardless of whether that ledger entry was posted.
-    if (status === 'COMPLETED') {
-        if (order.customerId) {
-            try {
-                await prisma.customerLedger.create({
-                  data: {
-                    customerId: order.customerId,
-                    type: 'DEBIT',
-                    amount: order.totalAmount,
-                    paymentMode: 'CASH', // Placeholder until payment
-                    referenceType: 'SALE',
-                    referenceId: order.id,
-                    note: `POS Sale — Invoice #${order.invoiceNum}`
-                  }
-                });
-            } catch (ledgerErr) {
-                console.error('[Accounting] Failed to create customer ledger entry', ledgerErr);
-            }
-        }
-        try {
-            await FinanceService.createInvoiceFromOrder(orderId);
-        } catch (invErr) {
-            console.error('[Accounting] Failed to create invoice', invErr);
-        }
-    }
-
     return order;
   }
 
@@ -414,11 +449,27 @@ export class POSService {
     if (!accountId) throw new Error('Source Account ID is required for POS payments.');
 
     return prisma.$transaction(async (tx) => {
-      let order = await tx.order.findUnique({ 
+      // Row lock: a double-submitted payment serializes here (audit H-08).
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = await tx.order.findUnique({
         where: { id: orderId },
         include: { invoice: true }
       });
-      if (!order) throw new Error('Order not found');
+      if (!order) throw new AppError('Order not found', 404);
+      if (order.status === 'CANCELLED' || order.status === 'REFUNDED') throw new AppError(`Cannot take payment for a ${order.status} order.`, 409);
+
+      // The money must land in an account of the order's own franchise/HQ.
+      const account = await tx.account.findUnique({ where: { id: accountId }, select: { franchiseId: true } });
+      if (!account) throw new AppError('Payment account not found', 404);
+      if ((await ownerKeyOf(account.franchiseId, tx)) !== (await ownerKeyOf(order.franchiseId, tx))) {
+        throw new AppError('The selected account does not belong to this order\'s branch.', 403);
+      }
+
+      // Pay only what is still outstanding — this used to charge the full
+      // total again on every call.
+      const paidSoFar = (await tx.payment.aggregate({ where: { orderId, status: 'PAID', isCancelled: false }, _sum: { paidAmount: true } }))._sum.paidAmount || 0;
+      const outstanding = Number((order.totalAmount - paidSoFar).toFixed(2));
+      if (outstanding <= 0.009) throw new AppError('This order is already fully paid.', 409);
 
       // Ensure invoice exists
       let invoice = order.invoice;
@@ -426,10 +477,13 @@ export class POSService {
         invoice = await FinanceService.createInvoiceFromOrder(orderId, tx);
       }
 
-      // 1. Create Centralized Payment via FinanceService
+      // 1. Create Centralized Payment via FinanceService. It also posts the
+      // CustomerLedger CREDIT for a customer and recomputes the invoice /
+      // order payment status — the separate ledger write that followed here
+      // credited every customer payment TWICE.
       await FinanceService.createPayment({
         tx,
-        amount: order.totalAmount,
+        amount: outstanding,
         flow: 'IN',
         status: 'PAID',
         sourceAccount: accountId,
@@ -445,28 +499,11 @@ export class POSService {
         createdBy: createdBy || 'POS_SYSTEM'
       });
 
-      // 2. Customer Ledger CREDIT (They paid us)
-      if (order.customerId) {
-        await tx.customerLedger.create({
-          data: {
-            customerId: order.customerId,
-            type: 'CREDIT',
-            amount: order.totalAmount,
-            paymentMode: method,
-            referenceType: 'PAYMENT',
-            referenceId: order.id,
-            accountId,
-            note: `Payment for Order #${order.invoiceNum}`
-          }
-        });
-      }
-
-      const updated = await tx.order.update({
+      // 2. Payment status was recomputed from actual payments by createPayment.
+      return tx.order.findUniqueOrThrow({
         where: { id: orderId },
-        data: { paymentStatus: 'PAID' },
         include: { payments: true, invoice: true, orderItems: { include: { product: true } }, customer: true }
       });
-      return updated;
     });
   }
 
